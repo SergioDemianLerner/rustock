@@ -15,7 +15,7 @@ anyhow = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 futures = "0.3.31"
-lru = "0.12"
+lru = { workspace = true }
 rand = { workspace = true }
 sha3 = "0.10"
 

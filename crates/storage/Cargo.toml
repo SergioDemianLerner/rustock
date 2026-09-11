@@ -12,7 +12,7 @@ alloy-rlp = { workspace = true }
 alloy-primitives = { workspace = true }
 sha3 = "0.10"
 tracing = { workspace = true }
-lru = "0.16.3"
+lru = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
