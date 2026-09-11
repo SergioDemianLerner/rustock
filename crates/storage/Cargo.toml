@@ -2,6 +2,7 @@
 name = "rustock-storage"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 rustock-core = { version = "0.1.0", path = "../core" }

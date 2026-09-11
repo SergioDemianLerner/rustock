@@ -2,11 +2,12 @@
 name = "rustock-execution"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
-rustock-core = { path = "../core" }
-rustock-trie = { path = "../trie" }
-rustock-storage = { path = "../storage" }
+rustock-core = { version = "0.1.0", path = "../core" }
+rustock-trie = { version = "0.1.0", path = "../trie" }
+rustock-storage = { version = "0.1.0", path = "../storage" }
 revm = { version = "36", default-features = false, features = ["std", "secp256k1", "optional_eip3541"] }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }

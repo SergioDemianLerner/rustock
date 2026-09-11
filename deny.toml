@@ -1,0 +1,92 @@
+# cargo-deny configuration -- supply chain policy for rustock.
+#
+# Run locally with:   cargo deny check
+# CI runs the same checks on every push/PR and on a daily schedule, so that
+# advisories published against already-pinned dependencies are caught even when
+# nobody touches the code.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = false
+
+# ---------------------------------------------------------------------------
+# Security advisories (RustSec)
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+# Refuse to build against a version that has been pulled from crates.io. This
+# caught keccak 0.1.5, a yanked release of the Keccak-256 implementation behind
+# every hash in the node.
+yanked = "deny"
+ignore = [
+    # paste -- unmaintained. Transitive only: pulled in by the ark-* crates
+    # behind revm's BN254/BLS12-381 precompiles. Not replaceable from here, and
+    # unmaintained is not the same as vulnerable. Kept as an explicit entry
+    # rather than relaxing the unmaintained policy, so that a NEW unmaintained
+    # crate still fails CI and forces a deliberate decision.
+    { id = "RUSTSEC-2024-0436", reason = "paste, unmaintained; transitive via ark-* under revm precompiles" },
+]
+
+# Note on RUSTSEC-2025-0055 (tracing-subscriber 0.2.25, ANSI escape injection)
+# and RUSTSEC-2024-0388 (derivative, unmaintained): deliberately NOT ignored. cargo-audit reports it because it scans
+# Cargo.lock flatly, but cargo-deny resolves the real build graph and correctly
+# does not see it -- the crate is never compiled. It arrives via ark-relations
+# 0.5.1 <- ark-r1cs-std 0.5.0 (which hard-pins ark-relations ^0.5.0) <-
+# ark-bn254 <- revm-precompile, a path that is not built. The node's own logging
+# uses tracing-subscriber 0.3.x, which is patched. Adding an ignore entry would
+# only produce an "advisory was not encountered" warning.
+
+# ---------------------------------------------------------------------------
+# Where code is allowed to come from
+# ---------------------------------------------------------------------------
+# This is the core supply chain control: every dependency must come from
+# crates.io, whose published versions are immutable. Combined with the checksums
+# in Cargo.lock, a compromised maintainer cannot alter a version we already
+# depend on -- they would have to publish a new one, which the lockfile will not
+# pick up until someone deliberately runs `cargo update`.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# ---------------------------------------------------------------------------
+# Bans and duplicate versions
+# ---------------------------------------------------------------------------
+[bans]
+# Every duplicated crate is another maintainer to trust and another advisory to
+# track. Kept at "warn" because the transitive tree still carries legitimate
+# duplicates (ark-* 0.3/0.4/0.5/0.6, syn 1/2) that we do not control. Direct
+# dependencies should always be consolidated -- prefer [workspace.dependencies]
+# so two crates cannot silently pin different versions, as sync and storage did
+# with lru 0.12 and 0.16.
+multiple-versions = "warn"
+# A wildcard version means "whatever is newest", which defeats the point of
+# pinning.
+wildcards = "deny"
+deny = []
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",      # 188 crates
+    "MIT",             # 252 crates
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MITNFA",          # hex_lit, via bitcoin: MIT + no-false-attribs
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]

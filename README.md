@@ -91,6 +91,39 @@ cargo test --workspace
 
 786 tests covering consensus validation, RLP encoding, P2P handshakes, sync state machines, storage, the Unitrie, EVM execution, every RSK precompile (including the full Bridge surface and REMASC), the transaction pool, RPC methods, transaction relay, and chain reorganizations.
 
+### Dependency Auditing
+
+Supply chain checks run in CI on every push and pull request, and on a daily
+schedule so that advisories published against already-pinned dependencies are
+caught even when nobody touches the code. To run the same checks locally:
+
+```bash
+cargo install cargo-deny --locked
+cargo deny check                  # advisories, bans, licenses, sources
+```
+
+The policy lives in [`deny.toml`](deny.toml). What it enforces:
+
+- **crates.io only.** Unknown registries and git dependencies are rejected.
+  Published crates.io versions are immutable, so together with the checksums in
+  `Cargo.lock` a compromised maintainer cannot alter a version already depended
+  on — only publish a new one, which the lockfile will not pick up until
+  someone deliberately runs `cargo update`.
+- **No yanked crates.** A yank usually signals a withdrawn or compromised
+  release.
+- **No wildcard version requirements**, which would defeat pinning.
+- **Known advisories**, with any exception recorded in `deny.toml` alongside the
+  reasoning for it.
+
+`Cargo.lock` is committed and must stay that way: it is the primary supply chain
+control, and CI verifies it is current (`cargo metadata --locked`) and that every
+non-workspace dependency carries a checksum. Treat lockfile diffs as
+security-relevant during review — a malicious dependency arrives through
+`Cargo.lock`, not through the Rust source.
+
+Prefer `[workspace.dependencies]` when adding a dependency used by more than one
+crate, so two crates cannot silently pin different versions of it.
+
 ## JSON-RPC API
 
 The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported methods:
