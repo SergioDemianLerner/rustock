@@ -7,6 +7,7 @@
 /// - `value_hash`: keccak256 of the value
 /// - `children_size`: aggregate size of child sub-trees (VarInt-encoded in serialization)
 use alloy_primitives::B256;
+use std::sync::OnceLock;
 use sha3::{Digest, Keccak256};
 use crate::path::TrieKeySlice;
 use crate::shared_path;
@@ -129,6 +130,20 @@ pub struct TrieNode {
     pub right: NodeRef,
     pub children_size: u64,
     saved: bool,
+    /// Memoised result of `compute_hash`.
+    ///
+    /// Safe to cache unconditionally: a TrieNode's content is immutable once
+    /// constructed. `put`/`delete` return *new* nodes rather than mutating in
+    /// place, and the only `&mut self` method is `save`, which merely sets the
+    /// `saved` flag. A cached hash therefore cannot go stale.
+    ///
+    /// This matters because hashing is not local: `to_message` needs each
+    /// in-memory child's hash (`NodeRef::get_hash` -> `compute_hash`), so
+    /// hashing a node recurses through its entire dirty subtree. Without a
+    /// cache that cascade repeats on every call. Profiling the syncing node
+    /// showed keccak at 23% of CPU and 1064 compute_hash calls per block, on
+    /// blocks carrying only ~2 transactions.
+    hash_cache: OnceLock<B256>,
 }
 
 impl TrieNode {
@@ -141,6 +156,7 @@ impl TrieNode {
             right: NodeRef::Empty,
             children_size: 0,
             saved: false,
+            hash_cache: OnceLock::new(),
         }
     }
 
@@ -153,7 +169,7 @@ impl TrieNode {
         left: NodeRef,
         right: NodeRef,
     ) -> Self {
-        Self { shared_path, value, value_hash, left, right, children_size: 0, saved: false }
+        Self { shared_path, value, value_hash, left, right, children_size: 0, saved: false, hash_cache: OnceLock::new() }
     }
 
     pub fn new_leaf(shared_path: TrieKeySlice, value: Vec<u8>) -> Self {
@@ -166,6 +182,7 @@ impl TrieNode {
             right: NodeRef::Empty,
             children_size: 0,
             saved: false,
+            hash_cache: OnceLock::new(),
         }
     }
 
@@ -343,6 +360,7 @@ impl TrieNode {
             right,
             children_size,
             saved: false,
+            hash_cache: OnceLock::new(),
         }
     }
 
@@ -351,7 +369,9 @@ impl TrieNode {
         if self.is_empty_trie() {
             return empty_trie_hash();
         }
-        keccak(&self.to_message(store))
+        *self
+            .hash_cache
+            .get_or_init(|| keccak(&self.to_message(store)))
     }
 
     /// Serializes this node in the pre-RSKIP107 ("Orchid") wire format
@@ -514,6 +534,7 @@ impl TrieNode {
             right: child.right,
             children_size: child.children_size,
             saved: false,
+            hash_cache: OnceLock::new(),
         })
     }
 
@@ -560,6 +581,7 @@ impl TrieNode {
                     right: NodeRef::Empty,
                     children_size: 0,
                     saved: false,
+                    hash_cache: OnceLock::new(),
                 });
             }
 
@@ -576,6 +598,7 @@ impl TrieNode {
                 right: self.right.clone(),
                 children_size: self.children_size,
                 saved: false,
+                hash_cache: OnceLock::new(),
             });
         }
 
@@ -590,6 +613,7 @@ impl TrieNode {
                 right: NodeRef::Empty,
                 children_size: 0,
                 saved: false,
+                hash_cache: OnceLock::new(),
             });
         }
 
@@ -629,6 +653,7 @@ impl TrieNode {
             right: new_right,
             children_size: new_cs,
             saved: false,
+            hash_cache: OnceLock::new(),
         })
     }
 
@@ -643,6 +668,7 @@ impl TrieNode {
             right: self.right.clone(),
             children_size: self.children_size,
             saved: false,
+            hash_cache: OnceLock::new(),
         };
 
         let child_ref = NodeRef::Node(Box::new(new_child));
@@ -663,6 +689,7 @@ impl TrieNode {
             right: new_right,
             children_size: cs,
             saved: false,
+            hash_cache: OnceLock::new(),
         }
     }
 
@@ -698,8 +725,12 @@ impl TrieNode {
             return;
         }
 
-        let hash = self.compute_hash(store);
+        // Serialise once. `compute_hash` calls `to_message` internally, so
+        // calling both built the message twice -- and because serialisation
+        // recurses into in-memory children, that doubled the work for the whole
+        // dirty subtree beneath this node, not merely this node.
         let msg = self.to_message(store);
+        let hash = *self.hash_cache.get_or_init(|| keccak(&msg));
         store.put(hash.as_slice(), &msg);
         self.saved = true;
     }
