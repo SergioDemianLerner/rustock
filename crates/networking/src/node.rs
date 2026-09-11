@@ -267,7 +267,7 @@ pub(crate) async fn register_and_run_session(
     handlers: Vec<Arc<dyn P2pHandler>>,
     peer_store: Arc<PeerStore>,
 ) -> Result<()> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
 
     if !peer_store.add_peer(peer_id, tx).await {
         trace!(target: "rustock::net", "Peer already connected: {:?}", peer_id);
@@ -412,10 +412,10 @@ mod tests {
         let store = Arc::new(PeerStore::new());
         let peer_id = B512::repeat_byte(0x01);
 
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
         assert!(store.add_peer(peer_id, tx1).await, "First add should succeed");
 
-        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
         assert!(!store.add_peer(peer_id, tx2).await, "Duplicate add should be rejected");
 
         assert_eq!(store.count().await, 1);

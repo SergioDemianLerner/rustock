@@ -1,3 +1,4 @@
+use tracing::warn;
 use std::collections::HashMap;
 use tokio::sync::{Mutex, mpsc};
 use alloy_primitives::{B512, U256, B256};
@@ -13,9 +14,19 @@ pub struct PeerMetadata {
 }
 
 struct PeerState {
-    sender: mpsc::UnboundedSender<P2pMessage>,
+    sender: mpsc::Sender<P2pMessage>,
     metadata: PeerMetadata,
 }
+
+/// Depth of each peer's outbound queue.
+///
+/// This was previously an unbounded channel, which let a peer that completed the
+/// handshake and then simply stopped reading drive our memory arbitrarily high:
+/// transaction and block broadcast fan out to every connected peer, so the queue
+/// for one stalled peer grows for as long as the node keeps producing traffic.
+/// A bounded queue converts that into backpressure we can act on -- we drop the
+/// message, and the peer falls behind rather than the node falling over.
+pub const PEER_CHANNEL_CAPACITY: usize = 1024;
 
 /// Thread-safe store for tracking active peer connections and their outbound senders.
 #[derive(Default)]
@@ -29,7 +40,7 @@ impl PeerStore {
     }
 
     /// Attempts to add a peer to the store. Returns true if it was newly added.
-    pub async fn add_peer(&self, id: B512, sender: mpsc::UnboundedSender<P2pMessage>) -> bool {
+    pub async fn add_peer(&self, id: B512, sender: mpsc::Sender<P2pMessage>) -> bool {
         let mut peers = self.connected_peers.lock().await;
         use std::collections::hash_map::Entry;
         match peers.entry(id) {
@@ -77,7 +88,17 @@ impl PeerStore {
     pub async fn send_to_peer(&self, id: &B512, msg: P2pMessage) -> bool {
         let peers = self.connected_peers.lock().await;
         if let Some(state) = peers.get(id) {
-            state.sender.send(msg).is_ok()
+            // try_send never awaits: a peer that has stopped reading must not be
+            // able to stall the caller or grow its queue without limit. A full
+            // queue means the peer is not keeping up, so the message is dropped.
+            match state.sender.try_send(msg) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(target: "rustock::net", "Outbound queue full for peer {:?}; dropping message", id);
+                    false
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
         } else {
             false
         }
@@ -99,7 +120,7 @@ impl PeerStore {
         let peers = self.connected_peers.lock().await;
         peers.iter()
             .filter(|(id, _)| !exclude.contains(id))
-            .filter(|(_, state)| state.sender.send(msg.clone()).is_ok())
+            .filter(|(_, state)| state.sender.try_send(msg.clone()).is_ok())
             .count()
     }
 }
@@ -115,8 +136,8 @@ mod tests {
         let store = PeerStore::new();
         let peer_a = B512::repeat_byte(0x0a);
         let peer_b = B512::repeat_byte(0x0b);
-        let (tx_a, _rx_a) = mpsc::unbounded_channel();
-        let (tx_b, _rx_b) = mpsc::unbounded_channel();
+        let (tx_a, _rx_a) = mpsc::channel(PEER_CHANNEL_CAPACITY);
+        let (tx_b, _rx_b) = mpsc::channel(PEER_CHANNEL_CAPACITY);
 
         store.add_peer(peer_a, tx_a).await;
         store.add_peer(peer_b, tx_b).await;
@@ -155,7 +176,7 @@ mod tests {
     async fn test_update_and_get_metadata() {
         let store = PeerStore::new();
         let peer_id = B512::repeat_byte(0x01);
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(PEER_CHANNEL_CAPACITY);
         store.add_peer(peer_id, tx).await;
 
         let metadata = PeerMetadata {
@@ -181,13 +202,13 @@ mod tests {
         let store = PeerStore::new();
         let id1 = B512::repeat_byte(0x01);
         let id2 = B512::repeat_byte(0x02);
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::channel(PEER_CHANNEL_CAPACITY);
+        let (tx2, _rx2) = mpsc::channel(PEER_CHANNEL_CAPACITY);
 
         // Add
         assert!(store.add_peer(id1, tx1).await);
         assert!(store.add_peer(id2, tx2).await);
-        assert!(!store.add_peer(id1, mpsc::unbounded_channel().0).await); // Duplicate
+        assert!(!store.add_peer(id1, mpsc::channel(PEER_CHANNEL_CAPACITY).0).await); // Duplicate
 
         assert_eq!(store.count().await, 2);
         assert!(store.is_connected(&id1).await);
@@ -216,9 +237,9 @@ mod tests {
         let id1 = B512::repeat_byte(0x01);
         let id2 = B512::repeat_byte(0x02);
         let id3 = B512::repeat_byte(0x03);
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
-        let (tx3, mut rx3) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::channel(PEER_CHANNEL_CAPACITY);
+        let (tx2, mut rx2) = mpsc::channel(PEER_CHANNEL_CAPACITY);
+        let (tx3, mut rx3) = mpsc::channel(PEER_CHANNEL_CAPACITY);
 
         store.add_peer(id1, tx1).await;
         store.add_peer(id2, tx2).await;
@@ -237,8 +258,8 @@ mod tests {
         let store = PeerStore::new();
         let id1 = B512::repeat_byte(0x01);
         let id2 = B512::repeat_byte(0x02);
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::channel(PEER_CHANNEL_CAPACITY);
+        let (tx2, mut rx2) = mpsc::channel(PEER_CHANNEL_CAPACITY);
 
         store.add_peer(id1, tx1).await;
         store.add_peer(id2, tx2).await;
