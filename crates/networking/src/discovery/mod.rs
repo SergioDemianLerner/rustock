@@ -12,6 +12,8 @@ use alloy_primitives::B512;
 use k256::ecdsa::SigningKey;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
+use futures::FutureExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -120,8 +122,29 @@ impl DiscoveryService {
             loop {
                 match receive_self.socket.recv_from(&mut buf).await {
                     Ok((n, addr)) => {
-                        if let Err(e) = receive_self.handle_packet(&buf[..n], addr).await {
-                            warn!(target: "rustock::discovery", "Error handling packet from {}: {:?}", addr, e);
+                        // handle_packet runs inside this loop, so a panic would
+                        // unwind out of it and kill the receive task outright —
+                        // peer discovery would then stay dead until the process
+                        // restarts. The input is unauthenticated UDP from
+                        // anyone, so contain a panic to the packet that caused
+                        // it rather than trusting every parser downstream.
+                        let handled = AssertUnwindSafe(
+                            receive_self.handle_packet(&buf[..n], addr),
+                        )
+                        .catch_unwind()
+                        .await;
+                        match handled {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                warn!(target: "rustock::discovery", "Error handling packet from {}: {:?}", addr, e);
+                            }
+                            Err(_) => {
+                                error!(
+                                    target: "rustock::discovery",
+                                    "Panic while handling discovery packet from {} — packet dropped, receive loop continues",
+                                    addr
+                                );
+                            }
                         }
                     }
                     Err(e) => {
