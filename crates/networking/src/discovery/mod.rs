@@ -76,6 +76,15 @@ pub struct DiscoveryService {
     /// Addresses that have completed an endpoint proof, with the time it was
     /// completed. Only these are answered when a FindNode arrives.
     verified_endpoints: Mutex<HashMap<std::net::SocketAddr, Instant>>,
+    /// Node ID -> the address that completed the endpoint proof for it.
+    ///
+    /// Replies are addressed from this map rather than from the packet's source,
+    /// which is what makes spoofing useless: an attacker can forge a source
+    /// address but not a signature, so the identity they prove is their own and
+    /// the reply goes to *their* verified address, never to the spoofed one.
+    /// This mirrors rskj's PeerExplorer, which answers FindNode at
+    /// `establishedConnections.get(nodeId).getAddress()`.
+    verified_nodes: Mutex<HashMap<B512, (std::net::SocketAddr, Instant)>>,
     network_id: u32,
     local_node: DiscoveryNode,
     /// Bootstrap peer addresses (rskj `peer.discovery.ip.list`). Node IDs are
@@ -104,6 +113,7 @@ impl DiscoveryService {
             bonded: Mutex::new(HashSet::new()),
             pending_pings: Mutex::new(HashMap::new()),
             verified_endpoints: Mutex::new(HashMap::new()),
+            verified_nodes: Mutex::new(HashMap::new()),
             network_id,
             local_node,
             bootstrap_addrs,
@@ -312,11 +322,21 @@ impl DiscoveryService {
                     }
                 };
                 if matched {
-                    let mut verified = self.verified_endpoints.lock().await;
                     let now = Instant::now();
-                    verified.retain(|_, at| now.duration_since(*at) < ENDPOINT_PROOF_TTL);
-                    if verified.len() < MAX_VERIFIED_ENDPOINTS {
-                        verified.insert(addr, now);
+                    {
+                        let mut verified = self.verified_endpoints.lock().await;
+                        verified.retain(|_, at| now.duration_since(*at) < ENDPOINT_PROOF_TTL);
+                        if verified.len() < MAX_VERIFIED_ENDPOINTS {
+                            verified.insert(addr, now);
+                        }
+                    }
+                    // Bind the proven address to the identity that signed the Pong.
+                    if let Ok(node_id) = packet.recover_id() {
+                        let mut by_id = self.verified_nodes.lock().await;
+                        by_id.retain(|_, (_, at)| now.duration_since(*at) < ENDPOINT_PROOF_TTL);
+                        if by_id.len() < MAX_VERIFIED_ENDPOINTS {
+                            by_id.insert(node_id, (addr, now));
+                        }
                     }
                 } else {
                     trace!(
@@ -360,8 +380,52 @@ impl DiscoveryService {
                     let _ = self.send_ping(addr).await;
                     return Ok(());
                 }
+                // The address gate above is cheap but not sufficient on its own:
+                // a legitimate peer we have already bonded with is, by
+                // definition, a verified address, so an attacker could spoof
+                // *its* address as the source and have us reflect at it.
+                //
+                // So resolve the reply target from the signing identity instead
+                // of trusting the source address. An attacker can forge a source
+                // address but not a signature, so the identity they prove is
+                // their own and the answer goes to their own verified address.
+                let node_id = match packet.recover_id() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        debug!(target: "rustock::discovery", "FindNode from {} has unrecoverable signature: {:?}", addr, e);
+                        return Ok(());
+                    }
+                };
+                let reply_to = {
+                    let by_id = self.verified_nodes.lock().await;
+                    match by_id.get(&node_id) {
+                        Some((verified_addr, at))
+                            if Instant::now().duration_since(*at) < ENDPOINT_PROOF_TTL =>
+                        {
+                            *verified_addr
+                        }
+                        _ => {
+                            debug!(
+                                target: "rustock::discovery",
+                                "Ignoring FindNode from {}: signing identity has no endpoint proof",
+                                addr
+                            );
+                            return Ok(());
+                        }
+                    }
+                };
+                if reply_to != addr {
+                    // Source address does not match the address this identity
+                    // proved. Spoofing is the likely explanation; answer the
+                    // proven address, never the claimed one.
+                    debug!(
+                        target: "rustock::discovery",
+                        "FindNode source {} disagrees with proven address {} for this identity; answering the proven address",
+                        addr, reply_to
+                    );
+                }
                 let closest = self.table.read().await.closest_nodes(&find.target, 16);
-                self.send_neighbors(find.message_id.clone(), closest, addr).await?;
+                self.send_neighbors(find.message_id.clone(), closest, reply_to).await?;
             }
             DiscoveryPayload::Neighbors(neighbors) => {
                 trace!(
