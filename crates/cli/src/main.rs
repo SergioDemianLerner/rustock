@@ -128,6 +128,17 @@ struct Args {
     /// absorb dead/unreachable nodes and recover faster after a network blip.
     #[arg(long, default_value_t = 25)]
     max_peers: usize,
+
+    /// Maximum simultaneous inbound peer connections. Bounds the work an
+    /// attacker can force by opening connections: each one costs an ECIES
+    /// handshake (secp256k1 ECDH + Keccak) plus per-connection buffers.
+    #[arg(long, default_value_t = 32)]
+    max_inbound_peers: usize,
+
+    /// Maximum simultaneous inbound connections from a single IP address, so
+    /// one host cannot occupy every inbound slot on its own.
+    #[arg(long, default_value_t = 4)]
+    max_inbound_per_ip: usize,
 }
 
 #[tokio::main]
@@ -238,6 +249,8 @@ async fn main() -> Result<()> {
         data_dir: args.data_dir.clone(),
         external_ip: args.external_ip,
         max_outbound_peers: args.max_peers,
+        max_inbound_peers: args.max_inbound_peers,
+        max_inbound_per_ip: args.max_inbound_per_ip,
     };
 
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());

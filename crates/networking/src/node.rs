@@ -6,6 +6,8 @@ use alloy_primitives::{B512, B256, U256};
 use anyhow::{Result, Context};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::{Semaphore, Mutex};
 use tracing::{info, error, warn, debug, trace};
 
 /// A P2P Node that manages incoming connections and peer handshakes.
@@ -35,6 +37,13 @@ pub struct NodeConfig {
     /// Target number of outbound peer connections to maintain (rskj's
     /// `maxActivePeers`). The outbound connector dials toward this count.
     pub max_outbound_peers: usize,
+    /// Maximum number of simultaneous *inbound* connections. The accept loop
+    /// refuses beyond this, so a single host cannot exhaust memory and CPU by
+    /// opening connections faster than handshakes complete.
+    pub max_inbound_peers: usize,
+    /// Maximum simultaneous inbound connections from any single IP address.
+    /// Without this, one host can occupy every inbound slot on its own.
+    pub max_inbound_per_ip: usize,
 }
 
 impl Node {
@@ -178,17 +187,69 @@ impl Node {
         );
         tokio::spawn(outbound.start());
 
+        // Bounds concurrent inbound connections. Each one spawns a task that
+        // performs an ECIES handshake (secp256k1 ECDH + Keccak), so an unbounded
+        // accept loop is a CPU and memory exhaustion vector from a single host.
+        let inbound_slots = Arc::new(Semaphore::new(self.config.max_inbound_peers));
+        let per_ip = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
+
         loop {
             let (stream, peer_addr) = listener.accept().await?;
+
+            // Acquire a global slot first. try_acquire_owned never blocks the
+            // accept loop: over the limit we drop the connection immediately
+            // rather than queueing work an attacker controls.
+            let permit = match inbound_slots.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    debug!(
+                        target: "rustock::net",
+                        "Refusing {}: inbound capacity {} reached",
+                        peer_addr, self.config.max_inbound_peers
+                    );
+                    drop(stream);
+                    continue;
+                }
+            };
+
+            // Then a per-IP slot, so one host cannot take every global slot.
+            let ip = peer_addr.ip();
+            {
+                let mut map = per_ip.lock().await;
+                let count = map.entry(ip).or_insert(0);
+                if *count >= self.config.max_inbound_per_ip {
+                    debug!(
+                        target: "rustock::net",
+                        "Refusing {}: {} connections already from this IP",
+                        peer_addr, count
+                    );
+                    drop(stream);
+                    continue;
+                }
+                *count += 1;
+            }
+
             debug!(target: "rustock::net", "New connection from: {}", peer_addr);
 
             let config = self.config.clone();
             let handlers = all_handlers.clone();
             let peer_store = self.peer_store.clone();
+            let per_ip_task = per_ip.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_incoming(stream, config, handlers, peer_store).await {
                     error!(target: "rustock::net", "Error handling peer {}: {:?}", peer_addr, e);
                 }
+                // Release both slots however the session ended, including panics
+                // unwinding through this task.
+                let mut map = per_ip_task.lock().await;
+                if let Some(c) = map.get_mut(&ip) {
+                    *c = c.saturating_sub(1);
+                    if *c == 0 {
+                        // Do not let the map grow without bound across churn.
+                        map.remove(&ip);
+                    }
+                }
+                drop(permit);
             });
         }
     }
@@ -279,6 +340,8 @@ mod tests {
             data_dir: ".".to_string(),
             external_ip: None,
             max_outbound_peers: 10,
+            max_inbound_peers: 32,
+            max_inbound_per_ip: 4,
         };
         
         let node2_config = NodeConfig {
@@ -297,6 +360,8 @@ mod tests {
             data_dir: ".".to_string(),
             external_ip: None,
             max_outbound_peers: 10,
+            max_inbound_peers: 32,
+            max_inbound_per_ip: 4,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
