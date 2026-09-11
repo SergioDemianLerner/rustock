@@ -52,12 +52,6 @@ A Rootstock (RSK) full node implementation in Rust. Rustock syncs and validates 
 cargo build --workspace --release
 ```
 
-RocksDB 8.10 (vendored by `librocksdb-sys` 0.16) relies on `<cstdint>` being
-included transitively, which GCC 13 and newer no longer do. `.cargo/config.toml`
-compensates by setting `CXXFLAGS = "-include cstdint"`. Cargo skips that default
-when `CXXFLAGS` is already set in your environment, so if you export your own
-flags, add `-include cstdint` to them.
-
 ### Running
 
 Start the full node on RSK Mainnet (default):

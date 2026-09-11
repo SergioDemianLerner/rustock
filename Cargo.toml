@@ -31,6 +31,7 @@ async-trait = "0.1"
 bitcoin = "0.32.8"
 ripemd = "0.1"
 futures = "0.3.31"
+rocksdb = "0.25.0"
 
 [profile.release]
 opt-level = 3

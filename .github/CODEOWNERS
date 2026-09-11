@@ -6,5 +6,4 @@
 /crates/*/Cargo.toml @SergioDemianLerner
 /deny.toml           @SergioDemianLerner
 /rust-toolchain.toml @SergioDemianLerner
-/.cargo/config.toml  @SergioDemianLerner
 /.github/            @SergioDemianLerner
