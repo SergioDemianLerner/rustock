@@ -1,0 +1,6 @@
+[env]
+# librocksdb-sys 0.16 vendors RocksDB 8.10, whose headers rely on <cstdint>
+# being pulled in transitively. GCC 13+ no longer does that, so the C++ build
+# fails with "uint32_t does not name a type" style errors. Force the include.
+# (Not applied if CXXFLAGS is already set in the environment.)
+CXXFLAGS = "-include cstdint"

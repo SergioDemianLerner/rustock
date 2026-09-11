@@ -30,12 +30,33 @@ A Rootstock (RSK) full node implementation in Rust. Rustock syncs and validates 
 
 - [Rust](https://rustup.rs/) (edition 2021)
 - RocksDB system libraries (usually handled automatically by `rust-rocksdb`)
+- A C/C++ toolchain plus `libclang` — `librocksdb-sys` compiles vendored C++, and
+  `zstd-sys` generates its bindings with `bindgen`, which needs `libclang.so` and
+  clang's builtin headers at build time:
+
+  ```bash
+  # Debian/Ubuntu
+  sudo apt install build-essential clang libclang-dev
+  # Fedora/RHEL
+  sudo dnf install gcc gcc-c++ clang-devel
+  # macOS (ships with the Xcode command line tools)
+  xcode-select --install
+  ```
+
+  If `bindgen` still reports `Unable to find libclang`, point it at the library
+  explicitly, e.g. `export LIBCLANG_PATH=/usr/lib/llvm-21/lib`.
 
 ### Building
 
 ```bash
 cargo build --workspace --release
 ```
+
+RocksDB 8.10 (vendored by `librocksdb-sys` 0.16) relies on `<cstdint>` being
+included transitively, which GCC 13 and newer no longer do. `.cargo/config.toml`
+compensates by setting `CXXFLAGS = "-include cstdint"`. Cargo skips that default
+when `CXXFLAGS` is already set in your environment, so if you export your own
+flags, add `-include cstdint` to them.
 
 ### Running
 
