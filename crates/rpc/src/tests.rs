@@ -268,6 +268,54 @@ async fn test_eth_get_block_by_number_latest() {
 }
 
 #[tokio::test]
+async fn test_eth_get_block_by_number_with_importer_written_td() {
+    // Every existing test writes total difficulty through
+    // `put_total_difficulty`, which RLP-encodes it. The rskj import wrote the
+    // same column family as raw 32 big-endian bytes, and nothing here ever
+    // exercised that -- so `eth_getBlockByNumber` returned null for all 9.2M
+    // imported blocks while the whole suite stayed green.
+    let (state, _tmp) = setup_state();
+    let header = test_header(43);
+    let hash = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_canonical_hash(43, hash).unwrap();
+    state
+        .store
+        .put_total_difficulty_raw(hash, &U256::from(99_u64).to_be_bytes::<32>())
+        .unwrap();
+
+    let req = make_request("eth_getBlockByNumber", json!(["0x2b", false]));
+    let resp = dispatch_for_test(&state, req).await;
+    let result = resp.result.unwrap();
+    assert_ne!(result, json!(null), "an imported block must not read as missing");
+    assert_eq!(result["number"], json!("0x2b"));
+    assert_eq!(result["totalDifficulty"], json!("0x63"));
+}
+
+#[tokio::test]
+async fn test_eth_get_block_by_number_survives_an_unreadable_td() {
+    // Defence in depth for the same failure: whatever the encoding, a block
+    // that exists should still be returned. Losing the total difficulty is not
+    // a reason to claim the block does not exist.
+    let (state, _tmp) = setup_state();
+    let header = test_header(44);
+    let hash = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_canonical_hash(44, hash).unwrap();
+    state
+        .store
+        .put_total_difficulty_raw(hash, &[0xFF, 0xFF, 0xFF])
+        .unwrap();
+
+    let req = make_request("eth_getBlockByNumber", json!(["0x2c", false]));
+    let resp = dispatch_for_test(&state, req).await;
+    let result = resp.result.unwrap();
+    assert_ne!(result, json!(null), "block must survive a corrupt total difficulty");
+    assert_eq!(result["number"], json!("0x2c"));
+    assert_eq!(result["totalDifficulty"], json!("0x0"), "unknown is reported as zero");
+}
+
+#[tokio::test]
 async fn test_eth_get_block_by_number_not_found() {
     let (state, _tmp) = setup_state();
     let req = make_request("eth_getBlockByNumber", json!(["0xfffff", false]));

@@ -224,7 +224,13 @@ fn build_block_dto_with_full_txs(
     full_txs: bool,
 ) -> Option<BlockResultDto> {
     let header = store.header(hash).ok()??;
-    let td = store.total_difficulty(hash).ok()?.unwrap_or_default();
+    // A block that exists must not disappear because an auxiliary field will
+    // not parse. `ok()?` on the total difficulty turned a decode failure into
+    // "no such block", so a single bad value hid the header, the transactions
+    // and everything else behind a bare `null` -- with no error to explain it.
+    // An unknown total difficulty is reported as zero; the block is still
+    // returned.
+    let td = store.total_difficulty(hash).ok().flatten().unwrap_or_default();
     let body = store.body(hash).ok().flatten();
     Some(BlockResultDto::from_header_with_body(&header, hash, td, body.as_ref(), full_txs))
 }

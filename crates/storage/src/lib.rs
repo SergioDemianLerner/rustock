@@ -8,7 +8,7 @@ use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
 use rustock_core::{Block, Header, Receipt, Transaction};
 use alloy_primitives::{B256, U256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Result, Context, anyhow, bail};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -94,6 +94,42 @@ pub fn encode_body(transactions: &[Transaction], ommers: &[Header]) -> Vec<u8> {
     RlpHeader { list: true, payload_length: ommers_payload.len() }.encode(&mut buf);
     buf.extend_from_slice(&ommers_payload);
     buf
+}
+
+/// The canonical on-disk form of a total difficulty: RLP.
+///
+/// Exposed as a free function because the import writes this column family
+/// through a `WriteBatch` rather than through `put_total_difficulty`, and when
+/// the two encodings drifted apart every imported block ended up with a total
+/// difficulty the reader could not parse.
+pub fn encode_td(td: U256) -> Vec<u8> {
+    let mut buf = Vec::new();
+    td.encode(&mut buf);
+    buf
+}
+
+/// Reads a total difficulty, accepting the legacy form as well.
+///
+/// Databases built by an earlier importer hold raw 32-byte big-endian values
+/// here instead of RLP. Rewriting 9.2M of them would be a migration for no
+/// benefit, so both are read. They cannot be confused in practice: RLP never
+/// begins with a zero byte, and a real total difficulty is nowhere near 2^248,
+/// so its raw form always starts with zeros. The length check and the
+/// fully-consumed check between them make the choice unambiguous anyway.
+pub fn decode_td(bytes: &[u8]) -> Result<U256> {
+    let mut slice = bytes;
+    if let Ok(v) = U256::decode(&mut slice) {
+        if slice.is_empty() {
+            return Ok(v);
+        }
+    }
+    if bytes.len() == 32 {
+        return Ok(U256::from_be_slice(bytes));
+    }
+    bail!(
+        "total difficulty is neither RLP nor a 32-byte big-endian value ({} bytes)",
+        bytes.len()
+    )
 }
 
 impl BlockStore {
@@ -237,18 +273,26 @@ impl BlockStore {
 
     // --- Total Difficulty Operations ---
 
+    /// Writes the total difficulty bytes exactly as given, without encoding.
+    ///
+    /// For tests and migration tooling that need to reproduce a historical
+    /// on-disk form -- notably the raw 32-byte big-endian values an earlier
+    /// importer wrote. Normal writes go through `put_total_difficulty`.
+    #[doc(hidden)]
+    pub fn put_total_difficulty_raw(&self, hash: B256, bytes: &[u8]) -> Result<()> {
+        self.db.put_cf(self.cf(CF_TD)?, hash.as_slice(), bytes)
+            .context("Failed to write raw total difficulty")
+    }
+
     pub fn put_total_difficulty(&self, hash: B256, td: U256) -> Result<()> {
-        let mut buf = Vec::new();
-        td.encode(&mut buf);
-        
-        self.db.put_cf(self.cf(CF_TD)?, hash.as_slice(), &buf)
+        self.db.put_cf(self.cf(CF_TD)?, hash.as_slice(), encode_td(td))
             .context("Failed to write total difficulty")
     }
 
     pub fn total_difficulty(&self, hash: B256) -> Result<Option<U256>> {
         let bytes = self.db.get_cf(self.cf(CF_TD)?, hash.as_slice())
             .context("Failed to read total difficulty")?;
-        bytes.map(|b| U256::decode(&mut b.as_slice()).map_err(Into::into)).transpose()
+        bytes.map(|b| decode_td(&b)).transpose()
     }
 
     /// Checks if a block header exists in the store by hash.
@@ -348,9 +392,7 @@ impl BlockStore {
             header.encode(&mut header_buf);
             batch.put_cf(cf_headers, hash.as_slice(), &header_buf);
 
-            let mut td_buf = Vec::new();
-            td.encode(&mut td_buf);
-            batch.put_cf(cf_td, hash.as_slice(), &td_buf);
+            batch.put_cf(cf_td, hash.as_slice(), encode_td(td));
 
             if td > best_td {
                 best_td = td;
@@ -1173,6 +1215,51 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(h.parent_hash, store.canonical_hash(n - 1).unwrap().unwrap());
+        }
+    }
+
+    #[test]
+    fn total_difficulty_reads_back_the_importers_encoding() {
+        // The import's fast batch path writes total difficulty as raw 32
+        // big-endian bytes, while `put_total_difficulty` RLP-encodes it. Both
+        // land in the same column family, and the reader only understood one of
+        // them -- so every block written by the importer had an unreadable
+        // total difficulty, which surfaced as `eth_getBlockByNumber` returning
+        // null for all 9.2M imported blocks.
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let hash = B256::repeat_byte(0x11);
+        let td = U256::from(123_456_789_u64);
+        // Exactly what rskj_import writes.
+        store.put_total_difficulty_raw(hash, &td.to_be_bytes::<32>()).unwrap();
+
+        let got = store.total_difficulty(hash).unwrap();
+        assert_eq!(got, Some(td), "raw 32-byte total difficulty must read back");
+    }
+
+    #[test]
+    fn total_difficulty_round_trips_both_encodings() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        for (i, td) in [
+            U256::ZERO,
+            U256::from(1u64),
+            U256::from(255u64),
+            U256::from(u64::MAX),
+            U256::from_be_bytes([0xFF; 32]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rlp_hash = B256::repeat_byte(i as u8);
+            store.put_total_difficulty(rlp_hash, td).unwrap();
+            assert_eq!(store.total_difficulty(rlp_hash).unwrap(), Some(td), "rlp {td}");
+
+            let raw_hash = B256::repeat_byte(0x80 | i as u8);
+            store.put_total_difficulty_raw(raw_hash, &td.to_be_bytes::<32>()).unwrap();
+            assert_eq!(store.total_difficulty(raw_hash).unwrap(), Some(td), "raw {td}");
         }
     }
 
