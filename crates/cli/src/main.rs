@@ -8,7 +8,7 @@ use rustock_trie::{AccountState, TrieKeySlice, TrieNode, TrieStore, account_key}
 use std::sync::Arc;
 use alloy_primitives::U256;
 use anyhow::{Result, Context};
-use tracing::info;
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 /// Reads block bodies from a synced rskj `blocks` LevelDB (keyed by block
@@ -320,6 +320,39 @@ struct Args {
     #[arg(long)]
     trie_tool_copy_overwrite: bool,
 
+    /// Trie storage backend: "single" (keep everything) or "epoch" (collect).
+    ///
+    /// Defaults to single, which is what the node has always done: one
+    /// database, every historical version retained, unbounded growth. The epoch
+    /// backend bounds the size by periodically reclaiming state older than the
+    /// retention window -- which means historical state queries below that
+    /// window stop working. That is a real trade, so it is opt-in.
+    #[arg(long, default_value = "single")]
+    trie_backend: String,
+
+    /// Epochs to keep with --trie-backend epoch. Minimum 3.
+    ///
+    /// More epochs means smaller, more frequent sweeps and less duplication,
+    /// at the cost of one more place a read miss has to look.
+    #[arg(long, default_value_t = 4)]
+    gc_epochs: usize,
+
+    /// Rotate the newest epoch once it reaches this many MB.
+    #[arg(long, default_value_t = 1024)]
+    gc_rotate_mb: u64,
+
+    /// Blocks a state root must be buried by before it is collected against.
+    ///
+    /// Must exceed the deepest reorganisation worth surviving: collecting
+    /// against a root that is later reorganised away discards the state the
+    /// chain needs to rebuild.
+    #[arg(long, default_value_t = 4_000)]
+    gc_burial: u64,
+
+    /// Seconds between checks of whether the store needs collecting.
+    #[arg(long, default_value_t = 60)]
+    gc_check_secs: u64,
+
     /// Print everything about the node at this path, then exit.
     ///
     /// Path notation is <hex>/<bits>, e.g. "a3f0/13"; bare hex means four bits
@@ -596,11 +629,70 @@ async fn main() -> Result<()> {
     );
     info!("Block processor wired (hardfork config: {:?})", hardfork_cfg);
 
-    let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> =
-        Arc::new(rustock_storage::CachedTrieStore::with_defaults(store.db().clone()));
+    let gc_config = rustock_storage::epoch_store::EpochConfig {
+        epochs: args.gc_epochs,
+        burial_depth: args.gc_burial,
+        rotate_bytes: args.gc_rotate_mb * (1 << 20),
+    };
+    let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
+
+    // The node only ever holds an `Arc<dyn TrieStore>`, so this is the entire
+    // extent of the choice: nothing downstream knows which store it got.
+    let epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>> = match &backend {
+        rustock_storage::epoch_store::TrieBackend::Epochs(cfg) => {
+            let dir = std::path::Path::new(&args.data_dir).join("trie-epochs");
+            Some(Arc::new(rustock_storage::epoch_store::EpochTrieStore::open(&dir, cfg.clone())?))
+        }
+        rustock_storage::epoch_store::TrieBackend::Single => None,
+    };
+    let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> = match &epoch_store {
+        // No write cache in front of the epoch store yet: CachedTrieStore wraps
+        // a RocksDB handle rather than a TrieStore, so it cannot sit on top of
+        // this one without a refactor. Execution therefore pays a real read and
+        // write per node here, which is a known cost of turning the collector on.
+        Some(e) => e.clone(),
+        None => Arc::new(rustock_storage::CachedTrieStore::with_defaults(store.db().clone())),
+    };
 
     let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
+
+    // Background collection. Kept out of the block-processing path on purpose:
+    // mark and drain only read the oldest epoch and write the newest, and block
+    // processing also writes the newest, so the two need no coordination beyond
+    // the brief lock the sweep takes.
+    if let Some(es) = epoch_store.clone() {
+        let store_for_gc = store.clone();
+        let burial = args.gc_burial;
+        let every = std::time::Duration::from_secs(args.gc_check_secs.max(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                if !es.should_collect() {
+                    continue;
+                }
+                // Collect against a buried block, never the head. Collecting
+                // against the head would leave nothing to fall back to if the
+                // chain reorganised past it.
+                let root = (|| {
+                    let head_hash = store_for_gc.head().ok().flatten()?;
+                    let head = store_for_gc.header(head_hash).ok().flatten()?;
+                    let target = head.number.checked_sub(burial)?;
+                    let hash = store_for_gc.canonical_hash(target).ok().flatten()?;
+                    let header = store_for_gc.header(hash).ok().flatten()?;
+                    Some((header.state_root, target))
+                })();
+                let Some((root, at)) = root else {
+                    debug!(target: "rustock::gc", "No block buried {burial} deep yet; not collecting");
+                    continue;
+                };
+                info!(target: "rustock::gc", "Collecting against #{at} ({root:?})");
+                if let Err(e) = es.collect(root) {
+                    error!(target: "rustock::gc", "Collection failed: {e:?}");
+                }
+            }
+        });
+    }
 
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_tx_pool(pool.clone())
