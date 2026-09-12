@@ -34,6 +34,10 @@ const BODY_RECLAIM_TIMEOUT: Duration = Duration::from_secs(12);
 /// pipeline deeply without the whole window piling onto one slow peer.
 const MAX_BODY_REQUESTS_PER_PEER: usize = 16;
 
+/// Ceiling on body requests outstanding across all peers at once. Bounds memory
+/// held for pending responses regardless of how many peers are connected.
+const MAX_TOTAL_BODY_REQUESTS: usize = 256;
+
 /// A peer is skipped for new body assignments after this many of its requests
 /// time out; reset to zero whenever it answers one. Keeps work off dead peers.
 const BODY_PEER_STRIKE_LIMIT: u32 = 8;
@@ -1378,7 +1382,18 @@ impl SyncService {
             return;
         };
 
-        let max_in_flight = (peers.len() * 8).clamp(8, 96);
+        // The global in-flight window should be the sum of what each peer will
+        // accept, not half of it. `peers.len() * 8` with a ceiling of 96 left
+        // most of the allowed concurrency unused: at 13 peers the per-peer limit
+        // permits 208 outstanding requests but this clamped to 96.
+        //
+        // BodyRequest carries a single hash (protocol-fixed), so the number of
+        // requests in flight *is* the download throughput -- there is no batching
+        // to trade against it. Each peer is still independently bounded by
+        // MAX_BODY_REQUESTS_PER_PEER in pick_body_peer, so raising the global
+        // ceiling cannot make us impolite to any individual peer.
+        let max_in_flight =
+            (peers.len() * MAX_BODY_REQUESTS_PER_PEER).clamp(8, MAX_TOTAL_BODY_REQUESTS);
         let mut load = peer_body_load(&peers, in_flight);
         let mut sent = 0u32;
         while in_flight.len() < max_in_flight && *next_request < pending_headers.len() {
