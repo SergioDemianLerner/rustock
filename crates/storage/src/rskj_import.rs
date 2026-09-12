@@ -734,7 +734,7 @@ pub fn rebuild_chain_metadata_in_memory(
     for (number, hash, difficulty) in &lineage {
         td += *difficulty;
         batch.put_cf(cf_numbers, number.to_be_bytes(), hash.as_slice());
-        batch.put_cf(cf_td, hash.as_slice(), td.to_be_bytes::<32>());
+        batch.put_cf(cf_td, hash.as_slice(), crate::encode_td(td));
         in_batch += 1;
         done += 1;
         if in_batch >= BATCH_SIZE {
@@ -846,7 +846,7 @@ pub fn load_metadata_from_dump(
         let hash = B256::from_slice(&hash_bytes);
 
         batch.put_cf(cf_numbers, number.to_be_bytes(), hash.as_slice());
-        batch.put_cf(cf_td, hash.as_slice(), td.to_be_bytes::<32>());
+        batch.put_cf(cf_td, hash.as_slice(), crate::encode_td(td));
         in_batch += 1;
         count += 1;
 
