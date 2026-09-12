@@ -2,6 +2,7 @@ pub mod trie_store;
 pub mod cached_trie_store;
 pub mod rskj_import;
 pub use trie_store::RocksDbTrieStore;
+pub mod trie_stats;
 pub use cached_trie_store::CachedTrieStore;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};

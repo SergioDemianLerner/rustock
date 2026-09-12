@@ -271,6 +271,19 @@ struct Args {
     /// mainnet -- and needs no JVM or rskj index file.
     #[arg(long)]
     metadata_in_memory: bool,
+    /// Scan the Unitrie reachable from a state root and print statistics, then
+    /// exit. Defaults to the last executed block; pass --trie-stats-block for
+    /// another. Opens the database read-only, so it can run while the node does.
+    #[arg(long)]
+    trie_stats: bool,
+
+    /// Block whose state root to scan with --trie-stats.
+    #[arg(long)]
+    trie_stats_block: Option<u64>,
+
+    /// Log a progress line every N nodes during --trie-stats. 0 disables.
+    #[arg(long, default_value_t = 5_000_000)]
+    trie_stats_progress: u64,
 }
 
 #[tokio::main]
@@ -433,6 +446,10 @@ async fn main() -> Result<()> {
                 args.import_unitrie_threads
             },
         );
+    }
+
+    if args.trie_stats || args.trie_stats_block.is_some() {
+        return run_trie_stats(&args.data_dir, args.trie_stats_block, args.trie_stats_progress);
     }
 
     let store = Arc::new(BlockStore::open(&args.data_dir)?);
@@ -805,5 +822,75 @@ fn run_rskj_import(
         block_stats.written,
         tip_number
     );
+/// Scans the Unitrie from one state root and prints statistics.
+///
+/// Opens read-only: the scan is a pure reader, and requiring the node to stop
+/// for it would make the tool far less useful. A read-only handle sees the
+/// database as of the last flush, which is what we want anyway -- a consistent
+/// snapshot rather than a moving target.
+fn run_trie_stats(data_dir: &str, block: Option<u64>, progress_every: u64) -> Result<()> {
+    use rustock_storage::trie_stats;
+
+    let mut opts = rocksdb::Options::default();
+    opts.create_if_missing(false);
+    opts.set_max_open_files(512);
+    let cfs = ["headers", "block_numbers", "total_difficulty", "block_bodies",
+               "receipts", "tx_index", "trie_nodes"];
+    let db = rocksdb::DB::open_cf_for_read_only(&opts, data_dir, cfs, false)
+        .with_context(|| format!("opening {data_dir} read-only"))?;
+    let db = std::sync::Arc::new(db);
+
+    // Resolve the root: an explicit block's header, or the last executed block.
+    let (root, resolved_block) = match block {
+        Some(n) => {
+            let cf_num = db.cf_handle("block_numbers")
+                .ok_or_else(|| anyhow::anyhow!("missing block_numbers column family"))?;
+            let hash = db.get_cf(cf_num, n.to_be_bytes())?
+                .ok_or_else(|| anyhow::anyhow!("no canonical block at #{n}"))?;
+            let cf_h = db.cf_handle("headers")
+                .ok_or_else(|| anyhow::anyhow!("missing headers column family"))?;
+            let raw = db.get_cf(cf_h, &hash)?
+                .ok_or_else(|| anyhow::anyhow!("header missing for block #{n}"))?;
+            let mut slice: &[u8] = &raw;
+            let h = <rustock_core::Header as alloy_rlp::Decodable>::decode(&mut slice)?;
+            // Before Wasabi100 (RSKIP126, mainnet #1,591,000) the header's
+            // state_root is the legacy Orchid root, not a Unitrie node hash, so
+            // it will not resolve in the trie store. Say so rather than
+            // reporting a bare "not found".
+            if n < 1_591_000 {
+                anyhow::bail!(
+                    "block #{n} predates RSKIP126 (mainnet #1,591,000): its header holds the \
+                     legacy Orchid state root, not a Unitrie node hash. Choose a later block."
+                );
+            }
+            (h.state_root, Some(n))
+        }
+        None => {
+            // The last EXECUTED block, not the last downloaded one: only the
+            // executed head is guaranteed to have its state present.
+            let raw = db.get(b"exec_head")?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no exec head recorded; pass --trie-stats-block to choose a block"
+                ))?;
+            if raw.len() < 64 {
+                anyhow::bail!("exec head record is malformed");
+            }
+            let hash = alloy_primitives::B256::from_slice(&raw[0..32]);
+            let root = alloy_primitives::B256::from_slice(&raw[32..64]);
+            let cf_h = db.cf_handle("headers")
+                .ok_or_else(|| anyhow::anyhow!("missing headers column family"))?;
+            let number = db.get_cf(cf_h, hash.as_slice())?.and_then(|raw| {
+                let mut slice: &[u8] = &raw;
+                <rustock_core::Header as alloy_rlp::Decodable>::decode(&mut slice).ok().map(|h| h.number)
+            });
+            (root, number)
+        }
+    };
+
+    info!("Scanning Unitrie from state root {root:?}");
+    let store = rustock_storage::RocksDbTrieStore::from_db(db);
+    let started = std::time::Instant::now();
+    let stats = trie_stats::scan(&store, root, progress_every)?;
+    trie_stats::report(&stats, root, resolved_block, started.elapsed().as_secs_f64());
     Ok(())
 }
