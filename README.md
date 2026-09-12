@@ -85,6 +85,23 @@ cargo test --workspace
 
 786 tests covering consensus validation, RLP encoding, P2P handshakes, sync state machines, storage, the Unitrie, EVM execution, every RSK precompile (including the full Bridge surface and REMASC), the transaction pool, RPC methods, transaction relay, and chain reorganizations.
 
+### Importing from rskj
+
+A synced rskj database can be imported instead of syncing from peers — about an
+hour against days. The two schemas differ structurally (rskj uses one RocksDB
+per datasource plus a MapDB index; rustock uses one RocksDB with column
+families), so this converts rather than copies:
+
+```bash
+rustock --import-rskj /path/to/database/mainnet --data-dir ./data
+rustock --metadata-in-memory --data-dir ./data
+```
+
+See [`docs/rskj-import.md`](docs/rskj-import.md) for the schema comparison, all
+options, and measured performance. [`tools/dump-index`](tools/dump-index) is a
+companion Java tool for reading rskj's MapDB index directly, used as an
+independent cross-check.
+
 ### Dependency Auditing
 
 Supply chain checks run in CI on every push and pull request, and on a daily

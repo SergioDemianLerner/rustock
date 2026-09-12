@@ -1,5 +1,6 @@
 pub mod trie_store;
 pub mod cached_trie_store;
+pub mod rskj_import;
 pub use trie_store::RocksDbTrieStore;
 pub use cached_trie_store::CachedTrieStore;
 
@@ -36,24 +37,150 @@ pub struct BlockStore {
     db: Arc<DB>,
 }
 
+/// RocksDB settings for a bulk import.
+///
+/// These are deliberately *not* the settings the node runs with. A node must
+/// survive an unclean shutdown; a bulk import does not, because it can simply be
+/// run again. That difference is what makes these trades safe here and unsafe in
+/// normal operation.
+#[derive(Debug, Clone, Copy)]
+pub struct ImportTuning {
+    /// Size of each memtable. Larger means fewer, bigger flushes and less write
+    /// amplification, at the cost of holding more dirty data in RAM.
+    pub write_buffer_mb: usize,
+    /// Background flush/compaction threads. The import itself is a single
+    /// sequential scan, so background work is where spare cores can be used.
+    pub parallelism: i32,
+    /// Leaving auto-compaction on during a bulk load means repeatedly compacting
+    /// data that is still being written. Disabling it defers that to one pass at
+    /// the end, which reads and writes each key far fewer times.
+    pub auto_compaction: bool,
+}
+
+impl Default for ImportTuning {
+    fn default() -> Self {
+        Self { write_buffer_mb: 256, parallelism: 4, auto_compaction: false }
+    }
+}
+
+/// RLP-encodes a header exactly as the headers column family stores it.
+pub fn encode_header(header: &Header) -> Vec<u8> {
+    let mut buf = Vec::new();
+    header.encode(&mut buf);
+    buf
+}
+
+/// RLP-encodes a block body exactly as the bodies column family stores it:
+/// `[[transactions], [ommers]]`.
+pub fn encode_body(transactions: &[Transaction], ommers: &[Header]) -> Vec<u8> {
+    let mut txs_payload = Vec::new();
+    for tx in transactions {
+        txs_payload.extend_from_slice(&tx.rlp_for_trie());
+    }
+    let mut ommers_payload = Vec::new();
+    for uncle in ommers {
+        uncle.encode(&mut ommers_payload);
+    }
+
+    let body_len = RlpHeader { list: true, payload_length: txs_payload.len() }.length()
+        + txs_payload.len()
+        + RlpHeader { list: true, payload_length: ommers_payload.len() }.length()
+        + ommers_payload.len();
+
+    let mut buf = Vec::with_capacity(body_len + 5);
+    RlpHeader { list: true, payload_length: body_len }.encode(&mut buf);
+    RlpHeader { list: true, payload_length: txs_payload.len() }.encode(&mut buf);
+    buf.extend_from_slice(&txs_payload);
+    RlpHeader { list: true, payload_length: ommers_payload.len() }.encode(&mut buf);
+    buf.extend_from_slice(&ommers_payload);
+    buf
+}
+
 impl BlockStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with(path, None)
+    }
+
+    /// Opens the store tuned for bulk import. See [`ImportTuning`].
+    pub fn open_for_import<P: AsRef<Path>>(path: P, tuning: ImportTuning) -> Result<Self> {
+        Self::open_with(path, Some(tuning))
+    }
+
+    fn open_with<P: AsRef<Path>>(path: P, tuning: Option<ImportTuning>) -> Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
+        let cf_opts = || {
+            let mut o = Options::default();
+            if let Some(t) = tuning {
+                o.set_write_buffer_size(t.write_buffer_mb * 1024 * 1024);
+                // More memtables so writers do not stall waiting for a flush.
+                o.set_max_write_buffer_number(4);
+                o.set_min_write_buffer_number_to_merge(1);
+                o.set_disable_auto_compactions(!t.auto_compaction);
+            }
+            o
+        };
+
+        if let Some(t) = tuning {
+            opts.increase_parallelism(t.parallelism);
+            opts.set_max_background_jobs(t.parallelism);
+        }
+
         let cfs = vec![
-            ColumnFamilyDescriptor::new(CF_HEADERS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_NUMBERS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_TD, Options::default()),
-            ColumnFamilyDescriptor::new(CF_BODIES, Options::default()),
-            ColumnFamilyDescriptor::new(CF_RECEIPTS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_TX_INDEX, Options::default()),
-            ColumnFamilyDescriptor::new("trie_nodes", Options::default()),
+            ColumnFamilyDescriptor::new(CF_HEADERS, cf_opts()),
+            ColumnFamilyDescriptor::new(CF_NUMBERS, cf_opts()),
+            ColumnFamilyDescriptor::new(CF_TD, cf_opts()),
+            ColumnFamilyDescriptor::new(CF_BODIES, cf_opts()),
+            ColumnFamilyDescriptor::new(CF_RECEIPTS, cf_opts()),
+            ColumnFamilyDescriptor::new(CF_TX_INDEX, cf_opts()),
+            ColumnFamilyDescriptor::new("trie_nodes", cf_opts()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs).context("Failed to open RocksDB")?;
         Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Scans the headers column family for the highest block number.
+    ///
+    /// Needed when resuming an import whose block phase already finished: the
+    /// tip is normally reported by that phase, but on a metadata-only run there
+    /// is nothing to report it, and `head` still points wherever the node last
+    /// synced to.
+    pub fn highest_header(&self) -> Result<Option<B256>> {
+        let cf = self.cf(CF_HEADERS)?;
+        let mut best: Option<(u64, B256)> = None;
+        let mut scanned = 0u64;
+        for item in self.db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item?;
+            scanned += 1;
+            if k.len() != 32 {
+                continue;
+            }
+            let mut slice: &[u8] = &v;
+            if let Ok(h) = Header::decode(&mut slice) {
+                if best.map_or(true, |(n, _)| h.number > n) {
+                    best = Some((h.number, B256::from_slice(&k)));
+                }
+            }
+            if scanned % 2_000_000 == 0 {
+                debug!("highest_header: scanned {scanned}, best #{}", best.map(|b| b.0).unwrap_or(0));
+            }
+        }
+        Ok(best.map(|(_, h)| h))
+    }
+
+    /// Compacts every column family. Run this after an import that had
+    /// auto-compaction disabled, otherwise the database is left as a deep stack
+    /// of un-merged levels and every subsequent read pays for it.
+    pub fn compact_all(&self) -> Result<()> {
+        for name in [CF_HEADERS, CF_NUMBERS, CF_TD, CF_BODIES, CF_RECEIPTS, CF_TX_INDEX, "trie_nodes"] {
+            if let Some(cf) = self.db.cf_handle(name) {
+                self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+            }
+        }
+        Ok(())
     }
 
     fn cf(&self, name: &str) -> Result<&rocksdb::ColumnFamily> {
@@ -70,12 +197,17 @@ impl BlockStore {
 
     /// Stores a header under an explicit hash key (useful for genesis with non-standard RLP).
     pub fn put_header_with_hash(&self, hash: B256, header: &Header) -> Result<()> {
-        let mut buf = Vec::new();
-        header.encode(&mut buf);
-        
+        let buf = encode_header(header);
         self.db.put_cf(self.cf(CF_HEADERS)?, hash.as_slice(), &buf)
             .context("Failed to write header")
     }
+
+    /// Column family handles, for callers that build their own write batches
+    /// (the importer does this to batch and to bypass the WAL).
+    pub fn cf_headers(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_HEADERS) }
+    pub fn cf_bodies(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_BODIES) }
+    pub fn cf_numbers(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_NUMBERS) }
+    pub fn cf_td(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_TD) }
 
     pub fn header(&self, hash: B256) -> Result<Option<Header>> {
         let bytes = self.db.get_cf(self.cf(CF_HEADERS)?, hash.as_slice())
@@ -333,27 +465,7 @@ impl BlockStore {
         transactions: &[Transaction],
         ommers: &[Header],
     ) -> Result<()> {
-        let mut txs_payload = Vec::new();
-        for tx in transactions {
-            txs_payload.extend_from_slice(&tx.rlp_for_trie());
-        }
-        let mut ommers_payload = Vec::new();
-        for uncle in ommers {
-            uncle.encode(&mut ommers_payload);
-        }
-
-        let body_len = RlpHeader { list: true, payload_length: txs_payload.len() }.length()
-            + txs_payload.len()
-            + RlpHeader { list: true, payload_length: ommers_payload.len() }.length()
-            + ommers_payload.len();
-
-        let mut buf = Vec::with_capacity(body_len + 5);
-        RlpHeader { list: true, payload_length: body_len }.encode(&mut buf);
-        RlpHeader { list: true, payload_length: txs_payload.len() }.encode(&mut buf);
-        buf.extend_from_slice(&txs_payload);
-        RlpHeader { list: true, payload_length: ommers_payload.len() }.encode(&mut buf);
-        buf.extend_from_slice(&ommers_payload);
-
+        let buf = encode_body(transactions, ommers);
         self.db
             .put_cf(self.cf(CF_BODIES)?, hash.as_slice(), &buf)
             .context("Failed to write block body")
