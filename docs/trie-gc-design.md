@@ -366,19 +366,19 @@ access pattern alone.
 
 ### 10.2 Frontier-batched mark (recommended)
 
-Process the trie **level by level**, and sort each level's keys before reading
-them. Sorted keys turn scattered point lookups into an ordered walk the storage
-engine can serve with an iterator.
+Process the trie **level by level**. The gain is not that the reads become
+sequential — it is that they become **independent**. Every key in one level was
+discovered by the previous level, so the whole level can be in flight at once
+instead of one request at a time. Depth of the device queue, not order on disk,
+is what a dependent-read traversal is missing.
 
 ```
 mark(root):
     L        := {root}
     frontier := [root]
     while frontier not empty:
-        sort(frontier)                        # key order == on-disk order
         next := []
-        for k in frontier:                    # ordered reads, seek-forward only
-            v := read(k)
+        for k, v in read_many(frontier):      # one batch, reads overlap
             for c in refs(v):
                 if c ∉ L:
                     L.insert(c)
@@ -390,16 +390,68 @@ mark(root):
 Properties:
 
 - **Passes** equal the depth of the trie in nodes — tens, not thousands.
-- **Reads within a pass are in key order**, so a single forward-moving iterator
-  per epoch serves them; the device sees a sequential-ish stream.
-- **Parallelisable.** Split each sorted frontier into key ranges and give each
-  range to a thread. Threads share only the live set, which needs a concurrent
+- **Reads within a pass are independent**, so they can be issued together
+  (`multi_get`, an async batch, or a thread pool) and the device works at a
+  queue depth equal to the batch size instead of 1.
+- **Parallelisable.** Split each frontier into ranges and give each range to a
+  thread. Threads share only the live set, which needs a concurrent
   set or per-thread sets merged between passes. In rustock, the same keyspace
   split applied to a trie copy gave 2.5× on 4 cores, limited by the shared write
   path rather than by reads — a mark has no write path, so it should scale
   better.
 - **Memory** is `|L| × (32 bytes + set overhead)`, plus the frontier. For 10⁷
   nodes, a few hundred MB.
+
+#### Sorting each frontier: only when the live set is dense
+
+It is tempting to also sort each frontier so that a single forward-moving
+iterator can serve the pass. That is a real optimisation *only when the live set
+is dense enough in the store that consecutive sorted keys share data blocks*.
+It is not free, and it can lose outright.
+
+Let **d** be the density of the live set within the epoch being read — the
+fraction of stored entries that are live — and let **b** be the number of
+entries per data block. Sorted iteration helps when `d × b ≳ 1`, i.e. when a
+block fetched for one live key also contains the next one. Below that, each
+sorted key still lands in its own block and usually its own file, so the walk is
+random anyway — and it is now a *worse* kind of random:
+
+- A **point lookup** consults the bloom filter of each candidate file and skips
+  the ones that cannot hold the key. With many files, most are skipped without
+  any I/O.
+- An **iterator seek** must position a cursor in *every* candidate file to
+  establish the merge order. Bloom filters do not apply. The cost is paid per
+  file, per seek.
+
+Measured on rustock's mainnet store, marking a single block's state against the
+full historical node set:
+
+| | |
+|---|---|
+| Live nodes reachable from the root | ~10.8 × 10⁶ |
+| Entries stored in the node column | 1.247 × 10⁹ |
+| Density `d` | **0.87 %** |
+| Mean gap between consecutive live keys | ~115 stored entries |
+| Files in the column | 772 |
+
+Three traversals over that store, same logic, same machine:
+
+| Traversal | Rate |
+|---|---|
+| Recursive DFS, dependent single reads | 2,658 nodes/s (early) → 763 (at 49 %) |
+| Frontier batched, sorted, per-key `get` | 956 nodes/s |
+| Frontier batched, sorted, one cursor per batch | **479 nodes/s** |
+
+Sorting bought nothing at `d = 0.87 %`, and replacing point lookups with a
+cursor halved throughput, exactly as the bloom-filter argument predicts.
+
+The density is a property of **which epoch is being marked**, not of the
+algorithm. This is the case the epoch design is built to improve: marking `E₀`
+right after a rotation reads a young, compact epoch where `d` is high and
+sorting pays, rather than scanning a decade of accumulated history where it does
+not. When implementing the mark, sort only if the epoch's measured density
+clears the `d × b ≳ 1` bar; otherwise batch for concurrency and leave the keys
+in discovery order.
 
 ### 10.3 Alternative: multi-pass sequential scan
 

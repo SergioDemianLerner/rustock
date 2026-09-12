@@ -32,7 +32,6 @@
 use alloy_primitives::B256;
 use anyhow::{Context, Result};
 use rustock_trie::{TrieKeySlice, TrieNode, TrieStore};
-use std::collections::HashSet;
 use std::time::Instant;
 use tracing::info;
 
@@ -206,6 +205,51 @@ fn subtree_size(node: &TrieNode, store: &dyn TrieStore) -> u64 {
 /// Progress is reported against the expanded total, crediting a skipped
 /// subtree's whole size from the memoised value rather than descending into it.
 pub fn scan(store: &dyn TrieStore, root_hash: B256, interval_secs: u64) -> Result<TrieStats> {
+    scan_with_batch(store, root_hash, interval_secs, DEFAULT_READ_BATCH)
+}
+
+/// How many pending references to accumulate before sorting and reading them.
+///
+/// Bounds memory: each entry carries a hash plus the path to it, and a storage
+/// key path runs to ~600 bits, so entries are on the order of 100 bytes. A
+/// strict level-by-level traversal would instead hold an entire level, which in
+/// a binary trie can approach half the nodes.
+pub const DEFAULT_READ_BATCH: usize = 262_144;
+
+/// Walks the trie reachable from `root_hash`, visiting each distinct node once.
+///
+/// Linear in the number of unique nodes, and reads in sorted key order.
+///
+/// # Why reads are batched and sorted
+///
+/// Following references one at a time is a chain of *dependent* random reads:
+/// each address is unknown until the previous read returns, so the device sees
+/// one outstanding request and nothing prefetches. Measured on RSK mainnet,
+/// that traversal decayed from 2,658 to 763 nodes/s as the working set outgrew
+/// the page cache -- see `docs/trie-scan-baseline.md`.
+///
+/// Instead of descending immediately, discovered references are buffered. When
+/// the buffer fills it is sorted by key and read in order, which the storage
+/// engine can serve as a forward-moving scan rather than scattered seeks. The
+/// set visited is identical; only the order changes.
+///
+/// This is the bounded-memory form of the frontier-batched mark in
+/// `docs/trie-gc-design.md` §10.2. A strict level-by-level frontier would give
+/// slightly better locality but has to hold a whole level in memory, and this
+/// scan -- unlike a GC mark -- carries the root-to-node path with every pending
+/// entry, because leaf classification needs the full key.
+///
+/// # Totals
+///
+/// - deduplicated: summed over distinct nodes as they are visited;
+/// - expanded: read from the root's `children_size`, which already counts a
+///   shared subtree once per reference, so it needs no traversal.
+pub fn scan_with_batch(
+    store: &dyn TrieStore,
+    root_hash: B256,
+    interval_secs: u64,
+    batch_size: usize,
+) -> Result<TrieStats> {
     let data = store
         .get(root_hash.as_slice())
         .with_context(|| format!("state root {root_hash:?} not found in the trie store"))?;
@@ -215,111 +259,164 @@ pub fn scan(store: &dyn TrieStore, root_hash: B256, interval_secs: u64) -> Resul
     st.size_with_dup = subtree_size(&root, store);
     let total_expanded = st.size_with_dup.max(1);
 
-    // hash -> that node's expanded subtree size, so a repeat reference can be
-    // credited without being walked again.
     let mut seen: std::collections::HashMap<B256, u64> = std::collections::HashMap::new();
-    // Values over 32 bytes live in their own store entry keyed by their hash,
-    // so two leaves holding identical bytes -- the same contract deployed
-    // twice, say -- reference one entry. That is a different kind of repetition
-    // from a shared subtree and is counted separately.
     let mut seen_values: std::collections::HashSet<B256> = std::collections::HashSet::new();
     let mut processed: u64 = 0;
     let start = Instant::now();
     let mut last_report = Instant::now();
 
-    let mut stack: Vec<(TrieNode, Vec<u8>, usize, bool)> = vec![(root, Vec::new(), 1, false)];
+    // Pending references, sorted by key before each read pass. Embedded
+    // children are already materialised, so they carry their node and skip the
+    // read entirely.
+    struct Pending {
+        hash: B256,
+        node: Option<TrieNode>, // Some => embedded, no read needed
+        path: Vec<u8>,
+        depth: usize,
+    }
+    let mut pending: Vec<Pending> = vec![Pending {
+        hash: root_hash,
+        node: Some(root),
+        path: Vec::new(),
+        depth: 1,
+    }];
+    let mut next: Vec<Pending> = Vec::new();
 
-    while let Some((node, mut path, depth, was_embedded)) = stack.pop() {
-        let hash = node.compute_hash(store);
-        let size = node.message_length(store) as u64;
-        let sub = subtree_size(&node, store);
+    while !pending.is_empty() {
+        // Hand the batch to the store as one request so the reads can overlap.
+        // Sorting first was tried and lost: at 0.87% live density the keys are
+        // too sparse to share blocks, and an iterator seek cannot use the bloom
+        // filters that point lookups get. Queue depth is what pays here, not
+        // order. Embedded children are already in hand and are not read at all.
+        let to_read: Vec<Vec<u8>> = pending
+            .iter()
+            .filter(|p| p.node.is_none())
+            .map(|p| p.hash.as_slice().to_vec())
+            .collect();
+        let fetched = store.get_many(&to_read);
+        let mut fetched_iter = fetched.into_iter();
 
-        // Already visited by another parent: credit its whole subtree and stop.
-        // Classify it first -- the node is in hand, and what repeats tells us
-        // far more than how often something repeats.
-        if let Some(prev) = seen.get(&hash) {
-            st.shared_refs += 1;
-            st.shared_bytes = st.shared_bytes.saturating_add(*prev);
-            let kind = if node.is_terminal() {
-                let mut full = path.clone();
-                let sp: &TrieKeySlice = &node.shared_path;
-                for i in 0..sp.length() {
-                    full.push(sp.get(i));
+        for p in pending.drain(..) {
+            let was_embedded = p.node.is_some();
+            let node = match p.node {
+                Some(n) => n,
+                None => match fetched_iter.next().flatten() {
+                    Some(d) => TrieNode::from_message(&d, store),
+                    None => continue, // dangling reference: counted by absence
+                },
+            };
+            let size = node.message_length(store) as u64;
+            let sub = subtree_size(&node, store);
+
+            if let Some(prev) = seen.get(&p.hash) {
+                st.shared_refs += 1;
+                st.shared_bytes = st.shared_bytes.saturating_add(*prev);
+                let kind = if node.is_terminal() {
+                    let mut full = p.path.clone();
+                    let sp: &TrieKeySlice = &node.shared_path;
+                    for i in 0..sp.length() {
+                        full.push(sp.get(i));
+                    }
+                    ShareKind::Leaf(match pack_bits(&full) {
+                        Some(key) => classify(&key),
+                        None => LeafKind::Unknown,
+                    })
+                } else if p.path.len() < ACCOUNT_KEY_BITS {
+                    ShareKind::BranchAccountRegion
+                } else {
+                    ShareKind::BranchStorageRegion
+                };
+                bump_share(&mut st.shares_by_kind, kind, *prev);
+                processed = processed.saturating_add(*prev);
+                continue;
+            }
+            seen.insert(p.hash, sub);
+
+            st.visited += 1;
+            st.unique += 1;
+            st.size_dedup += size;
+            processed = processed.saturating_add(size);
+            st.max_depth = st.max_depth.max(p.depth);
+            if was_embedded {
+                st.embedded += 1;
+            }
+
+            let mut path = p.path;
+            let sp: &TrieKeySlice = &node.shared_path;
+            for i in 0..sp.length() {
+                path.push(sp.get(i));
+            }
+
+            if node.is_terminal() {
+                st.leaves += 1;
+                st.leaf_size += size;
+                st.depth_sum += p.depth as u64;
+                let vlen = node.value_length() as u64;
+                st.value_bytes += vlen;
+                if node.has_long_value() {
+                    st.long_values += 1;
+                    processed = processed.saturating_add(vlen);
+                    let vh = node.value_hash.unwrap_or_default();
+                    if seen_values.insert(vh) {
+                        st.distinct_long_values += 1;
+                    } else {
+                        st.shared_values += 1;
+                        st.shared_value_bytes = st.shared_value_bytes.saturating_add(vlen);
+                    }
                 }
-                ShareKind::Leaf(match pack_bits(&full) {
+                let kind = match pack_bits(&path) {
                     Some(key) => classify(&key),
                     None => LeafKind::Unknown,
-                })
-            } else if path.len() < ACCOUNT_KEY_BITS {
-                ShareKind::BranchAccountRegion
+                };
+                bump(&mut st.by_kind, kind, vlen);
             } else {
-                ShareKind::BranchStorageRegion
-            };
-            bump_share(&mut st.shares_by_kind, kind, *prev);
-            processed = processed.saturating_add(*prev);
-            continue;
-        }
-        seen.insert(hash, sub);
-
-        st.visited += 1;
-        st.unique += 1;
-        st.size_dedup += size;
-        processed = processed.saturating_add(size);
-        st.max_depth = st.max_depth.max(depth);
-        if was_embedded {
-            st.embedded += 1;
-        }
-
-        let sp: &TrieKeySlice = &node.shared_path;
-        for i in 0..sp.length() {
-            path.push(sp.get(i));
-        }
-
-        if node.is_terminal() {
-            st.leaves += 1;
-            st.leaf_size += size;
-            st.depth_sum += depth as u64;
-            let vlen = node.value_length() as u64;
-            st.value_bytes += vlen;
-            if node.has_long_value() {
-                st.long_values += 1;
-                processed = processed.saturating_add(vlen);
-                let vh = node.value_hash.unwrap_or_default();
-                if seen_values.insert(vh) {
-                    st.distinct_long_values += 1;
-                } else {
-                    st.shared_values += 1;
-                    st.shared_value_bytes = st.shared_value_bytes.saturating_add(vlen);
+                st.branches += 1;
+                st.branch_size += size;
+                if node.value.is_some() {
+                    st.value_bytes += node.value_length() as u64;
+                }
+                for (bit, child) in [(0u8, &node.left), (1u8, &node.right)] {
+                    let mut p2 = path.clone();
+                    p2.push(bit);
+                    match child {
+                        rustock_trie::NodeRef::Node(n) => next.push(Pending {
+                            hash: n.compute_hash(store),
+                            node: Some((**n).clone()),
+                            path: p2,
+                            depth: p.depth + 1,
+                        }),
+                        rustock_trie::NodeRef::Hash(h) => next.push(Pending {
+                            hash: *h,
+                            node: None,
+                            path: p2,
+                            depth: p.depth + 1,
+                        }),
+                        rustock_trie::NodeRef::Empty => {}
+                    }
                 }
             }
-            let kind = match pack_bits(&path) {
-                Some(key) => classify(&key),
-                None => LeafKind::Unknown,
-            };
-            bump(&mut st.by_kind, kind, vlen);
-        } else {
-            st.branches += 1;
-            st.branch_size += size;
-            if node.value.is_some() {
-                st.value_bytes += node.value_length() as u64;
+
+            if interval_secs > 0 && last_report.elapsed().as_secs_f64() >= interval_secs as f64 {
+                let secs = start.elapsed().as_secs_f64().max(0.001);
+                // Queue depth: `pending` is being drained here and cannot be
+                // inspected, so report the buffer being filled for the next pass.
+                report_partial(&st, processed, total_expanded, secs, next.len());
+                last_report = Instant::now();
             }
-            for (bit, child) in [(0u8, &node.left), (1u8, &node.right)] {
-                let embedded = matches!(child, rustock_trie::NodeRef::Node(_));
-                if let Some(c) = child.resolve(store) {
-                    let mut p = path.clone();
-                    p.push(bit);
-                    stack.push((c, p, depth + 1, embedded));
-                }
-            }
+
         }
 
-        // Full counters on a wall-clock interval rather than a node count:
-        // node rate varies by orders of magnitude with cache warmth, so a
-        // count-based interval reports either constantly or almost never.
-        if interval_secs > 0 && last_report.elapsed().as_secs_f64() >= interval_secs as f64 {
-            let secs = start.elapsed().as_secs_f64().max(0.001);
-            report_partial(&st, processed, total_expanded, secs, stack.len());
-            last_report = Instant::now();
+        // The whole batch is consumed each pass, so `pending` is empty here and
+        // the discovered references become the next pass. Breaking early would
+        // desynchronise the fetched values from the entries still queued.
+        std::mem::swap(&mut pending, &mut next);
+
+        // Cap how much is read at once: each entry carries its root-to-node
+        // path, and a storage key path runs to ~600 bits. Anything above the
+        // cap is deferred to a later pass rather than held.
+        if pending.len() > batch_size {
+            let deferred = pending.split_off(batch_size);
+            next = deferred;
         }
     }
     Ok(st)
