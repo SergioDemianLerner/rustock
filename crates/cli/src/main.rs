@@ -828,6 +828,10 @@ fn run_rskj_import(
         block_stats.written,
         tip_number
     );
+
+    Ok(())
+}
+
 /// Scans the Unitrie from one state root and prints statistics.
 ///
 /// Opens read-only: the scan is a pure reader, and requiring the node to stop
