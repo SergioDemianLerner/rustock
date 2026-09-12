@@ -80,6 +80,36 @@ fn classify(key: &[u8]) -> LeafKind {
     }
 }
 
+/// What kind of repetition a shared reference represents.
+///
+/// These mean quite different things. A repeated storage cell is two contracts
+/// holding the same slot value; a repeated code reference is the same contract
+/// bytecode deployed twice; a repeated branch high in the keyspace would mean
+/// two accounts with structurally identical sub-tries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareKind {
+    /// Leaf sharing, by what the leaf holds.
+    Leaf(LeafKind),
+    /// A branch shared while still inside the account index -- the path is
+    /// shorter than one account key, so the subtree spans several accounts.
+    BranchAccountRegion,
+    /// A branch shared below an account key, i.e. within one account's storage.
+    BranchStorageRegion,
+}
+
+impl ShareKind {
+    fn label(self) -> String {
+        match self {
+            ShareKind::Leaf(k) => format!("leaf: {}", k.label()),
+            ShareKind::BranchAccountRegion => "branch: account region".into(),
+            ShareKind::BranchStorageRegion => "branch: storage region".into(),
+        }
+    }
+}
+
+/// Bits in an account key for a standard 20-byte address: 0x00 || 10 || 20.
+const ACCOUNT_KEY_BITS: usize = 31 * 8;
+
 #[derive(Default)]
 pub struct TrieStats {
     pub visited: u64,
@@ -95,7 +125,29 @@ pub struct TrieStats {
     pub depth_sum: u64,
     pub value_bytes: u64,
     pub long_values: u64,
+    /// References to a node already visited via another parent. Each one is a
+    /// subtree the trie stores once but the tree structure reaches twice.
+    pub shared_refs: u64,
+    /// Bytes that sharing avoids storing: the subtree size of each repeat
+    /// reference.
+    pub shared_bytes: u64,
+    /// Repeat references broken down by kind: (kind, count, bytes saved).
+    pub shares_by_kind: Vec<(ShareKind, u64, u64)>,
+    /// Long values (over 32 bytes, stored as their own entry keyed by hash)
+    /// referenced by more than one leaf, and the bytes that saves.
+    pub shared_values: u64,
+    pub shared_value_bytes: u64,
+    pub distinct_long_values: u64,
     pub by_kind: Vec<(LeafKind, u64, u64)>, // kind, count, value bytes
+}
+
+fn bump_share(v: &mut Vec<(ShareKind, u64, u64)>, kind: ShareKind, bytes: u64) {
+    if let Some(e) = v.iter_mut().find(|e| e.0 == kind) {
+        e.1 += 1;
+        e.2 += bytes;
+    } else {
+        v.push((kind, 1, bytes));
+    }
 }
 
 fn bump(v: &mut Vec<(LeafKind, u64, u64)>, kind: LeafKind, bytes: u64) {
@@ -120,46 +172,104 @@ fn pack_bits(bits: &[u8]) -> Option<Vec<u8>> {
     )
 }
 
-/// Walks every node reachable from `root_hash`.
+/// The RSKIP107 subtree size: this node's serialised bytes, plus everything
+/// below it, plus any value held outside the node.
 ///
-/// Traversal follows every edge rather than stopping at nodes already seen, so
-/// both totals are real: `size_with_dup` counts a shared subtree once per
-/// reference, `size_dedup` once overall. Identical subtrees do occur -- the trie
-/// is content-addressed, so two accounts with identical storage share nodes.
+/// `children_size` is summed at insert time, so a subtree shared by several
+/// parents is counted in each of them. That makes the root's value the
+/// *tree-expanded* total -- the size the trie would occupy if nothing were
+/// shared -- available without walking anything.
+fn subtree_size(node: &TrieNode, store: &dyn TrieStore) -> u64 {
+    let external = if node.has_long_value() { node.value_length() as u64 } else { 0 };
+    node.children_size + external + node.message_length(store) as u64
+}
+
+/// Walks the trie reachable from `root_hash`, visiting each distinct node once.
 ///
-/// Memory is dominated by the set of seen hashes: 32 bytes per unique node plus
-/// set overhead, so tens of millions of nodes cost a few GB.
-pub fn scan(store: &dyn TrieStore, root_hash: B256, progress_every: u64) -> Result<TrieStats> {
+/// Linear in the number of unique nodes. An earlier version followed every edge
+/// so that the non-deduplicated total would be measured rather than derived;
+/// that is quadratic on a content-addressed trie, because every shared subtree
+/// is re-walked once per reference. On RSK mainnet it made no observable
+/// progress in 22 minutes: the set of seen hashes stopped growing while the
+/// process kept decompressing nodes it had already visited.
+///
+/// The expanded total does not need traversal at all -- the root's
+/// `children_size` already carries it, for the reason described on
+/// [`subtree_size`]. So traversal now stops at any node already seen, and both
+/// totals are still exact:
+///
+/// - deduplicated: summed over distinct nodes as they are visited;
+/// - expanded: read from the root.
+///
+/// `interval_secs` sets how often every counter is printed; 0 disables it.
+///
+/// Progress is reported against the expanded total, crediting a skipped
+/// subtree's whole size from the memoised value rather than descending into it.
+pub fn scan(store: &dyn TrieStore, root_hash: B256, interval_secs: u64) -> Result<TrieStats> {
     let data = store
         .get(root_hash.as_slice())
         .with_context(|| format!("state root {root_hash:?} not found in the trie store"))?;
     let root = TrieNode::from_message(&data, store);
 
     let mut st = TrieStats::default();
-    let mut seen: HashSet<B256> = HashSet::new();
-    let start = Instant::now();
+    st.size_with_dup = subtree_size(&root, store);
+    let total_expanded = st.size_with_dup.max(1);
 
-    // (node, bit path so far, depth, was it embedded in its parent)
+    // hash -> that node's expanded subtree size, so a repeat reference can be
+    // credited without being walked again.
+    let mut seen: std::collections::HashMap<B256, u64> = std::collections::HashMap::new();
+    // Values over 32 bytes live in their own store entry keyed by their hash,
+    // so two leaves holding identical bytes -- the same contract deployed
+    // twice, say -- reference one entry. That is a different kind of repetition
+    // from a shared subtree and is counted separately.
+    let mut seen_values: std::collections::HashSet<B256> = std::collections::HashSet::new();
+    let mut processed: u64 = 0;
+    let start = Instant::now();
+    let mut last_report = Instant::now();
+
     let mut stack: Vec<(TrieNode, Vec<u8>, usize, bool)> = vec![(root, Vec::new(), 1, false)];
 
     while let Some((node, mut path, depth, was_embedded)) = stack.pop() {
+        let hash = node.compute_hash(store);
         let size = node.message_length(store) as u64;
+        let sub = subtree_size(&node, store);
+
+        // Already visited by another parent: credit its whole subtree and stop.
+        // Classify it first -- the node is in hand, and what repeats tells us
+        // far more than how often something repeats.
+        if let Some(prev) = seen.get(&hash) {
+            st.shared_refs += 1;
+            st.shared_bytes = st.shared_bytes.saturating_add(*prev);
+            let kind = if node.is_terminal() {
+                let mut full = path.clone();
+                let sp: &TrieKeySlice = &node.shared_path;
+                for i in 0..sp.length() {
+                    full.push(sp.get(i));
+                }
+                ShareKind::Leaf(match pack_bits(&full) {
+                    Some(key) => classify(&key),
+                    None => LeafKind::Unknown,
+                })
+            } else if path.len() < ACCOUNT_KEY_BITS {
+                ShareKind::BranchAccountRegion
+            } else {
+                ShareKind::BranchStorageRegion
+            };
+            bump_share(&mut st.shares_by_kind, kind, *prev);
+            processed = processed.saturating_add(*prev);
+            continue;
+        }
+        seen.insert(hash, sub);
+
         st.visited += 1;
-        st.size_with_dup += size;
+        st.unique += 1;
+        st.size_dedup += size;
+        processed = processed.saturating_add(size);
         st.max_depth = st.max_depth.max(depth);
         if was_embedded {
             st.embedded += 1;
         }
 
-        // Deduplicate by content hash. Embedded nodes have no independent
-        // database entry, but they still have a hash and can recur.
-        let hash = node.compute_hash(store);
-        if seen.insert(hash) {
-            st.unique += 1;
-            st.size_dedup += size;
-        }
-
-        // Extend the path by this node's shared prefix.
         let sp: &TrieKeySlice = &node.shared_path;
         for i in 0..sp.length() {
             path.push(sp.get(i));
@@ -173,6 +283,14 @@ pub fn scan(store: &dyn TrieStore, root_hash: B256, progress_every: u64) -> Resu
             st.value_bytes += vlen;
             if node.has_long_value() {
                 st.long_values += 1;
+                processed = processed.saturating_add(vlen);
+                let vh = node.value_hash.unwrap_or_default();
+                if seen_values.insert(vh) {
+                    st.distinct_long_values += 1;
+                } else {
+                    st.shared_values += 1;
+                    st.shared_value_bytes = st.shared_value_bytes.saturating_add(vlen);
+                }
             }
             let kind = match pack_bits(&path) {
                 Some(key) => classify(&key),
@@ -182,7 +300,6 @@ pub fn scan(store: &dyn TrieStore, root_hash: B256, progress_every: u64) -> Resu
         } else {
             st.branches += 1;
             st.branch_size += size;
-            // A node may carry a value and still have children.
             if node.value.is_some() {
                 st.value_bytes += node.value_length() as u64;
             }
@@ -196,16 +313,60 @@ pub fn scan(store: &dyn TrieStore, root_hash: B256, progress_every: u64) -> Resu
             }
         }
 
-        if progress_every > 0 && st.visited % progress_every == 0 {
+        // Full counters on a wall-clock interval rather than a node count:
+        // node rate varies by orders of magnitude with cache warmth, so a
+        // count-based interval reports either constantly or almost never.
+        if interval_secs > 0 && last_report.elapsed().as_secs_f64() >= interval_secs as f64 {
             let secs = start.elapsed().as_secs_f64().max(0.001);
-            info!(
-                target: "rustock::triestats",
-                "scanned {} nodes ({:.0}/s), {} unique, depth {}, stack {}",
-                st.visited, st.visited as f64 / secs, st.unique, st.max_depth, stack.len()
-            );
+            report_partial(&st, processed, total_expanded, secs, stack.len());
+            last_report = Instant::now();
         }
     }
     Ok(st)
+}
+
+/// Prints every counter mid-scan. Deliberately the same numbers as the final
+/// report: a partial view that omits fields invites the assumption that a
+/// missing one is zero.
+fn report_partial(st: &TrieStats, processed: u64, total: u64, secs: f64, stack_depth: usize) {
+    let frac = processed as f64 / total.max(1) as f64;
+    let eta = if frac > 0.001 {
+        let remaining = secs / frac - secs;
+        if remaining >= 3600.0 {
+            format!("{}h{}m", remaining as u64 / 3600, (remaining as u64 % 3600) / 60)
+        } else {
+            format!("{}m{}s", remaining as u64 / 60, remaining as u64 % 60)
+        }
+    } else {
+        "--".into()
+    };
+    info!(
+        target: "rustock::triestats",
+        "[{:.2}%] {} nodes ({:.0}/s) | leaves {} branches {} embedded {} | dedup {} of {} | \
+         shared: {} refs / {} | long values {} ({} shared) | depth {} | stack {} | ETA {}",
+        (frac * 100.0).min(100.0), st.unique, st.unique as f64 / secs,
+        st.leaves, st.branches, st.embedded,
+        human(st.size_dedup), human(total),
+        st.shared_refs, human(st.shared_bytes),
+        st.distinct_long_values, st.shared_values,
+        st.max_depth, stack_depth, eta
+    );
+    let mut kinds = st.by_kind.clone();
+    kinds.sort_by_key(|k| std::cmp::Reverse(k.1));
+    let leaf_line: Vec<String> = kinds.iter()
+        .map(|(k, c, _)| format!("{} {}", k.label(), c))
+        .collect();
+    if !leaf_line.is_empty() {
+        info!(target: "rustock::triestats", "         leaves by type: {}", leaf_line.join(", "));
+    }
+    let mut shares = st.shares_by_kind.clone();
+    shares.sort_by_key(|k| std::cmp::Reverse(k.1));
+    let share_line: Vec<String> = shares.iter()
+        .map(|(k, c, b)| format!("{} {} ({})", k.label(), c, human(*b)))
+        .collect();
+    if !share_line.is_empty() {
+        info!(target: "rustock::triestats", "         shares by type: {}", share_line.join(", "));
+    }
 }
 
 fn pct(part: u64, whole: u64) -> f64 {
@@ -236,7 +397,7 @@ pub fn report(st: &TrieStats, root: B256, block: Option<u64>, elapsed: f64) {
     println!();
 
     println!("SIZE");
-    println!("  {:<34}{:>14}", "total, counting shared subtrees", human(st.size_with_dup));
+    println!("  {:<34}{:>14}", "expanded (shared counted per ref)", human(st.size_with_dup));
     println!("  {:<34}{:>14}", "total, deduplicated", human(st.size_dedup));
     let saved = st.size_with_dup.saturating_sub(st.size_dedup);
     println!("  {:<34}{:>14}  ({:.1}%)", "saved by sharing", human(saved), pct(saved, st.size_with_dup.max(1)));
@@ -244,8 +405,8 @@ pub fn report(st: &TrieStats, root: B256, block: Option<u64>, elapsed: f64) {
     println!();
 
     println!("NODES");
-    println!("  {:<34}{:>14}", "reachable (edges followed)", n);
-    println!("  {:<34}{:>14}  ({:.1}%)", "unique by content hash", st.unique, pct(st.unique, n));
+    println!("  {:<34}{:>14}", "distinct nodes", st.unique);
+    println!("  {:<34}{:>14}", "shared references (not re-walked)", st.shared_refs);
     println!("  {:<34}{:>14}  ({:.1}%)", "leaf (terminal)", st.leaves, pct(st.leaves, n));
     println!("  {:<34}{:>14}  ({:.1}%)", "non-leaf (branch)", st.branches, pct(st.branches, n));
     println!("  {:<34}{:>14}  ({:.1}%)", "embedded in parent", st.embedded, pct(st.embedded, n));
@@ -261,6 +422,28 @@ pub fn report(st: &TrieStats, root: B256, block: Option<u64>, elapsed: f64) {
     println!("DEPTH (nodes from root)");
     println!("  {:<34}{:>14}", "maximum", st.max_depth);
     println!("  {:<34}{:>11.1}", "average over leaves", st.depth_sum as f64 / st.leaves.max(1) as f64);
+    println!();
+
+    println!("SHARING (repeat references, not re-walked)");
+    println!("  {:<34}{:>14}", "repeat references", st.shared_refs);
+    println!("  {:<34}{:>14}", "bytes they would have cost", human(st.shared_bytes));
+    if !st.shares_by_kind.is_empty() {
+        println!("  {:<26}{:>12}{:>9}{:>14}", "  what repeats", "count", "share", "bytes");
+        let mut shares = st.shares_by_kind.clone();
+        shares.sort_by_key(|k| std::cmp::Reverse(k.1));
+        for (kind, count, bytes) in &shares {
+            println!("  {:<26}{:>12}{:>8.1}%{:>14}",
+                format!("  {}", kind.label()), count,
+                pct(*count, st.shared_refs.max(1)), human(*bytes));
+        }
+    }
+    println!();
+
+    println!("LONG VALUES (over 32 bytes, stored by hash)");
+    println!("  {:<34}{:>14}", "distinct", st.distinct_long_values);
+    println!("  {:<34}{:>14}  ({:.1}%)", "repeat references", st.shared_values,
+        pct(st.shared_values, (st.shared_values + st.distinct_long_values).max(1)));
+    println!("  {:<34}{:>14}", "bytes saved by sharing", human(st.shared_value_bytes));
     println!();
 
     println!("LEAVES BY TYPE");

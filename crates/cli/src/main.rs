@@ -281,8 +281,14 @@ struct Args {
     #[arg(long)]
     trie_stats_block: Option<u64>,
 
-    /// Log a progress line every N nodes during --trie-stats. 0 disables.
-    #[arg(long, default_value_t = 5_000_000)]
+    /// Seconds between full counter dumps during --trie-stats. 0 disables.
+    ///
+    /// Wall-clock rather than a node count: the node rate varies by orders of
+    /// magnitude with cache warmth, so a count-based interval reports either
+    /// constantly or almost never. A scan silent for twenty minutes is also
+    /// indistinguishable from one that has hung, which is how an earlier
+    /// quadratic version of this scan went unnoticed.
+    #[arg(long, default_value_t = 30)]
     trie_stats_progress: u64,
 }
 
