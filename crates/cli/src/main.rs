@@ -290,6 +290,43 @@ struct Args {
     /// quadratic version of this scan went unnoticed.
     #[arg(long, default_value_t = 30)]
     trie_stats_progress: u64,
+
+    /// Database to scan or inspect. Defaults to --data-dir.
+    ///
+    /// Accepts either a node datadir or a standalone trie snapshot written by
+    /// --trie-stats-copy. A snapshot is recognised by its metadata file and
+    /// carries its own state root, so no block lookup is needed -- or possible,
+    /// since a snapshot holds no headers.
+    #[arg(long)]
+    trie_stats_source: Option<String>,
+
+    /// Copy the scanned state into a new standalone trie database.
+    ///
+    /// The scan already reads every live node, so extracting them costs the
+    /// write and nothing more. The result is under a gigabyte against a 129 GB
+    /// source, and is immutable, which makes re-running the statistics a matter
+    /// of minutes instead of the better part of an hour -- and makes repeated
+    /// runs comparable, since the live store keeps moving as the node syncs.
+    ///
+    /// Pass a directory, or give the flag alone to name it after the state root.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    trie_stats_copy: Option<String>,
+
+    /// Delete the copy target first if it already exists.
+    ///
+    /// Off by default. Every key in a trie database is a hash, so a snapshot
+    /// written over unrelated data would neither collide nor complain -- it
+    /// would just quietly carry whatever was there before.
+    #[arg(long)]
+    trie_stats_copy_overwrite: bool,
+
+    /// Print everything about the node at this path, then exit.
+    ///
+    /// Path notation is <hex>/<bits>, e.g. "a3f0/13"; bare hex means four bits
+    /// per digit. Reads --trie-stats-source. Paths printed by --trie-stats can
+    /// be passed straight back in.
+    #[arg(long)]
+    trie_node: Option<String>,
 }
 
 #[tokio::main]
@@ -454,8 +491,20 @@ async fn main() -> Result<()> {
         );
     }
 
-    if args.trie_stats || args.trie_stats_block.is_some() {
-        return run_trie_stats(&args.data_dir, args.trie_stats_block, args.trie_stats_progress);
+    if let Some(path) = args.trie_node.as_deref() {
+        let src = args.trie_stats_source.as_deref().unwrap_or(&args.data_dir);
+        return run_trie_node(src, args.trie_stats_block, path);
+    }
+
+    if args.trie_stats || args.trie_stats_block.is_some() || args.trie_stats_copy.is_some() {
+        let src = args.trie_stats_source.as_deref().unwrap_or(&args.data_dir);
+        return run_trie_stats(
+            src,
+            args.trie_stats_block,
+            args.trie_stats_progress,
+            args.trie_stats_copy.as_deref(),
+            args.trie_stats_copy_overwrite,
+        );
     }
 
     let store = Arc::new(BlockStore::open(&args.data_dir)?);
@@ -838,9 +887,43 @@ fn run_rskj_import(
 /// for it would make the tool far less useful. A read-only handle sees the
 /// database as of the last flush, which is what we want anyway -- a consistent
 /// snapshot rather than a moving target.
-fn run_trie_stats(data_dir: &str, block: Option<u64>, progress_every: u64) -> Result<()> {
-    use rustock_storage::trie_stats;
+/// Opens a trie source and resolves which state root to start from.
+///
+/// Two shapes are accepted. A node datadir carries headers, so a root can be
+/// chosen by block or taken from the executed head. A snapshot carries only
+/// trie nodes and its own metadata, so the root comes from there -- and a block
+/// cannot be selected, because a snapshot holds exactly one state and no
+/// headers to look anything up in.
+fn open_trie_source(
+    dir: &str,
+    block: Option<u64>,
+) -> Result<(std::sync::Arc<rocksdb::DB>, alloy_primitives::B256, Option<u64>)> {
+    if rustock_storage::trie_snapshot::is_snapshot(dir) {
+        let meta = rustock_storage::trie_snapshot::read_meta(dir)?;
+        if block.is_some() {
+            anyhow::bail!(
+                "{dir} is a trie snapshot: it holds one state ({:?}) and no headers, so a                  block cannot be selected. Drop --trie-stats-block, or point at a node datadir.",
+                meta.root
+            );
+        }
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(false);
+        opts.set_max_open_files(512);
+        let db = rocksdb::DB::open_cf_for_read_only(&opts, dir, ["trie_nodes"], false)
+            .with_context(|| format!("opening snapshot {dir} read-only"))?;
+        info!(
+            "Snapshot {dir}: root {:?}, {} nodes, taken {}",
+            meta.root, meta.nodes, meta.created
+        );
+        return Ok((std::sync::Arc::new(db), meta.root, meta.block));
+    }
+    open_node_trie_source(dir, block)
+}
 
+fn open_node_trie_source(
+    data_dir: &str,
+    block: Option<u64>,
+) -> Result<(std::sync::Arc<rocksdb::DB>, alloy_primitives::B256, Option<u64>)> {
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(false);
     opts.set_max_open_files(512);
@@ -896,11 +979,91 @@ fn run_trie_stats(data_dir: &str, block: Option<u64>, progress_every: u64) -> Re
             (root, number)
         }
     };
+    Ok((db, root, resolved_block))
+}
+
+fn run_trie_stats(
+    source: &str,
+    block: Option<u64>,
+    progress_every: u64,
+    copy_to: Option<&str>,
+    copy_overwrite: bool,
+) -> Result<()> {
+    use rustock_storage::trie_stats;
+    use rustock_storage::trie_snapshot::SnapshotWriter;
+
+    let (db, root, resolved_block) = open_trie_source(source, block)?;
+
+    // An empty string means the flag was given without a value: name the
+    // directory after the root, which is the one label guaranteed to identify
+    // the contents.
+    let target = copy_to.map(|t| {
+        if t.is_empty() {
+            format!("{root:?}").trim_start_matches("0x").to_string()
+        } else {
+            t.to_string()
+        }
+    });
+
+    let mut writer = match target.as_deref() {
+        Some(t) => {
+            info!("Copying scanned state to {t}");
+            Some(SnapshotWriter::create(t, copy_overwrite)?)
+        }
+        None => None,
+    };
 
     info!("Scanning Unitrie from state root {root:?}");
     let store = rustock_storage::RocksDbTrieStore::from_db(db);
     let started = std::time::Instant::now();
-    let stats = trie_stats::scan(&store, root, progress_every)?;
+    let stats = trie_stats::scan_with_options(
+        &store,
+        root,
+        trie_stats::ScanOptions {
+            interval_secs: progress_every,
+            snapshot: writer.as_mut(),
+            ..Default::default()
+        },
+    )?;
     trie_stats::report(&stats, root, resolved_block, started.elapsed().as_secs_f64());
+
+    if let Some(w) = writer {
+        let meta = w.finish(root, resolved_block, source)?;
+        println!("SNAPSHOT");
+        println!("  {:<34}{:>14}", "directory", target.as_deref().unwrap_or("-"));
+        println!("  {:<34}{:>14}", "nodes written", meta.nodes);
+        println!("  {:<34}{:>14}", "long values written", meta.long_values);
+        println!("  {:<34}{:>14}", "bytes written", meta.bytes);
+        println!();
+        println!("  Re-scan it with:");
+        println!("    rustock --trie-stats --trie-stats-source {}",
+            target.as_deref().unwrap_or("-"));
+    }
+    Ok(())
+}
+
+/// Prints every field of the node at one path.
+fn run_trie_node(source: &str, block: Option<u64>, path: &str) -> Result<()> {
+    use rustock_storage::trie_inspect;
+
+    let bits = trie_inspect::parse_path(path)?;
+    let (db, root, _) = open_trie_source(source, block)?;
+    let store = rustock_storage::RocksDbTrieStore::from_db(db);
+
+    match trie_inspect::find_by_path(&store, root, &bits)? {
+        Some(found) => {
+            println!("state root      {root:?}");
+            print!("{}", trie_inspect::describe(&found, &store));
+        }
+        None => {
+            println!("state root      {root:?}");
+            println!(
+                "No node at {}. The path either leaves the trie, or ends partway through a \
+                 shared path -- a run of bits the trie keeps compressed inside one node, where \
+                 no node exists to address.",
+                trie_inspect::format_path(&bits)
+            );
+        }
+    }
     Ok(())
 }

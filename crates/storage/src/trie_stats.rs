@@ -31,6 +31,7 @@
 
 use alloy_primitives::B256;
 use anyhow::{Context, Result};
+use crate::trie_snapshot::SnapshotWriter;
 use rustock_trie::{TrieKeySlice, TrieNode, TrieStore};
 use std::time::Instant;
 use tracing::info;
@@ -48,7 +49,7 @@ pub enum LeafKind {
 }
 
 impl LeafKind {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             LeafKind::Account => "accounts",
             LeafKind::ContractCode => "contract code",
@@ -64,7 +65,7 @@ impl LeafKind {
 /// Length alone is enough: only the account-key length varies, and it varies
 /// with the address, so the trailing marker byte disambiguates code from the
 /// storage-root marker.
-fn classify(key: &[u8]) -> LeafKind {
+pub fn classify(key: &[u8]) -> LeafKind {
     const ACCOUNT_20: usize = 1 + 10 + 20; // 31
     const ACCOUNT_1: usize = 1 + 10 + 1; //  12, REMASC
     match key.len() {
@@ -97,7 +98,7 @@ pub enum ShareKind {
 }
 
 impl ShareKind {
-    fn label(self) -> String {
+    pub fn label(self) -> String {
         match self {
             ShareKind::Leaf(k) => format!("leaf: {}", k.label()),
             ShareKind::BranchAccountRegion => "branch: account region".into(),
@@ -138,6 +139,56 @@ pub struct TrieStats {
     pub shared_value_bytes: u64,
     pub distinct_long_values: u64,
     pub by_kind: Vec<(LeafKind, u64, u64)>, // kind, count, value bytes
+    /// Embedded nodes broken down the same way sharing is: (kind, count,
+    /// bytes). An embedded node has no entry of its own -- it is serialised
+    /// inside its parent -- so this says what the trie chose to inline.
+    pub embedded_by_kind: Vec<(ShareKind, u64, u64)>,
+    /// Every node carrying a value, by what its key says it holds, whether the
+    /// node is a leaf or a branch.
+    ///
+    /// `by_kind` counts leaves, and for accounts that is an undercount: an
+    /// account key is a strict prefix of that account's storage and code keys,
+    /// so **an account with any storage or code is a branch that carries a
+    /// value**, not a terminal node. Counting only leaves silently drops
+    /// exactly the accounts that are interesting.
+    pub values_by_kind: Vec<(LeafKind, u64, u64)>,
+    /// The most-referenced nodes, most first. Each carries a path that reaches
+    /// it, so the node can be looked up afterwards.
+    pub top_duplicates: Vec<DupNode>,
+}
+
+/// A node reached from more than one parent.
+#[derive(Debug, Clone)]
+pub struct DupNode {
+    pub hash: B256,
+    /// How many references point at it in total (1 original + its repeats).
+    pub refs: u64,
+    /// Subtree bytes each extra reference avoids storing.
+    pub bytes: u64,
+    /// One path that reaches it. A shared node has several by definition; this
+    /// is the one seen when the repeat was first noticed, which is enough to
+    /// address it.
+    pub path: Vec<u8>,
+    pub kind: ShareKind,
+}
+
+/// Classifies a node for the sharing and embedding breakdowns.
+///
+/// `path_before` is the path length above the node's own shared path, which is
+/// what decides whether a branch sits in the account index or inside one
+/// account's storage. `full_path` includes the shared path and is the whole key
+/// when the node is terminal.
+fn node_kind(node: &TrieNode, path_before: usize, full_path: &[u8]) -> ShareKind {
+    if node.is_terminal() {
+        ShareKind::Leaf(match pack_bits(full_path) {
+            Some(key) => classify(&key),
+            None => LeafKind::Unknown,
+        })
+    } else if path_before < ACCOUNT_KEY_BITS {
+        ShareKind::BranchAccountRegion
+    } else {
+        ShareKind::BranchStorageRegion
+    }
 }
 
 fn bump_share(v: &mut Vec<(ShareKind, u64, u64)>, kind: ShareKind, bytes: u64) {
@@ -205,7 +256,38 @@ fn subtree_size(node: &TrieNode, store: &dyn TrieStore) -> u64 {
 /// Progress is reported against the expanded total, crediting a skipped
 /// subtree's whole size from the memoised value rather than descending into it.
 pub fn scan(store: &dyn TrieStore, root_hash: B256, interval_secs: u64) -> Result<TrieStats> {
-    scan_with_batch(store, root_hash, interval_secs, DEFAULT_READ_BATCH)
+    scan_with_options(store, root_hash, ScanOptions { interval_secs, ..Default::default() })
+}
+
+/// Knobs for a scan. Defaults match `scan`.
+pub struct ScanOptions<'a> {
+    /// Seconds between progress dumps. 0 disables them.
+    pub interval_secs: u64,
+    /// References buffered before a read pass.
+    pub batch_size: usize,
+    /// When set, every distinct node is also written here as it is visited, so
+    /// one traversal both measures the state and extracts it.
+    pub snapshot: Option<&'a mut SnapshotWriter>,
+}
+
+impl Default for ScanOptions<'_> {
+    fn default() -> Self {
+        Self { interval_secs: 0, batch_size: DEFAULT_READ_BATCH, snapshot: None }
+    }
+}
+
+/// Back-compatible entry point for a scan with an explicit batch size.
+pub fn scan_with_batch(
+    store: &dyn TrieStore,
+    root_hash: B256,
+    interval_secs: u64,
+    batch_size: usize,
+) -> Result<TrieStats> {
+    scan_with_options(
+        store,
+        root_hash,
+        ScanOptions { interval_secs, batch_size, snapshot: None },
+    )
 }
 
 /// How many pending references to accumulate before sorting and reading them.
@@ -244,12 +326,12 @@ pub const DEFAULT_READ_BATCH: usize = 262_144;
 /// - deduplicated: summed over distinct nodes as they are visited;
 /// - expanded: read from the root's `children_size`, which already counts a
 ///   shared subtree once per reference, so it needs no traversal.
-pub fn scan_with_batch(
+pub fn scan_with_options(
     store: &dyn TrieStore,
     root_hash: B256,
-    interval_secs: u64,
-    batch_size: usize,
+    opts: ScanOptions<'_>,
 ) -> Result<TrieStats> {
+    let ScanOptions { interval_secs, batch_size, mut snapshot } = opts;
     let data = store
         .get(root_hash.as_slice())
         .with_context(|| format!("state root {root_hash:?} not found in the trie store"))?;
@@ -270,16 +352,33 @@ pub fn scan_with_batch(
     // read entirely.
     struct Pending {
         hash: B256,
-        node: Option<TrieNode>, // Some => embedded, no read needed
+        node: Option<TrieNode>, // Some => already materialised, no read needed
+        /// The node's stored bytes when we hold them. Distinguishes the root --
+        /// materialised because we just read it -- from a genuinely embedded
+        /// child, which has no entry of its own. Without this the root counts
+        /// as embedded and, worse, a snapshot would omit the one node that
+        /// makes the rest reachable.
+        raw: Option<Vec<u8>>,
         path: Vec<u8>,
         depth: usize,
     }
     let mut pending: Vec<Pending> = vec![Pending {
         hash: root_hash,
         node: Some(root),
+        raw: Some(data),
         path: Vec::new(),
         depth: 1,
     }];
+
+    /// A node reached more than once, tracked only from its second reference so
+    /// the map holds duplicates rather than every node.
+    struct DupEntry {
+        repeats: u64,
+        bytes: u64,
+        path: Vec<u8>,
+        kind: ShareKind,
+    }
+    let mut dups: std::collections::HashMap<B256, DupEntry> = std::collections::HashMap::new();
     let mut next: Vec<Pending> = Vec::new();
 
     while !pending.is_empty() {
@@ -297,11 +396,14 @@ pub fn scan_with_batch(
         let mut fetched_iter = fetched.into_iter();
 
         for p in pending.drain(..) {
-            let was_embedded = p.node.is_some();
-            let node = match p.node {
-                Some(n) => n,
+            let was_embedded = p.node.is_some() && p.raw.is_none();
+            let (node, raw) = match p.node {
+                Some(n) => (n, p.raw),
                 None => match fetched_iter.next().flatten() {
-                    Some(d) => TrieNode::from_message(&d, store),
+                    Some(d) => {
+                        let n = TrieNode::from_message(&d, store);
+                        (n, Some(d))
+                    }
                     None => continue, // dangling reference: counted by absence
                 },
             };
@@ -311,22 +413,20 @@ pub fn scan_with_batch(
             if let Some(prev) = seen.get(&p.hash) {
                 st.shared_refs += 1;
                 st.shared_bytes = st.shared_bytes.saturating_add(*prev);
-                let kind = if node.is_terminal() {
-                    let mut full = p.path.clone();
-                    let sp: &TrieKeySlice = &node.shared_path;
-                    for i in 0..sp.length() {
-                        full.push(sp.get(i));
-                    }
-                    ShareKind::Leaf(match pack_bits(&full) {
-                        Some(key) => classify(&key),
-                        None => LeafKind::Unknown,
-                    })
-                } else if p.path.len() < ACCOUNT_KEY_BITS {
-                    ShareKind::BranchAccountRegion
-                } else {
-                    ShareKind::BranchStorageRegion
-                };
+                let mut full = p.path.clone();
+                let sp: &TrieKeySlice = &node.shared_path;
+                for i in 0..sp.length() {
+                    full.push(sp.get(i));
+                }
+                let kind = node_kind(&node, p.path.len(), &full);
                 bump_share(&mut st.shares_by_kind, kind, *prev);
+                let entry = dups.entry(p.hash).or_insert_with(|| DupEntry {
+                    repeats: 0,
+                    bytes: *prev,
+                    path: full,
+                    kind,
+                });
+                entry.repeats += 1;
                 processed = processed.saturating_add(*prev);
                 continue;
             }
@@ -337,14 +437,25 @@ pub fn scan_with_batch(
             st.size_dedup += size;
             processed = processed.saturating_add(size);
             st.max_depth = st.max_depth.max(p.depth);
-            if was_embedded {
-                st.embedded += 1;
+
+            // Copy before descending. Only nodes with bytes of their own are
+            // written: an embedded child lives inside its parent's message, so
+            // writing it would add a key the source does not have.
+            if let (Some(w), Some(bytes)) = (snapshot.as_deref_mut(), raw.as_ref()) {
+                w.put_node(p.hash, bytes)?;
             }
 
+            let path_before = p.path.len();
             let mut path = p.path;
             let sp: &TrieKeySlice = &node.shared_path;
             for i in 0..sp.length() {
                 path.push(sp.get(i));
+            }
+
+            if was_embedded {
+                st.embedded += 1;
+                let kind = node_kind(&node, path_before, &path);
+                bump_share(&mut st.embedded_by_kind, kind, size);
             }
 
             if node.is_terminal() {
@@ -359,6 +470,12 @@ pub fn scan_with_batch(
                     let vh = node.value_hash.unwrap_or_default();
                     if seen_values.insert(vh) {
                         st.distinct_long_values += 1;
+                        // Over 32 bytes, so the trie keeps it as its own entry
+                        // keyed by the value hash. A snapshot without it would
+                        // hold leaves pointing at values that are not there.
+                        if let (Some(w), Some(v)) = (snapshot.as_deref_mut(), node.value.as_ref()) {
+                            w.put_long_value(vh, v)?;
+                        }
                     } else {
                         st.shared_values += 1;
                         st.shared_value_bytes = st.shared_value_bytes.saturating_add(vlen);
@@ -369,11 +486,31 @@ pub fn scan_with_batch(
                     None => LeafKind::Unknown,
                 };
                 bump(&mut st.by_kind, kind, vlen);
+                bump(&mut st.values_by_kind, kind, vlen);
             } else {
                 st.branches += 1;
                 st.branch_size += size;
                 if node.value.is_some() {
                     st.value_bytes += node.value_length() as u64;
+                    // A branch with a value is almost always an account that
+                    // owns storage or code: its key is a prefix of theirs.
+                    let kind = match pack_bits(&path) {
+                        Some(key) => classify(&key),
+                        None => LeafKind::Unknown,
+                    };
+                    bump(&mut st.values_by_kind, kind, node.value_length() as u64);
+                    // Rare, but a branch can hold a value, and a long one is
+                    // stored separately exactly like a leaf's.
+                    if node.has_long_value() {
+                        let vh = node.value_hash.unwrap_or_default();
+                        if seen_values.insert(vh) {
+                            if let (Some(w), Some(v)) =
+                                (snapshot.as_deref_mut(), node.value.as_ref())
+                            {
+                                w.put_long_value(vh, v)?;
+                            }
+                        }
+                    }
                 }
                 for (bit, child) in [(0u8, &node.left), (1u8, &node.right)] {
                     let mut p2 = path.clone();
@@ -382,12 +519,14 @@ pub fn scan_with_batch(
                         rustock_trie::NodeRef::Node(n) => next.push(Pending {
                             hash: n.compute_hash(store),
                             node: Some((**n).clone()),
+                            raw: None, // embedded: no entry of its own
                             path: p2,
                             depth: p.depth + 1,
                         }),
                         rustock_trie::NodeRef::Hash(h) => next.push(Pending {
                             hash: *h,
                             node: None,
+                            raw: None,
                             path: p2,
                             depth: p.depth + 1,
                         }),
@@ -419,8 +558,28 @@ pub fn scan_with_batch(
             next = deferred;
         }
     }
+
+    // Rank the duplicates. `refs` counts the original reference as well as the
+    // repeats, so a node seen twice reports 2.
+    let mut ranked: Vec<DupNode> = dups
+        .into_iter()
+        .map(|(hash, e)| DupNode {
+            hash,
+            refs: e.repeats + 1,
+            bytes: e.bytes,
+            path: e.path,
+            kind: e.kind,
+        })
+        .collect();
+    ranked.sort_unstable_by(|a, b| b.refs.cmp(&a.refs).then_with(|| b.bytes.cmp(&a.bytes)));
+    ranked.truncate(TOP_DUPLICATES);
+    st.top_duplicates = ranked;
+
     Ok(st)
 }
+
+/// How many of the most-referenced nodes to keep and report.
+pub const TOP_DUPLICATES: usize = 3;
 
 /// Prints every counter mid-scan. Deliberately the same numbers as the final
 /// report: a partial view that omits fields invites the assumption that a
@@ -554,4 +713,205 @@ pub fn report(st: &TrieStats, root: B256, block: Option<u64>, elapsed: f64) {
         );
     }
     println!();
+
+    println!("VALUE-BEARING NODES BY TYPE (leaves and branches)");
+    println!("  {:<20}{:>12}{:>9}{:>14}", "type", "count", "share", "value bytes");
+    let total_values: u64 = st.values_by_kind.iter().map(|k| k.1).sum();
+    let mut vkinds = st.values_by_kind.clone();
+    vkinds.sort_by_key(|k| std::cmp::Reverse(k.1));
+    for (kind, count, bytes) in &vkinds {
+        println!(
+            "  {:<20}{:>12}{:>8.1}%{:>14}",
+            kind.label(), count, pct(*count, total_values.max(1)), human(*bytes)
+        );
+    }
+    let leaf_accounts = st.by_kind.iter().find(|k| k.0 == LeafKind::Account).map_or(0, |k| k.1);
+    let all_accounts = st.values_by_kind.iter().find(|k| k.0 == LeafKind::Account).map_or(0, |k| k.1);
+    println!(
+        "  (accounts with storage or code are branches: {} of {} accounts are not leaves)",
+        all_accounts.saturating_sub(leaf_accounts), all_accounts
+    );
+    println!();
+
+    println!("EMBEDDED NODES BY TYPE (serialised inside the parent)");
+    println!("  {:<26}{:>12}{:>9}{:>14}", "type", "count", "share", "bytes");
+    if st.embedded_by_kind.is_empty() {
+        println!("  {:<26}{:>12}", "none", 0);
+    } else {
+        let mut emb = st.embedded_by_kind.clone();
+        emb.sort_by_key(|k| std::cmp::Reverse(k.1));
+        for (kind, count, bytes) in &emb {
+            println!(
+                "  {:<26}{:>12}{:>8.1}%{:>14}",
+                kind.label(), count, pct(*count, st.embedded.max(1)), human(*bytes)
+            );
+        }
+    }
+    println!("  {:<26}{:>12}{:>8.1}%", "  total embedded", st.embedded,
+        pct(st.embedded, st.unique.max(1)));
+    println!();
+
+    println!("TOP {} MOST-REFERENCED NODES", TOP_DUPLICATES);
+    if st.top_duplicates.is_empty() {
+        println!("  none: no node was reached twice");
+    } else {
+        for (i, d) in st.top_duplicates.iter().enumerate() {
+            println!("  #{}  {} references, {} per extra reference, {}",
+                i + 1, d.refs, human(d.bytes), d.kind.label());
+            println!("      path  {}", crate::trie_inspect::format_path(&d.path));
+            println!("      hash  {:?}", d.hash);
+        }
+    }
+    println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustock_trie::{MemoryTrieStore, TrieKeySlice};
+
+    /// Builds a small trie with account-shaped keys, storage cells, and a value
+    /// long enough to be stored separately.
+    fn build() -> (MemoryTrieStore, B256) {
+        let store = MemoryTrieStore::new();
+        let mut root = TrieNode::empty();
+
+        // Account keys: 0x00 || 10 bytes || 20 bytes = 31 bytes.
+        for i in 0u8..6 {
+            let mut key = vec![0x00];
+            key.extend_from_slice(&[0x11; 10]);
+            key.extend_from_slice(&[i; 20]);
+            root = root.put(&TrieKeySlice::from_key(&key), &[i, i, i], &store);
+        }
+        // Storage cells: longer than an account key plus its marker.
+        for i in 0u8..4 {
+            let mut key = vec![0x00];
+            key.extend_from_slice(&[0x11; 10]);
+            key.extend_from_slice(&[0x01; 20]);
+            key.push(0x00);
+            key.extend_from_slice(&[i; 32]);
+            root = root.put(&TrieKeySlice::from_key(&key), &[0xEE; 8], &store);
+        }
+        // One value over 32 bytes, so it lands in the store under its own hash.
+        let mut key = vec![0x00];
+        key.extend_from_slice(&[0x11; 10]);
+        key.extend_from_slice(&[0x02; 20]);
+        key.push(0x80); // code marker
+        root = root.put(&TrieKeySlice::from_key(&key), &[0xAB; 200], &store);
+
+        root.save(&store, true);
+        let hash = root.compute_hash(&store);
+        (store, hash)
+    }
+
+    #[test]
+    fn scan_counts_a_small_trie() {
+        let (store, root) = build();
+        let st = scan(&store, root, 0).unwrap();
+        assert!(st.unique > 0);
+        assert_eq!(st.leaves + st.branches, st.unique);
+        assert_eq!(st.long_values, 1, "the 200-byte value is stored separately");
+
+        // Four of the six accounts are leaves. The other two were given storage
+        // and code, and an account key is a strict prefix of those, so those
+        // accounts are branches carrying a value -- which is exactly why
+        // `values_by_kind` exists alongside `by_kind`.
+        let leaf_accounts = st.by_kind.iter().find(|k| k.0 == LeafKind::Account);
+        assert!(
+            leaf_accounts.is_some_and(|a| a.1 == 4),
+            "four childless accounts are leaves: {:?}", st.by_kind
+        );
+        let all_accounts = st.values_by_kind.iter().find(|k| k.0 == LeafKind::Account);
+        assert!(
+            all_accounts.is_some_and(|a| a.1 == 6),
+            "all six accounts carry a value: {:?}", st.values_by_kind
+        );
+        let cells = st.by_kind.iter().find(|k| k.0 == LeafKind::StorageCell);
+        assert!(cells.is_some_and(|c| c.1 >= 4), "four storage cells: {:?}", st.by_kind);
+    }
+
+    #[test]
+    fn embedded_nodes_are_classified_not_just_counted() {
+        let (store, root) = build();
+        let st = scan(&store, root, 0).unwrap();
+        let total: u64 = st.embedded_by_kind.iter().map(|e| e.1).sum();
+        assert_eq!(
+            total, st.embedded,
+            "every embedded node lands in exactly one bucket: {:?}",
+            st.embedded_by_kind
+        );
+    }
+
+    #[test]
+    fn the_root_is_not_counted_as_embedded() {
+        // The root is materialised before the loop starts, which once made it
+        // look embedded -- and would have left it out of a snapshot, taking the
+        // whole trie with it.
+        let (store, root) = build();
+        let st = scan(&store, root, 0).unwrap();
+        assert!(st.embedded < st.unique);
+        let root_node = TrieNode::from_message(&store.get(root.as_slice()).unwrap(), &store);
+        assert!(!root_node.is_terminal(), "test trie should branch at the root");
+    }
+
+    #[test]
+    fn snapshot_round_trips_and_reproduces_the_same_statistics() {
+        use crate::trie_snapshot::{read_meta, SnapshotWriter};
+
+        let (store, root) = build();
+        let before = scan(&store, root, 0).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("snap");
+        let target = target.to_str().unwrap();
+
+        let mut w = SnapshotWriter::create(target, false).unwrap();
+        let during = scan_with_options(
+            &store,
+            root,
+            ScanOptions { interval_secs: 0, snapshot: Some(&mut w), ..Default::default() },
+        )
+        .unwrap();
+        let meta = w.finish(root, Some(42), "test").unwrap();
+
+        assert_eq!(meta.root, root);
+        assert_eq!(meta.block, Some(42));
+        assert_eq!(read_meta(target).unwrap().root, root);
+        assert_eq!(meta.long_values, 1);
+
+        // Re-scan the copy. If a single node or long value were missing, the
+        // traversal would come up short -- this is the check that the snapshot
+        // is complete, not merely non-empty.
+        let copy = crate::RocksDbTrieStore::open(std::path::Path::new(target)).unwrap();
+        let after = scan(&copy, root, 0).unwrap();
+
+        assert_eq!(after.unique, before.unique, "node count");
+        assert_eq!(after.leaves, before.leaves, "leaf count");
+        assert_eq!(after.branches, before.branches, "branch count");
+        assert_eq!(after.size_dedup, before.size_dedup, "deduplicated bytes");
+        assert_eq!(after.value_bytes, before.value_bytes, "value bytes");
+        assert_eq!(after.long_values, before.long_values, "long values");
+        assert_eq!(after.embedded, during.embedded, "embedded count");
+
+        let mut a = after.by_kind.clone();
+        let mut b = before.by_kind.clone();
+        a.sort_by_key(|k| format!("{:?}", k.0));
+        b.sort_by_key(|k| format!("{:?}", k.0));
+        assert_eq!(a, b, "leaves by type");
+    }
+
+    #[test]
+    fn duplicate_paths_address_the_node_they_name() {
+        use crate::trie_inspect::{find_by_path, parse_path, format_path};
+
+        let (store, root) = build();
+        let st = scan(&store, root, 0).unwrap();
+        for d in &st.top_duplicates {
+            let parsed = parse_path(&format_path(&d.path)).unwrap();
+            assert_eq!(parsed, d.path, "path notation round trips");
+            let found = find_by_path(&store, root, &d.path).unwrap();
+            assert!(found.is_some(), "path {} should resolve", format_path(&d.path));
+            assert_eq!(found.unwrap().hash, d.hash, "path leads to the named node");
+        }
+    }
 }
