@@ -9,6 +9,19 @@ use crate::rlpx::ecies::RLPxSecrets;
 
 type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
+/// Upper bound on a reassembled multi-frame message.
+///
+/// A chunked message declares its total size in the first frame's header-data,
+/// and that value comes straight off the wire. Without a bound, a peer can
+/// declare an arbitrary total and then stream continuation frames until the
+/// process is killed by the OOM killer: the assembly loop only terminates once
+/// `assembly_buf.len() >= assembly_expected`.
+///
+/// 16 MiB is far above anything the protocol legitimately produces -- a batch of
+/// 192 headers is on the order of 100 KiB, and RSK block bodies are smaller
+/// still -- while remaining small enough that a peer cannot exhaust memory.
+const MAX_ASSEMBLED_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 /// Parsed header-data from an RLPx frame header.
 #[derive(Debug, Clone)]
 enum FrameType {
@@ -156,6 +169,16 @@ impl FrameCodec {
                 // But the first frame body = [code_byte] + [RLP chunk], so extract code byte
                 // BEFORE buffering, so assembly_buf only contains RLP data.
                 let total_size = *total_size;
+                if total_size > MAX_ASSEMBLED_MESSAGE_SIZE {
+                    // Refuse before allocating anything. Reset assembly state so a
+                    // rejected message cannot leave a half-open buffer behind.
+                    self.reset_assembly();
+                    return Err(anyhow::anyhow!(
+                        "chunked message declares {} bytes, over the {} byte limit",
+                        total_size,
+                        MAX_ASSEMBLED_MESSAGE_SIZE
+                    ));
+                }
                 let mut ptr = body_data;
                 let protocol_id = u8::decode(&mut ptr)?;
                 let rlp_chunk = ptr; // body without code byte
@@ -183,6 +206,15 @@ impl FrameCodec {
                     let mut ptr = body_data;
                     let _ptype = u8::decode(&mut ptr)?;
                     let rlp_chunk = ptr;
+                    if self.assembly_buf.len().saturating_add(rlp_chunk.len())
+                        > MAX_ASSEMBLED_MESSAGE_SIZE
+                    {
+                        self.reset_assembly();
+                        return Err(anyhow::anyhow!(
+                            "chunked message exceeded the {} byte limit during assembly",
+                            MAX_ASSEMBLED_MESSAGE_SIZE
+                        ));
+                    }
                     self.assembly_buf.extend_from_slice(rlp_chunk);
                     if self.assembly_buf.len() >= self.assembly_expected {
                         self.assembling = false;
@@ -206,6 +238,16 @@ impl FrameCodec {
                 Ok(Some((protocol_id, payload)))
             }
         }
+    }
+
+    /// Drops any in-progress chunked assembly and releases the buffer's capacity.
+    /// `Vec::clear` keeps the allocation, which would let a peer hold the peak
+    /// size for the lifetime of the connection.
+    fn reset_assembly(&mut self) {
+        self.assembling = false;
+        self.assembly_expected = 0;
+        self.assembly_protocol_id = 0;
+        self.assembly_buf = Vec::new();
     }
 
     /// Parse the header-data from the decrypted frame header (bytes 3..16).
@@ -489,6 +531,58 @@ mod tests {
         alloy_rlp::Header { list: true, payload_length: elems.len() }.encode(&mut out);
         out.extend_from_slice(&elems);
         out
+    }
+
+    /// Finding 1: a peer declaring an oversized chunked message must be rejected
+    /// before any memory is committed, rather than being allowed to stream
+    /// continuation frames until the node is OOM-killed.
+    #[test]
+    fn test_chunked_oversized_total_size_rejected() {
+        let (mut encoder, mut decoder) = make_codec_pair();
+
+        let protocol_id: u8 = 0x18;
+        let chunk: Vec<u8> = vec![0xAB; 64];
+
+        // Declare a total far beyond the cap -- the shape of the attack.
+        let hd_first = header_data_chunked_first(1, MAX_ASSEMBLED_MESSAGE_SIZE + 1);
+        let frame = encode_java_frame(&mut encoder, protocol_id, &chunk, &hd_first);
+
+        let mut src = BytesMut::new();
+        src.extend_from_slice(&frame);
+
+        let err = decoder
+            .decode_frame(&mut src)
+            .expect_err("oversized chunked message must be rejected");
+        assert!(
+            err.to_string().contains("over the"),
+            "unexpected error: {}",
+            err
+        );
+
+        // No assembly state may survive a rejection.
+        assert!(!decoder.assembling);
+        assert_eq!(decoder.assembly_buf.capacity(), 0);
+    }
+
+    /// Finding 1: a message at exactly the cap is still legal -- the bound must
+    /// not break legitimate large messages.
+    #[test]
+    fn test_chunked_total_size_at_limit_accepted() {
+        let (mut encoder, mut decoder) = make_codec_pair();
+
+        let protocol_id: u8 = 0x18;
+        let payload: Vec<u8> = vec![0xCD; 128];
+        // Declare the maximum permitted total; we only send the first frame, so
+        // assembly stays in progress rather than completing.
+        let hd_first = header_data_chunked_first(1, MAX_ASSEMBLED_MESSAGE_SIZE);
+        let frame = encode_java_frame(&mut encoder, protocol_id, &payload, &hd_first);
+
+        let mut src = BytesMut::new();
+        src.extend_from_slice(&frame);
+
+        let r = decoder.decode_frame(&mut src).expect("must be accepted");
+        assert!(r.is_none(), "assembly should still be in progress");
+        assert!(decoder.assembling);
     }
 
     #[test]

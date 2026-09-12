@@ -1,0 +1,9 @@
+# A malicious dependency enters through Cargo.lock and the manifests, not
+# through the Rust source. These files are the highest-leverage review target
+# in the repository, so changes to them require an explicit owner sign-off.
+/Cargo.lock          @SergioDemianLerner
+/Cargo.toml          @SergioDemianLerner
+/crates/*/Cargo.toml @SergioDemianLerner
+/deny.toml           @SergioDemianLerner
+/rust-toolchain.toml @SergioDemianLerner
+/.github/            @SergioDemianLerner

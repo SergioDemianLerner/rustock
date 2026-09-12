@@ -1,0 +1,8 @@
+# Pinning the toolchain keeps builds reproducible and makes sure everyone --
+# developers and CI alike -- runs the same rustc, cargo and lints. Without this
+# the compiler floats per machine, which undermines the guarantees the committed
+# Cargo.lock is meant to provide.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

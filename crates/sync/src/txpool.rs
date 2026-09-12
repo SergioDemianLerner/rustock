@@ -13,6 +13,15 @@ use tracing::debug;
 const TRANSACTION_GAS_CAP: u64 = 1u64 << 60;
 const MAX_TX_SIZE: usize = 128 * 1024;
 
+/// Ceiling on the total number of transactions held across every account.
+///
+/// `account_slots` bounds how many transactions a single sender may occupy, but
+/// nothing bounded the number of *senders*. Admission does verify balance, so
+/// filling the pool costs an attacker real funds — but "expensive" is not the
+/// same as "bounded", and geth caps globally for the same reason. At the default
+/// 128 KiB per transaction this also bounds worst-case pool memory.
+const MAX_POOL_TRANSACTIONS: usize = 8192;
+
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub account_slots: u64,
@@ -20,6 +29,8 @@ pub struct PoolConfig {
     pub outdated_threshold: u64,
     pub outdated_timeout_secs: u64,
     pub max_tx_size: usize,
+    /// Maximum transactions held across all accounts, pending and queued.
+    pub max_pool_transactions: usize,
 }
 
 impl Default for PoolConfig {
@@ -30,6 +41,7 @@ impl Default for PoolConfig {
             outdated_threshold: 10,
             outdated_timeout_secs: 650,
             max_tx_size: MAX_TX_SIZE,
+            max_pool_transactions: MAX_POOL_TRANSACTIONS,
         }
     }
 }
@@ -45,6 +57,7 @@ pub enum PoolError {
     IntrinsicGasTooHigh,
     ReplacementGasPriceTooLow,
     TxTooLarge,
+    PoolFull,
     InvalidSignature(String),
     InsufficientFundsForPendingAndNew,
     IsRemascTransaction,
@@ -64,6 +77,7 @@ impl fmt::Display for PoolError {
             Self::IntrinsicGasTooHigh => write!(f, "transaction's basic cost is above the gas limit"),
             Self::ReplacementGasPriceTooLow => write!(f, "gas price not enough to bump transaction"),
             Self::TxTooLarge => write!(f, "transaction's size is higher than defined maximum"),
+            Self::PoolFull => write!(f, "transaction pool is full"),
             Self::InvalidSignature(e) => write!(f, "invalid signature: {e}"),
             Self::InsufficientFundsForPendingAndNew => {
                 write!(f, "insufficient funds to pay for pending and new transactions")
@@ -161,6 +175,16 @@ impl TransactionPool {
 
         if inner.by_hash.contains_key(&hash) {
             return Err(PoolError::AlreadyKnown);
+        }
+
+        if inner.by_hash.len() >= self.config.max_pool_transactions {
+            // Try to make room by dropping the furthest-out queued transaction.
+            // Queued entries have future nonces, so they are not executable yet
+            // and are the class an attacker can most cheaply pile up. Pending
+            // transactions are never evicted here.
+            if !Self::evict_one_queued(&mut inner) {
+                return Err(PoolError::PoolFull);
+            }
         }
 
         let goes_to_pending = if tx.nonce == state_nonce {
@@ -286,6 +310,33 @@ impl TransactionPool {
     }
 
     /// Remove transactions that are included in a newly imported block.
+    /// Drops the queued transaction with the highest nonce, returning whether
+    /// one was removed. Highest nonce is the furthest from being executable and
+    /// so the least valuable entry to keep.
+    fn evict_one_queued(inner: &mut PoolInner) -> bool {
+        let victim = inner
+            .queued
+            .iter()
+            .filter_map(|(addr, m)| m.keys().last().map(|&nonce| (*addr, nonce)))
+            .max_by_key(|(_, nonce)| *nonce);
+
+        let Some((addr, nonce)) = victim else {
+            return false;
+        };
+
+        let removed = inner.queued.get_mut(&addr).and_then(|m| m.remove(&nonce));
+        if let Some(tx) = removed {
+            inner.by_hash.remove(&tx.hash);
+            if inner.queued.get(&addr).is_some_and(|m| m.is_empty()) {
+                inner.queued.remove(&addr);
+            }
+            debug!("Pool full: evicted queued tx {:?} nonce {}", tx.hash, nonce);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn remove_mined(&self, transactions: &[Transaction]) {
         let mut inner = self.inner.write().unwrap();
         for tx in transactions {
@@ -497,6 +548,7 @@ mod tests {
             outdated_threshold: 10,
             outdated_timeout_secs: 650,
             max_tx_size: MAX_TX_SIZE,
+            max_pool_transactions: MAX_POOL_TRANSACTIONS,
         }
     }
 
@@ -532,6 +584,14 @@ mod tests {
         balance: U256,
         nonce: u64,
     ) -> (TransactionPool, SigningKey, Address) {
+        setup_pool_with_config(balance, nonce, test_config())
+    }
+
+    fn setup_pool_with_config(
+        balance: U256,
+        nonce: u64,
+        config: PoolConfig,
+    ) -> (TransactionPool, SigningKey, Address) {
         let dir = tempdir().unwrap();
         let store = Arc::new(BlockStore::open(dir.path()).unwrap());
         let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
@@ -555,7 +615,7 @@ mod tests {
         store.update_head(&header, U256::from(100_000)).unwrap();
 
         // Keep dir alive by leaking it (temp dir will be cleaned up on process exit)
-        let pool = TransactionPool::new(test_config(), 33, store, trie_store);
+        let pool = TransactionPool::new(config, 33, store, trie_store);
         std::mem::forget(dir);
         (pool, signing_key, addr)
     }
@@ -739,6 +799,64 @@ mod tests {
     }
 
     // ========== rskj: checkTxWithHighNonceIsRejected ==========
+
+    /// Finding 5: the pool must have a global ceiling, not only a per-account
+    /// one. At the cap a queued (future-nonce) transaction is evicted to make
+    /// room, since those are not executable and are the cheapest class for an
+    /// attacker to pile up.
+    #[test]
+    fn test_pool_full_evicts_queued() {
+        let config = PoolConfig {
+            max_pool_transactions: 2,
+            ..test_config()
+        };
+        let (pool, key, _addr) =
+            setup_pool_with_config(U256::from(10u64.pow(18)), 0, config);
+
+        // nonce 0 is executable -> pending
+        let mut tx0 = make_tx(0, 59_240_000);
+        sign_tx(&mut tx0, &key, 33);
+        pool.add_transaction(&encode_tx(&tx0)).unwrap();
+
+        // nonce 2 is not contiguous -> queued. Pool is now at the cap.
+        let mut tx2 = make_tx(2, 59_240_000);
+        sign_tx(&mut tx2, &key, 33);
+        let hash2 = pool.add_transaction(&encode_tx(&tx2)).unwrap();
+
+        // nonce 3 forces an eviction rather than unbounded growth.
+        let mut tx3 = make_tx(3, 59_240_000);
+        sign_tx(&mut tx3, &key, 33);
+        pool.add_transaction(&encode_tx(&tx3)).unwrap();
+
+        let (pending, queued) = pool.status();
+        assert_eq!(pending + queued, 2, "pool must not exceed its cap");
+        assert!(pool.get(&hash2).is_none(), "highest queued nonce evicted");
+    }
+
+    /// Finding 5: with nothing evictable, admission is refused outright instead
+    /// of letting the pool grow past its bound.
+    #[test]
+    fn test_pool_full_rejects_when_nothing_evictable() {
+        let config = PoolConfig {
+            max_pool_transactions: 1,
+            ..test_config()
+        };
+        let (pool, key, _addr) =
+            setup_pool_with_config(U256::from(10u64.pow(18)), 0, config);
+
+        let mut tx0 = make_tx(0, 59_240_000);
+        sign_tx(&mut tx0, &key, 33);
+        pool.add_transaction(&encode_tx(&tx0)).unwrap();
+
+        // Contiguous, so this is pending too -- and pending is never evicted.
+        let mut tx1 = make_tx(1, 59_240_000);
+        sign_tx(&mut tx1, &key, 33);
+        let err = pool.add_transaction(&encode_tx(&tx1)).unwrap_err();
+        assert!(matches!(err, PoolError::PoolFull), "got {:?}", err);
+
+        let (pending, queued) = pool.status();
+        assert_eq!(pending + queued, 1);
+    }
 
     #[test]
     fn test_high_nonce_rejected() {

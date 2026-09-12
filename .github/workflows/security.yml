@@ -1,0 +1,64 @@
+name: Security
+
+# The daily schedule is the important part: advisories get published against
+# dependencies that are already pinned, so a push-only workflow would never
+# notice them. RUSTSEC-2026-0220 (ruint, EVM integer shift bugs) sat in the tree
+# undetected precisely because nothing ran on a timer.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Split so an advisory failure is distinguishable at a glance from a
+        # license or sourcing failure.
+        checks:
+          - advisories
+          - bans licenses sources
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+
+  lockfile:
+    name: Lockfile is current and complete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # --locked fails if Cargo.lock would need to change to build. This catches
+      # a manifest edit that was committed without the corresponding lockfile
+      # update, which would otherwise let CI resolve fresh (unreviewed) versions.
+      - name: Verify Cargo.lock matches the manifests
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      # Every dependency must carry a checksum. A source without one is not
+      # content-verified, and is how a non-crates.io dependency would sneak in.
+      - name: Verify every dependency is checksummed
+        run: |
+          pkgs=$(grep -c '^\[\[package\]\]' Cargo.lock)
+          sums=$(grep -c '^checksum = ' Cargo.lock)
+          members=$(cargo metadata --locked --no-deps --format-version 1 \
+            | grep -o '"name":"rustock-[a-z]*"' | sort -u | wc -l)
+          echo "packages=$pkgs checksummed=$sums workspace_members=$members"
+          if [ "$((pkgs - sums))" -ne "$members" ]; then
+            echo "::error::Unchecksummed dependencies found outside the workspace."
+            awk '/^\[\[package\]\]/{n="";s=""} /^name = /{n=$0} /^checksum = /{s=1} \
+                 /^$/{if(n!="" && s=="") print n}' Cargo.lock
+            exit 1
+          fi

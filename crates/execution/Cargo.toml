@@ -2,23 +2,24 @@
 name = "rustock-execution"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
-rustock-core = { path = "../core" }
-rustock-trie = { path = "../trie" }
-rustock-storage = { path = "../storage" }
+rustock-core = { version = "0.1.0", path = "../core" }
+rustock-trie = { version = "0.1.0", path = "../trie" }
+rustock-storage = { version = "0.1.0", path = "../storage" }
 revm = { version = "36", default-features = false, features = ["std", "secp256k1", "optional_eip3541"] }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-sha3 = "0.10"
-sha2 = "0.10"
-ripemd = "0.1"
-k256 = { version = "0.13.4", features = ["arithmetic"] }
-bitcoin = "0.32.8"
+sha3 = { workspace = true }
+sha2 = { workspace = true }
+ripemd = { workspace = true }
+k256 = { workspace = true, features = ["arithmetic"] }
+bitcoin = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-hex = "0.4"
+hex = { workspace = true }

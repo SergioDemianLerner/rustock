@@ -2,17 +2,18 @@
 name = "rustock-storage"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-trie = { version = "0.1.0", path = "../trie" }
-rocksdb = "0.22.0"
+rocksdb = { workspace = true }
 anyhow = { workspace = true }
 alloy-rlp = { workspace = true }
 alloy-primitives = { workspace = true }
-sha3 = "0.10"
+sha3 = { workspace = true }
 tracing = { workspace = true }
-lru = "0.16.3"
+lru = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

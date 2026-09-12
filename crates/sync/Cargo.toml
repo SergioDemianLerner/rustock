@@ -2,6 +2,7 @@
 name = "rustock-sync"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 rustock-core = { version = "0.1.0", path = "../core" }
@@ -14,11 +15,11 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
-futures = "0.3.31"
-lru = "0.12"
+futures = { workspace = true }
+lru = { workspace = true }
 rand = { workspace = true }
-sha3 = "0.10"
+sha3 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-k256 = { version = "0.13.4", features = ["ecdsa"] }
+k256 = { workspace = true, features = ["ecdsa"] }

@@ -376,7 +376,7 @@ async fn test_headers_response_advances_chunks() {
 
     let peer = B512::repeat_byte(0x01);
     // Register the peer so fill_pipeline can find it
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer, tx).await;
 
     let mut tracker = PeerChunkTracker::new(skeleton.len());
@@ -431,7 +431,7 @@ async fn test_try_start_sync_when_behind_peer() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
 
     let peer_id = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer_id, tx).await;
     peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
         best_number: 1000,
@@ -468,7 +468,7 @@ async fn test_try_start_sync_already_synced() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
 
     let peer_id = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer_id, tx).await;
     peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
         best_number: 0,
@@ -575,7 +575,7 @@ async fn test_skeleton_round_transitions_to_next_skeleton() {
     ];
     let peer = B512::repeat_byte(0x01);
     // Register the peer so the service can find it for the next skeleton
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer, tx).await;
     peer_store.update_metadata(&peer, rustock_networking::peers::PeerMetadata {
         best_number: 10000,
@@ -646,7 +646,7 @@ async fn test_failed_body_send_stays_tracked_for_retry() {
 
     // Peer whose session channel is closed: every send to it fails.
     let peer = B512::repeat_byte(0x01);
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer, tx).await;
     drop(rx);
 
@@ -703,7 +703,7 @@ async fn test_stalled_body_retry_rotates_across_peers() {
     let mut rxs = std::collections::HashMap::new();
     for i in 0u8..3 {
         let id = B512::repeat_byte(i + 1);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
         peer_store.add_peer(id, tx).await;
         rxs.insert(id, rx);
     }
@@ -736,7 +736,7 @@ async fn test_stalled_body_retry_rotates_across_peers() {
     };
 
     // Identify which peer received the single retried request this round.
-    let receiver_of_round = |rxs: &mut std::collections::HashMap<B512, mpsc::UnboundedReceiver<_>>| {
+    let receiver_of_round = |rxs: &mut std::collections::HashMap<B512, mpsc::Receiver<_>>| {
         let mut hit = None;
         for (id, rx) in rxs.iter_mut() {
             if rx.try_recv().is_ok() {
@@ -793,7 +793,7 @@ async fn test_body_requests_skip_struck_peers_and_balance() {
     let dead = B512::repeat_byte(0x0d);
     let mut rxs = std::collections::HashMap::new();
     for id in [good_a, good_b, dead] {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
         peer_store.add_peer(id, tx).await;
         rxs.insert(id, rx);
     }
@@ -809,7 +809,7 @@ async fn test_body_requests_skip_struck_peers_and_balance() {
 
     service.send_body_requests().await;
 
-    let count = |id: &B512, rxs: &mut std::collections::HashMap<B512, mpsc::UnboundedReceiver<_>>| {
+    let count = |id: &B512, rxs: &mut std::collections::HashMap<B512, mpsc::Receiver<_>>| {
         let rx = rxs.get_mut(id).unwrap();
         let mut n = 0;
         while rx.try_recv().is_ok() {
@@ -847,7 +847,7 @@ async fn test_late_body_response_on_superseded_id_still_applies() {
     let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
 
     let peer = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer, tx).await;
 
     // b1 (idx 0) outstanding on id 7 and already stale; b2 (idx 1) on id 8, fresh.
@@ -1137,8 +1137,8 @@ async fn test_stalled_peer_sidelined_and_chunks_reassigned() {
 
     let peer_a = B512::repeat_byte(0x0A);
     let peer_b = B512::repeat_byte(0x0B);
-    let (tx_a, _rx_a) = mpsc::unbounded_channel();
-    let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+    let (tx_a, _rx_a) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    let (tx_b, mut rx_b) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer_a, tx_a).await;
     peer_store.add_peer(peer_b, tx_b).await;
 
@@ -1209,7 +1209,7 @@ async fn test_small_gap_enters_following_mode() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
 
     let peer_id = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer_id, tx).await;
     peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
         best_number: 10, // only 10 blocks behind (< 24)
@@ -1239,7 +1239,7 @@ async fn test_large_gap_enters_skeleton_sync() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
 
     let peer_id = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer_id, tx).await;
     peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
         best_number: 100, // 100 blocks behind (> 24)
@@ -1297,7 +1297,7 @@ async fn test_new_block_hashes_processed_in_following_mode() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
 
     let peer = B512::repeat_byte(0x01);
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer, tx).await;
 
     let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
@@ -1343,7 +1343,7 @@ async fn test_following_switches_to_sync_on_large_gap() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
 
     let peer_id = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer_id, tx).await;
     peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
         best_number: 200, // 198 blocks ahead (> 24)
@@ -1383,7 +1383,7 @@ async fn test_following_stays_when_gap_small() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
 
     let peer_id = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer_id, tx).await;
     peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
         best_number: 5, // only 4 blocks ahead (< 24)
@@ -1423,7 +1423,7 @@ async fn test_following_small_gap_requests_missing_headers() {
 
     let peer_id = B512::repeat_byte(0x01);
     let peer_best_hash = B256::repeat_byte(0x05);
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer_id, tx).await;
     peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
         best_number: 5,
@@ -2076,7 +2076,7 @@ async fn test_new_block_hashes_reorg_candidate_triggers_request() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
 
     let peer = B512::repeat_byte(0x01);
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer, tx).await;
 
     let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
@@ -2115,7 +2115,7 @@ async fn test_new_block_hashes_same_hash_ignored() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
 
     let peer = B512::repeat_byte(0x01);
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer, tx).await;
 
     let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
@@ -2356,7 +2356,7 @@ async fn test_body_download_state_machine() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
 
     let peer = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer, tx).await;
 
     let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
@@ -2435,8 +2435,8 @@ async fn test_tx_relay_filters_duplicates() {
 
     let peer_a = alloy_primitives::B512::repeat_byte(0x0a);
     let peer_b = alloy_primitives::B512::repeat_byte(0x0b);
-    let (_tx_a, _rx_a) = mpsc::unbounded_channel();
-    let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+    let (_tx_a, _rx_a) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    let (tx_b, mut rx_b) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer_a, _tx_a).await;
     peer_store.add_peer(peer_b, tx_b).await;
 
@@ -2464,7 +2464,7 @@ async fn test_tx_relay_submit_transaction() {
 
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let peer_a = alloy_primitives::B512::repeat_byte(0x0a);
-    let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+    let (tx_a, mut rx_a) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(peer_a, tx_a).await;
 
     let relay = TxRelay::new(peer_store);
@@ -2595,6 +2595,7 @@ fn make_service(store: Arc<BlockStore>) -> SyncService {
     let verifier = Arc::new(HeaderVerifier::new());
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    // SyncEvent channel, not a peer channel -- stays unbounded.
     let (_tx, rx) = mpsc::unbounded_channel();
     SyncService::new(manager, peer_store, rx)
 }
@@ -2613,7 +2614,7 @@ async fn test_pipeline_next_batch_downloads_while_executing() {
 
     // Register a peer so continue_after_bodies can request the next skeleton.
     let peer = B512::repeat_byte(0x01);
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     service.peer_store_for_test().add_peer(peer, tx).await;
     service.peer_store_for_test()
         .update_metadata(&peer, rustock_networking::peers::PeerMetadata {
@@ -2654,7 +2655,7 @@ async fn test_pipeline_depth_capped_at_one_ahead() {
     service.set_test_exec(ctrl.exec_fn());
 
     let peer = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     service.peer_store_for_test().add_peer(peer, tx).await;
     service.peer_store_for_test()
         .update_metadata(&peer, rustock_networking::peers::PeerMetadata {
@@ -2708,7 +2709,7 @@ async fn test_pipeline_exec_failure_halts() {
     service.set_test_exec(ctrl.exec_fn());
 
     let peer = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     service.peer_store_for_test().add_peer(peer, tx).await;
     service.peer_store_for_test()
         .update_metadata(&peer, rustock_networking::peers::PeerMetadata {
@@ -2763,7 +2764,7 @@ async fn test_pipeline_two_batches_advance_exec_head() {
     service.set_test_exec(exec_fn);
 
     let peer = B512::repeat_byte(0x01);
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     service.peer_store_for_test().add_peer(peer, tx).await;
     service.peer_store_for_test()
         .update_metadata(&peer, rustock_networking::peers::PeerMetadata {

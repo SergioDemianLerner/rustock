@@ -1,0 +1,21 @@
+# Dependabot turns a published advisory into a pull request instead of a silent
+# risk. Updates are grouped so the weekly noise stays reviewable -- an unreviewed
+# flood of dependency PRs is itself a supply chain hazard, since it trains
+# reviewers to approve lockfile diffs without reading them.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        update-types: ["patch", "minor"]
+    labels: ["dependencies"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels: ["dependencies", "ci"]

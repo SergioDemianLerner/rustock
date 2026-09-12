@@ -6,7 +6,30 @@ use alloy_primitives::{B512, B256, U256};
 use anyhow::{Result, Context};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::{Semaphore, Mutex};
 use tracing::{info, error, warn, debug, trace};
+
+/// Masks `ip` to its network block, so all addresses within one block collapse
+/// to a single key. IPv4 uses `prefix` bits; IPv6 uses `prefix * 2` bits, since
+/// allocations there are far larger (a /48 or /56 is a routine single-customer
+/// assignment, so treating an IPv6 /24 as one block would be meaningless).
+fn cidr_block(ip: IpAddr, prefix: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let bits = u32::from(v4);
+            let p = prefix.min(32);
+            let mask: u32 = if p == 0 { 0 } else { u32::MAX << (32 - p) };
+            IpAddr::V4(std::net::Ipv4Addr::from(bits & mask))
+        }
+        IpAddr::V6(v6) => {
+            let bits = u128::from(v6);
+            let p = (prefix as u16 * 2).min(128) as u32;
+            let mask: u128 = if p == 0 { 0 } else { u128::MAX << (128 - p) };
+            IpAddr::V6(std::net::Ipv6Addr::from(bits & mask))
+        }
+    }
+}
 
 /// A P2P Node that manages incoming connections and peer handshakes.
 pub struct Node {
@@ -35,6 +58,27 @@ pub struct NodeConfig {
     /// Target number of outbound peer connections to maintain (rskj's
     /// `maxActivePeers`). The outbound connector dials toward this count.
     pub max_outbound_peers: usize,
+    /// Maximum number of simultaneous *inbound* connections. The accept loop
+    /// refuses beyond this, so a single host cannot exhaust memory and CPU by
+    /// opening connections faster than handshakes complete.
+    pub max_inbound_peers: usize,
+    /// Maximum simultaneous inbound connections from any single IP address.
+    /// Without this, one host can occupy every inbound slot on its own.
+    pub max_inbound_per_ip: usize,
+    /// Maximum simultaneous inbound connections from any single network block,
+    /// with the block size given by `inbound_cidr_prefix`.
+    ///
+    /// A per-IP cap alone is trivially sidestepped by an attacker holding a
+    /// subnet: a /24 gives 256 addresses, each under the per-IP limit. rskj
+    /// bounds by network block for this reason (`peer.filter.maxConnections`
+    /// over `networkCIDR`), and this mirrors it. The two limits are kept
+    /// together rather than one replacing the other: the per-IP cap stops one
+    /// host monopolising slots, the per-block cap stops one operator doing the
+    /// same from many hosts.
+    pub max_inbound_per_cidr: usize,
+    /// Prefix length defining a network block for `max_inbound_per_cidr`
+    /// (IPv4; the IPv6 block uses the same value against the /64-style prefix).
+    pub inbound_cidr_prefix: u8,
 }
 
 impl Node {
@@ -178,17 +222,106 @@ impl Node {
         );
         tokio::spawn(outbound.start());
 
+        // Bounds concurrent inbound connections. Each one spawns a task that
+        // performs an ECIES handshake (secp256k1 ECDH + Keccak), so an unbounded
+        // accept loop is a CPU and memory exhaustion vector from a single host.
+        let inbound_slots = Arc::new(Semaphore::new(self.config.max_inbound_peers));
+        let per_ip = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
+        let per_cidr = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
+
         loop {
             let (stream, peer_addr) = listener.accept().await?;
+
+            // Acquire a global slot first. try_acquire_owned never blocks the
+            // accept loop: over the limit we drop the connection immediately
+            // rather than queueing work an attacker controls.
+            let permit = match inbound_slots.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    debug!(
+                        target: "rustock::net",
+                        "Refusing {}: inbound capacity {} reached",
+                        peer_addr, self.config.max_inbound_peers
+                    );
+                    drop(stream);
+                    continue;
+                }
+            };
+
+            // Then a per-IP slot, so one host cannot take every global slot.
+            let ip = peer_addr.ip();
+            {
+                let mut map = per_ip.lock().await;
+                let count = map.entry(ip).or_insert(0);
+                if *count >= self.config.max_inbound_per_ip {
+                    debug!(
+                        target: "rustock::net",
+                        "Refusing {}: {} connections already from this IP",
+                        peer_addr, count
+                    );
+                    drop(stream);
+                    continue;
+                }
+                *count += 1;
+            }
+
+            let block = cidr_block(ip, self.config.inbound_cidr_prefix);
+            {
+                let mut map = per_cidr.lock().await;
+                let count = map.entry(block).or_insert(0);
+                if *count >= self.config.max_inbound_per_cidr {
+                    debug!(
+                        target: "rustock::net",
+                        "Refusing {}: {} connections already from network block {}",
+                        peer_addr, count, block
+                    );
+                    // Give back the per-IP slot taken just above.
+                    let mut ip_map = per_ip.lock().await;
+                    if let Some(c) = ip_map.get_mut(&ip) {
+                        *c = c.saturating_sub(1);
+                        if *c == 0 {
+                            ip_map.remove(&ip);
+                        }
+                    }
+                    drop(stream);
+                    continue;
+                }
+                *count += 1;
+            }
+
             debug!(target: "rustock::net", "New connection from: {}", peer_addr);
 
             let config = self.config.clone();
             let handlers = all_handlers.clone();
             let peer_store = self.peer_store.clone();
+            let per_ip_task = per_ip.clone();
+            let per_cidr_task = per_cidr.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_incoming(stream, config, handlers, peer_store).await {
                     error!(target: "rustock::net", "Error handling peer {}: {:?}", peer_addr, e);
                 }
+                // Release both slots however the session ended, including panics
+                // unwinding through this task.
+                {
+                    let mut map = per_ip_task.lock().await;
+                    if let Some(c) = map.get_mut(&ip) {
+                        *c = c.saturating_sub(1);
+                        if *c == 0 {
+                            // Do not let the map grow without bound across churn.
+                            map.remove(&ip);
+                        }
+                    }
+                }
+                {
+                    let mut map = per_cidr_task.lock().await;
+                    if let Some(c) = map.get_mut(&block) {
+                        *c = c.saturating_sub(1);
+                        if *c == 0 {
+                            map.remove(&block);
+                        }
+                    }
+                }
+                drop(permit);
             });
         }
     }
@@ -206,7 +339,7 @@ pub(crate) async fn register_and_run_session(
     handlers: Vec<Arc<dyn P2pHandler>>,
     peer_store: Arc<PeerStore>,
 ) -> Result<()> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
 
     if !peer_store.add_peer(peer_id, tx).await {
         trace!(target: "rustock::net", "Peer already connected: {:?}", peer_id);
@@ -261,6 +394,41 @@ mod tests {
     use alloy_primitives::B512;
     use tokio::time::{sleep, Duration, timeout};
 
+    #[test]
+    fn test_cidr_block_groups_a_subnet() {
+        use std::net::Ipv4Addr;
+        // A /24 collapses to one key, so an attacker holding the subnet cannot
+        // sidestep the per-IP cap by spreading across 256 addresses.
+        let a = cidr_block(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 24);
+        let b = cidr_block(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 250)), 24);
+        assert_eq!(a, b);
+        let other = cidr_block(IpAddr::V4(Ipv4Addr::new(203, 0, 114, 7)), 24);
+        assert_ne!(a, other, "a different /24 must be a different block");
+    }
+
+    #[test]
+    fn test_cidr_block_ipv6_uses_wider_prefix() {
+        use std::net::Ipv6Addr;
+        // prefix 24 means /48 for IPv6, since a /48 is a routine single-customer
+        // allocation there.
+        let a = cidr_block(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 1, 0, 0, 0, 1)), 24);
+        let b = cidr_block(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, 9, 0, 0, 0, 2)), 24);
+        assert_eq!(a, b, "same /48 must collapse to one block");
+        let other = cidr_block(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xabce, 1, 0, 0, 0, 1)), 24);
+        assert_ne!(a, other);
+    }
+
+    #[test]
+    fn test_cidr_block_prefix_edges() {
+        use std::net::Ipv4Addr;
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 42));
+        // /32 degenerates to a per-IP key; /0 collapses everything.
+        assert_eq!(cidr_block(ip, 32), ip);
+        assert_eq!(cidr_block(ip, 0), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        // Over-long prefixes must saturate rather than overflow the shift.
+        assert_eq!(cidr_block(ip, 255), ip);
+    }
+
     #[tokio::test]
     async fn test_handshake() {
         let node1_config = NodeConfig {
@@ -279,6 +447,10 @@ mod tests {
             data_dir: ".".to_string(),
             external_ip: None,
             max_outbound_peers: 10,
+            max_inbound_peers: 32,
+            max_inbound_per_ip: 4,
+            max_inbound_per_cidr: 16,
+            inbound_cidr_prefix: 24,
         };
         
         let node2_config = NodeConfig {
@@ -297,6 +469,10 @@ mod tests {
             data_dir: ".".to_string(),
             external_ip: None,
             max_outbound_peers: 10,
+            max_inbound_peers: 32,
+            max_inbound_per_ip: 4,
+            max_inbound_per_cidr: 16,
+            inbound_cidr_prefix: 24,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -347,10 +523,10 @@ mod tests {
         let store = Arc::new(PeerStore::new());
         let peer_id = B512::repeat_byte(0x01);
 
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
         assert!(store.add_peer(peer_id, tx1).await, "First add should succeed");
 
-        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
         assert!(!store.add_peer(peer_id, tx2).await, "Duplicate add should be rejected");
 
         assert_eq!(store.count().await, 1);

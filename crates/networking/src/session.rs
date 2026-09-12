@@ -23,12 +23,12 @@ pub struct PeerSession {
     pub peer_id: B512,
     framed: Framed<TcpStream, HandshakeCodec>,
     handlers: Vec<Arc<dyn P2pHandler>>,
-    outbound_rx: mpsc::UnboundedReceiver<P2pMessage>,
+    outbound_rx: mpsc::Receiver<P2pMessage>,
     read_idle_timeout: Duration,
 }
 
 impl PeerSession {
-    pub fn new(peer_id: B512, stream: TcpStream, outbound_rx: mpsc::UnboundedReceiver<P2pMessage>) -> Self {
+    pub fn new(peer_id: B512, stream: TcpStream, outbound_rx: mpsc::Receiver<P2pMessage>) -> Self {
         Self {
             peer_id,
             framed: Framed::new(stream, HandshakeCodec::Plain(P2pCodec)),
@@ -38,7 +38,7 @@ impl PeerSession {
         }
     }
 
-    pub fn from_framed(peer_id: B512, framed: Framed<TcpStream, HandshakeCodec>, outbound_rx: mpsc::UnboundedReceiver<P2pMessage>) -> Self {
+    pub fn from_framed(peer_id: B512, framed: Framed<TcpStream, HandshakeCodec>, outbound_rx: mpsc::Receiver<P2pMessage>) -> Self {
         Self {
             peer_id,
             framed,
@@ -144,7 +144,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
         
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -173,7 +173,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
 
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -196,7 +196,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
 
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();

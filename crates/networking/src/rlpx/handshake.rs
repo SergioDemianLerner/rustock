@@ -174,6 +174,10 @@ mod tests {
             data_dir: ".".to_string(),
             external_ip: None,
             max_outbound_peers: 10,
+            max_inbound_peers: 32,
+            max_inbound_per_ip: 4,
+            max_inbound_per_cidr: 16,
+            inbound_cidr_prefix: 24,
         }
     }
 

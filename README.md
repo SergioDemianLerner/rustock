@@ -30,6 +30,21 @@ A Rootstock (RSK) full node implementation in Rust. Rustock syncs and validates 
 
 - [Rust](https://rustup.rs/) (edition 2021)
 - RocksDB system libraries (usually handled automatically by `rust-rocksdb`)
+- A C/C++ toolchain plus `libclang` — `librocksdb-sys` compiles vendored C++, and
+  `zstd-sys` generates its bindings with `bindgen`, which needs `libclang.so` and
+  clang's builtin headers at build time:
+
+  ```bash
+  # Debian/Ubuntu
+  sudo apt install build-essential clang libclang-dev
+  # Fedora/RHEL
+  sudo dnf install gcc gcc-c++ clang-devel
+  # macOS (ships with the Xcode command line tools)
+  xcode-select --install
+  ```
+
+  If `bindgen` still reports `Unable to find libclang`, point it at the library
+  explicitly, e.g. `export LIBCLANG_PATH=/usr/lib/llvm-21/lib`.
 
 ### Building
 
@@ -69,6 +84,39 @@ cargo test --workspace
 ```
 
 786 tests covering consensus validation, RLP encoding, P2P handshakes, sync state machines, storage, the Unitrie, EVM execution, every RSK precompile (including the full Bridge surface and REMASC), the transaction pool, RPC methods, transaction relay, and chain reorganizations.
+
+### Dependency Auditing
+
+Supply chain checks run in CI on every push and pull request, and on a daily
+schedule so that advisories published against already-pinned dependencies are
+caught even when nobody touches the code. To run the same checks locally:
+
+```bash
+cargo install cargo-deny --locked
+cargo deny check                  # advisories, bans, licenses, sources
+```
+
+The policy lives in [`deny.toml`](deny.toml). What it enforces:
+
+- **crates.io only.** Unknown registries and git dependencies are rejected.
+  Published crates.io versions are immutable, so together with the checksums in
+  `Cargo.lock` a compromised maintainer cannot alter a version already depended
+  on — only publish a new one, which the lockfile will not pick up until
+  someone deliberately runs `cargo update`.
+- **No yanked crates.** A yank usually signals a withdrawn or compromised
+  release.
+- **No wildcard version requirements**, which would defeat pinning.
+- **Known advisories**, with any exception recorded in `deny.toml` alongside the
+  reasoning for it.
+
+`Cargo.lock` is committed and must stay that way: it is the primary supply chain
+control, and CI verifies it is current (`cargo metadata --locked`) and that every
+non-workspace dependency carries a checksum. Treat lockfile diffs as
+security-relevant during review — a malicious dependency arrives through
+`Cargo.lock`, not through the Rust source.
+
+Prefer `[workspace.dependencies]` when adding a dependency used by more than one
+crate, so two crates cannot silently pin different versions of it.
 
 ## JSON-RPC API
 
