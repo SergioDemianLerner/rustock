@@ -581,9 +581,13 @@ pub fn scan_with_options(
 /// How many of the most-referenced nodes to keep and report.
 pub const TOP_DUPLICATES: usize = 3;
 
-/// Prints every counter mid-scan. Deliberately the same numbers as the final
-/// report: a partial view that omits fields invites the assumption that a
-/// missing one is zero.
+/// One progress line: how far along, how fast, and the running totals.
+///
+/// The per-type breakdowns belong in the final report rather than here. They
+/// were printed every interval while a full scan took the better part of an
+/// hour and finishing was not a given; now that a snapshot re-scans in under
+/// two minutes, repeating four tables every thirty seconds is noise that
+/// buries the one line saying whether the scan is progressing.
 fn report_partial(st: &TrieStats, processed: u64, total: u64, secs: f64, stack_depth: usize) {
     let frac = processed as f64 / total.max(1) as f64;
     let eta = if frac > 0.001 {
@@ -597,7 +601,7 @@ fn report_partial(st: &TrieStats, processed: u64, total: u64, secs: f64, stack_d
         "--".into()
     };
     info!(
-        target: "rustock::triestats",
+        target: "rustock::trietool",
         "[{:.2}%] {} nodes ({:.0}/s) | leaves {} branches {} embedded {} | dedup {} of {} | \
          shared: {} refs / {} | long values {} ({} shared) | depth {} | stack {} | ETA {}",
         (frac * 100.0).min(100.0), st.unique, st.unique as f64 / secs,
@@ -607,22 +611,6 @@ fn report_partial(st: &TrieStats, processed: u64, total: u64, secs: f64, stack_d
         st.distinct_long_values, st.shared_values,
         st.max_depth, stack_depth, eta
     );
-    let mut kinds = st.by_kind.clone();
-    kinds.sort_by_key(|k| std::cmp::Reverse(k.1));
-    let leaf_line: Vec<String> = kinds.iter()
-        .map(|(k, c, _)| format!("{} {}", k.label(), c))
-        .collect();
-    if !leaf_line.is_empty() {
-        info!(target: "rustock::triestats", "         leaves by type: {}", leaf_line.join(", "));
-    }
-    let mut shares = st.shares_by_kind.clone();
-    shares.sort_by_key(|k| std::cmp::Reverse(k.1));
-    let share_line: Vec<String> = shares.iter()
-        .map(|(k, c, b)| format!("{} {} ({})", k.label(), c, human(*b)))
-        .collect();
-    if !share_line.is_empty() {
-        info!(target: "rustock::triestats", "         shares by type: {}", share_line.join(", "));
-    }
 }
 
 fn pct(part: u64, whole: u64) -> f64 {

@@ -1,6 +1,6 @@
 # Unitrie scan: recursive-DFS baseline
 
-Partial results from `--trie-stats` using the original depth-first traversal,
+Partial results from `--trie-tool` using the original depth-first traversal,
 kept as the comparison point for the sorted-batch optimisation described in
 [`trie-gc-design.md` §10](./trie-gc-design.md#10-suggested-refinement-sequential-mark).
 

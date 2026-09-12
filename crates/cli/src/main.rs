@@ -272,16 +272,16 @@ struct Args {
     #[arg(long)]
     metadata_in_memory: bool,
     /// Scan the Unitrie reachable from a state root and print statistics, then
-    /// exit. Defaults to the last executed block; pass --trie-stats-block for
+    /// exit. Defaults to the last executed block; pass --trie-tool-block for
     /// another. Opens the database read-only, so it can run while the node does.
     #[arg(long)]
-    trie_stats: bool,
+    trie_tool: bool,
 
-    /// Block whose state root to scan with --trie-stats.
+    /// Block whose state root to scan with --trie-tool.
     #[arg(long)]
-    trie_stats_block: Option<u64>,
+    trie_tool_block: Option<u64>,
 
-    /// Seconds between full counter dumps during --trie-stats. 0 disables.
+    /// Seconds between progress lines during --trie-tool. 0 disables.
     ///
     /// Wall-clock rather than a node count: the node rate varies by orders of
     /// magnitude with cache warmth, so a count-based interval reports either
@@ -289,16 +289,16 @@ struct Args {
     /// indistinguishable from one that has hung, which is how an earlier
     /// quadratic version of this scan went unnoticed.
     #[arg(long, default_value_t = 30)]
-    trie_stats_progress: u64,
+    trie_tool_progress: u64,
 
     /// Database to scan or inspect. Defaults to --data-dir.
     ///
     /// Accepts either a node datadir or a standalone trie snapshot written by
-    /// --trie-stats-copy. A snapshot is recognised by its metadata file and
+    /// --trie-tool-copy. A snapshot is recognised by its metadata file and
     /// carries its own state root, so no block lookup is needed -- or possible,
     /// since a snapshot holds no headers.
     #[arg(long)]
-    trie_stats_source: Option<String>,
+    trie_tool_source: Option<String>,
 
     /// Copy the scanned state into a new standalone trie database.
     ///
@@ -310,7 +310,7 @@ struct Args {
     ///
     /// Pass a directory, or give the flag alone to name it after the state root.
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
-    trie_stats_copy: Option<String>,
+    trie_tool_copy: Option<String>,
 
     /// Delete the copy target first if it already exists.
     ///
@@ -318,12 +318,12 @@ struct Args {
     /// written over unrelated data would neither collide nor complain -- it
     /// would just quietly carry whatever was there before.
     #[arg(long)]
-    trie_stats_copy_overwrite: bool,
+    trie_tool_copy_overwrite: bool,
 
     /// Print everything about the node at this path, then exit.
     ///
     /// Path notation is <hex>/<bits>, e.g. "a3f0/13"; bare hex means four bits
-    /// per digit. Reads --trie-stats-source. Paths printed by --trie-stats can
+    /// per digit. Reads --trie-tool-source. Paths printed by --trie-tool can
     /// be passed straight back in.
     #[arg(long)]
     trie_node: Option<String>,
@@ -492,18 +492,18 @@ async fn main() -> Result<()> {
     }
 
     if let Some(path) = args.trie_node.as_deref() {
-        let src = args.trie_stats_source.as_deref().unwrap_or(&args.data_dir);
-        return run_trie_node(src, args.trie_stats_block, path);
+        let src = args.trie_tool_source.as_deref().unwrap_or(&args.data_dir);
+        return run_trie_node(src, args.trie_tool_block, path);
     }
 
-    if args.trie_stats || args.trie_stats_block.is_some() || args.trie_stats_copy.is_some() {
-        let src = args.trie_stats_source.as_deref().unwrap_or(&args.data_dir);
-        return run_trie_stats(
+    if args.trie_tool || args.trie_tool_block.is_some() || args.trie_tool_copy.is_some() {
+        let src = args.trie_tool_source.as_deref().unwrap_or(&args.data_dir);
+        return run_trie_tool(
             src,
-            args.trie_stats_block,
-            args.trie_stats_progress,
-            args.trie_stats_copy.as_deref(),
-            args.trie_stats_copy_overwrite,
+            args.trie_tool_block,
+            args.trie_tool_progress,
+            args.trie_tool_copy.as_deref(),
+            args.trie_tool_copy_overwrite,
         );
     }
 
@@ -794,7 +794,7 @@ fn run_rskj_import(
 
     // State first: if this is interrupted the blocks are still absent, so the
     // node will not come up believing it has a chain it cannot execute.
-    let trie_stats = if metadata_only {
+    let unitrie_phase = if metadata_only {
         Default::default()
     } else if unitrie_threads == 1 {
         rskj_import::import_unitrie(
@@ -873,7 +873,7 @@ fn run_rskj_import(
     info!(
         "Import complete in {:.0}s: {} trie nodes, {} blocks, head #{}",
         started.elapsed().as_secs_f64(),
-        trie_stats.written,
+        unitrie_phase.written,
         block_stats.written,
         tip_number
     );
@@ -902,7 +902,7 @@ fn open_trie_source(
         let meta = rustock_storage::trie_snapshot::read_meta(dir)?;
         if block.is_some() {
             anyhow::bail!(
-                "{dir} is a trie snapshot: it holds one state ({:?}) and no headers, so a                  block cannot be selected. Drop --trie-stats-block, or point at a node datadir.",
+                "{dir} is a trie snapshot: it holds one state ({:?}) and no headers, so a                  block cannot be selected. Drop --trie-tool-block, or point at a node datadir.",
                 meta.root
             );
         }
@@ -963,7 +963,7 @@ fn open_node_trie_source(
             // executed head is guaranteed to have its state present.
             let raw = db.get(b"exec_head")?
                 .ok_or_else(|| anyhow::anyhow!(
-                    "no exec head recorded; pass --trie-stats-block to choose a block"
+                    "no exec head recorded; pass --trie-tool-block to choose a block"
                 ))?;
             if raw.len() < 64 {
                 anyhow::bail!("exec head record is malformed");
@@ -982,14 +982,14 @@ fn open_node_trie_source(
     Ok((db, root, resolved_block))
 }
 
-fn run_trie_stats(
+fn run_trie_tool(
     source: &str,
     block: Option<u64>,
     progress_every: u64,
     copy_to: Option<&str>,
     copy_overwrite: bool,
 ) -> Result<()> {
-    use rustock_storage::trie_stats;
+    use rustock_storage::trie_tool;
     use rustock_storage::trie_snapshot::SnapshotWriter;
 
     let (db, root, resolved_block) = open_trie_source(source, block)?;
@@ -1016,16 +1016,16 @@ fn run_trie_stats(
     info!("Scanning Unitrie from state root {root:?}");
     let store = rustock_storage::RocksDbTrieStore::from_db(db);
     let started = std::time::Instant::now();
-    let stats = trie_stats::scan_with_options(
+    let stats = trie_tool::scan_with_options(
         &store,
         root,
-        trie_stats::ScanOptions {
+        trie_tool::ScanOptions {
             interval_secs: progress_every,
             snapshot: writer.as_mut(),
             ..Default::default()
         },
     )?;
-    trie_stats::report(&stats, root, resolved_block, started.elapsed().as_secs_f64());
+    trie_tool::report(&stats, root, resolved_block, started.elapsed().as_secs_f64());
 
     if let Some(w) = writer {
         let meta = w.finish(root, resolved_block, source)?;
@@ -1036,7 +1036,7 @@ fn run_trie_stats(
         println!("  {:<34}{:>14}", "bytes written", meta.bytes);
         println!();
         println!("  Re-scan it with:");
-        println!("    rustock --trie-stats --trie-stats-source {}",
+        println!("    rustock --trie-tool --trie-tool-source {}",
             target.as_deref().unwrap_or("-"));
     }
     Ok(())

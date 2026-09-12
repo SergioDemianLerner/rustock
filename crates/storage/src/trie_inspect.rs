@@ -225,7 +225,7 @@ pub fn describe(found: &NodeAt, store: &dyn TrieStore) -> String {
         match pack_path(&found.path) {
             Some(key) => format!(
                 "{} (key {} bytes: {})",
-                crate::trie_stats::classify(&key).label(),
+                crate::trie_tool::classify(&key).label(),
                 key.len(),
                 hex_encode(&key)
             ),

@@ -1,9 +1,10 @@
-# Unitrie inspection tools
+# The trie tool
 
-Three things live behind the `--trie-*` flags: a statistics scan, a way to
+Three things live behind the `--trie-tool*` flags: a statistics scan, a way to
 extract one state into a standalone database, and a lookup for a single node.
 They share one source argument, so anything the scan reports can be handed back
-to the lookup.
+to the lookup. It is named for what it is rather than for the statistics it
+started as.
 
 ## Why snapshot a state
 
@@ -24,20 +25,20 @@ else. Take it once, then iterate against it.
 ## Scanning
 
 ```bash
-rustock --trie-stats                                  # last executed block
-rustock --trie-stats --trie-stats-block 9233965       # a specific block
-rustock --trie-stats --trie-stats-source ./snap       # a snapshot
-rustock --trie-stats --trie-stats-progress 0          # no progress lines
+rustock --trie-tool                                  # last executed block
+rustock --trie-tool --trie-tool-block 9233965       # a specific block
+rustock --trie-tool --trie-tool-source ./snap       # a snapshot
+rustock --trie-tool --trie-tool-progress 0          # no progress lines
 ```
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--trie-stats` | off | Scan and print statistics, then exit |
-| `--trie-stats-block N` | last executed | Which block's state root to scan |
-| `--trie-stats-progress N` | `30` | Seconds between full counter dumps; `0` disables |
-| `--trie-stats-source DIR` | `--data-dir` | Node datadir or snapshot to read |
-| `--trie-stats-copy [DIR]` | off | Also write the state to a new database |
-| `--trie-stats-copy-overwrite` | off | Replace `DIR` if it exists |
+| `--trie-tool` | off | Scan and print statistics, then exit |
+| `--trie-tool-block N` | last executed | Which block's state root to scan |
+| `--trie-tool-progress N` | `30` | Seconds between progress lines; `0` disables |
+| `--trie-tool-source DIR` | `--data-dir` | Node datadir or snapshot to read |
+| `--trie-tool-copy [DIR]` | off | Also write the state to a new database |
+| `--trie-tool-copy-overwrite` | off | Replace `DIR` if it exists |
 
 The database is opened **read-only**, so a scan runs against a node that is
 syncing. Progress is reported against the root's `children_size` (RSKIP107),
@@ -51,13 +52,13 @@ hash and will not resolve.
 
 ```bash
 # Name it after the state root
-rustock --trie-stats --trie-stats-copy
+rustock --trie-tool --trie-tool-copy
 
 # Or choose the directory
-rustock --trie-stats --trie-stats-copy /srv/snapshots/mainnet-9233965
+rustock --trie-tool --trie-tool-copy /srv/snapshots/mainnet-9233965
 
 # Replace an existing one
-rustock --trie-stats --trie-stats-copy ./snap --trie-stats-copy-overwrite
+rustock --trie-tool --trie-tool-copy ./snap --trie-tool-copy-overwrite
 ```
 
 Overwrite is opt-in on purpose. Every key in a trie database is a hash, so a
@@ -98,15 +99,15 @@ It is written **last**. A run that dies partway therefore leaves a directory
 that is visibly not a snapshot, rather than one that opens and silently serves a
 truncated trie.
 
-A snapshot holds one state and no headers, so `--trie-stats-block` against one
+A snapshot holds one state and no headers, so `--trie-tool-block` against one
 is an error rather than a lookup that quietly returns the wrong thing.
 
 ## Looking at a single node
 
 ```bash
-rustock --trie-node ""            --trie-stats-source ./snap   # the root
-rustock --trie-node "0000/9"      --trie-stats-source ./snap
-rustock --trie-node "a3f0/13"     --trie-stats-source ./snap
+rustock --trie-node ""            --trie-tool-source ./snap   # the root
+rustock --trie-node "0000/9"      --trie-tool-source ./snap
+rustock --trie-node "a3f0/13"     --trie-tool-source ./snap
 ```
 
 ```
@@ -176,7 +177,20 @@ Block #9,233,965, 4 vCPU, network-attached SSD, node syncing concurrently:
 | Saved by sharing | 155.15 MB (16.9%) |
 | Leaves / branches | 6,071,806 / 6,175,544 |
 | Max depth | 47 |
-| Scan time | 2,912 s (4,205 nodes/s) |
+| Scan time, live store | 2,992 s (4,092 nodes/s) |
+| Scan time, snapshot | **103 s (118,893 nodes/s)** |
+| Snapshot on disk | 1.2 GB, 10,477,850 nodes, 745,946 long values |
+
+The snapshot re-scan is **29x faster** on identical work, and produces byte-for-byte
+the same report -- every counter, size, type breakdown and top-duplicate entry
+matches the live-store scan, which is the check that the copy is complete rather
+than merely non-empty. Taking the snapshot cost 2.7% on top of one scan.
+
+That ratio is worth dwelling on. Three rewrites of the traversal moved the
+live-store scan between 479 and 4,096 nodes/s. Moving the same nodes into a
+database where they are 100% of the contents instead of 0.87% was worth more
+than all of them together, running the same code. The bottleneck was never the
+traversal.
 
 Of the 50.33 MB that sharing saves, **contract code is 39.97 MB** from only
 16.6% of the repeat references -- identical bytecode deployed many times.
