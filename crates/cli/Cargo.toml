@@ -24,4 +24,5 @@ rand = { workspace = true }
 hex = { workspace = true }
 tracing-appender = "0.2.4"
 rocksdb = { workspace = true }
+libc = { workspace = true }
 alloy-rlp = { workspace = true }

@@ -8,6 +8,7 @@ license = "MIT"
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-trie = { version = "0.1.0", path = "../trie" }
 rocksdb = { workspace = true }
+libc = { workspace = true }
 anyhow = { workspace = true }
 alloy-rlp = { workspace = true }
 alloy-primitives = { workspace = true }
