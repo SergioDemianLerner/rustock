@@ -67,7 +67,7 @@ pub fn install_signal_handlers() {
 pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(Ordering::SeqCst)
 }
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Entries per write batch. Large enough to amortise the write path, small
 /// enough that a failure does not discard much work.
@@ -200,6 +200,182 @@ fn open_source(path: &Path) -> Result<DB> {
         .with_context(|| format!("opening rskj datasource at {}", path.display()))
 }
 
+/// Splits the 256-way first-byte keyspace into `n` contiguous ranges.
+///
+/// Trie keys are Keccak hashes, so they are uniformly distributed and equal
+/// slices of the keyspace hold roughly equal numbers of nodes. Returns
+/// `(start, end)` bounds where `end` is exclusive and `None` means open-ended.
+fn keyspace_ranges(n: usize) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    let n = n.max(1).min(256);
+    (0..n)
+        .map(|i| {
+            let start = (i * 256 / n) as u8;
+            let start_key = vec![start];
+            let end_key = if i + 1 == n {
+                None
+            } else {
+                Some(vec![((i + 1) * 256 / n) as u8])
+            };
+            (start_key, end_key)
+        })
+        .collect()
+}
+
+/// Copies `unitrie` into `trie_nodes` using several threads.
+///
+/// The sequential copy is CPU-bound, not disk-bound: it sustained 48.6 MB/s
+/// against a volume measured at 358 MB/s sequential, so roughly 14% of the
+/// available bandwidth. The work is decompressing source SST blocks and pushing
+/// them through the write path, which is per-core.
+///
+/// Splitting is straightforward because the keys are hashes: each thread takes a
+/// contiguous slice of the keyspace and its own iterator, and they share nothing
+/// but the destination handle. `DB::write` is thread-safe, and since the entries
+/// are content-addressed there is no ordering requirement between threads.
+///
+/// Reads and writes also land on different volumes here, so they do not contend.
+pub fn import_unitrie_parallel(
+    src_dir: &Path,
+    dest_db: &Arc<DB>,
+    mode: WriteMode,
+    wal: WalMode,
+    threads: usize,
+    csv: Option<&mut dyn std::io::Write>,
+) -> Result<ImportStats> {
+    use std::sync::atomic::AtomicU64;
+
+    let src = Arc::new(open_source(&src_dir.join("unitrie"))?);
+    let ranges = keyspace_ranges(threads);
+    info!(
+        target: "rustock::import",
+        "unitrie: {} threads over the keyspace, mode {:?}, WAL {:?}",
+        ranges.len(), mode, wal
+    );
+
+    let scanned = AtomicU64::new(0);
+    let written = AtomicU64::new(0);
+    let skipped = AtomicU64::new(0);
+    let bytes = AtomicU64::new(0);
+    let start = Instant::now();
+
+    std::thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for (idx, (lo, hi)) in ranges.iter().enumerate() {
+            let src = Arc::clone(&src);
+            let dest = Arc::clone(dest_db);
+            let (lo, hi) = (lo.clone(), hi.clone());
+            let (scanned, written, skipped, bytes) = (&scanned, &written, &skipped, &bytes);
+
+            handles.push(scope.spawn(move || -> Result<()> {
+                let cf = dest
+                    .cf_handle("trie_nodes")
+                    .context("destination is missing the trie_nodes column family")?;
+                let wo = wal.write_options();
+
+                let mut ro = rocksdb::ReadOptions::default();
+                if let Some(ref upper) = hi {
+                    ro.set_iterate_upper_bound(upper.clone());
+                }
+                let iter = src.iterator_opt(
+                    IteratorMode::From(&lo, rocksdb::Direction::Forward),
+                    ro,
+                );
+
+                let mut batch = WriteBatch::default();
+                let mut in_batch = 0usize;
+                let mut local = 0u64;
+
+                for item in iter {
+                    let (k, v) = item.context("iterating rskj unitrie")?;
+                    local += 1;
+                    bytes.fetch_add((k.len() + v.len()) as u64, Ordering::Relaxed);
+
+                    let skip = mode == WriteMode::SkipExisting
+                        && dest.get_cf(cf, &k)?.is_some();
+                    if skip {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        batch.put_cf(cf, &k, &v);
+                        in_batch += 1;
+                        written.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    if in_batch >= BATCH_SIZE {
+                        dest.write_opt(std::mem::take(&mut batch), &wo)?;
+                        in_batch = 0;
+                    }
+                    if local % 50_000 == 0 {
+                        scanned.fetch_add(50_000, Ordering::Relaxed);
+                        local = 0;
+                        if shutdown_requested() {
+                            break;
+                        }
+                    }
+                }
+                if in_batch > 0 {
+                    dest.write_opt(batch, &wo)?;
+                }
+                scanned.fetch_add(local, Ordering::Relaxed);
+                debug!(target: "rustock::import", "unitrie thread {idx} finished");
+                Ok(())
+            }));
+        }
+
+        // Report aggregate progress while the workers run.
+        let mut last = Instant::now();
+        loop {
+            if handles.iter().all(|h| h.is_finished()) {
+                break;
+            }
+            if last.elapsed().as_secs() >= 10 {
+                let sc = scanned.load(Ordering::Relaxed);
+                let by = bytes.load(Ordering::Relaxed);
+                let secs = start.elapsed().as_secs_f64().max(0.001);
+                info!(
+                    target: "rustock::import",
+                    "unitrie: {} scanned | {} written, {} present | {:.0} nodes/s, {:.1} MB/s",
+                    sc, written.load(Ordering::Relaxed), skipped.load(Ordering::Relaxed),
+                    sc as f64 / secs, by as f64 / 1e6 / secs
+                );
+                last = Instant::now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        for h in handles {
+            h.join().map_err(|_| anyhow::anyhow!("unitrie worker panicked"))??;
+        }
+        Ok(())
+    })?;
+
+    // Durable before reporting complete: writes bypass the WAL.
+    dest_db.flush()?;
+
+    let mut st = ImportStats {
+        scanned: scanned.load(Ordering::Relaxed),
+        written: written.load(Ordering::Relaxed),
+        skipped: skipped.load(Ordering::Relaxed),
+        bytes: bytes.load(Ordering::Relaxed),
+        ..Default::default()
+    };
+    st.elapsed_secs = start.elapsed().as_secs_f64();
+    if let Some(w) = csv {
+        let _ = writeln!(
+            w, "unitrie_parallel_{},{},{},{},{},{:.1}",
+            ranges.len(), st.scanned, st.written, st.skipped, st.bytes, st.elapsed_secs
+        );
+    }
+    // Say "stopped early" rather than "done" when interrupted: a phase that
+    // reports completion while being partial is what made an earlier killed
+    // import look finished when it was missing data.
+    info!(
+        target: "rustock::import",
+        "unitrie {} ({} threads): {} nodes ({} new, {} present) in {:.0}s = {:.0} nodes/s",
+        if shutdown_requested() { "STOPPED EARLY" } else { "done" },
+        ranges.len(), st.scanned, st.written, st.skipped, st.elapsed_secs, st.rate()
+    );
+    Ok(st)
+}
+
 /// Copies `unitrie` into the `trie_nodes` column family.
 ///
 /// Values are moved verbatim: a trie node's serialised form is identical in
@@ -288,7 +464,8 @@ pub fn import_unitrie(
     }
     info!(
         target: "rustock::import",
-        "unitrie done: {} nodes ({} new, {} present) in {:.0}s = {:.0} nodes/s",
+        "unitrie {}: {} nodes ({} new, {} present) in {:.0}s = {:.0} nodes/s",
+        if shutdown_requested() { "STOPPED EARLY" } else { "done" },
         st.scanned, st.written, st.skipped, st.elapsed_secs, st.rate()
     );
     Ok(st)
@@ -404,7 +581,8 @@ pub fn import_blocks(
     }
     info!(
         target: "rustock::import",
-        "blocks done: {} scanned ({} new, {} present), tip #{} {:?}, {:.0}s",
+        "blocks {}: {} scanned ({} new, {} present), tip #{} {:?}, {:.0}s",
+        if shutdown_requested() { "STOPPED EARLY" } else { "done" },
         st.scanned, st.written, st.skipped, max_number, tip_hash, st.elapsed_secs
     );
     Ok(st)

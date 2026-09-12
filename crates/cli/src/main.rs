@@ -201,6 +201,16 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     import_parallelism: usize,
 
+    /// Threads for the trie copy. 0 uses the CPU count; 1 forces the sequential
+    /// path.
+    ///
+    /// Parallel by default because the copy is CPU-bound, not disk-bound: it
+    /// sustained 48.6 MB/s against a volume measured at 358 MB/s sequential.
+    /// Trie keys are hashes, so the keyspace splits into equal contiguous
+    /// ranges and the threads share nothing but the destination handle.
+    #[arg(long, default_value_t = 0)]
+    import_unitrie_threads: usize,
+
     /// Probe an rskj unitrie for specific node hashes, then exit.
     ///
     /// Answers whether a snapshot is archival or pruned: pass historical state
@@ -417,6 +427,11 @@ async fn main() -> Result<()> {
             !args.import_enable_wal,
             !args.import_auto_compaction,
             args.import_metadata_only,
+            if args.import_unitrie_threads == 0 {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+            } else {
+                args.import_unitrie_threads
+            },
         );
     }
 
@@ -662,6 +677,7 @@ fn run_rskj_import(
     disable_wal: bool,
     compact_first: bool,
     metadata_only: bool,
+    unitrie_threads: usize,
 ) -> Result<()> {
     use rustock_storage::rskj_import::{self, WalMode, WriteMode};
     use std::path::Path;
@@ -708,14 +724,23 @@ fn run_rskj_import(
     // node will not come up believing it has a chain it cannot execute.
     let trie_stats = if metadata_only {
         Default::default()
-    } else {
+    } else if unitrie_threads == 1 {
         rskj_import::import_unitrie(
-        src,
-        store.db(),
-        mode,
-        wal,
-        csv.as_mut().map(|f| f as &mut dyn std::io::Write),
-    )?
+            src,
+            store.db(),
+            mode,
+            wal,
+            csv.as_mut().map(|f| f as &mut dyn std::io::Write),
+        )?
+    } else {
+        rskj_import::import_unitrie_parallel(
+            src,
+            store.db(),
+            mode,
+            wal,
+            unitrie_threads,
+            csv.as_mut().map(|f| f as &mut dyn std::io::Write),
+        )?
     };
 
     let block_stats = if metadata_only {
