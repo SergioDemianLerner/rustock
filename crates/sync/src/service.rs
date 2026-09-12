@@ -32,6 +32,10 @@ const BODY_RECLAIM_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Cap on concurrent body requests to a single peer, so a fast peer can
 /// pipeline deeply without the whole window piling onto one slow peer.
+/// Extra blocks to re-assert below the executed head when repairing the
+/// canonical index, so a repair is not defeated by damage just below the hole.
+const CANONICAL_REPAIR_MARGIN: u64 = 64;
+
 const MAX_BODY_REQUESTS_PER_PEER: usize = 16;
 
 /// Ceiling on body requests outstanding across all peers at once. Bounds memory
@@ -475,7 +479,37 @@ impl SyncService {
         // Is there a canonical child, and does it build on our executed head?
         let child_hash = match store.canonical_hash(header.number + 1).ok().flatten() {
             Some(h) => h,
-            None => return, // at the tip — nothing to reconcile
+            None => {
+                // No pointer at the next height. That means one of two very
+                // different things, and treating them alike wedges the node:
+                // either we are at the tip and there is genuinely nothing to
+                // reconcile, or the canonical index has a hole and the block
+                // we need is unreachable by number.
+                //
+                // The best downloaded head tells them apart. If it sits above
+                // the missing height, this is a hole -- repair the lineage
+                // downward from the head, which fills it and corrects anything
+                // else the damaged walk left behind.
+                let head_number = store
+                    .head()
+                    .ok()
+                    .flatten()
+                    .and_then(|h| store.header(h).ok().flatten())
+                    .map(|h| h.number);
+                match head_number {
+                    Some(head_number) if head_number > header.number + 1 => {
+                        warn!(
+                            target: "rustock::sync",
+                            "Canonical index has no entry for #{} while the head is #{}; \
+                             repairing lineage",
+                            header.number + 1, head_number
+                        );
+                        self.repair_canonical_gap(head_number, header.number);
+                    }
+                    _ => {}
+                }
+                return;
+            }
         };
         let child = match store.header(child_hash).ok().flatten() {
             Some(h) => h,
@@ -535,6 +569,43 @@ impl SyncService {
              rolled executed head back to #{} ({:?})",
             header.number, exec_hash, child.number, child.parent_hash, parent.number, parent_hash
         );
+    }
+
+    /// Rebuild the canonical pointers from the best downloaded head down past
+    /// `exec_number`, so execution has a contiguous chain to follow again.
+    ///
+    /// Walks a little below the executed head as well: the damage that hides a
+    /// height is rarely confined to one pointer, and re-asserting a few blocks
+    /// that were already correct costs nothing.
+    fn repair_canonical_gap(&self, head_number: u64, exec_number: u64) {
+        let store = &self.manager.store;
+        let head_hash = match store.head().ok().flatten() {
+            Some(h) => h,
+            None => return,
+        };
+        let depth = head_number.saturating_sub(exec_number) + CANONICAL_REPAIR_MARGIN;
+        match store.repair_canonical_lineage(head_hash, depth) {
+            Ok(r) => {
+                if r.corrected > 0 || r.filled > 0 {
+                    warn!(
+                        target: "rustock::sync",
+                        "Canonical repair: {} pointers rewritten, {} holes filled \
+                         over {} blocks down to #{:?}",
+                        r.corrected, r.filled, r.walked, r.lowest
+                    );
+                } else {
+                    warn!(
+                        target: "rustock::sync",
+                        "Canonical repair found nothing to fix over {} blocks; \
+                         the missing height is not recoverable from stored headers",
+                        r.walked
+                    );
+                }
+            }
+            Err(e) => {
+                error!(target: "rustock::sync", "Canonical repair failed: {:?}", e);
+            }
+        }
     }
 
     pub(crate) async fn try_start_sync(&mut self) {

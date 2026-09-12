@@ -165,6 +165,64 @@ async fn test_eth_syncing_not_syncing() {
 }
 
 #[tokio::test]
+async fn test_eth_syncing_reports_execution_backlog() {
+    // The failure this method used to hide. Header download and execution are
+    // separate pipelines: when execution wedges, the downloaded head keeps
+    // climbing with the network while the executed head stands still. Taking
+    // `currentBlock` from the downloaded head made such a node answer `false`
+    // -- fully synced -- while serving state 100 blocks stale.
+    let (state, _tmp) = setup_state();
+
+    let executed = test_header(42);
+    state.store.put_header(&executed).unwrap();
+    state
+        .store
+        .set_exec_head(executed.hash(), executed.state_root)
+        .unwrap();
+
+    // Headers ran ahead; nothing executed them.
+    let downloaded = test_header(142);
+    state
+        .store
+        .update_head(&downloaded, U256::from(142_000))
+        .unwrap();
+
+    let req = make_request("eth_syncing", json!([]));
+    let resp = dispatch_for_test(&state, req).await;
+    let result = resp.result.unwrap();
+
+    assert_ne!(result, json!(false), "a 100-block execution backlog is not 'synced'");
+    assert_eq!(
+        result["currentBlock"],
+        json!("0x2a"),
+        "currentBlock must be the executed head, not the downloaded one"
+    );
+    assert_eq!(
+        result["highestBlock"],
+        json!("0x8e"),
+        "downloaded-but-unexecuted blocks count towards the target even with no peers"
+    );
+}
+
+#[tokio::test]
+async fn test_eth_syncing_false_once_execution_catches_up() {
+    // The complement: execution level with the downloaded head is synced, and
+    // must not report a backlog just because there are no peers to compare to.
+    let (state, _tmp) = setup_state();
+
+    let head = test_header(42);
+    state.store.put_header(&head).unwrap();
+    state
+        .store
+        .set_exec_head(head.hash(), head.state_root)
+        .unwrap();
+
+    let req = make_request("eth_syncing", json!([]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), json!(false));
+}
+
+#[tokio::test]
 async fn test_eth_gas_price() {
     let (state, _tmp) = setup_state();
     let req = make_request("eth_gasPrice", json!([]));

@@ -4,7 +4,7 @@ pub mod rskj_import;
 pub use trie_store::RocksDbTrieStore;
 pub use cached_trie_store::CachedTrieStore;
 
-use rocksdb::{DB, Options, ColumnFamilyDescriptor};
+use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
 use rustock_core::{Block, Header, Receipt, Transaction};
 use alloy_primitives::{B256, U256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
@@ -329,7 +329,6 @@ impl BlockStore {
         current_head_hash: Option<B256>,
         current_td: U256,
     ) -> Result<Option<B256>> {
-        use rocksdb::WriteBatch;
 
         if entries.is_empty() {
             return Ok(current_head_hash);
@@ -412,6 +411,17 @@ impl BlockStore {
     /// revisits such a hole, so it must be repaired explicitly at the block
     /// that exposes it.
     pub fn ensure_canonical_lineage(&self, hash: B256) -> Result<u64> {
+        // The whole walk commits as one batch. Writing pointer by pointer is
+        // not crash-safe: the walk moves from the tip down to the fork point,
+        // so an interruption part-way leaves the upper heights naming the new
+        // fork and the lower ones still naming the old, with no record that a
+        // rewrite was in progress. Nothing detects that on restart, and the
+        // node wedges -- execution follows the canonical pointers into a block
+        // whose parent is a block it never executed. A batch makes the rewrite
+        // all-or-nothing, so an interrupted reorg simply did not happen.
+        let mut batch = WriteBatch::default();
+        let cf = self.cf(CF_NUMBERS)?;
+
         let mut hash = hash;
         let mut depth: u64 = 0;
 
@@ -423,7 +433,7 @@ impl BlockStore {
 
             let already_canonical = self.canonical_hash(header.number)? == Some(hash);
             if !already_canonical {
-                self.put_canonical_hash(header.number, hash)?;
+                batch.put_cf(cf, header.number.to_be_bytes(), hash.as_slice());
             }
 
             if header.number == 0 {
@@ -451,8 +461,85 @@ impl BlockStore {
             hash = header.parent_hash;
         }
 
+        if !batch.is_empty() {
+            self.db
+                .write(batch)
+                .context("Failed to commit canonical lineage")?;
+        }
+
         Ok(depth)
     }
+
+    /// Rewrites the canonical `number -> hash` pointers for `depth` blocks below
+    /// `hash` *unconditionally*, without the "chain below is already
+    /// consistent" early stop.
+    ///
+    /// `ensure_canonical_lineage` stops as soon as a block is canonical and its
+    /// parent height agrees, which is the right thing during normal operation
+    /// and the wrong thing when repairing: a damaged index can be
+    /// self-consistent at the top and broken further down, and the early stop
+    /// means the walk never looks there. This one keeps going, so it fixes both
+    /// stale pointers and outright missing heights.
+    ///
+    /// Commits as a single batch, like the walk it repairs.
+    pub fn repair_canonical_lineage(&self, hash: B256, depth: u64) -> Result<CanonicalRepair> {
+        let mut batch = WriteBatch::default();
+        let cf = self.cf(CF_NUMBERS)?;
+        let mut report = CanonicalRepair::default();
+
+        let mut hash = hash;
+        for _ in 0..depth {
+            let header = match self.header(hash)? {
+                Some(h) => h,
+                None => {
+                    report.stopped_at_missing_header = Some(hash);
+                    break;
+                }
+            };
+
+            match self.canonical_hash(header.number)? {
+                Some(h) if h == hash => {}
+                Some(_) => {
+                    report.corrected += 1;
+                    batch.put_cf(cf, header.number.to_be_bytes(), hash.as_slice());
+                }
+                None => {
+                    report.filled += 1;
+                    batch.put_cf(cf, header.number.to_be_bytes(), hash.as_slice());
+                }
+            }
+
+            report.walked += 1;
+            report.lowest = Some(header.number);
+            if header.number == 0 {
+                break;
+            }
+            hash = header.parent_hash;
+        }
+
+        if !batch.is_empty() {
+            self.db
+                .write(batch)
+                .context("Failed to commit canonical repair")?;
+        }
+
+        Ok(report)
+    }
+}
+
+/// What a `repair_canonical_lineage` pass changed.
+#[derive(Debug, Default, Clone)]
+pub struct CanonicalRepair {
+    /// Heights visited.
+    pub walked: u64,
+    /// Heights that named a block from another fork.
+    pub corrected: u64,
+    /// Heights that had no canonical pointer at all.
+    pub filled: u64,
+    /// Lowest height reached.
+    pub lowest: Option<u64>,
+    /// Set when the walk ran out of stored headers before `depth`.
+    pub stopped_at_missing_header: Option<B256>,
 }
 
 impl BlockStore {
@@ -994,6 +1081,99 @@ mod tests {
         // the canonical block below it.
         let c3 = store.header(store.canonical_hash(3).unwrap().unwrap()).unwrap().unwrap();
         assert_eq!(c3.parent_hash, store.canonical_hash(2).unwrap().unwrap());
+    }
+
+    #[test]
+    fn test_repair_fills_buried_missing_canonical_entry() {
+        // Reproduces the production wedge. An interrupted canonical rewrite
+        // left height #3 with no pointer *at all* (distinct from the stale
+        // pointer case above), while every height around it stayed
+        // self-consistent. Two mechanisms that look like they should recover
+        // from this both decline to:
+        //
+        //   - a tip update walks down from the head, finds the top already
+        //     consistent, and stops before reaching the buried hole;
+        //   - the sync reconcile path reads a missing pointer at exec_head+1
+        //     as "we are at the tip" and returns.
+        //
+        // So execution halts at the hole and retries forever.
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let chain = build_and_store_chain(&store, 6, 10, 0xAA);
+        let head_hash = chain[5].0.hash();
+        store.update_canonical_chain(head_hash).unwrap();
+        for n in 0..=5u64 {
+            assert!(store.canonical_hash(n).unwrap().is_some(), "setup: #{n} canonical");
+        }
+
+        // The interrupted rewrite: no pointer at #3.
+        store.delete_canonical_hash(3).unwrap();
+        assert_eq!(store.canonical_hash(3).unwrap(), None, "hole precondition");
+
+        // A tip update does not repair it -- the chain above the hole is
+        // already consistent, so the walk stops at the top.
+        store.update_canonical_chain(head_hash).unwrap();
+        assert_eq!(
+            store.canonical_hash(3).unwrap(),
+            None,
+            "buried hole survives a tip update; this is why an explicit repair exists"
+        );
+
+        // The repair walk has no early stop, so it reaches and fills the hole.
+        let report = store.repair_canonical_lineage(head_hash, 16).unwrap();
+        assert_eq!(report.filled, 1, "one missing pointer filled");
+        assert_eq!(report.corrected, 0, "nothing else was wrong");
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(chain[3].0.hash()));
+
+        // Contiguous again: every canonical block's parent is the canonical
+        // block below it, which is what execution needs to cross the gap.
+        for n in 1..=5u64 {
+            let h = store
+                .header(store.canonical_hash(n).unwrap().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(h.parent_hash, store.canonical_hash(n - 1).unwrap().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_repair_corrects_index_straddling_two_forks() {
+        // The other half of the observed damage: an interrupted rewrite that
+        // left the upper heights naming the new fork and the lower ones still
+        // naming the old, so the index is a mix of two chains.
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let chain_a = build_and_store_chain(&store, 5, 10, 0xAA);
+        store.update_canonical_chain(chain_a[4].0.hash()).unwrap();
+
+        // Fork B from #2 upward, heavier.
+        let a2_hash = chain_a[2].0.hash();
+        let b3 = make_chain_header(3, a2_hash, 20, 0xBB);
+        let b4 = make_chain_header(4, b3.hash(), 20, 0xBB);
+        for h in [&b3, &b4] {
+            store.put_header(h).unwrap();
+            store.put_total_difficulty(h.hash(), U256::from(100)).unwrap();
+        }
+
+        // Half-applied rewrite: #4 moved to fork B, #3 still names fork A.
+        store.put_canonical_hash(4, b4.hash()).unwrap();
+        store.set_head(b4.hash()).unwrap();
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(chain_a[3].0.hash()));
+
+        let report = store.repair_canonical_lineage(b4.hash(), 16).unwrap();
+        assert_eq!(report.corrected, 1, "#3 rewritten to the fork it belongs to");
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(b3.hash()));
+        assert_eq!(store.canonical_hash(2).unwrap(), Some(a2_hash), "ancestor intact");
+
+        for n in 1..=4u64 {
+            let h = store
+                .header(store.canonical_hash(n).unwrap().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(h.parent_hash, store.canonical_hash(n - 1).unwrap().unwrap());
+        }
     }
 
     #[test]
