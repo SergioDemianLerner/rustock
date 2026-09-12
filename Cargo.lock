@@ -3078,6 +3078,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "anyhow",
+ "hex",
  "libc",
  "lru",
  "rocksdb",

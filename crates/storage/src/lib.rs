@@ -206,6 +206,8 @@ impl BlockStore {
     /// (the importer does this to batch and to bypass the WAL).
     pub fn cf_headers(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_HEADERS) }
     pub fn cf_bodies(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_BODIES) }
+    pub fn cf_numbers(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_NUMBERS) }
+    pub fn cf_td(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_TD) }
 
     pub fn header(&self, hash: B256) -> Result<Option<Header>> {
         let bytes = self.db.get_cf(self.cf(CF_HEADERS)?, hash.as_slice())

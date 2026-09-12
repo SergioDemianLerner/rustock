@@ -221,6 +221,46 @@ struct Args {
     /// import to redo them would rewrite ~180 GB for nothing.
     #[arg(long)]
     import_metadata_only: bool,
+
+    /// Rebuild chain metadata for this block range only, then exit.
+    ///
+    /// For benchmarking the metadata phase without paying for a full pass --
+    /// the full rebuild took 5 hours on RSK mainnet, which is far too slow a
+    /// loop for trying optimisations. Requires a completed full pass, since it
+    /// seeds itself from the existing canonical hash and total difficulty at
+    /// the range boundaries. Non-destructive: it recomputes exactly the values
+    /// already stored.
+    #[arg(long, num_args = 2, value_names = ["FROM", "TO"])]
+    metadata_range: Vec<u64>,
+
+    /// Load chain metadata from a dump of rskj's MapDB index (the fast path).
+    ///
+    /// Produced by tools/dump-index. Reads canonical hash and cumulative
+    /// difficulty straight from what rskj already computed, instead of deriving
+    /// them by walking parentHash back from the tip -- a chain of 9.2M dependent
+    /// random lookups measured at ~1,065 blocks/s, roughly five hours.
+    ///
+    /// Pass the dump sorted by block number so writes land in key order.
+    #[arg(long)]
+    import_index_dump: Option<String>,
+
+    /// Derive chain metadata by walking parentHash on disk.
+    ///
+    /// The original method, kept for comparison and for cases where memory is
+    /// too tight for --metadata-in-memory. Slow: the walk is a chain of
+    /// dependent random lookups that cannot be batched, measured at ~1,065
+    /// blocks/s, roughly five hours for RSK mainnet.
+    #[arg(long)]
+    metadata_by_walk: bool,
+
+    /// Rebuild chain metadata using an in-memory header index (the fast path).
+    ///
+    /// Scans the headers column family sequentially into a hash -> (number,
+    /// parent, difficulty) map, walks the chain through RAM, then writes in
+    /// batches. Costs roughly 150 bytes per header -- about 2 GB for RSK
+    /// mainnet -- and needs no JVM or rskj index file.
+    #[arg(long)]
+    metadata_in_memory: bool,
 }
 
 #[tokio::main]
@@ -268,6 +308,69 @@ async fn main() -> Result<()> {
     // Block-hash computation (RSKIP92) needs the activation heights before
     // any header is decoded.
     config.activation_heights.clone().install();
+
+    if args.metadata_in_memory {
+        let store = Arc::new(BlockStore::open(&args.data_dir)?);
+        rustock_storage::rskj_import::install_signal_handlers();
+        let wal = if args.import_enable_wal {
+            rustock_storage::rskj_import::WalMode::Enabled
+        } else {
+            rustock_storage::rskj_import::WalMode::Disabled
+        };
+        let mut csv = match args.import_metrics.as_deref() {
+            Some(p) => Some(std::fs::OpenOptions::new().create(true).append(true).open(p)?),
+            None => None,
+        };
+        let tip = rustock_storage::rskj_import::rebuild_chain_metadata_in_memory(
+            &store,
+            wal,
+            csv.as_mut().map(|f| f as &mut dyn std::io::Write),
+        )?;
+        info!("Chain metadata rebuilt in memory, head #{tip}");
+        return Ok(());
+    }
+
+    if let Some(dump) = args.import_index_dump.clone() {
+        let store = Arc::new(BlockStore::open(&args.data_dir)?);
+        rustock_storage::rskj_import::install_signal_handlers();
+        let wal = if args.import_enable_wal {
+            rustock_storage::rskj_import::WalMode::Enabled
+        } else {
+            rustock_storage::rskj_import::WalMode::Disabled
+        };
+        let mut csv = match args.import_metrics.as_deref() {
+            Some(p) => Some(std::fs::OpenOptions::new().create(true).append(true).open(p)?),
+            None => None,
+        };
+        let tip = rustock_storage::rskj_import::load_metadata_from_dump(
+            &store,
+            std::path::Path::new(&dump),
+            wal,
+            csv.as_mut().map(|f| f as &mut dyn std::io::Write),
+        )?;
+        info!("Chain metadata loaded from index dump, head #{tip}");
+        return Ok(());
+    }
+
+    if !args.metadata_range.is_empty() {
+        if args.metadata_range.len() != 2 {
+            anyhow::bail!("--metadata-range takes exactly two values: FROM TO");
+        }
+        let (from, to) = (args.metadata_range[0], args.metadata_range[1]);
+        let store = Arc::new(BlockStore::open(&args.data_dir)?);
+        rustock_storage::rskj_import::install_signal_handlers();
+        let mut csv = match args.import_metrics.as_deref() {
+            Some(p) => Some(std::fs::OpenOptions::new().create(true).append(true).open(p)?),
+            None => None,
+        };
+        rustock_storage::rskj_import::rebuild_chain_metadata_range(
+            &store,
+            from,
+            to,
+            csv.as_mut().map(|f| f as &mut dyn std::io::Write),
+        )?;
+        return Ok(());
+    }
 
     if !args.probe_unitrie.is_empty() {
         let dir = args.probe_source.clone()

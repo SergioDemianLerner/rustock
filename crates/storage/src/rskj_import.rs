@@ -410,6 +410,391 @@ pub fn import_blocks(
     Ok(st)
 }
 
+/// Rebuilds chain metadata using an in-memory index of the headers.
+///
+/// The naive walk is slow for a structural reason: following `parentHash` from
+/// the tip is a chain of dependent random lookups, where each address is only
+/// known once the previous read returns. Nothing can be batched or prefetched,
+/// and it measured ~1,065 blocks/s -- about five hours for RSK mainnet, with
+/// 88% of that in the walk rather than the writes.
+///
+/// The dependency is unavoidable, but the *disk* access is not. Every header is
+/// already stored; only the order of traversal is unknown. So:
+///
+///   1. scan the headers column family sequentially, which has no dependent
+///      lookups, building `hash -> (number, parent, difficulty)` in memory;
+///   2. walk the chain through that map, which is pointer-chasing in RAM;
+///   3. write the canonical mapping and accumulated difficulty in batches.
+///
+/// Note the block header carries `difficulty`, its own, but no cumulative
+/// total -- total difficulty exists only as a running sum, which is why step 3
+/// has to accumulate rather than copy. That sum is cheap: the forward pass
+/// already ran at ~7,661 blocks/s, so it was never the problem.
+///
+/// Memory: roughly 150 bytes per header, so about 2 GB for RSK mainnet's 12.5M
+/// headers. The function reports its own footprint as it builds.
+pub fn rebuild_chain_metadata_in_memory(
+    dest: &BlockStore,
+    wal: WalMode,
+    csv: Option<&mut dyn std::io::Write>,
+) -> Result<u64> {
+    use std::collections::HashMap;
+
+    let overall = Instant::now();
+    let cf_headers = dest.cf_headers()?;
+
+    // --- 1. Sequential scan into memory ---------------------------------
+    let scan_start = Instant::now();
+    let mut index: HashMap<B256, (u64, B256, U256)> = HashMap::with_capacity(13_000_000);
+    let mut scanned = 0u64;
+    let mut tip = (0u64, B256::ZERO);
+    let mut last_report = Instant::now();
+
+    for item in dest.db().iterator_cf(cf_headers, IteratorMode::Start) {
+        let (k, v) = item.context("scanning headers")?;
+        if k.len() != 32 {
+            continue;
+        }
+        let mut slice: &[u8] = &v;
+        let h = match rustock_core::Header::decode(&mut slice) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        let hash = B256::from_slice(&k);
+        if h.number >= tip.0 {
+            tip = (h.number, hash);
+        }
+        index.insert(hash, (h.number, h.parent_hash, h.difficulty));
+        scanned += 1;
+
+        if shutdown_requested() {
+            anyhow::bail!("interrupted while indexing headers");
+        }
+        if last_report.elapsed().as_secs() >= 10 {
+            let rate = scanned as f64 / scan_start.elapsed().as_secs_f64().max(0.001);
+            info!(
+                target: "rustock::import",
+                "header index: {} headers | {:.0}/s | ~{} MB | tip #{}",
+                scanned, rate, scanned * 150 / 1_000_000, tip.0
+            );
+            last_report = Instant::now();
+        }
+    }
+    let scan_secs = scan_start.elapsed().as_secs_f64();
+    info!(
+        target: "rustock::import",
+        "header index built: {} headers in {:.1}s ({:.0}/s), tip #{}",
+        scanned, scan_secs, scanned as f64 / scan_secs.max(0.001), tip.0
+    );
+
+    // --- 2. Walk the chain in RAM ---------------------------------------
+    let walk_start = Instant::now();
+    let tip_number = tip.0;
+    let mut lineage: Vec<(u64, B256, U256)> = Vec::with_capacity(tip_number as usize + 1);
+    let mut cursor = tip.1;
+    loop {
+        let (number, parent, difficulty) = match index.get(&cursor) {
+            Some(v) => *v,
+            None => {
+                warn!(target: "rustock::import", "chain walk stopped: missing header {cursor:?}");
+                break;
+            }
+        };
+        lineage.push((number, cursor, difficulty));
+        if number == 0 {
+            break;
+        }
+        cursor = parent;
+    }
+    lineage.reverse();
+    let walk_secs = walk_start.elapsed().as_secs_f64();
+    info!(
+        target: "rustock::import",
+        "chain walked in memory: {} blocks in {:.2}s ({:.0} blk/s)",
+        lineage.len(), walk_secs, lineage.len() as f64 / walk_secs.max(0.001)
+    );
+    drop(index);
+
+    // --- 3. Batched forward pass ----------------------------------------
+    let fwd_start = Instant::now();
+    let wo = wal.write_options();
+    let cf_numbers = dest.cf_numbers()?;
+    let cf_td = dest.cf_td()?;
+    let mut batch = WriteBatch::default();
+    let mut in_batch = 0usize;
+    let mut td = U256::ZERO;
+    let mut done = 0u64;
+    let mut last_report = Instant::now();
+
+    for (number, hash, difficulty) in &lineage {
+        td += *difficulty;
+        batch.put_cf(cf_numbers, number.to_be_bytes(), hash.as_slice());
+        batch.put_cf(cf_td, hash.as_slice(), td.to_be_bytes::<32>());
+        in_batch += 1;
+        done += 1;
+        if in_batch >= BATCH_SIZE {
+            dest.db().write_opt(std::mem::take(&mut batch), &wo)?;
+            in_batch = 0;
+        }
+        if shutdown_requested() {
+            dest.db().write_opt(std::mem::take(&mut batch), &wo)?;
+            dest.db().flush()?;
+            anyhow::bail!("interrupted during forward pass at #{number}");
+        }
+        if last_report.elapsed().as_secs() >= 10 {
+            let rate = done as f64 / fwd_start.elapsed().as_secs_f64().max(0.001);
+            info!(
+                target: "rustock::import",
+                "metadata forward: {:.1}% | #{} | {:.0} blk/s | ETA {}",
+                done as f64 / lineage.len() as f64 * 100.0, number, rate,
+                fmt_eta((lineage.len() as u64 - done) as f64 / rate.max(1.0))
+            );
+            last_report = Instant::now();
+        }
+    }
+    if in_batch > 0 {
+        dest.db().write_opt(batch, &wo)?;
+    }
+    dest.db().flush()?;
+    let fwd_secs = fwd_start.elapsed().as_secs_f64();
+
+    if let Some((_, tip_hash, _)) = lineage.last() {
+        if let Some(h) = dest.header(*tip_hash)? {
+            dest.update_head(&h, td)?;
+        }
+    }
+
+    let total = overall.elapsed().as_secs_f64();
+    info!(
+        target: "rustock::import",
+        "metadata done (in-memory): {} blocks in {:.1}s | scan {:.1}s, walk {:.2}s, forward {:.1}s ({:.0} blk/s) | head #{} td={}",
+        lineage.len(), total, scan_secs, walk_secs, fwd_secs,
+        lineage.len() as f64 / fwd_secs.max(0.001), tip_number, td
+    );
+    if let Some(w) = csv {
+        let _ = writeln!(w, "metadata_in_memory,{},{},0,0,{:.1}", lineage.len(), lineage.len(), total);
+    }
+    Ok(tip_number)
+}
+
+/// Loads chain metadata from a dump of rskj's MapDB block index.
+///
+/// This is the fast path, and the reason it exists is that the alternative is
+/// slow for a structural reason rather than an implementation one. Deriving the
+/// canonical chain means walking `parentHash` back from the tip: 9.2M lookups
+/// where each address depends on the previous result, so nothing can be batched
+/// or prefetched. Measured at ~1,065 blocks/s, which is about five hours for
+/// RSK mainnet -- and 88% of that is the walk, not the writes.
+///
+/// rskj already has the answer. Its index stores, per height, the canonical
+/// block's hash and its cumulative difficulty. The obstacle was only that it
+/// lives in a MapDB file holding Java-serialised objects, which a separate Java
+/// tool (tools/dump-index) converts to a flat file:
+///
+/// ```text
+/// <number> <hash-hex> <cumulative-difficulty-decimal>
+/// ```
+///
+/// Reading that is a sequential scan with no dependent lookups at all.
+///
+/// Feed it sorted by block number: writes then land in key order, which lets
+/// RocksDB compact by trivial move instead of rewriting.
+pub fn load_metadata_from_dump(
+    dest: &BlockStore,
+    dump_path: &Path,
+    wal: WalMode,
+    csv: Option<&mut dyn std::io::Write>,
+) -> Result<u64> {
+    use std::io::{BufRead, BufReader};
+
+    let f = std::fs::File::open(dump_path)
+        .with_context(|| format!("opening index dump {}", dump_path.display()))?;
+    let reader = BufReader::with_capacity(1 << 20, f);
+    let wo = wal.write_options();
+    let cf_numbers = dest.cf_numbers()?;
+    let cf_td = dest.cf_td()?;
+
+    let start = Instant::now();
+    let mut batch = WriteBatch::default();
+    let mut in_batch = 0usize;
+    let mut count = 0u64;
+    let mut malformed = 0u64;
+    let mut tip_number = 0u64;
+    let mut tip_hash = B256::ZERO;
+    let mut tip_td = U256::ZERO;
+    let mut last_report = Instant::now();
+
+    for line in reader.lines() {
+        let line = line?;
+        let mut it = line.split_ascii_whitespace();
+        let (num, hash_hex, td_dec) = match (it.next(), it.next(), it.next()) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => { malformed += 1; continue; }
+        };
+        let number: u64 = match num.parse() { Ok(n) => n, Err(_) => { malformed += 1; continue; } };
+        let hash_bytes = match hex::decode(hash_hex) {
+            Ok(h) if h.len() == 32 => h,
+            _ => { malformed += 1; continue; }
+        };
+        let td = match U256::from_str_radix(td_dec, 10) {
+            Ok(t) => t,
+            Err(_) => { malformed += 1; continue; }
+        };
+        let hash = B256::from_slice(&hash_bytes);
+
+        batch.put_cf(cf_numbers, number.to_be_bytes(), hash.as_slice());
+        batch.put_cf(cf_td, hash.as_slice(), td.to_be_bytes::<32>());
+        in_batch += 1;
+        count += 1;
+
+        if number >= tip_number {
+            tip_number = number;
+            tip_hash = hash;
+            tip_td = td;
+        }
+
+        if in_batch >= BATCH_SIZE {
+            dest.db().write_opt(std::mem::take(&mut batch), &wo)?;
+            in_batch = 0;
+        }
+        if shutdown_requested() {
+            info!(target: "rustock::import", "index dump: signal received at {count} records");
+            break;
+        }
+        if last_report.elapsed().as_secs() >= 10 {
+            let rate = count as f64 / start.elapsed().as_secs_f64().max(0.001);
+            info!(
+                target: "rustock::import",
+                "index dump: {} records | {:.0} rec/s | at #{}",
+                count, rate, number
+            );
+            last_report = Instant::now();
+        }
+    }
+    if in_batch > 0 {
+        dest.db().write_opt(batch, &wo)?;
+    }
+    dest.db().flush()?;
+
+    // Set the head from the highest record seen.
+    if let Some(h) = dest.header(tip_hash)? {
+        dest.update_head(&h, tip_td)?;
+    }
+
+    let secs = start.elapsed().as_secs_f64();
+    if malformed > 0 {
+        warn!(target: "rustock::import", "index dump: {malformed} malformed lines skipped");
+    }
+    info!(
+        target: "rustock::import",
+        "index dump done: {} records in {:.1}s ({:.0} rec/s), head #{} td={}",
+        count, secs, count as f64 / secs.max(0.001), tip_number, tip_td
+    );
+    if let Some(w) = csv {
+        let _ = writeln!(w, "index_dump,{},{},0,0,{:.1}", count, count, secs);
+    }
+    Ok(tip_number)
+}
+
+/// Rebuilds chain metadata for a block range only, for benchmarking.
+///
+/// The full pass takes hours, which is far too slow a loop for trying
+/// optimisations. A range gives the same per-block work at a chosen cost.
+///
+/// It can skip the two things that force the full pass to start at the extremes:
+///
+/// - the backward walk normally starts at the tip because canonical-ness is
+///   defined as the tip's ancestry; here it starts at `canonical_hash(to)`,
+///   which an earlier full pass already established;
+/// - total difficulty normally accumulates from genesis; here it is seeded from
+///   `total_difficulty` at `from - 1`.
+///
+/// Both are reads of existing metadata, so this is only meaningful once a full
+/// pass has run. It is non-destructive: the values recomputed for the range are
+/// identical to the ones already stored, since the lineage comes from immutable
+/// parentHash links and the difficulty sum is deterministic.
+pub fn rebuild_chain_metadata_range(
+    dest: &BlockStore,
+    from: u64,
+    to: u64,
+    csv: Option<&mut dyn std::io::Write>,
+) -> Result<()> {
+    if from > to {
+        anyhow::bail!("--metadata-from ({from}) is above --metadata-to ({to})");
+    }
+    let start = Instant::now();
+
+    let end_hash = dest
+        .canonical_hash(to)?
+        .with_context(|| format!("no canonical hash at #{to}; run a full metadata pass first"))?;
+
+    // Seed the difficulty from the block before the range.
+    let mut td = if from == 0 {
+        U256::ZERO
+    } else {
+        let prev = dest
+            .canonical_hash(from - 1)?
+            .with_context(|| format!("no canonical hash at #{}", from - 1))?;
+        dest.total_difficulty(prev)?
+            .with_context(|| format!("no total difficulty at #{}", from - 1))?
+    };
+
+    info!(
+        target: "rustock::import",
+        "metadata range #{from}..#{to} ({} blocks), seeded td={td}",
+        to - from + 1
+    );
+
+    // Backward walk over the range only.
+    let walk_start = Instant::now();
+    let mut lineage: Vec<(u64, B256)> = Vec::with_capacity((to - from + 1) as usize);
+    let mut cursor = end_hash;
+    loop {
+        let h = dest.header(cursor)?.context("missing header during range walk")?;
+        if h.number < from {
+            break;
+        }
+        lineage.push((h.number, cursor));
+        if h.number == 0 || shutdown_requested() {
+            break;
+        }
+        cursor = h.parent_hash;
+    }
+    lineage.reverse();
+    let walk_secs = walk_start.elapsed().as_secs_f64();
+
+    // Forward pass.
+    let fwd_start = Instant::now();
+    for (number, hash) in &lineage {
+        let h = dest.header(*hash)?.context("header vanished mid-walk")?;
+        td += h.difficulty;
+        dest.put_canonical_hash(*number, *hash)?;
+        dest.put_total_difficulty(*hash, td)?;
+        if shutdown_requested() {
+            break;
+        }
+    }
+    let fwd_secs = fwd_start.elapsed().as_secs_f64();
+    let total_secs = start.elapsed().as_secs_f64();
+    let n = lineage.len() as f64;
+
+    info!(
+        target: "rustock::import",
+        "metadata range done: {} blocks in {:.1}s ({:.0} blk/s) | walk {:.1}s ({:.0} blk/s), forward {:.1}s ({:.0} blk/s) | final td={}",
+        lineage.len(), total_secs, n / total_secs.max(0.001),
+        walk_secs, n / walk_secs.max(0.001),
+        fwd_secs, n / fwd_secs.max(0.001),
+        td
+    );
+    if let Some(w) = csv {
+        let _ = writeln!(
+            w, "metadata_range_{}_{},{},{},0,0,{:.1}",
+            from, to, lineage.len(), lineage.len(), total_secs
+        );
+    }
+    Ok(())
+}
+
 /// Rebuilds `block_numbers` and `total_difficulty` from the imported headers.
 ///
 /// rskj keeps both in its MapDB index, which is not readable from here, so they
