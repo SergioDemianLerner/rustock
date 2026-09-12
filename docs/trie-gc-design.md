@@ -436,22 +436,32 @@ full historical node set:
 
 Three traversals over that store, same logic, same machine:
 
-| Traversal | Rate |
-|---|---|
-| Recursive DFS, dependent single reads | 2,658 nodes/s (early) → 763 (at 49 %) |
-| Frontier batched, sorted, per-key `get` | 956 nodes/s |
-| Frontier batched, sorted, one cursor per batch | **479 nodes/s** |
+| Traversal | Queue depth | Read order | Rate |
+|---|---|---|---|
+| Recursive DFS, dependent single reads | 1 | discovery | 2,658 nodes/s (early) → 763 (at 49 %) |
+| Frontier batched, sorted, one cursor per batch | 1 | sorted | 479 nodes/s |
+| Frontier batched, `multi_get` | 1 | sorted | 517 nodes/s |
+| Frontier batched, 16 threads of point `get` | 16 | discovery | **4,096 nodes/s** |
 
 Sorting bought nothing at `d = 0.87 %`, and replacing point lookups with a
 cursor halved throughput, exactly as the bloom-filter argument predicts.
+`multi_get` was no better: it reuses one pinned superversion but still performs
+the lookups one after another, so the queue depth stays at 1 — batching an API
+call is not the same as batching the I/O.
+
+What actually paid was **concurrency at unchanged read order**: the same point
+lookups, in discovery order, issued by 16 threads. That is the one variable of
+the three that changes how many requests the device has outstanding.
 
 The density is a property of **which epoch is being marked**, not of the
 algorithm. This is the case the epoch design is built to improve: marking `E₀`
 right after a rotation reads a young, compact epoch where `d` is high and
 sorting pays, rather than scanning a decade of accumulated history where it does
-not. When implementing the mark, sort only if the epoch's measured density
-clears the `d × b ≳ 1` bar; otherwise batch for concurrency and leave the keys
-in discovery order.
+not. When implementing the mark, batch for concurrency first — that gain does not
+depend on density and is worth roughly 5× here. Then sort *additionally* only if
+the epoch's measured density clears the `d × b ≳ 1` bar; on a freshly rotated
+`E₀` it should, and the two compose. On a decade of accumulated history it does
+not, and sorting is a pessimisation.
 
 ### 10.3 Alternative: multi-pass sequential scan
 
