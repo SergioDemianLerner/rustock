@@ -28,21 +28,43 @@ pub async fn eth_syncing(
     store: &BlockStore,
     peer_store: &rustock_networking::peers::PeerStore,
 ) -> JsonRpcResponse {
-    let current = head_number(store).unwrap_or(0);
-    let best_peer = peer_store.best_peer().await;
+    // `currentBlock` is the executed head, not the best downloaded header.
+    //
+    // Those two diverge precisely when something is wrong. Header download and
+    // block execution are separate pipelines, so if execution stalls the
+    // downloaded head keeps climbing with the network while the state the node
+    // can actually serve stays put. Reporting the downloaded head then makes a
+    // wedged node indistinguishable from a healthy one: it answers `false`
+    // -- fully synced -- while `eth_getBalance` serves state hundreds of blocks
+    // stale. A node stuck this way went unnoticed for ~1,300 retries because
+    // this method said it was fine.
+    //
+    // Callers reading `currentBlock` want the block whose state they will be
+    // served, which is the executed one.
+    let downloaded = head_number(store).unwrap_or(0);
+    let current = executed_number(store).unwrap_or(downloaded);
+    let peer_best = peer_store
+        .best_peer()
+        .await
+        .map(|(_, meta)| meta.best_number)
+        .unwrap_or(0);
 
-    match best_peer {
-        Some((_, meta)) if meta.best_number > current => {
-            JsonRpcResponse::success(
-                id,
-                json!({
-                    "startingBlock": to_hex_u64(0),
-                    "currentBlock": to_hex_u64(current),
-                    "highestBlock": to_hex_u64(meta.best_number),
-                }),
-            )
-        }
-        _ => JsonRpcResponse::success(id, json!(false)),
+    // The target is the highest block we know to exist. A block we have already
+    // downloaded but not executed counts: with no peers, or with peers at our
+    // own downloaded height, that is the only thing revealing the backlog.
+    let highest = peer_best.max(downloaded);
+
+    if highest > current {
+        JsonRpcResponse::success(
+            id,
+            json!({
+                "startingBlock": to_hex_u64(0),
+                "currentBlock": to_hex_u64(current),
+                "highestBlock": to_hex_u64(highest),
+            }),
+        )
+    } else {
+        JsonRpcResponse::success(id, json!(false))
     }
 }
 
@@ -179,6 +201,15 @@ pub fn eth_get_uncle_count_by_block_number(id: Value, params: &Value, store: &Bl
 fn head_number(store: &BlockStore) -> Option<u64> {
     store.head().ok()?
         .and_then(|h| store.header(h).ok().flatten())
+        .map(|h| h.number)
+}
+
+/// Height of the last block the node has *executed*, i.e. the newest state it
+/// can serve. Distinct from `head_number`, which is the newest header it has
+/// downloaded.
+fn executed_number(store: &BlockStore) -> Option<u64> {
+    store.exec_head().ok()?
+        .and_then(|(hash, _)| store.header(hash).ok().flatten())
         .map(|h| h.number)
 }
 
