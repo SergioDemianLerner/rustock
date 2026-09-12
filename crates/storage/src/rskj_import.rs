@@ -200,6 +200,33 @@ fn open_source(path: &Path) -> Result<DB> {
         .with_context(|| format!("opening rskj datasource at {}", path.display()))
 }
 
+
+/// Points the node at the imported chain.
+///
+/// Sets both heads. `update_head` alone is not enough: the node resolves its
+/// starting state from `exec_head`, the last block it has *executed*, and
+/// without that it rebuilds from genesis and re-syncs the whole chain -- which
+/// is exactly what a freshly imported database looked like before this existed.
+///
+/// The tip header's `state_root` is the Unitrie root for any block after
+/// RSKIP126, which every usable snapshot is. Setting it also gives a free
+/// end-to-end check of the trie import: on startup the node loads that root,
+/// recomputes its hash and refuses it if they disagree, so a trie missing nodes
+/// is caught immediately rather than part-way through execution.
+fn set_heads(dest: &BlockStore, tip_hash: B256, td: U256) -> Result<()> {
+    let tip = dest
+        .header(tip_hash)?
+        .context("tip header missing when setting heads")?;
+    dest.update_head(&tip, td)?;
+    dest.set_exec_head(tip_hash, tip.state_root)?;
+    info!(
+        target: "rustock::import",
+        "heads set: block #{} {:?}, exec state root {:?}",
+        tip.number, tip_hash, tip.state_root
+    );
+    Ok(())
+}
+
 /// Splits the 256-way first-byte keyspace into `n` contiguous ranges.
 ///
 /// Trie keys are Keccak hashes, so they are uniformly distributed and equal
@@ -737,9 +764,7 @@ pub fn rebuild_chain_metadata_in_memory(
     let fwd_secs = fwd_start.elapsed().as_secs_f64();
 
     if let Some((_, tip_hash, _)) = lineage.last() {
-        if let Some(h) = dest.header(*tip_hash)? {
-            dest.update_head(&h, td)?;
-        }
+        set_heads(dest, *tip_hash, td)?;
     }
 
     let total = overall.elapsed().as_secs_f64();
@@ -854,9 +879,9 @@ pub fn load_metadata_from_dump(
     }
     dest.db().flush()?;
 
-    // Set the head from the highest record seen.
-    if let Some(h) = dest.header(tip_hash)? {
-        dest.update_head(&h, tip_td)?;
+    // Set both heads from the highest record seen.
+    if tip_hash != B256::ZERO {
+        set_heads(dest, tip_hash, tip_td)?;
     }
 
     let secs = start.elapsed().as_secs_f64();
@@ -1055,7 +1080,7 @@ pub fn rebuild_chain_metadata(dest: &BlockStore, tip: B256, csv: Option<&mut dyn
             last_report = Instant::now();
         }
     }
-    dest.update_head(&tip_header, td)?;
+    set_heads(dest, tip, td)?;
     let elapsed = start.elapsed().as_secs_f64();
     if let Some(w) = csv {
         let _ = writeln!(w, "metadata,{},{},0,0,{:.1}", lineage.len(), lineage.len(), elapsed);
