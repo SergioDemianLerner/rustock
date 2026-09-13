@@ -320,7 +320,17 @@ struct Args {
     #[arg(long)]
     trie_tool_copy_overwrite: bool,
 
-    /// Trie storage backend: "single" (keep everything) or "epoch" (collect).
+    /// Directory for a detached trie store.
+    ///
+    /// Used by --trie-backend external and epoch. Defaults to
+    /// <data-dir>/trie-<backend>. Pointing this at different directories is how
+    /// one switches between trie stores -- a full archival one and a collected
+    /// one, say -- without touching headers, bodies or the chain index.
+    #[arg(long)]
+    trie_dir: Option<String>,
+
+    /// Trie storage backend: "single" (in the main database), "external" (its
+    /// own database, no collection) or "epoch" (its own databases, collected).
     ///
     /// Defaults to single, which is what the node has always done: one
     /// database, every historical version retained, unbounded growth. The epoch
@@ -613,8 +623,61 @@ async fn main() -> Result<()> {
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let sync_handler = Arc::new(SyncHandler::new(sync_manager.clone(), event_tx));
-    let trie_store_for_pool: Arc<dyn rustock_trie::TrieStore> =
-        Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone()));
+    let gc_config = rustock_storage::epoch_store::EpochConfig {
+        epochs: args.gc_epochs,
+        burial_depth: args.gc_burial,
+        rotate_bytes: args.gc_rotate_mb * (1 << 20),
+    };
+    let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
+
+    // The node only ever holds an `Arc<dyn TrieStore>`, so this is the entire
+    // extent of the choice: nothing downstream knows which store it got.
+    let trie_dir = args.trie_dir.clone().unwrap_or_else(|| {
+        let suffix = if backend.is_collecting() { "trie-epochs" } else { "trie" };
+        std::path::Path::new(&args.data_dir).join(suffix).to_string_lossy().into_owned()
+    });
+    if backend.is_detached() {
+        info!("Trie store: {} backend at {trie_dir}", args.trie_backend);
+    }
+
+    let epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>> = match &backend {
+        rustock_storage::epoch_store::TrieBackend::Epochs(cfg) => {
+            Some(Arc::new(rustock_storage::epoch_store::EpochTrieStore::open(
+                &trie_dir,
+                cfg.clone(),
+            )?))
+        }
+        _ => None,
+    };
+    let external_store: Option<Arc<dyn rustock_trie::TrieStore>> = match &backend {
+        rustock_storage::epoch_store::TrieBackend::External => Some(Arc::new(
+            rustock_storage::RocksDbTrieStore::open(std::path::Path::new(&trie_dir))?,
+        )),
+        _ => None,
+    };
+    let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> = match &epoch_store {
+        // No write cache in front of the epoch store yet: CachedTrieStore wraps
+        // a RocksDB handle rather than a TrieStore, so it cannot sit on top of
+        // this one without a refactor. Execution therefore pays a real read and
+        // write per node here, which is a known cost of turning the collector on.
+        Some(e) => e.clone(),
+        None => match &external_store {
+            Some(e) => e.clone(),
+            None => Arc::new(rustock_storage::CachedTrieStore::with_defaults(store.db().clone())),
+        },
+    };
+
+    // The pool and RPC read state too. With a detached trie they must read the
+    // same store as execution, or they answer from a trie the node is no longer
+    // writing to.
+    let detached_for_readers: Option<Arc<dyn rustock_trie::TrieStore>> =
+        if backend.is_detached() { Some(trie_store_for_exec.clone()) } else { None };
+
+
+    let trie_store_for_pool: Arc<dyn rustock_trie::TrieStore> = match &detached_for_readers {
+        Some(t) => t.clone(),
+        None => Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone())),
+    };
     let pool = Arc::new(rustock_sync::TransactionPool::new(
         rustock_sync::txpool::PoolConfig::default(),
         config.chain_id.into(),
@@ -628,31 +691,6 @@ async fn main() -> Result<()> {
         store.clone(),
     );
     info!("Block processor wired (hardfork config: {:?})", hardfork_cfg);
-
-    let gc_config = rustock_storage::epoch_store::EpochConfig {
-        epochs: args.gc_epochs,
-        burial_depth: args.gc_burial,
-        rotate_bytes: args.gc_rotate_mb * (1 << 20),
-    };
-    let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
-
-    // The node only ever holds an `Arc<dyn TrieStore>`, so this is the entire
-    // extent of the choice: nothing downstream knows which store it got.
-    let epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>> = match &backend {
-        rustock_storage::epoch_store::TrieBackend::Epochs(cfg) => {
-            let dir = std::path::Path::new(&args.data_dir).join("trie-epochs");
-            Some(Arc::new(rustock_storage::epoch_store::EpochTrieStore::open(&dir, cfg.clone())?))
-        }
-        rustock_storage::epoch_store::TrieBackend::Single => None,
-    };
-    let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> = match &epoch_store {
-        // No write cache in front of the epoch store yet: CachedTrieStore wraps
-        // a RocksDB handle rather than a TrieStore, so it cannot sit on top of
-        // this one without a refactor. Execution therefore pays a real read and
-        // write per node here, which is a known cost of turning the collector on.
-        Some(e) => e.clone(),
-        None => Arc::new(rustock_storage::CachedTrieStore::with_defaults(store.db().clone())),
-    };
 
     let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
@@ -719,8 +757,10 @@ async fn main() -> Result<()> {
     });
 
     if !args.no_rpc {
-        let trie_store: Arc<dyn rustock_trie::TrieStore> =
-            Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone()));
+        let trie_store: Arc<dyn rustock_trie::TrieStore> = match &detached_for_readers {
+            Some(t) => t.clone(),
+            None => Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone())),
+        };
 
         let rpc_state = rustock_rpc::server::RpcState {
             store: store.clone(),

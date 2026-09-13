@@ -521,6 +521,11 @@ impl TrieStore for EpochTrieStore {
 /// it is a different store that happens to satisfy the same trait.
 #[derive(Debug, Clone)]
 pub enum TrieBackend {
+    /// A standalone trie database, separate from the node's main database but
+    /// with no collection. Same retention as `Single`; the difference is only
+    /// that the trie lives in its own directory, so it can be swapped, copied
+    /// or replaced without touching headers and bodies.
+    External,
     /// One database, nothing is ever reclaimed. Every historical version of
     /// every node is kept, which is what makes historical state queryable and
     /// what makes the store grow without bound.
@@ -535,6 +540,7 @@ impl TrieBackend {
     pub fn parse(name: &str, config: EpochConfig) -> Result<Self> {
         match name {
             "single" | "none" | "off" => Ok(TrieBackend::Single),
+            "external" | "detached" => Ok(TrieBackend::External),
             "epoch" | "epochs" | "gc" => Ok(TrieBackend::Epochs(config)),
             other => bail!("unknown trie backend {other:?}; expected \"single\" or \"epoch\""),
         }
@@ -542,6 +548,11 @@ impl TrieBackend {
 
     pub fn is_collecting(&self) -> bool {
         matches!(self, TrieBackend::Epochs(_))
+    }
+
+    /// True when the trie lives outside the node's main database.
+    pub fn is_detached(&self) -> bool {
+        matches!(self, TrieBackend::External | TrieBackend::Epochs(_))
     }
 }
 
@@ -557,6 +568,9 @@ pub fn open_backend(
 ) -> Result<Arc<dyn TrieStore>> {
     match backend {
         TrieBackend::Single => Ok(Arc::new(crate::RocksDbTrieStore::from_db(single_db))),
+        TrieBackend::External => {
+            Ok(Arc::new(crate::RocksDbTrieStore::open(epoch_root)?))
+        }
         TrieBackend::Epochs(cfg) => {
             Ok(Arc::new(EpochTrieStore::open(epoch_root, cfg.clone())?))
         }
