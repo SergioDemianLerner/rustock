@@ -46,6 +46,9 @@ use tracing::{debug, info, warn};
 
 const CF_TRIE: &str = "trie_nodes";
 
+/// Block cache shared by every epoch.
+const BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Directory name for epoch `seq`.
 fn epoch_dir(root: &Path, seq: u64) -> PathBuf {
     root.join(format!("epoch-{seq:012}"))
@@ -109,11 +112,30 @@ pub struct EpochTrieStore {
     /// held off for the brief moment it takes.
     epochs: RwLock<Vec<Epoch>>,
     next_seq: AtomicU64,
+    /// One block cache for every epoch. See `cf_options`.
+    cache: rocksdb::Cache,
+    /// Bytes written to the newest epoch since it was created.
+    ///
+    /// Tracked incrementally because the rotation trigger is tested once per
+    /// block, and measuring it by walking the directory meant a recursive
+    /// readdir plus a stat per SST file on every block. This over-estimates
+    /// (it counts pre-compaction bytes), which is the safe direction: it
+    /// rotates slightly early rather than letting an epoch overshoot.
+    newest_written: AtomicU64,
     /// Counters, so a benchmark can see read amplification rather than infer it.
     pub reads: AtomicU64,
     pub read_probes: AtomicU64,
     pub writes: AtomicU64,
 }
+
+/// Background compaction jobs per epoch.
+///
+/// Deliberately low. Every epoch is an independent RocksDB instance, so this
+/// multiplies by `N`: the default of 2 across four epochs puts eight background
+/// threads on a machine that may have four cores, and they compete with block
+/// processing for them. One epoch is also small by construction, so it has less
+/// to compact than a single unbounded database would.
+const BG_JOBS_PER_EPOCH: i32 = 1;
 
 fn db_options() -> Options {
     let mut o = Options::default();
@@ -121,27 +143,38 @@ fn db_options() -> Options {
     o.create_missing_column_families(true);
     o.set_write_buffer_size(64 * 1024 * 1024);
     o.set_max_write_buffer_number(3);
+    o.set_max_background_jobs(BG_JOBS_PER_EPOCH);
     o
 }
 
-fn cf_options() -> Options {
+/// Table options for one epoch, sharing `cache` with every other epoch.
+///
+/// The cache is shared on purpose. Giving each epoch its own divides a fixed
+/// memory budget `N` ways instead of pooling it, and the split is arbitrary --
+/// reads concentrate on the newest epoch, so most of the memory would sit in
+/// caches serving the epochs that are read least.
+///
+/// `cache_index_and_filter_blocks` is left off. Turning it on puts index and
+/// filter blocks into the same cache as data blocks, where they are evicted and
+/// re-read; an earlier version of this file enabled it against a default-sized
+/// cache, which is a known way to make reads slower rather than faster.
+fn cf_options(cache: &rocksdb::Cache) -> Options {
     let mut o = Options::default();
-    // A read miss has to be answered by every epoch before the one holding the
-    // key, so the cost of a miss scales with N. Bloom filters are what keep
-    // that from turning into N disk reads.
     let mut block = rocksdb::BlockBasedOptions::default();
+    // A read miss must be answered by every epoch above the one holding the
+    // key, so a miss costs N lookups. Bloom filters keep that from becoming N
+    // disk reads.
     block.set_bloom_filter(10.0, false);
-    block.set_cache_index_and_filter_blocks(true);
-    block.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    block.set_block_cache(cache);
     o.set_block_based_table_factory(&block);
     o
 }
 
-fn open_epoch(dir: &Path) -> Result<Arc<DB>> {
+fn open_epoch(dir: &Path, cache: &rocksdb::Cache) -> Result<Arc<DB>> {
     let db = DB::open_cf_descriptors(
         &db_options(),
         dir,
-        vec![ColumnFamilyDescriptor::new(CF_TRIE, cf_options())],
+        vec![ColumnFamilyDescriptor::new(CF_TRIE, cf_options(cache))],
     )
     .with_context(|| format!("opening epoch at {}", dir.display()))?;
     Ok(Arc::new(db))
@@ -188,10 +221,11 @@ impl EpochTrieStore {
             seqs.push(0);
         }
 
+        let cache = rocksdb::Cache::new_lru_cache(BLOCK_CACHE_BYTES);
         let mut epochs = Vec::with_capacity(seqs.len());
         for seq in &seqs {
             let d = epoch_dir(&root, *seq);
-            epochs.push(Epoch { seq: *seq, db: open_epoch(&d)?, dir: d });
+            epochs.push(Epoch { seq: *seq, db: open_epoch(&d, &cache)?, dir: d });
         }
         let next = seqs.last().copied().unwrap_or(0) + 1;
 
@@ -203,11 +237,15 @@ impl EpochTrieStore {
             config.epochs, config.burial_depth, config.rotate_bytes / (1 << 20)
         );
 
+        let newest_written = AtomicU64::new(dir_size(&epoch_dir(&root, seqs[seqs.len() - 1])));
+
         Ok(Self {
             root,
             config,
             epochs: RwLock::new(epochs),
             next_seq: AtomicU64::new(next),
+            cache,
+            newest_written,
             reads: AtomicU64::new(0),
             read_probes: AtomicU64::new(0),
             writes: AtomicU64::new(0),
@@ -231,8 +269,11 @@ impl EpochTrieStore {
     }
 
     /// True when the newest epoch has grown past the rotation threshold.
+    ///
+    /// Reads a counter rather than measuring the directory: this is tested once
+    /// per block, and a recursive directory walk per block is not free.
     pub fn should_collect(&self) -> bool {
-        self.newest_bytes() >= self.config.rotate_bytes
+        self.newest_written.load(Ordering::Relaxed) >= self.config.rotate_bytes
     }
 
     /// Runs one collection cycle against `root_hash`, the state root of a block
@@ -405,7 +446,8 @@ impl EpochTrieStore {
 
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let dir = epoch_dir(&self.root, seq);
-        epochs.push(Epoch { seq, db: open_epoch(&dir)?, dir });
+        epochs.push(Epoch { seq, db: open_epoch(&dir, &self.cache)?, dir });
+        self.newest_written.store(0, Ordering::Relaxed);
         Ok(reclaimed)
     }
 
@@ -415,7 +457,8 @@ impl EpochTrieStore {
         let mut epochs = self.epochs.write().unwrap();
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let dir = epoch_dir(&self.root, seq);
-        epochs.push(Epoch { seq, db: open_epoch(&dir)?, dir });
+        epochs.push(Epoch { seq, db: open_epoch(&dir, &self.cache)?, dir });
+        self.newest_written.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -452,6 +495,8 @@ impl TrieStore for EpochTrieStore {
     /// references.
     fn put(&self, key: &[u8], value: &[u8]) {
         self.writes.fetch_add(1, Ordering::Relaxed);
+        self.newest_written
+            .fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
         let epochs = self.epochs.read().unwrap();
         if let Some(e) = epochs.last() {
             if let Some(cf) = e.db.cf_handle(CF_TRIE) {

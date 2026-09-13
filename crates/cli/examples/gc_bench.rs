@@ -129,7 +129,30 @@ fn main() -> Result<()> {
     };
     let store: Arc<dyn TrieStore> = match &epoch_store {
         Some(e) => e.clone(),
-        None => Arc::new(rustock_storage::RocksDbTrieStore::open(std::path::Path::new(&args.dir))?),
+        None => {
+            // Give the single backend the same table options the epoch store
+            // uses -- bloom filters and a 256 MB block cache. Without this the
+            // comparison confounds the collector with a RocksDB configuration
+            // difference: `RocksDbTrieStore::open` takes the library defaults,
+            // which include no bloom filter at all.
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            opts.set_write_buffer_size(64 * 1024 * 1024);
+            opts.set_max_write_buffer_number(3);
+            let cache = rocksdb::Cache::new_lru_cache(256 * 1024 * 1024);
+            let mut block = rocksdb::BlockBasedOptions::default();
+            block.set_bloom_filter(10.0, false);
+            block.set_block_cache(&cache);
+            let mut cfo = rocksdb::Options::default();
+            cfo.set_block_based_table_factory(&block);
+            let db = rocksdb::DB::open_cf_descriptors(
+                &opts,
+                std::path::Path::new(&args.dir),
+                vec![rocksdb::ColumnFamilyDescriptor::new("trie_nodes", cfo)],
+            )?;
+            Arc::new(rustock_storage::RocksDbTrieStore::from_db(std::sync::Arc::new(db)))
+        }
     };
 
     println!("backend      {}", args.backend);
