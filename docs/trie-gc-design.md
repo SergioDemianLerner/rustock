@@ -527,6 +527,98 @@ brief exclusive moment.
 
 ---
 
+## 11a. Implementation
+
+Implemented in `crates/storage/src/epoch_store.rs`, selected with
+`--trie-backend epoch`.
+
+### Choosing it
+
+The node only ever holds an `Arc<dyn TrieStore>`, so the collector is not a mode
+of the existing store -- it is a different store satisfying the same trait, and
+nothing downstream knows which one it got.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--trie-backend` | `single` | `single` keeps everything; `epoch` collects |
+| `--gc-epochs` | 4 | `N`, at least 3 |
+| `--gc-rotate-mb` | 1024 | rotate once the newest epoch reaches this size |
+| `--gc-burial` | 4000 | `D`, confirmations before a root may be collected against |
+| `--gc-check-secs` | 60 | how often to test the rotation trigger |
+
+The default is `single`, deliberately. Collecting means historical state below
+the retention window stops being queryable, which is a real trade and not one to
+make on an operator's behalf silently.
+
+### Structure on disk
+
+```
+<data-dir>/trie-epochs/
+  epoch-000000000007/     <- oldest, drained and deleted next
+  epoch-000000000008/
+  epoch-000000000009/
+  epoch-000000000010/     <- newest, receives all writes
+```
+
+Epochs are named by a monotonic sequence rather than by position, so a rotation
+never renames a directory. The ordered list is recovered on startup by sorting
+the directory names, which means a crash mid-cycle needs no recovery beyond
+restarting the cycle -- there is no partial state to repair, by I7.
+
+### Deviations from the specification above
+
+Two, both deliberate:
+
+**Mark is batched, not recursive.** §4.4 describes a traversal following
+references. That is a chain of *dependent* reads -- each address is known only
+once the previous read returns -- which leaves the device at queue depth 1.
+Keys discovered at the same level are independent of one another and are read
+together. §10 argues for this; the implementation does it from the start,
+because the measurement in §10.2 showed it is worth ~5x on a real store.
+
+**Drain scans, it does not seek.** §4.5 already specifies a sequential scan; it
+is worth saying why the obvious alternative is wrong. Looking up each live key
+in the oldest epoch would be a seek per survivor, and survivors are scattered.
+Reading the epoch in key order and testing membership costs one pass regardless
+of how many survive.
+
+### Testing
+
+`crates/cli/examples/gc_bench.rs` drives a synthetic chain whose every block
+increments 1000 sequential storage slots of one contract. Two workloads:
+
+- `--workload growing` advances the slot window, so the live set itself grows.
+  A collector can only make growth *sublinear* here -- it cannot make it flat,
+  because the live state is expanding. This is what a real chain does.
+- `--workload bounded` cycles over a fixed range, so the live set is constant
+  and every write supersedes an earlier version. This is the case the design is
+  pitched at, and the one where a collector should hold size flat indefinitely
+  while an uncollected store grows forever.
+
+Note that RSK storage keys hash the slot (`keccak256(slot)[0:10]`), so
+"sequential" slots do not occupy adjacent trie paths. They scatter, which makes
+this harder than a clustered workload and more representative.
+
+The harness verifies as well as measures. Each run ends by re-reading the head
+state root, re-hashing it, walking the whole state looking for a dangling
+reference, and checking that the storage counters hold the values they should. A
+collector that is fast and wrong is worse than no collector.
+
+One trap worth recording: the first version of the harness reported *zero* store
+reads. `save` leaves the in-memory tree materialised, so every later block walked
+RAM and never touched the store -- it was benchmarking an in-memory trie. The
+harness now reloads the root from its hash each block, which is what a node
+actually does between blocks.
+
+### Known gap
+
+`CachedTrieStore` wraps a RocksDB handle rather than a `TrieStore`, so it cannot
+sit in front of the epoch store without a refactor. Execution with the collector
+enabled therefore pays a real read and write per node. The synthetic comparison
+is fair because neither side is cached, but a node-level comparison against a
+cached single backend would not be, and has not been made.
+
+
 ## 12. Open questions
 
 1. **How much does the live set actually change between cycles?** If most of `L`

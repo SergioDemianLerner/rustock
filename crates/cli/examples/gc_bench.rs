@@ -32,6 +32,7 @@ use std::time::Instant;
 
 struct Args {
     backend: String,
+    workload: String,
     dir: String,
     blocks: u64,
     slots: u64,
@@ -44,6 +45,7 @@ struct Args {
 fn parse_args() -> Result<Args> {
     let mut a = Args {
         backend: "epoch".into(),
+        workload: "growing".into(),
         dir: "/srv/gc-bench/run".into(),
         blocks: 1000,
         slots: 1000,
@@ -60,6 +62,7 @@ fn parse_args() -> Result<Args> {
         };
         match argv[i].as_str() {
             "--backend" => { a.backend = get(i)?; i += 2; }
+            "--workload" => { a.workload = get(i)?; i += 2; }
             "--dir" => { a.dir = get(i)?; i += 2; }
             "--blocks" => { a.blocks = get(i)?.parse()?; i += 2; }
             "--slots" => { a.slots = get(i)?.parse()?; i += 2; }
@@ -130,6 +133,7 @@ fn main() -> Result<()> {
     };
 
     println!("backend      {}", args.backend);
+    println!("workload     {}", args.workload);
     println!("blocks       {}", args.blocks);
     println!("slots/block  {}", args.slots);
     if args.backend == "epoch" {
@@ -148,11 +152,22 @@ fn main() -> Result<()> {
     let mut last_report = Instant::now();
 
     for block in 1..=args.blocks {
-        // Each block touches a window of slots that advances, so the working
-        // set moves and old versions die off -- rather than rewriting the same
-        // thousand leaves forever, which would be unrealistically kind to the
-        // collector's drain step.
-        let base = (block - 1) * (args.slots / 4);
+        // Two shapes of workload, which test different claims.
+        //
+        // "growing": the slot window advances, so a quarter of each block's
+        // slots are new and the live set grows without bound. This is what a
+        // real chain does, and the collector can only make growth sublinear --
+        // it cannot make it flat, because the live state itself is growing.
+        //
+        // "bounded": the window cycles over a fixed range, so the live set is
+        // constant and every write supersedes an earlier version. This is the
+        // case the design is pitched at -- "the last N blocks fit in X GB" --
+        // and the one where a collector should hold size flat indefinitely
+        // while an uncollected store grows forever.
+        let base = match args.workload.as_str() {
+            "bounded" => ((block - 1) * (args.slots / 4)) % args.slots.max(1),
+            _ => (block - 1) * (args.slots / 4),
+        };
         for i in 0..args.slots {
             let slot = slot_hash(base + i);
             let key = key_mapper::storage_key(&contract, &slot);
@@ -219,6 +234,7 @@ fn main() -> Result<()> {
     println!();
     println!("RESULT");
     println!("  {:<26}{:>14}", "backend", args.backend);
+    println!("  {:<26}{:>14}", "workload", args.workload);
     println!("  {:<26}{:>14.1}", "wall seconds", elapsed);
     println!("  {:<26}{:>14.1}", "blocks/s", args.blocks as f64 / elapsed);
     println!("  {:<26}{:>13.1} MB", "final size", mb(final_size));
