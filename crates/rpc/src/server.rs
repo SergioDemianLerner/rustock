@@ -17,7 +17,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::types::*;
-use crate::{call, eth, logs, net, rsk, state, tx, web3};
+use crate::{admin, call, eth, logs, net, rsk, state, tx, web3};
 
 /// Trait for submitting raw transactions, allowing the RPC layer to use
 /// the P2P relay without depending on the sync crate directly.
@@ -44,6 +44,12 @@ pub struct RpcState {
     pub hardfork_cfg: Option<RskHardforkConfig>,
     pub filter_store: Arc<logs::FilterStore>,
     pub tx_pool: Option<Arc<dyn TxPoolReader>>,
+    /// Present only when the node runs the epoch trie backend.
+    pub epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>>,
+    /// Administrative methods are refused unless the operator enabled them.
+    pub admin_enabled: bool,
+    /// Burial depth used when an admin collection request names no block.
+    pub gc_burial: u64,
 }
 
 /// Starts the JSON-RPC HTTP server on the given host and port.
@@ -152,6 +158,17 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
 
         // -- rsk --
         "rsk_protocolVersion" => rsk::rsk_protocol_version(id),
+
+        // Administrative. Refused outright unless --rpc-admin was passed, and
+        // reported as unknown rather than forbidden so that a node without them
+        // looks the same as one that never had them.
+        "rsk_collectTrie" | "rsk_collectTrieStatus" if !state.admin_enabled => {
+            JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found")
+        }
+        "rsk_collectTrie" => admin::rsk_collect_trie(
+            id, &req.params, &state.store, &state.epoch_store, state.gc_burial,
+        ),
+        "rsk_collectTrieStatus" => admin::rsk_collect_trie_status(id, &state.epoch_store),
         "rsk_getRawBlockHeaderByHash" => rsk::rsk_get_raw_block_header_by_hash(id, params, &state.store),
         "rsk_getRawBlockHeaderByNumber" => rsk::rsk_get_raw_block_header_by_number(id, params, &state.store),
 

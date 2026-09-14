@@ -126,6 +126,11 @@ pub struct EpochTrieStore {
     pub reads: AtomicU64,
     pub read_probes: AtomicU64,
     pub writes: AtomicU64,
+    /// Set while a cycle is running. A second concurrent cycle would drain and
+    /// sweep the same epoch twice, so callers are refused rather than queued.
+    collecting: std::sync::atomic::AtomicBool,
+    /// Stats from the most recent completed cycle, for status reporting.
+    last_collect: RwLock<Option<CollectStats>>,
 }
 
 /// Background compaction jobs per epoch.
@@ -249,6 +254,8 @@ impl EpochTrieStore {
             reads: AtomicU64::new(0),
             read_probes: AtomicU64::new(0),
             writes: AtomicU64::new(0),
+            collecting: std::sync::atomic::AtomicBool::new(false),
+            last_collect: RwLock::new(None),
         })
     }
 
@@ -282,15 +289,68 @@ impl EpochTrieStore {
     /// The caller chooses the root, because only the caller knows the chain.
     /// Passing an insufficiently buried root is the one way to lose state that
     /// a reorg would need, so the choice is deliberately not made here.
+    /// True while a cycle is in progress.
+    pub fn is_collecting(&self) -> bool {
+        self.collecting.load(Ordering::Relaxed)
+    }
+
+    /// Stats from the most recent completed cycle.
+    pub fn last_collect(&self) -> Option<CollectStats> {
+        self.last_collect.read().unwrap().clone()
+    }
+
     pub fn collect(&self, root_hash: B256) -> Result<CollectStats> {
+        // One cycle at a time. Two concurrent cycles would each drain and sweep
+        // the oldest epoch, and the second would delete an epoch the first had
+        // not finished copying out of.
+        if self
+            .collecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            bail!("a collection cycle is already running");
+        }
+        let result = self.collect_inner(root_hash);
+        self.collecting.store(false, Ordering::SeqCst);
+        if let Ok(stats) = &result {
+            *self.last_collect.write().unwrap() = Some(stats.clone());
+        }
+        result
+    }
+
+    fn collect_inner(&self, root_hash: B256) -> Result<CollectStats> {
         let mut stats = CollectStats::default();
 
-        // Nothing to reclaim until the store has grown to its full width:
-        // with fewer epochs than N, the oldest is still within the retention
-        // window and deleting it would drop state the design promises to keep.
+        // Refuse to collect against a root the store cannot resolve.
+        //
+        // Without this the cycle proceeds on an almost-empty live set, the
+        // drain copies nothing forward, and the sweep deletes an epoch whose
+        // contents were still reachable -- destroying state rather than
+        // reclaiming it. A root can legitimately be unresolvable: a store
+        // seeded from a snapshot holds no state below the snapshot's block, so
+        // a burial depth deeper than the seed is out of range until the chain
+        // has moved far enough past it.
+        // Validate the root before anything else, including before deciding
+        // whether this is a growth rotation. A caller that named an unusable
+        // root should be told so, not handed a success that silently did
+        // something different from what they asked for.
+        if self.get(root_hash.as_slice()).is_none() {
+            bail!(
+                "collection root {root_hash:?} is not in the store; refusing to collect. \
+                 If this store was seeded from a snapshot, the burial depth reaches below \
+                 the seeded block and collection must wait until the chain advances."
+            );
+        }
+
+        // Nothing to reclaim until the store has grown to its full width: with
+        // fewer epochs than N, the oldest is still inside the retention window
+        // and deleting it would drop state the design promises to keep.
         if self.epoch_count() < self.config.epochs {
             self.rotate_only()?;
-            debug!(target: "rustock::gc", "Grew to {} epochs; nothing to collect yet", self.epoch_count());
+            debug!(
+                target: "rustock::gc",
+                "Grew to {} epochs; nothing to collect yet", self.epoch_count()
+            );
             return Ok(stats);
         }
 
@@ -330,6 +390,7 @@ impl EpochTrieStore {
     /// together. Measured on the mainnet store this was worth ~5x.
     fn mark(&self, root_hash: B256) -> Result<HashSet<B256>> {
         let mut live: HashSet<B256> = HashSet::new();
+        let mut missing = 0u64;
         let mut frontier: Vec<B256> = vec![root_hash];
         live.insert(root_hash);
 
@@ -340,9 +401,12 @@ impl EpochTrieStore {
 
             for (hash, value) in frontier.iter().zip(values) {
                 let Some(bytes) = value else {
-                    // A referenced entry that is not in any epoch. Either the
-                    // root predates this store or something has already been
-                    // lost; either way, marking cannot proceed through it.
+                    // A referenced entry missing from every epoch. The subtree
+                    // below it cannot be marked, so anything living only there
+                    // would be swept. Count these: a healthy store has none, and
+                    // a nonzero count means the live set being computed is
+                    // incomplete and must not be used to decide what to delete.
+                    missing += 1;
                     warn!(target: "rustock::gc", "Mark: {hash:?} not found; subtree unreachable");
                     continue;
                 };
@@ -371,6 +435,13 @@ impl EpochTrieStore {
                 }
             }
             frontier = next;
+        }
+        if missing > 0 {
+            bail!(
+                "mark found {missing} referenced entries missing from the store; \
+                 the live set is incomplete and collecting on it would delete \
+                 reachable state"
+            );
         }
         Ok(live)
     }
@@ -719,6 +790,30 @@ mod tests {
             s.collect(revived).unwrap();
         }
         walk(&s, revived).expect("revived state must survive collection");
+    }
+
+    #[test]
+    fn refuses_to_collect_against_an_unresolvable_root() {
+        // A store seeded from a snapshot holds no state below the snapshot's
+        // block. Collecting against a root it cannot resolve would mark almost
+        // nothing, drain almost nothing, and then delete an epoch whose
+        // contents were still reachable.
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let root = build(&s, 150, 3);
+        for _ in 0..3 {
+            s.collect(root).unwrap();
+        }
+
+        let before = walk(&s, root).unwrap();
+        let bogus = B256::repeat_byte(0x5A);
+        let err = s.collect(bogus);
+        assert!(err.is_err(), "collecting against an unknown root must fail");
+        let msg = err.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(msg.contains("not in the store"), "{msg}");
+
+        // And nothing was swept.
+        assert_eq!(walk(&s, root).unwrap(), before, "state must be untouched");
     }
 
     #[test]

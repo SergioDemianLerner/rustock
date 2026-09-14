@@ -359,6 +359,16 @@ struct Args {
     #[arg(long, default_value_t = 4_000)]
     gc_burial: u64,
 
+    /// Enable administrative JSON-RPC methods.
+    ///
+    /// Off by default. These act on the node rather than answering questions
+    /// about the chain -- rsk_collectTrie deletes a database -- and the RPC
+    /// server binding to localhost is a deployment detail, not an access
+    /// control decision. With this off the methods report as unknown, so a node
+    /// without them is indistinguishable from one that never had them.
+    #[arg(long)]
+    rpc_admin: bool,
+
     /// Seconds between checks of whether the store needs collecting.
     #[arg(long, default_value_t = 60)]
     gc_check_secs: u64,
@@ -636,8 +646,72 @@ async fn main() -> Result<()> {
         let suffix = if backend.is_collecting() { "trie-epochs" } else { "trie" };
         std::path::Path::new(&args.data_dir).join(suffix).to_string_lossy().into_owned()
     });
-    if backend.is_detached() {
-        info!("Trie store: {} backend at {trie_dir}", args.trie_backend);
+    // Always say where the trie is. With three backends and a migration in the
+    // field, "which trie is this node actually reading?" is the first question
+    // worth answering in any log, and the answer should not depend on which
+    // backend happens to be selected.
+    match &backend {
+        rustock_storage::epoch_store::TrieBackend::Single => info!(
+            "Trie store: single backend (trie_nodes column family inside {})",
+            args.data_dir
+        ),
+        rustock_storage::epoch_store::TrieBackend::External => {
+            info!("Trie store: external backend at {trie_dir} (no collection)")
+        }
+        rustock_storage::epoch_store::TrieBackend::Epochs(cfg) => info!(
+            "Trie store: epoch backend at {trie_dir} (collecting; N={}, rotate at {} MB, burial {} blocks)",
+            cfg.epochs,
+            cfg.rotate_bytes / (1 << 20),
+            cfg.burial_depth
+        ),
+    }
+
+    // Refuse configurations that would come up with no state instead of failing.
+    //
+    // RocksDB is asked to create missing column families, so opening a database
+    // whose trie was moved out recreates `trie_nodes` empty and the node starts
+    // against a blank trie -- no error, no missing file, just a node that cannot
+    // execute anything and looks like it needs a resync. That is worth stopping
+    // for; the operator can always choose a backend, but they cannot recover
+    // state that was quietly declared absent.
+    {
+        let has_chain = store.exec_head()?.is_some() || store.head()?.is_some();
+        let detached_dir_populated = std::path::Path::new(&trie_dir)
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+
+        if !backend.is_detached() && has_chain && store.trie_cf_is_empty() {
+            anyhow::bail!(
+                "This database has no trie in it, but --trie-backend is \"{}\".\n\
+                 \n\
+                 Its trie column family is empty, which means the trie was moved \
+                 into its own database (see examples/detach_trie.rs) and this \
+                 column family was recreated empty on open. Starting like this \
+                 would run the node against a blank trie.\n\
+                 \n\
+                 Start it against the detached trie instead:\n\
+                 \x20   --trie-backend external --trie-dir <path-to-trie-db>\n\
+                 \x20   --trie-backend epoch    --trie-dir <path-to-epoch-store>",
+                args.trie_backend
+            );
+        }
+
+        if backend.is_detached() && has_chain && !detached_dir_populated && !store.trie_cf_is_empty() {
+            anyhow::bail!(
+                "--trie-backend {} points at {}, which is empty, while this \
+                 database still holds its own trie.\n\
+                 \n\
+                 Starting would create an empty trie store and the node would be \
+                 unable to execute. Move the trie out first:\n\
+                 \n\
+                 \x20   cargo run --release --example detach_trie -- {} {}\n\
+                 \n\
+                 then start with the same --trie-dir. The source database is \
+                 opened read-only and is not modified.",
+                args.trie_backend, trie_dir, args.data_dir, trie_dir
+            );
+        }
     }
 
     let epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>> = match &backend {
@@ -771,6 +845,10 @@ async fn main() -> Result<()> {
             hardfork_cfg: Some(hardfork_cfg),
             filter_store: Arc::new(rustock_rpc::logs::FilterStore::new()),
             tx_pool: Some(Arc::new(PoolAdapter(pool.clone()))),
+
+            epoch_store: epoch_store.clone(),
+            admin_enabled: args.rpc_admin,
+            gc_burial: args.gc_burial,
         };
         let rpc_host = args.rpc_host.clone();
         let rpc_port = args.rpc_port;
