@@ -149,6 +149,31 @@ impl BlockStore {
         Self::open_with(path, Some(tuning))
     }
 
+    /// Opens the store read-only, alongside a live writer.
+    ///
+    /// RocksDB allows exactly one writer per directory, so a diagnostic that
+    /// wants to read a running node's blocks would otherwise have to stop it.
+    /// A read-only handle opens against the manifest as it stands and never
+    /// takes the lock, at the cost of not seeing anything still in the
+    /// writer's memtables -- fine for history, wrong for the tip.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(false);
+        let cfs = vec![
+            CF_HEADERS,
+            CF_NUMBERS,
+            CF_TD,
+            CF_BODIES,
+            CF_RECEIPTS,
+            CF_TX_INDEX,
+            "trie_nodes",
+        ];
+        // `false`: do not fail when the writer's WAL files are present.
+        let db = DB::open_cf_for_read_only(&opts, path, cfs, false)
+            .context("Failed to open RocksDB read-only")?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
     fn open_with<P: AsRef<Path>>(path: P, tuning: Option<ImportTuning>) -> Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);

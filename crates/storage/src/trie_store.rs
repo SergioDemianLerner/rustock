@@ -41,6 +41,23 @@ impl RocksDbTrieStore {
         Ok(Self { db: Arc::new(db) })
     }
 
+    /// Open a trie store read-only, without taking the directory lock.
+    ///
+    /// RocksDB allows one writer per directory and that writer holds an
+    /// exclusive lock, so several readers of one archival trie -- parallel
+    /// block replay across disjoint ranges, say -- cannot each `open` it. A
+    /// read-only handle takes no lock, so any number can coexist, alongside a
+    /// live writer if there is one. It sees the manifest as it stands and not
+    /// the writer's memtables.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(false);
+        // `false`: tolerate a live writer's WAL files being present.
+        let db = DB::open_cf_for_read_only(&opts, path, vec![CF_TRIE], false)
+            .map_err(|e| anyhow::anyhow!("Failed to open trie RocksDB read-only: {e}"))?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
     /// Open using an existing RocksDB instance that has a `trie_nodes` CF.
     pub fn from_db(db: Arc<DB>) -> Self {
         Self { db }
