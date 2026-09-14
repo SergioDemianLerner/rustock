@@ -495,6 +495,18 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     mining_refresh_secs: u64,
 
+    /// Blocks of history to keep below the head when pruning.
+    ///
+    /// Clamped up to 8,000 whatever is given: Rootstock's block-info
+    /// precompiles reach 4,000 blocks back, and a reorg may re-execute from
+    /// 4,000 back, so a re-executed block can read 8,000 back.
+    #[arg(long, default_value_t = 100_000)]
+    prune_keep_depth: u64,
+
+    /// Most blocks one prune sweep may remove.
+    #[arg(long, default_value_t = 50_000)]
+    prune_max_batch: u64,
+
     /// Enable administrative JSON-RPC methods.
     ///
     /// Off by default. These act on the node rather than answering questions
@@ -1144,6 +1156,8 @@ async fn main() -> Result<()> {
             miner: miner.clone().map(|m| m as Arc<dyn rustock_rpc::mnr::MiningService>),
             admin_enabled: args.rpc_admin,
             gc_burial: args.gc_burial,
+            prune_keep_depth: args.prune_keep_depth,
+            prune_max_batch: args.prune_max_batch,
         };
         let rpc_host = args.rpc_host.clone();
         let rpc_port = args.rpc_port;

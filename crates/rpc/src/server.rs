@@ -53,6 +53,10 @@ pub struct RpcState {
     pub admin_enabled: bool,
     /// Burial depth used when an admin collection request names no block.
     pub gc_burial: u64,
+    /// Blocks kept below the head when a prune request names no block.
+    pub prune_keep_depth: u64,
+    /// Most blocks one prune sweep may remove.
+    pub prune_max_batch: u64,
 }
 
 /// Starts the JSON-RPC HTTP server on the given host and port.
@@ -187,13 +191,19 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         // Administrative. Refused outright unless --rpc-admin was passed, and
         // reported as unknown rather than forbidden so that a node without them
         // looks the same as one that never had them.
-        "rsk_collectTrie" | "rsk_collectTrieStatus" if !state.admin_enabled => {
+        "rsk_collectTrie" | "rsk_collectTrieStatus" | "rsk_pruneBlocks" | "rsk_storageStatus"
+            if !state.admin_enabled =>
+        {
             JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found")
         }
         "rsk_collectTrie" => admin::rsk_collect_trie(
             id, &req.params, &state.store, &state.epoch_store, state.gc_burial,
         ),
         "rsk_collectTrieStatus" => admin::rsk_collect_trie_status(id, &state.epoch_store),
+        "rsk_pruneBlocks" => admin::rsk_prune_blocks(
+            id, &req.params, &state.store, state.prune_keep_depth, state.prune_max_batch,
+        ),
+        "rsk_storageStatus" => admin::rsk_storage_status(id, &state.store, &state.epoch_store),
         "rsk_getRawBlockHeaderByHash" => rsk::rsk_get_raw_block_header_by_hash(id, params, &state.store),
         "rsk_getRawBlockHeaderByNumber" => rsk::rsk_get_raw_block_header_by_number(id, params, &state.store),
 

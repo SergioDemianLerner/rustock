@@ -7,6 +7,7 @@ pub mod trie_snapshot;
 pub mod trie_inspect;
 pub mod epoch_store;
 pub mod window_store;
+pub mod pruner;
 pub use cached_trie_store::CachedTrieStore;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
@@ -435,6 +436,8 @@ impl BlockStore {
     pub fn cf_bodies(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_BODIES) }
     pub fn cf_numbers(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_NUMBERS) }
     pub fn cf_td(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_TD) }
+    pub fn cf_receipts(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_RECEIPTS) }
+    pub fn cf_tx_index(&self) -> Result<&rocksdb::ColumnFamily> { self.cf(CF_TX_INDEX) }
 
     pub fn header(&self, hash: B256) -> Result<Option<Header>> {
         let bytes = self.db.get_cf(self.cf(CF_HEADERS)?, hash.as_slice())
