@@ -798,8 +798,28 @@ async fn main() -> Result<()> {
                     debug!(target: "rustock::gc", "No block buried {burial} deep yet; not collecting");
                     continue;
                 };
+                let head_now = store_for_gc
+                    .head()
+                    .ok()
+                    .flatten()
+                    .and_then(|h| store_for_gc.header(h).ok().flatten())
+                    .map(|h| h.number)
+                    .unwrap_or(at);
+                // A root the store cannot resolve is normal for a while after
+                // seeding: the burial depth reaches below the seeded block until
+                // the chain advances past it. That is a "not yet", not a fault,
+                // and logging it as an error once a minute would bury the real
+                // ones.
+                if rustock_trie::TrieStore::get(es.as_ref(), root.as_slice()).is_none() {
+                    debug!(
+                        target: "rustock::gc",
+                        "Collection root #{at} is not in the store yet; waiting for the \
+                         chain to advance past the seeded block"
+                    );
+                    continue;
+                }
                 info!(target: "rustock::gc", "Collecting against #{at} ({root:?})");
-                if let Err(e) = es.collect(root) {
+                if let Err(e) = es.collect(root, at, head_now) {
                     error!(target: "rustock::gc", "Collection failed: {e:?}");
                 }
             }

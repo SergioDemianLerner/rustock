@@ -77,8 +77,15 @@ pub fn rsk_collect_trie(
         );
     };
 
+    let head_now = store
+        .head()
+        .ok()
+        .flatten()
+        .and_then(|h| store.header(h).ok().flatten())
+        .map(|h| h.number)
+        .unwrap_or(at);
     let store_for_task = es.clone();
-    tokio::task::spawn_blocking(move || match store_for_task.collect(root) {
+    tokio::task::spawn_blocking(move || match store_for_task.collect(root, at, head_now) {
         Ok(s) => tracing::info!(
             target: "rustock::gc",
             "Forced collection complete: marked {}, drained {}, reclaimed {} MB",
