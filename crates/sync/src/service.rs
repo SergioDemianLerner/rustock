@@ -57,6 +57,14 @@ const EXEC_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// forever, which is what it was.
 const FOLLOW_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Unexecuted blocks tolerated in follow mode before switching to the body
+/// pipeline.
+///
+/// One or two is ordinary -- a tip has arrived and is about to be executed.
+/// More than that means blocks were missed, and follow mode has no way to go
+/// back for them.
+const FOLLOW_BACKLOG_TOLERANCE: u64 = 2;
+
 /// Whether downloaded-but-unexecuted blocks must be executed before following.
 ///
 /// Follow mode only executes blocks that arrive as fresh announcements; it has
@@ -448,6 +456,7 @@ impl SyncService {
             }
             SyncState::Following => {
                 self.check_follow_gap().await;
+                self.leave_follow_if_backlog().await;
             }
             SyncState::DownloadingBodies { .. } => {
                 // Per-request timeout: re-send only the individually-stalled
@@ -653,6 +662,52 @@ impl SyncService {
                  the blocks will be re-requested"
             );
         }
+    }
+
+    /// Leave follow mode when a backlog has built up behind the tip.
+    ///
+    /// Follow mode executes blocks as they are announced and has no way to fetch
+    /// ones it missed. When the chain moves faster than announcements are
+    /// processed, the blocks in between are never requested and execution falls
+    /// behind for good.
+    ///
+    /// The execution watchdog does eventually notice, but only after two minutes
+    /// of standing still, so the node spent most of its time stalled and
+    /// recovering rather than following. This catches it within a tick.
+    ///
+    /// The tolerance matters: a single unexecuted block is the ordinary state
+    /// between a tip arriving and being executed, and reacting to that would
+    /// fight follow mode rather than help it.
+    async fn leave_follow_if_backlog(&mut self) {
+        if self.block_processor.is_none() || self.executing.is_some() || self.pending_exec.is_some()
+        {
+            return;
+        }
+        let executed = match self
+            .manager
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(h, _)| self.manager.store.header(h).ok().flatten())
+        {
+            Some(h) => h.number,
+            None => return,
+        };
+        let downloaded = self.our_head_number();
+        if downloaded <= executed + FOLLOW_BACKLOG_TOLERANCE {
+            return;
+        }
+        info!(
+            target: "rustock::sync",
+            "Follow mode is {} blocks behind execution (#{} executed, #{} downloaded); \
+             switching to the body pipeline",
+            downloaded - executed, executed, downloaded
+        );
+        self.follow_buffer.clear();
+        self.follow_gap_since = None;
+        self.last_body_height = executed;
+        self.state = SyncState::Idle;
     }
 
     /// Restart the pipeline if execution has stopped while blocks are waiting.
