@@ -2134,6 +2134,64 @@ async fn test_follow_mode_tick_keeps_following_when_head_is_canonical() {
     let _ = b2_hash;
 }
 
+#[tokio::test]
+async fn test_follow_drain_waits_for_background_execution() {
+    // A batch executing in the background commits each block as it goes, so
+    // `exec_head` advances in the store while `current_state_root` -- the
+    // in-memory root follow mode executes against -- still holds the pre-batch
+    // state until `poll_execution` reaps the job on a later tick.
+    //
+    // In that window a follow-mode block whose parent IS the freshly committed
+    // head would pass the link check and execute against an older state,
+    // computing a wrong state root for a perfectly valid block. Seen on mainnet
+    // at #9238768, which re-executed cleanly from the pipeline two minutes
+    // later.
+    //
+    // The drain must stand down while a batch is executing or parked. Staying
+    // buffered is the correct behaviour: `follow_buffer` still holds the block.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.update_head(&b1, U256::from(2)).unwrap();
+    // b2 builds directly on the executed head, so only the guard can hold it.
+    let b2 = dummy_header(2, b1_hash, U256::from(1));
+    let b2_hash = b2.hash();
+    store.update_head(&b2, U256::from(3)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(b1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    store.set_exec_head(b1_hash, b1.state_root).unwrap();
+    service.state = SyncState::Following;
+    service.follow_buffer.insert(2, (b2_hash, b2, vec![], vec![]));
+
+    // A batch is parked waiting to run: the trie state is not ours to use.
+    service.park_empty_batch_for_test();
+    service.drain_follow_buffer().await;
+
+    assert!(service.follow_buffer.contains_key(&2),
+        "the drain must leave the block buffered while a batch is parked; \
+         removing it means execution was attempted against a stale root");
+    assert_eq!(store.exec_head().unwrap().map(|(h, _)| h), Some(b1_hash),
+        "the executed head must not move while a batch owns the trie state");
+}
+
 // -- Peer serving tests (BlockHeadersRequest, BlockHashRequest, SkeletonRequest) --
 
 #[tokio::test]

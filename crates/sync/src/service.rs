@@ -393,6 +393,13 @@ impl SyncService {
         self.pending_exec.is_some()
     }
 
+    /// Park an empty batch so tests can exercise the paths that must stand
+    /// down while a background execution owns the trie state.
+    #[cfg(test)]
+    pub(crate) fn park_empty_batch_for_test(&mut self) {
+        self.pending_exec = Some((Vec::new(), 0));
+    }
+
     #[cfg(test)]
     pub(crate) fn last_body_height_for_test(&self) -> u64 {
         self.last_body_height
@@ -1959,6 +1966,29 @@ impl SyncService {
     /// block whose parent isn't our current head — its predecessor hasn't
     /// arrived yet) or the first execution failure.
     pub(crate) async fn drain_follow_buffer(&mut self) {
+        // Never execute a follow-mode block while a batch is executing in the
+        // background or parked waiting to run.
+        //
+        // The batch thread commits each block as it goes, so `exec_head` in the
+        // store advances while `self.current_state_root` -- the in-memory trie
+        // root this path executes against -- still holds the pre-batch state
+        // until `poll_execution` reaps the job on a later tick. In that window
+        // the parent-link check below passes against the freshly committed head
+        // while execution would start from an older state, and the block fails
+        // with a state root mismatch.
+        //
+        // Observed on mainnet at #9238768: the batch for #9238765-#9238767
+        // committed at 09:16:24, the body for #9238768 arrived 3.4s later and
+        // executed against the state after #9238764, computing
+        // 0x2c5ab80b... against a header root of 0x8b2b2497.... Re-executed
+        // from the pipeline two minutes later it produced the header's root, so
+        // the block was fine -- the state it ran against was not.
+        //
+        // Staying buffered costs nothing: the next drain runs after
+        // `poll_execution` has installed the batch's root.
+        if self.executing.is_some() || self.pending_exec.is_some() {
+            return;
+        }
         loop {
             let head_hash = match self.manager.store.exec_head().ok().flatten() {
                 Some((hash, _)) => hash,
@@ -2069,6 +2099,24 @@ impl SyncService {
             (Some(p), Some(ts), Some(sr)) => (p, ts.clone(), sr.clone()),
             _ => return false,
         };
+
+        // The in-memory root must be the state the executed head committed.
+        // Executing against anything else silently computes a wrong state root
+        // for a perfectly valid block -- the failure looks like a bad block and
+        // is not. The drain guard above should make this unreachable; check
+        // anyway, because the cost of being wrong here is a consensus error.
+        if let Ok(Some((_, committed_root))) = self.manager.store.exec_head() {
+            let in_memory = state_root.compute_hash(trie_store.as_ref());
+            if in_memory != committed_root {
+                warn!(
+                    target: "rustock::sync",
+                    "Refusing to execute #{} in follow mode: in-memory state root {:?} \
+                     is not the executed head's committed root {:?}",
+                    header.number, in_memory, committed_root
+                );
+                return false;
+            }
+        }
 
         let block = Block {
             header: header.clone(),
