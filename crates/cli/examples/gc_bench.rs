@@ -229,7 +229,9 @@ fn main() -> Result<()> {
             if es.should_collect() && block > args.burial {
                 let h = (block - args.burial) as usize - 1;
                 let t = Instant::now();
-                let st = es.collect(roots[h])?;
+                // `roots[0]` is block 1, so `roots[h]` is block `h + 1`,
+                // i.e. the buried block `block - args.burial`.
+                let st = es.collect(roots[h], block - args.burial, block)?;
                 collect_secs += t.elapsed().as_secs_f64();
                 reclaimed += st.reclaimed_bytes;
                 collections += 1;
