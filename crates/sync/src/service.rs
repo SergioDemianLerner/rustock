@@ -34,6 +34,14 @@ const BODY_RECLAIM_TIMEOUT: Duration = Duration::from_secs(12);
 /// pipeline deeply without the whole window piling onto one slow peer.
 /// Extra blocks to re-assert below the executed head when repairing the
 /// canonical index, so a repair is not defeated by damage just below the hole.
+/// How long a follow-mode gap must persist, with nothing in flight that could
+/// fill it, before the missing range is re-fetched.
+///
+/// Long enough that ordinary out-of-order responses are never disturbed --
+/// those land within seconds -- and short enough that a permanent gap costs a
+/// minute rather than the twenty hours it cost on mainnet.
+const FOLLOW_GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 const CANONICAL_REPAIR_MARGIN: u64 = 64;
 
 const MAX_BODY_REQUESTS_PER_PEER: usize = 16;
@@ -197,6 +205,13 @@ pub struct SyncService {
     /// processor is attached; tests may override it to control timing/outcome.
     exec_fn: Option<ExecFn>,
     pub(crate) last_body_height: u64,
+    /// When the follow buffer was first seen blocked behind a missing block.
+    ///
+    /// A block arriving before its predecessor is normal -- a gap-pull fires
+    /// several body requests and the responses land out of order -- so a gap is
+    /// only treated as permanent once it has outlived any plausible in-flight
+    /// response.
+    pub(crate) follow_gap_since: Option<std::time::Instant>,
     pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header)>,
     /// Follow-mode blocks whose bodies have arrived, keyed by block number so
     /// they execute in strict order. Body responses for the several headers a
@@ -237,6 +252,7 @@ impl SyncService {
             pending_exec: None,
             exec_fn: None,
             last_body_height: 0,
+            follow_gap_since: None,
             pending_follow_bodies: HashMap::new(),
             follow_buffer: BTreeMap::new(),
             tx_pool: None,
@@ -1728,6 +1744,24 @@ impl SyncService {
                     .map(|h| h.number)
                     .unwrap_or(0);
 
+                // Wait while responses that could fill the gap are still in
+                // flight; out-of-order arrival is ordinary and the buffer exists
+                // precisely to hold those blocks.
+                if !self.pending_follow_bodies.is_empty() {
+                    return;
+                }
+
+                let waited = match self.follow_gap_since {
+                    Some(t) => t.elapsed(),
+                    None => {
+                        self.follow_gap_since = Some(std::time::Instant::now());
+                        return;
+                    }
+                };
+                if waited < FOLLOW_GAP_TIMEOUT {
+                    return;
+                }
+
                 if next_num > exec_number + 1 {
                     // A gap: the block right after our executed head was never
                     // buffered -- missed while the node was busy or restarting,
@@ -1753,6 +1787,7 @@ impl SyncService {
                     self.follow_buffer.clear();
                     self.last_body_height = exec_number;
                     self.pending_exec = None;
+                    self.follow_gap_since = None;
                     self.state = SyncState::Idle;
                 }
                 // Otherwise `next_num` is the very next block and simply does
@@ -1760,6 +1795,7 @@ impl SyncService {
                 // reconcile path handles by rolling the executed head back.
                 return;
             }
+            self.follow_gap_since = None;
             let (hash, header, txs, uncles) = self.follow_buffer.remove(&next_num).unwrap();
             if !self.process_single_block(hash, &header, txs, uncles).await {
                 // Real divergence: head didn't advance, so looping would spin.

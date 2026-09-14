@@ -290,6 +290,14 @@ async fn test_follow_buffer_gap_triggers_refetch_instead_of_stalling() {
     service.follow_buffer.insert(12, (b12.hash(), b12.clone(), vec![], vec![]));
     service.follow_buffer.insert(13, (b13.hash(), b13.clone(), vec![], vec![]));
 
+    // First observation only starts the clock: an out-of-order response may
+    // still be on its way.
+    service.drain_follow_buffer().await;
+    assert_eq!(service.follow_buffer.len(), 2, "a fresh gap must be given time");
+    assert!(matches!(service.state, SyncState::Following));
+
+    // Once it has outlived any plausible in-flight response, re-fetch.
+    service.follow_gap_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
     service.drain_follow_buffer().await;
 
     assert!(
