@@ -2022,6 +2022,118 @@ async fn test_reconcile_rolls_back_orphaned_exec_head() {
         "body cursor should follow the rolled-back head");
 }
 
+#[tokio::test]
+async fn test_follow_mode_tick_reconciles_orphaned_exec_head() {
+    // Same 1-block tip reorg as above, but the node is in follow mode -- the
+    // state it is in whenever a reorg orphans the tip it just executed.
+    //
+    // Follow mode used to have no way to notice: the reconcile that rolls the
+    // executed head back was reachable only from `try_start_sync`, which runs
+    // in `Idle`, so the node stood still until the backlog check or the
+    // execution watchdog forced it out. A tick in `Following` must reconcile
+    // and hand the chain back to the body pipeline, which is the only path
+    // that can re-fetch the canonical blocks.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.update_head(&b1, U256::from(2)).unwrap();
+
+    // Orphan fork: a2 on top of b1 -- the block we executed.
+    let mut a2 = dummy_header(2, b1_hash, U256::from(1));
+    a2.extra_data = vec![0xAA].into();
+    let a2_hash = a2.hash();
+    store.put_header(&a2).unwrap();
+    store.put_total_difficulty(a2_hash, U256::from(3)).unwrap();
+
+    // Canonical fork: b2(#2) <- b3(#3), heavier.
+    let mut b2 = dummy_header(2, b1_hash, U256::from(5));
+    b2.extra_data = vec![0xBB].into();
+    let b2_hash = b2.hash();
+    store.put_header(&b2).unwrap();
+    store.put_total_difficulty(b2_hash, U256::from(7)).unwrap();
+    let b3 = dummy_header(3, b2_hash, U256::from(5));
+    store.update_head(&b3, U256::from(12)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(b1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    store.set_exec_head(a2_hash, a2.state_root).unwrap();
+    service.state = SyncState::Following;
+
+    service.on_tick().await;
+
+    let (rolled_hash, _) = store.exec_head().unwrap().unwrap();
+    assert_eq!(rolled_hash, b1_hash,
+        "a tick in follow mode should roll the orphaned exec head back to b1, got {:?}",
+        rolled_hash);
+    assert!(matches!(service.state, SyncState::Idle),
+        "after rolling back, follow mode must hand over to the body pipeline, state is {:?}",
+        std::mem::discriminant(&service.state));
+    assert_eq!(service.last_body_height_for_test(), 1,
+        "body cursor should follow the rolled-back head");
+}
+
+#[tokio::test]
+async fn test_follow_mode_tick_keeps_following_when_head_is_canonical() {
+    // The reconcile now runs on every follow-mode tick, so it must be inert
+    // when the executed head is on the canonical chain: no rollback, and no
+    // drop out of follow mode.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.update_head(&b1, U256::from(2)).unwrap();
+    let b2 = dummy_header(2, b1_hash, U256::from(1));
+    let b2_hash = b2.hash();
+    store.update_head(&b2, U256::from(3)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(b1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    // Executed head is b1, and the canonical child b2 builds on it.
+    store.set_exec_head(b1_hash, b1.state_root).unwrap();
+    service.state = SyncState::Following;
+
+    service.on_tick().await;
+
+    assert_eq!(store.exec_head().unwrap().map(|(h, _)| h), Some(b1_hash),
+        "a canonical exec head must not be rolled back");
+    assert!(matches!(service.state, SyncState::Following),
+        "the node should still be following");
+    let _ = b2_hash;
+}
+
 // -- Peer serving tests (BlockHeadersRequest, BlockHashRequest, SkeletonRequest) --
 
 #[tokio::test]

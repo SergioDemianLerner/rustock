@@ -455,8 +455,30 @@ impl SyncService {
                 }
             }
             SyncState::Following => {
-                self.check_follow_gap().await;
-                self.leave_follow_if_backlog().await;
+                // A tip reorg can orphan the block we last executed, and follow
+                // mode has no path that notices: `drain_follow_buffer` sees the
+                // next tip fail to link and returns, while the reconcile that
+                // rolls the executed head back is reachable only from
+                // `try_start_sync`, which runs in `Idle`. The node therefore
+                // stands still until the backlog check or the execution
+                // watchdog forces it out -- ninety seconds at best. Observed on
+                // mainnet: twenty orphaned executions in three hours, each
+                // costing that wait, holding the node fifteen to twenty-five
+                // blocks behind the tip.
+                //
+                // Reconcile here, and leave follow mode when it rolls back:
+                // follow mode only executes blocks as they are announced and
+                // cannot re-fetch the canonical ones we now need -- only the
+                // body pipeline can.
+                let before = self.manager.store.exec_head().ok().flatten().map(|(h, _)| h);
+                self.reconcile_exec_head_with_canonical().await;
+                let after = self.manager.store.exec_head().ok().flatten().map(|(h, _)| h);
+                if before != after {
+                    self.state = SyncState::Idle;
+                } else {
+                    self.check_follow_gap().await;
+                    self.leave_follow_if_backlog().await;
+                }
             }
             SyncState::DownloadingBodies { .. } => {
                 // Per-request timeout: re-send only the individually-stalled
