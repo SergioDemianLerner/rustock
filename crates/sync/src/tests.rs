@@ -95,6 +95,158 @@ async fn test_invalid_header_rejected_when_parent_known() {
     assert_eq!(store.head().unwrap(), Some(genesis_hash));
 }
 
+#[tokio::test]
+async fn test_parent_is_taken_from_parent_hash_not_from_batch_position() {
+    // The mainnet defect. A chunk can contain a fork header at a height it
+    // already covers; if the parent is chosen because it is the previous entry
+    // at `number - 1`, the next header is verified against the wrong block.
+    // Observed on RSK mainnet: #9,236,893 checked against #9,236,891.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new()
+        .with_parent_rule(rustock_core::validation::BlockNumberRule)
+        .with_parent_rule(rustock_core::validation::ParentHashRule));
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    // The real chain: genesis <- a1 <- a2.
+    let a1 = dummy_header(1, genesis_hash, U256::from(10));
+    manager.handle_headers_response(vec![a1.clone()]).unwrap();
+
+    // A competing block at height 1, also building on genesis.
+    let mut fork1 = dummy_header(1, genesis_hash, U256::from(11));
+    fork1.timestamp = 999;
+    assert_ne!(fork1.hash(), a1.hash(), "fork must be a different block");
+
+    // A batch carrying the fork immediately before a2. a2's parent is a1.
+    let a2 = dummy_header(2, a1.hash(), U256::from(5));
+    let a2_hash = a2.hash();
+    manager.handle_headers_response(vec![fork1.clone(), a2.clone()]).unwrap();
+
+    assert!(
+        store.header(a2_hash).unwrap().is_some(),
+        "a2 must be accepted: its parent_hash names a1, which is stored. \
+         Verifying it against the fork at the same height rejects valid chain data."
+    );
+    assert_eq!(
+        store.total_difficulty(a2_hash).unwrap(),
+        Some(U256::from(16)),
+        "TD must accumulate through a1 (1+10+5), not through the fork"
+    );
+}
+
+#[tokio::test]
+async fn test_competing_headers_at_one_height_are_both_kept() {
+    // Deduplicating a chunk by block number discards whichever block at a
+    // contested height arrives second -- which may be the canonical one.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new()
+        .with_parent_rule(rustock_core::validation::BlockNumberRule)
+        .with_parent_rule(rustock_core::validation::ParentHashRule));
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    let a1 = dummy_header(1, genesis_hash, U256::from(10));
+    let mut b1 = dummy_header(1, genesis_hash, U256::from(20));
+    b1.timestamp = 777;
+    assert_ne!(a1.hash(), b1.hash());
+
+    manager.handle_headers_response(vec![a1.clone(), b1.clone()]).unwrap();
+
+    assert!(store.header(a1.hash()).unwrap().is_some(), "first block at height 1 kept");
+    assert!(
+        store.header(b1.hash()).unwrap().is_some(),
+        "the competing block at height 1 must also be kept -- that is what a fork is"
+    );
+    // Fork choice still picks the heavier one.
+    assert_eq!(store.head().unwrap(), Some(b1.hash()), "heavier fork wins");
+}
+
+#[tokio::test]
+async fn test_difficulty_is_checked_against_the_true_parent() {
+    // Reproduces the shape of RSK mainnet #9,236,891/892/893, where the middle
+    // block carries an uncle and sits 7s before its child while the grandparent
+    // sits 34s before it. Verifying against the grandparent flips the
+    // adjustment sign and rejects a valid header.
+    use rustock_core::config::ChainConfig;
+    use rustock_core::validation::DifficultyRule;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let config = Arc::new(ChainConfig::mainnet());
+
+    // Heights above papyrus200 so the divisor is 400, matching mainnet.
+    let base = config.activation_heights.papyrus200 + 1_000_000;
+    let step = |d: U256| d / U256::from(400);
+
+    let mut g = dummy_header(base, B256::ZERO, U256::from(6_661_282_993_281_678_603_550u128));
+    g.timestamp = 1_789_321_796;
+    let g_hash = g.hash();
+    store.update_head(&g, g.difficulty).unwrap();
+
+    // Parent: 27s after the grandparent, one uncle, difficulty stepped down.
+    let mut parent = dummy_header(base + 1, g_hash, U256::ZERO);
+    parent.timestamp = 1_789_321_823;
+    parent.uncle_count = 1;
+    // (1 + 1 uncle) * 14 = 28 > 27 elapsed  ->  sign +1
+    parent.difficulty = g.difficulty + step(g.difficulty);
+    let parent_hash = parent.hash();
+
+    // Child: 7s after the parent, no uncles.  (1 + 0) * 14 = 14 > 7  ->  sign +1
+    let mut child = dummy_header(base + 2, parent_hash, U256::ZERO);
+    child.timestamp = 1_789_321_830;
+    child.difficulty = parent.difficulty + step(parent.difficulty);
+    let child_hash = child.hash();
+
+    // Against the grandparent the elapsed time would be 34s, so the sign would
+    // be -1 and the expected difficulty would come out low. Assert the two
+    // really do differ, or the test proves nothing.
+    let against_grandparent = g.difficulty - step(g.difficulty);
+    assert_ne!(child.difficulty, against_grandparent);
+
+    let verifier = Arc::new(HeaderVerifier::new()
+        .with_parent_rule(rustock_core::validation::BlockNumberRule)
+        .with_parent_rule(rustock_core::validation::ParentHashRule)
+        .with_parent_rule(DifficultyRule { config: config.clone() }));
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    // Store the true parent first, as the node would have from an earlier chunk.
+    manager.handle_headers_response(vec![parent.clone()]).unwrap();
+    assert!(store.header(parent_hash).unwrap().is_some(), "parent accepted");
+
+    // A competing block at the parent's height, building on the grandparent
+    // 34s later -- so its own difficulty is a valid -1 step. This is the shape
+    // that produced the mainnet rejection: its difficulty is exactly the
+    // "expected" value that was logged for #9,236,893.
+    let mut fork = dummy_header(base + 1, g_hash, against_grandparent);
+    fork.timestamp = 1_789_321_830;
+    assert_ne!(fork.hash(), parent_hash, "fork must differ from the true parent");
+
+    // The fork arrives immediately before the child. Positionally it looks like
+    // the parent -- same height, right order -- but it is a different block.
+    manager.handle_headers_response(vec![fork.clone(), child.clone()]).unwrap();
+
+    assert!(
+        store.header(child_hash).unwrap().is_some(),
+        "child must be accepted: its difficulty is a correct +1 step from the \
+         block its parent_hash names. Checking it against the fork at the same \
+         height yields a -1 step and rejects valid chain data -- and the missing \
+         canonical entry at its height is what wedges execution."
+    );
+}
+
 // -- SyncHandler tests (event forwarding) --------------------------------
 
 #[tokio::test]
@@ -2790,14 +2942,20 @@ async fn test_pipeline_two_batches_advance_exec_head() {
 
 /// Poll on_tick until no background execution remains in flight.
 async fn drain_executions(service: &mut SyncService) {
-    for _ in 0..100 {
+    // Bounded by wall-clock, not by iteration count. Execution runs on a
+    // background task, so a fixed number of polls is really a bet on how much
+    // CPU this process gets -- and on a loaded machine that bet loses, failing
+    // the test for reasons that have nothing to do with the code under test.
+    // Sleeping rather than only yielding also lets the executor actually run.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if !service.is_executing_for_test() && !service.has_parked_batch_for_test() {
             return;
         }
         service.on_tick().await;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
-    panic!("executions did not drain");
+    panic!("executions did not drain within 30s");
 }
 
 fn exec_head_number(store: &BlockStore) -> u64 {
