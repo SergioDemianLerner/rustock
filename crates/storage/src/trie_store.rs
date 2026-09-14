@@ -52,6 +52,23 @@ impl RocksDbTrieStore {
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(false);
+        // Bound this handle's memory, because these exist to be opened many at
+        // once -- parallel replay over disjoint ranges -- and each one
+        // otherwise pins an index and filter block per SST in an unbounded
+        // table cache. Against a store with a couple of thousand files that is
+        // hundreds of megabytes per handle, and on a small machine it evicts
+        // the page cache the readers depend on: measured, eight readers of one
+        // warm range fell from 46 blocks/s to 12 and began hitting disk again.
+        //
+        // Capping `max_open_files` fixes the memory but costs far more than it
+        // saves -- at 128 against 2,002 SSTs the file churn took a warm reader
+        // from 27 blocks/s to 5.9. Put the index and filter blocks in a bounded
+        // block cache instead, which evicts rather than thrashing handles.
+        let mut block = rocksdb::BlockBasedOptions::default();
+        block.set_block_cache(&rocksdb::Cache::new_lru_cache(64 * 1024 * 1024));
+        block.set_cache_index_and_filter_blocks(true);
+        block.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        opts.set_block_based_table_factory(&block);
         // `false`: tolerate a live writer's WAL files being present.
         let db = DB::open_cf_for_read_only(&opts, path, vec![CF_TRIE], false)
             .map_err(|e| anyhow::anyhow!("Failed to open trie RocksDB read-only: {e}"))?;

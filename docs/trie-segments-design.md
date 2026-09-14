@@ -255,11 +255,86 @@ argument in §1. A 512 MB segment spanning ~30,000 recent-era blocks costs 512 M
 of device reads once and then serves from RAM. The same 30,000 blocks against
 the archive cost ~99 GB of device reads — **roughly 190x more I/O**.
 
-It also bounds the payoff. Freeing the reads lets a worker approach one full
-core, ~5x its current 20%, and four cores cap the total. Expect on the order of
-60--85 blocks/s aggregate against 26 blocks/s now: **~1.3 days for the Unitrie
-era against ~4.3 days**. That is a projection from the CPU headroom, not a
-measurement of a segment store that does not exist yet.
+### 6.6 What a resident working set actually does
+
+A 100-block range, replayed three times, small enough that its footprint fits in
+cache:
+
+| Pass | Rate | Device reads |
+|---|---|---|
+| Cold | 2.63 blocks/s | 1,989 MB |
+| Warm | **26.75 blocks/s** | **0 MB** |
+| Warm again | 27.86 blocks/s | 0 MB |
+
+**10.6x, with the device untouched.** The second pass is what a resident segment
+looks like, so this is the segmented rate measured rather than projected: a
+warm worker runs at **27--35 blocks/s** (35 with the read-only block cache
+configured as below), against 4.5 cold.
+
+Note the amplification at this size: 1,989 MB of device reads for 3.0 MB of
+useful nodes, **656x**. Fewer blocks amortise the SST blocks less, so short
+ranges suffer most.
+
+This also explains what more RAM would and would not do. Caching works
+spectacularly when the working set fits and does nothing when it does not: the
+same experiment over 1,000 blocks (footprint 3.3 GB, above what this machine can
+hold) gained 6%, against 960% for 100 blocks (2.0 GB). A full replay pass never
+revisits a block, so its working set is the whole 131 GB store; enlarging the
+cache from 4.5 GB to 12.5 GB moves the cliff from ~100 blocks of footprint to
+~300 and leaves a single forward pass essentially unchanged. Reorganising the
+data is what removes the 656x, not caching more of it.
+
+### 6.7 Core scaling, with the I/O removed
+
+Every worker replaying the *same* warm range, so the data is shared and cached
+and only CPU is in play. Device reads were zero at every worker count:
+
+| Workers | Aggregate | Per worker | Scaling |
+|---|---|---|---|
+| 1 | 4.57 blocks/s | 4.57 | 1.00x |
+| 2 | 9.09 | 4.55 | 1.99x |
+| 3 | 13.32 | 4.44 | 2.91x |
+| 4 | 14.30 | 3.58 | 3.13x |
+| 6 | 13.89 | 2.31 | 3.04x |
+
+Confirmed over a longer range: 1.00x, 1.95x, 2.84x, 3.23x. **Linear until the
+cores run out** -- the plateau at ~3.2x on four cores is the production node
+taking the rest. So once the working set is resident, throughput tracks core
+count, and doubling cores roughly doubles it until something else binds.
+
+Two things would bind next. Each worker needs its segment resident, so RAM has
+to scale with workers -- 8 x 512 MB plus the OS does not fit in 7.7 GB, which is
+where added memory finally pays, and it pays only after segmenting. And replay
+still reads a header and a body per block from the block store; at 280 blocks/s
+that is ~560 IOPS against a device that saturates near 2,700.
+
+### 6.8 The device
+
+| Sequential read, direct I/O | 211 MB/s |
+|---|---|
+| Random 16K, queue depth 1 | 1,286 IOPS, **0.78 ms** each |
+| Saturated, 4--8 workers | ~43 MB/s |
+
+0.78 ms is network-attached latency, and one worker doing dependent reads sits
+close to that ceiling on its own. Local NVMe (~0.08 ms) would lift the cold path
+without any code change.
+
+### 6.9 Configuring a read-only handle
+
+These handles exist to be opened many at once, and the obvious configurations
+are both wrong on a small machine:
+
+| `max_open_files` | Block cache | Warm rate, 1 worker | 8 workers on one warm range |
+|---|---|---|---|
+| unbounded | default | 27 blocks/s | collapses to 12, hits disk |
+| 128 | default | 5.9 | stable, 0 device reads |
+| unbounded | 64 MB, index+filter cached | **35** | memory-tight above 3 |
+
+An unbounded table cache pins an index and filter block per SST -- hundreds of
+MB per handle against 2,002 files -- and evicts the page cache the readers
+depend on. Capping `max_open_files` fixes the memory and costs 4.6x in file
+churn. A bounded block cache holding index and filter blocks does both, and is
+what `open_read_only` now configures.
 
 ## 7. Answers
 
@@ -301,12 +376,20 @@ for 131 GB and expect to use ~98 GB.
 | Pass | Against the archive | Against segments |
 |---|---|---|
 | Device I/O per 30,000 blocks | ~99 GB | ~0.5 GB |
-| Aggregate throughput | 26 blocks/s (8 workers) | 60--85 blocks/s (projected) |
-| Full Unitrie-era replay | ~4.3 days | **~1.3 days** (projected) |
+| Per-worker rate | 4.5 blocks/s | **27--35** (measured warm, §6.6) |
+| Aggregate on 4 cores | 26 blocks/s (8 workers) | ~90--110 (3 workers x scaling) |
+| Full Unitrie-era replay | ~4.3 days | **~0.9 days** |
 
-The I/O row is measured (§6.5). The throughput row is projected from the 20%
-per-worker CPU utilisation measured there, capped by four cores; it should be
-confirmed against a real segment store before being relied on.
+Both the I/O row and the per-worker rate are measured (§6.5, §6.6); the
+aggregate applies the core scaling of §6.7. What is not measured is a real
+segment store -- these come from a page cache standing in for one.
+
+**On buying hardware.** More RAM alone does almost nothing (§6.6): a forward
+pass never revisits a block, so the cache cannot cover it. More cores do almost
+nothing *first*, because at 8 workers the job uses ~17% of the four cores it
+has. Segment the store and the order reverses -- cores scale it linearly
+(§6.7) and RAM has to keep up with the workers. Faster storage helps in either
+order (§6.8).
 
 The build pass costs one archive-speed traversal -- ~4.3 days -- so it pays for
 itself after roughly one repeat run. Worth it for a regression harness that runs

@@ -159,6 +159,12 @@ impl BlockStore {
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(false);
+        // See `RocksDbTrieStore::open_read_only` for why this is a bounded
+        // block cache rather than a bounded table cache.
+        let mut block = rocksdb::BlockBasedOptions::default();
+        block.set_block_cache(&rocksdb::Cache::new_lru_cache(64 * 1024 * 1024));
+        block.set_cache_index_and_filter_blocks(true);
+        opts.set_block_based_table_factory(&block);
         let cfs = vec![
             CF_HEADERS,
             CF_NUMBERS,
