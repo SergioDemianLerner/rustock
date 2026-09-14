@@ -167,15 +167,25 @@ impl SyncManager {
         // Commit all validated headers in a single atomic batch
         let _new_head = self.store.store_headers_batch(&validated, current_head_hash, current_td)?;
 
-        if skipped > 0 || unverified > 0 {
-            // Rejections are worth a warning, not a debug line: a rejected
-            // header leaves no canonical entry at its height, and a hole in the
-            // canonical index halts execution when it is reached.
+        if skipped > 0 {
+            // A rejection is worth a warning: it leaves no canonical entry at
+            // that height, and a hole in the canonical index halts execution
+            // when it is reached.
             warn!(
                 target: "rustock::sync",
                 "Stored {} headers (#{} -> #{}), rejected {} invalid, {} stored \
                  without a parent to verify against",
                 stored, first_num, last_num, skipped, unverified
+            );
+        } else if unverified > 0 {
+            // Storing a header whose named parent we do not hold is ordinary: a
+            // chunk routinely begins above our head, and the node re-requests
+            // the same range every few seconds while catching up. Warning about
+            // it produced a line every five seconds.
+            debug!(
+                target: "rustock::sync",
+                "Stored {} headers (#{} -> #{}), {} without a parent to verify against",
+                stored, first_num, last_num, unverified
             );
         } else {
             trace!(
