@@ -247,6 +247,103 @@ async fn test_difficulty_is_checked_against_the_true_parent() {
     );
 }
 
+#[tokio::test]
+async fn test_follow_buffer_gap_triggers_refetch_instead_of_stalling() {
+    // The silent stall. In follow mode the lowest buffered block is executed
+    // only if it builds on the executed head; if it does not, the old code
+    // returned and nothing ever fetched the block in between. Later blocks piled
+    // up behind the hole and execution stopped permanently -- observed on
+    // mainnet as a node that executed nothing for twenty hours while downloading
+    // tips the whole time, with no error logged.
+    //
+    // The resync trigger cannot catch it: that compares the *downloaded* head
+    // against peers, and the downloaded head is at the tip.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    // Executed head at #10.
+    let mut parent = genesis.clone();
+    for n in 1..=10u64 {
+        let h = dummy_header(n, parent.hash(), U256::from(1));
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(n, h.hash()).unwrap();
+        parent = h;
+    }
+    let head10 = parent.clone();
+    store.set_exec_head(head10.hash(), head10.state_root).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    service.last_body_height = 99;
+
+    // Buffer #12 and #13 -- #11 never arrived, so nothing links to #10.
+    let b11 = dummy_header(11, head10.hash(), U256::from(1));
+    let b12 = dummy_header(12, b11.hash(), U256::from(1));
+    let b13 = dummy_header(13, b12.hash(), U256::from(1));
+    service.follow_buffer.insert(12, (b12.hash(), b12.clone(), vec![], vec![]));
+    service.follow_buffer.insert(13, (b13.hash(), b13.clone(), vec![], vec![]));
+
+    service.drain_follow_buffer().await;
+
+    assert!(
+        service.follow_buffer.is_empty(),
+        "the stale buffer must be dropped so the missing range can be re-fetched"
+    );
+    assert_eq!(
+        service.last_body_height, 10,
+        "the body cursor must rewind to the executed head so the sync path \
+         re-fetches #11 onward"
+    );
+    assert!(
+        matches!(service.state, SyncState::Idle),
+        "must leave follow mode so a sync round can start; staying in Following \
+         is what made this stall permanent"
+    );
+}
+
+#[tokio::test]
+async fn test_follow_buffer_keeps_waiting_on_a_same_height_reorg() {
+    // The other reason the lowest buffered block may not link: it is the very
+    // next block but builds on a different block at our head's height. That is a
+    // reorg, handled by the reconcile path, and must NOT trigger a re-fetch --
+    // otherwise every tip reorg would throw away the follow buffer.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let a1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&a1).unwrap();
+    store.set_exec_head(a1.hash(), a1.state_root).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    service.last_body_height = 1;
+
+    // #2 building on a *different* #1.
+    let mut fork1 = dummy_header(1, genesis.hash(), U256::from(2));
+    fork1.timestamp = 4242;
+    let b2 = dummy_header(2, fork1.hash(), U256::from(1));
+    service.follow_buffer.insert(2, (b2.hash(), b2.clone(), vec![], vec![]));
+
+    service.drain_follow_buffer().await;
+
+    assert_eq!(service.follow_buffer.len(), 1, "buffer kept: this is a reorg, not a gap");
+    assert_eq!(service.last_body_height, 1, "cursor untouched");
+    assert!(matches!(service.state, SyncState::Following), "stays in follow mode");
+}
+
 // -- SyncHandler tests (event forwarding) --------------------------------
 
 #[tokio::test]

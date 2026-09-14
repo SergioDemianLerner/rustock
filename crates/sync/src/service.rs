@@ -196,7 +196,7 @@ pub struct SyncService {
     /// Closure run on a blocking thread to execute a batch. Set when a block
     /// processor is attached; tests may override it to control timing/outcome.
     exec_fn: Option<ExecFn>,
-    last_body_height: u64,
+    pub(crate) last_body_height: u64,
     pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header)>,
     /// Follow-mode blocks whose bodies have arrived, keyed by block number so
     /// they execute in strict order. Body responses for the several headers a
@@ -1699,7 +1699,7 @@ impl SyncService {
     /// starting from the executed head. Stops at the first gap (a buffered
     /// block whose parent isn't our current head — its predecessor hasn't
     /// arrived yet) or the first execution failure.
-    async fn drain_follow_buffer(&mut self) {
+    pub(crate) async fn drain_follow_buffer(&mut self) {
         loop {
             let head_hash = match self.manager.store.exec_head().ok().flatten() {
                 Some((hash, _)) => hash,
@@ -1716,6 +1716,48 @@ impl SyncService {
                 .get(&next_num)
                 .is_some_and(|(_, header, _, _)| header.parent_hash == head_hash);
             if !links {
+                // The lowest buffered block does not build on what we executed.
+                // Two quite different situations produce that, and only one of
+                // them resolves on its own.
+                let exec_number = self
+                    .manager
+                    .store
+                    .header(head_hash)
+                    .ok()
+                    .flatten()
+                    .map(|h| h.number)
+                    .unwrap_or(0);
+
+                if next_num > exec_number + 1 {
+                    // A gap: the block right after our executed head was never
+                    // buffered -- missed while the node was busy or restarting,
+                    // or simply never announced. Nothing in the follow path ever
+                    // fetches it, so every later block piles up behind a hole
+                    // and execution stops for good. Observed on mainnet: a node
+                    // executed nothing for twenty hours while downloading tips
+                    // the whole time, with no error logged.
+                    //
+                    // The sync trigger cannot notice, because it compares the
+                    // *downloaded* head against peers and that is at the tip.
+                    // Recover the way an execution failure does: rewind the body
+                    // cursor to the executed head and let the normal sync round
+                    // re-fetch and re-execute the missing range.
+                    warn!(
+                        target: "rustock::sync",
+                        "Follow buffer starts at #{next_num} but the executed head is \
+                         #{exec_number}; blocks #{}..#{} are missing. Rewinding to \
+                         re-fetch them.",
+                        exec_number + 1,
+                        next_num - 1
+                    );
+                    self.follow_buffer.clear();
+                    self.last_body_height = exec_number;
+                    self.pending_exec = None;
+                    self.state = SyncState::Idle;
+                }
+                // Otherwise `next_num` is the very next block and simply does
+                // not extend our head -- a reorg at that height, which the
+                // reconcile path handles by rolling the executed head back.
                 return;
             }
             let (hash, header, txs, uncles) = self.follow_buffer.remove(&next_num).unwrap();
