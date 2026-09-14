@@ -1,48 +1,51 @@
-//! Print a canonical block's header essentials and a per-transaction summary.
+//! Writes a block's stored bytes to disk, for attaching to a bug report.
 //!
-//! Usage: cargo run -p rustock-cli --release --example dump_block -- <data-dir> <number>
+//! Emits the header RLP, the body RLP, and a manifest of the header fields as
+//! text. Opens the database read-only.
+//!
+//! ```text
+//! dump_block /var/lib/rustock 9236893 /tmp/out
+//! ```
 
-use rustock_storage::BlockStore;
+use anyhow::{Context, Result};
+use alloy_primitives::B256;
 
-fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let data_dir = args.next().expect("usage: dump_block <data-dir> <number>");
-    let number: u64 = args.next().expect("usage: dump_block <data-dir> <number>").parse()?;
+fn main() -> Result<()> {
+    let mut a = std::env::args().skip(1);
+    let dir = a.next().context("usage: dump_block <datadir> <block> <outdir>")?;
+    let num: u64 = a.next().context("missing block")?.parse()?;
+    let out = a.next().context("missing outdir")?;
+    std::fs::create_dir_all(&out)?;
 
-    let store = BlockStore::open(&data_dir)?;
-    let hash = store.canonical_hash(number)?.expect("no canonical hash for number");
-    let hdr = store.header(hash)?.expect("no header");
-    println!("#{number} hash={hash:?}");
-    println!("  parent={:?}", hdr.parent_hash);
-    println!("  state_root={:?}", hdr.state_root);
-    println!("  gas_used={} gas_limit={}", hdr.gas_used, hdr.gas_limit);
-    println!("  coinbase={:?}", hdr.beneficiary);
+    let mut o = rocksdb::Options::default();
+    o.create_if_missing(false);
+    o.set_max_open_files(256);
+    let cfs = ["headers", "block_numbers", "total_difficulty", "block_bodies",
+               "receipts", "tx_index", "trie_nodes"];
+    let db = rocksdb::DB::open_cf_for_read_only(&o, &dir, cfs, false)
+        .with_context(|| format!("opening {dir}"))?;
 
-    match store.body(hash)? {
-        Some((txs, ommers)) => {
-            println!("  ommers={}", ommers.len());
-            println!("  txs={}", txs.len());
-            for (i, tx) in txs.iter().enumerate() {
-                let to = if tx.to.is_empty() {
-                    "CREATE".to_string()
-                } else {
-                    format!("0x{}", hex::encode(&tx.to))
-                };
-                println!(
-                    "    [{i}] nonce={} to={to} value={} gas_limit={} gas_price={} input_len={}",
-                    tx.nonce,
-                    tx.value,
-                    tx.gas_limit,
-                    tx.gas_price,
-                    tx.input.len(),
-                );
-                if !tx.input.is_empty() {
-                    let head = &tx.input[..tx.input.len().min(4)];
-                    println!("        selector=0x{}", hex::encode(head));
-                }
-            }
+    let cf_n = db.cf_handle("block_numbers").context("no block_numbers")?;
+    let cf_h = db.cf_handle("headers").context("no headers")?;
+    let cf_b = db.cf_handle("block_bodies").context("no block_bodies")?;
+
+    let hash = db.get_cf(cf_n, num.to_be_bytes())?
+        .ok_or_else(|| anyhow::anyhow!("no canonical block at #{num}"))?;
+    let hash = B256::from_slice(&hash);
+
+    let header = db.get_cf(cf_h, hash.as_slice())?
+        .ok_or_else(|| anyhow::anyhow!("header missing"))?;
+    std::fs::write(format!("{out}/block-{num}-header.rlp"), &header)?;
+    println!("header  {} bytes -> block-{num}-header.rlp", header.len());
+
+    match db.get_cf(cf_b, hash.as_slice())? {
+        Some(body) => {
+            std::fs::write(format!("{out}/block-{num}-body.rlp"), &body)?;
+            println!("body    {} bytes -> block-{num}-body.rlp", body.len());
         }
-        None => println!("  (no body stored)"),
+        None => println!("body    absent"),
     }
+
+    println!("hash    {hash:?}");
     Ok(())
 }
