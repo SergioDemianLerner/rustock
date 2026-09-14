@@ -28,6 +28,10 @@
 //! a height at or above the floor because lower ones are not "ours", and the RPC
 //! answers `null` for a pruned height exactly as it does for an unknown one.
 //!
+//! Genesis is always retained. It costs one block and keeps every "start of the
+//! chain" lookup working, so the gap is a hole in the middle of the chain rather
+//! than a missing beginning.
+//!
 //! The floor is recorded in the database -- number, hash and total difficulty --
 //! so a node can say what it holds without a scan, and so the value needed to
 //! keep total difficulty accumulating is never the thing that was deleted.
@@ -136,11 +140,17 @@ impl BlockStore {
         };
 
         let floor = self.prune_floor()?;
-        // Resume *at* the floor, not past it. The floor is the lowest block
-        // still held, so it is the next one eligible to go; starting at
-        // `floor + 1` leaves that block behind on every resumed sweep, stranding
-        // data below the floor that nothing will ever report or reclaim.
-        let from = floor.as_ref().map(|f| f.number).unwrap_or(0);
+        // Resume *at* the floor, not past it. The floor is the lowest pruned-to
+        // block, so it is the next one eligible to go; starting at `floor + 1`
+        // leaves one block behind on every resumed sweep, stranding data below
+        // the floor that nothing will ever report or reclaim.
+        //
+        // Genesis is never pruned, so the first prunable block is 1. Keeping it
+        // costs one block and removes a class of edge cases: every "start of the
+        // chain" lookup keeps working, and the chain retains an anchor whose
+        // hash is fixed by the network rather than by what this node happens
+        // still to hold.
+        let from = floor.as_ref().map(|f| f.number).unwrap_or(1).max(1);
         if from > target {
             debug!(target: "rustock::prune", "Already pruned to #{}", from.saturating_sub(1));
             return Ok(stats);
@@ -207,6 +217,21 @@ impl BlockStore {
             new_floor.as_ref().map(|f| f.number).unwrap_or(new_floor_number)
         );
         Ok(stats)
+    }
+
+    /// The lowest block above genesis that the database holds contiguously: the
+    /// prune floor if it has been pruned, genesis otherwise.
+    ///
+    /// Genesis itself is always present, so this is not "the oldest block" so
+    /// much as "where uninterrupted history begins". Callers that need a chain
+    /// anchor can keep using block 0.
+    pub fn oldest_block(&self) -> Result<Option<(u64, B256)>> {
+        if let Some(f) = self.prune_floor()? {
+            if self.canonical_hash(f.number)? == Some(f.hash) {
+                return Ok(Some((f.number, f.hash)));
+            }
+        }
+        Ok(self.canonical_hash(0)?.map(|h| (0, h)))
     }
 
     /// Builds the floor record for a block that is being retained.
@@ -332,6 +357,25 @@ mod tests {
     }
 
     #[test]
+    fn genesis_is_never_pruned() {
+        // Keeping block 0 costs one block and keeps every "start of the chain"
+        // lookup working, so a pruned database has a hole in the middle rather
+        // than a missing beginning.
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hashes = chain(&store, 12_000);
+
+        store
+            .prune_blocks(&PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 }, 11_999)
+            .unwrap();
+
+        assert_eq!(store.canonical_hash(0).unwrap(), Some(hashes[0]), "genesis kept");
+        assert!(store.header(hashes[0]).unwrap().is_some(), "genesis header kept");
+        assert!(store.canonical_hash(1).unwrap().is_none(), "block 1 pruned");
+        assert!(store.header(hashes[1]).unwrap().is_none());
+    }
+
+    #[test]
     fn records_a_floor_that_can_be_read_back() {
         let dir = tempdir().unwrap();
         let store = BlockStore::open(dir.path()).unwrap();
@@ -342,7 +386,7 @@ mod tests {
             .unwrap();
 
         let floor = store.prune_floor().unwrap().expect("floor recorded");
-        assert_eq!(floor.number, 8_999 - MIN_KEEP_DEPTH + 1);
+        assert_eq!(floor.number, 8_999 - MIN_KEEP_DEPTH + 1, "floor is the lowest retained block");
         // The floor's own data is retained, including the total difficulty that
         // everything below it used to carry.
         assert_eq!(store.canonical_hash(floor.number).unwrap(), Some(floor.hash));
@@ -363,7 +407,9 @@ mod tests {
         for _ in 0..20 {
             total += store.prune_blocks(&cfg, 11_999).unwrap().blocks;
         }
-        assert_eq!(total, 11_999 - MIN_KEEP_DEPTH + 1, "all prunable blocks removed across sweeps");
+        // Blocks 1..=target are prunable; genesis is retained, so the count is
+        // `target`, not `target + 1`.
+        assert_eq!(total, 11_999 - MIN_KEEP_DEPTH, "all prunable blocks removed across sweeps");
 
         // Running again removes nothing and does not move the floor.
         let before = store.prune_floor().unwrap().unwrap();
