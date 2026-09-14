@@ -357,7 +357,7 @@ impl BlockProcessor {
 }
 
 /// Compute the Keccak256 hash of the RLP-encoded list of ommer headers.
-fn compute_ommers_hash(ommers: &[rustock_core::Header]) -> B256 {
+pub fn compute_ommers_hash(ommers: &[rustock_core::Header]) -> B256 {
     use alloy_rlp::Encodable;
     use sha3::{Digest, Keccak256};
 
