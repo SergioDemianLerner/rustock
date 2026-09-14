@@ -471,6 +471,26 @@ async fn test_unanswered_follow_body_requests_expire() {
     );
 }
 
+#[test]
+fn test_backlog_decision() {
+    // Follow mode cannot execute a backlog already in the store, so a node that
+    // executes must clear one before following. This is the decision that made
+    // the mainnet stall self-sustaining: both recovery paths rewound the cursor
+    // and dropped to Idle, and the next tick saw a small gap and returned to
+    // follow mode having executed nothing.
+    use super::service::backlog_needs_executing;
+
+    // Blocks downloaded past the executed head: must be executed first.
+    assert!(backlog_needs_executing(true, 10, 4));
+    assert!(backlog_needs_executing(true, 5, 4), "even one block counts");
+
+    // Caught up: nothing to do.
+    assert!(!backlog_needs_executing(true, 4, 4));
+
+    // A node that does not execute cannot fall behind on execution.
+    assert!(!backlog_needs_executing(false, 10, 4));
+}
+
 // -- SyncHandler tests (event forwarding) --------------------------------
 
 #[tokio::test]

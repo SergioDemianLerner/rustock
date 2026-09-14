@@ -57,6 +57,18 @@ const EXEC_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// forever, which is what it was.
 const FOLLOW_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Whether downloaded-but-unexecuted blocks must be executed before following.
+///
+/// Follow mode only executes blocks that arrive as fresh announcements; it has
+/// no path for a backlog already in the store. Entering it with one leaves those
+/// blocks unexecuted forever, and the backlog grows with every new tip.
+///
+/// Only applies to a node that executes: without a block processor there is no
+/// execution to fall behind.
+pub(crate) fn backlog_needs_executing(has_processor: bool, downloaded: u64, executed: u64) -> bool {
+    has_processor && downloaded > executed
+}
+
 const CANONICAL_REPAIR_MARGIN: u64 = 64;
 
 const MAX_BODY_REQUESTS_PER_PEER: usize = 16;
@@ -798,6 +810,27 @@ impl SyncService {
         // or above the executed head.
         if self.block_processor.is_some() {
             self.last_body_height = head.number;
+        }
+
+        // Blocks may already be downloaded but not yet executed. Follow mode
+        // only executes blocks that arrive as fresh announcements -- it has no
+        // path for a backlog already sitting in the store -- so entering it here
+        // leaves those blocks unexecuted forever, and the backlog grows with
+        // every new tip.
+        //
+        // This is what made the stall self-sustaining. Both recovery paths
+        // rewound the cursor to the executed head and dropped to Idle, and the
+        // very next tick came back through here, saw a small gap, and returned
+        // to follow mode without executing anything.
+        let downloaded = self.our_head_number();
+        if backlog_needs_executing(self.block_processor.is_some(), downloaded, head.number) {
+            info!(
+                target: "rustock::sync",
+                "{} block(s) downloaded but not executed (#{} -> #{}); executing before following",
+                downloaded - head.number, head.number, downloaded
+            );
+            self.start_body_downloads(metadata.best_number).await;
+            return;
         }
 
         if head.number >= metadata.best_number {
