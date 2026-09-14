@@ -64,94 +64,77 @@ impl SyncManager {
             None => U256::ZERO,
         };
 
-        // Track the previous header's TD by position for sequential propagation.
-        // Java's RLP encoding may differ from our canonical encoding, so
-        // header.hash() can produce a different value than what the next
-        // header's parent_hash field contains.  Hash-based parent lookup in
-        // `pending` would then fail.  Since headers in a chunk are always in
-        // ascending block-number order and form a chain, we propagate TD by
-        // position: header[i+1]'s parent TD is header[i]'s TD.
+        // Propagate total difficulty positionally through the chunk, but never
+        // *identify the parent* positionally. Headers in a chunk are normally a
+        // chain, so the previous entry is usually the parent -- but "usually" is
+        // not a rule the consensus check may rely on. A chunk can carry a fork
+        // header at a height it already covered, or arrive out of order, and
+        // then the previous entry is a different block at the right height, or
+        // the right block at the wrong height.
+        //
+        // Verifying a header against anything other than the block its own
+        // `parent_hash` names produces a wrong expected difficulty and rejects
+        // valid chain data. That was observed on mainnet: #9,236,893 was checked
+        // against #9,236,891, whose timestamp is 34s earlier rather than 7s, so
+        // the adjustment sign flipped and the expected difficulty came out 0.75%
+        // low. A rejected header writes no canonical entry, and the resulting
+        // hole in the index later wedged execution entirely.
         let mut prev_in_chunk: Option<(&Header, U256)> = None;
         let mut validated: Vec<(&Header, U256)> = Vec::with_capacity(headers.len());
         let mut skipped = 0u64;
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut unverified = 0u64;
+        // Deduplicate by hash, not by block number. Two different blocks may
+        // legitimately share a height -- that is what a fork is -- and dropping
+        // the second means dropping whichever of them arrived last, which may be
+        // the canonical one.
+        let mut seen: std::collections::HashSet<B256> = std::collections::HashSet::new();
 
         for header in &headers {
-            // Skip duplicates within this batch (by block number)
-            if !seen.insert(header.number) {
+            let hash = header.hash();
+            if !seen.insert(hash) {
                 continue;
             }
 
-            let hash = header.hash();
             let already_stored = self.store.header(hash)?.is_some();
 
-            // Determine parent header and TD:
-            // 1) Sequential from the previous header in this chunk (most common)
-            // 2) Fall back to store lookup by parent_hash (for the first header)
+            // The parent is the block named by `parent_hash`, and nothing else.
+            // Take it from the chunk when the previous entry *is* that block,
+            // otherwise from the store.
             #[allow(unused_assignments)]
             let mut parent_from_store: Option<Header> = None;
             let parent_ref: Option<&Header>;
             let parent_td: U256;
 
-            if let Some((prev_hdr, prev_td)) = prev_in_chunk {
-                if header.number == prev_hdr.number + 1 {
+            match prev_in_chunk {
+                Some((prev_hdr, prev_td)) if prev_hdr.hash() == header.parent_hash => {
                     parent_ref = Some(prev_hdr);
                     parent_td = prev_td;
-                } else {
-                    // Non-sequential — fall back to store lookup
+                }
+                _ => {
                     parent_from_store = self.store.header(header.parent_hash)?;
                     if parent_from_store.is_some() {
                         parent_ref = parent_from_store.as_ref();
-                        parent_td = self.store
+                        parent_td = self
+                            .store
                             .total_difficulty(header.parent_hash)?
                             .unwrap_or_default();
-                    } else if header.number > 0 {
-                        let parent_number = header.number - 1;
-                        if let Some(canonical_hash) = self.store.canonical_hash(parent_number)? {
-                            parent_from_store = self.store.header(canonical_hash)?;
-                            parent_ref = parent_from_store.as_ref();
-                            parent_td = if parent_ref.is_some() {
-                                self.store.total_difficulty(canonical_hash)?.unwrap_or_default()
-                            } else {
-                                U256::ZERO
-                            };
-                        } else {
-                            parent_ref = None;
-                            parent_td = U256::ZERO;
-                        }
                     } else {
+                        // The named parent is not held. Do not substitute the
+                        // canonical block at `number - 1`: it is a different
+                        // block, and checking against it rejects valid headers.
+                        // Accept the header unverified and let the body/execution
+                        // path reject it if it really does not belong -- losing a
+                        // check is recoverable, discarding valid chain data is not.
                         parent_ref = None;
                         parent_td = U256::ZERO;
+                        unverified += 1;
+                        debug!(
+                            target: "rustock::sync",
+                            "Header #{} ({:?}): parent {:?} not held; storing without \
+                             difficulty verification",
+                            header.number, hash, header.parent_hash
+                        );
                     }
-                }
-            } else {
-                // First header in the chunk — look up parent from store.
-                // Try by parent_hash first; if not found (Java non-canonical RLP
-                // hash mismatch), fall back to canonical number → hash lookup.
-                parent_from_store = self.store.header(header.parent_hash)?;
-                if parent_from_store.is_some() {
-                    parent_ref = parent_from_store.as_ref();
-                    parent_td = self.store
-                        .total_difficulty(header.parent_hash)?
-                        .unwrap_or_default();
-                } else if header.number > 0 {
-                    // Fall back: look up parent by block number
-                    let parent_number = header.number - 1;
-                    if let Some(canonical_hash) = self.store.canonical_hash(parent_number)? {
-                        parent_from_store = self.store.header(canonical_hash)?;
-                        parent_ref = parent_from_store.as_ref();
-                        parent_td = if parent_ref.is_some() {
-                            self.store.total_difficulty(canonical_hash)?.unwrap_or_default()
-                        } else {
-                            U256::ZERO
-                        };
-                    } else {
-                        parent_ref = None;
-                        parent_td = U256::ZERO;
-                    }
-                } else {
-                    parent_ref = None;
-                    parent_td = U256::ZERO;
                 }
             }
 
@@ -184,11 +167,15 @@ impl SyncManager {
         // Commit all validated headers in a single atomic batch
         let _new_head = self.store.store_headers_batch(&validated, current_head_hash, current_td)?;
 
-        if skipped > 0 {
-            debug!(
+        if skipped > 0 || unverified > 0 {
+            // Rejections are worth a warning, not a debug line: a rejected
+            // header leaves no canonical entry at its height, and a hole in the
+            // canonical index halts execution when it is reached.
+            warn!(
                 target: "rustock::sync",
-                "Stored {} headers (#{} -> #{}), rejected {} invalid",
-                stored, first_num, last_num, skipped
+                "Stored {} headers (#{} -> #{}), rejected {} invalid, {} stored \
+                 without a parent to verify against",
+                stored, first_num, last_num, skipped, unverified
             );
         } else {
             trace!(
