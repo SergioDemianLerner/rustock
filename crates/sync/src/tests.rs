@@ -434,6 +434,43 @@ async fn test_execution_watchdog_is_quiet_when_there_is_nothing_to_execute() {
     assert_eq!(service.last_body_height, 1, "cursor untouched");
 }
 
+#[tokio::test]
+async fn test_unanswered_follow_body_requests_expire() {
+    // The root cause of the stall. A follow-mode body request a peer never
+    // answered stayed in the map forever: the block was never re-requested, and
+    // both recovery paths stand down while the map is non-empty, so one stuck
+    // entry disabled every mechanism that could have noticed.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    let h = dummy_header(1, genesis.hash(), U256::from(1));
+    // A fresh request is left alone.
+    service.pending_follow_bodies.insert(7, (h.hash(), h.clone(), std::time::Instant::now()));
+    service.on_tick().await;
+    assert_eq!(service.pending_follow_bodies.len(), 1, "a fresh request must not be dropped");
+
+    // One that has gone unanswered is dropped, so the block can be re-requested
+    // and the recovery paths can see an idle pipeline.
+    service.pending_follow_bodies.insert(
+        7,
+        (h.hash(), h, std::time::Instant::now() - std::time::Duration::from_secs(120)),
+    );
+    service.on_tick().await;
+    assert!(
+        service.pending_follow_bodies.is_empty(),
+        "an unanswered request must not block the pipeline forever"
+    );
+}
+
 // -- SyncHandler tests (event forwarding) --------------------------------
 
 #[tokio::test]
@@ -1887,7 +1924,7 @@ async fn test_follow_mode_buffers_out_of_order_body() {
 
     // Body for #102 arrives while #101 is still missing.
     let req_id = 42u64;
-    service.pending_follow_bodies.insert(req_id, (h102_hash, h102));
+    service.pending_follow_bodies.insert(req_id, (h102_hash, h102, std::time::Instant::now()));
     service.on_body_response(req_id, vec![], vec![]).await;
 
     // #102 must remain buffered (parent #101 is not our head), not executed.

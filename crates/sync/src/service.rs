@@ -50,6 +50,13 @@ const FOLLOW_GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6
 /// stall costs minutes rather than the twenty hours it cost unfixed.
 const EXEC_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long a follow-mode body request may go unanswered before it is dropped
+/// and the block re-requested.
+///
+/// Comfortably longer than any healthy round trip, and far shorter than
+/// forever, which is what it was.
+const FOLLOW_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 const CANONICAL_REPAIR_MARGIN: u64 = 64;
 
 const MAX_BODY_REQUESTS_PER_PEER: usize = 16;
@@ -227,7 +234,16 @@ pub struct SyncService {
     /// only treated as permanent once it has outlived any plausible in-flight
     /// response.
     pub(crate) follow_gap_since: Option<std::time::Instant>,
-    pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header)>,
+    /// Follow-mode body requests awaiting a response, with when each was sent.
+    ///
+    /// The timestamp is the point. Entries used to be removed only when a
+    /// matching response arrived, so a request a peer never answered -- it
+    /// disconnected, or the response was dropped -- stayed here forever. The
+    /// block was never re-requested, every later block piled up behind the hole
+    /// it left, and execution stopped for good. Worse, two separate recovery
+    /// paths check this map for in-flight work and stand down when it is
+    /// non-empty, so a single stuck entry disabled both of them.
+    pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header, Instant)>,
     /// Follow-mode blocks whose bodies have arrived, keyed by block number so
     /// they execute in strict order. Body responses for the several headers a
     /// gap-pull requests can land out of order; executing them as they arrive
@@ -406,6 +422,7 @@ impl SyncService {
         // so a parked next batch can start executing and downloads can resume.
         self.poll_execution().await;
 
+        self.expire_stale_follow_bodies();
         self.check_execution_progress();
 
         match &self.state {
@@ -606,6 +623,26 @@ impl SyncService {
         );
     }
 
+    /// Drop follow-mode body requests a peer never answered.
+    ///
+    /// Without this the entry lives forever: the block is never re-requested,
+    /// and the two recovery paths that treat a non-empty map as "work in
+    /// flight" never act. Expiring lets the next tip re-request the body and
+    /// lets those recoveries see an idle pipeline.
+    fn expire_stale_follow_bodies(&mut self) {
+        let before = self.pending_follow_bodies.len();
+        self.pending_follow_bodies
+            .retain(|_, (_, _, sent)| sent.elapsed() < FOLLOW_BODY_TIMEOUT);
+        let expired = before - self.pending_follow_bodies.len();
+        if expired > 0 {
+            warn!(
+                target: "rustock::sync",
+                "Expired {expired} follow-mode body request(s) with no response; \
+                 the blocks will be re-requested"
+            );
+        }
+    }
+
     /// Restart the pipeline if execution has stopped while blocks are waiting.
     ///
     /// This is a watchdog over the one thing nothing else measures. Header
@@ -644,8 +681,21 @@ impl SyncService {
         }
 
         // Executing a batch, or holding one ready, is progress in flight.
+        //
+        // Report rather than silently reset: a batch that never finishes looks
+        // exactly like one making progress, and treating it as healthy is how a
+        // watchdog ends up never firing. If this line repeats, execution is
+        // wedged inside the pipeline rather than starved of work.
         if self.executing.is_some() || self.pending_exec.is_some() {
-            self.last_exec_progress = Instant::now();
+            if self.last_exec_progress.elapsed() >= EXEC_STALL_TIMEOUT {
+                warn!(
+                    target: "rustock::sync",
+                    "Execution stuck at #{exec_height} for {}s with #{downloaded} downloaded, \
+                     but a batch is {} -- watchdog deferring",
+                    self.last_exec_progress.elapsed().as_secs(),
+                    if self.executing.is_some() { "in flight" } else { "parked" }
+                );
+            }
             return;
         }
 
@@ -656,8 +706,10 @@ impl SyncService {
         warn!(
             target: "rustock::sync",
             "Execution has not advanced past #{exec_height} for {}s while #{downloaded} is \
-             downloaded; restarting the block pipeline",
-            self.last_exec_progress.elapsed().as_secs()
+             downloaded (state {:?}, body cursor #{}); restarting the block pipeline",
+            self.last_exec_progress.elapsed().as_secs(),
+            std::mem::discriminant(&self.state),
+            self.last_body_height
         );
         self.follow_buffer.clear();
         self.follow_gap_since = None;
@@ -1522,7 +1574,8 @@ impl SyncService {
                 let (req_id, msg) = create_body_request(hash);
                 let peer = &peers[0];
                 self.peer_store.send_to_peer(peer, msg).await;
-                self.pending_follow_bodies.insert(req_id, (hash, header.clone()));
+                self.pending_follow_bodies
+                    .insert(req_id, (hash, header.clone(), Instant::now()));
             }
         }
     }
@@ -1763,7 +1816,7 @@ impl SyncService {
             }
             SyncState::Following => {
                 self.state = SyncState::Following;
-                if let Some((hash, header)) = self.pending_follow_bodies.remove(&request_id) {
+                if let Some((hash, header, _sent)) = self.pending_follow_bodies.remove(&request_id) {
                     if let Err(e) = self.manager.store.put_body(hash, &transactions, &uncles) {
                         error!(
                             target: "rustock::sync",
