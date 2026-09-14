@@ -312,10 +312,70 @@ The build pass costs one archive-speed traversal -- ~4.3 days -- so it pays for
 itself after roughly one repeat run. Worth it for a regression harness that runs
 often; not worth it for a single verification.
 
-## 8. What this does not answer
+## 8. Blocks 0--1,590,999: a recorded-roots baseline
 
-- **Blocks 0--1,590,999.** Pre-Unitrie, no state in the snapshot, serial by
-  necessity, and verified only by Orchid conversion. Separate problem.
+Sergio's proposal for the pre-RSKIP126 era: record the Unitrie root each block
+*computes* -- not the one its header declares, which is Orchid-format -- into a
+side database, and check later runs against it. 1,591,000 blocks x 32 bytes is
+~51 MB.
+
+**It is serial only once.** The design above calls this era serial by necessity;
+that is wrong, and the baseline is what makes it wrong. The era cannot be
+range-parallelised today only because no historical state exists to start a
+worker mid-chain -- unlike the Unitrie era, where the snapshot is archival. A
+baseline pass supplies the missing starting roots, and if it also writes its
+nodes into segments, later runs replay 0--1,590,999 in parallel like the rest of
+the chain. Record the root keyed so that a worker starting at block N can look
+up its parent's.
+
+**It needs an anchor, or it preserves whatever rustock does today.** A recorded
+baseline checks rustock against itself: a wrong root at #400,000 becomes
+permanent and every later run agrees with it. That is regression detection, not
+correctness -- worth having, but only trustworthy if something independent
+validates it.
+
+One independent check exists and is a single comparison. **#1,591,000 is the
+first block whose header carries a Unitrie root.** Replaying 0 -> #1,591,000
+from genesis and matching that header validates the entire cumulative pre-Unitrie
+state -- every balance, nonce, code blob and storage cell that survived to that
+point. Trust the baseline only if that anchor holds.
+
+The finer-grained check would be the Orchid conversion, per block or at
+intervals, which is what rskj 1.x did while building its Unitrie from genesis.
+It is unavailable today: since rustock started writing REMASC's `siblings`
+storage cell, `orchid_state_root` no longer reproduces the pre-126 header root
+(`quirks-frozen-bugs.md` §9c, logged as an open item). Measured here, the
+failure is *not* uniform -- blocks #1 to ~#6,000 mismatch and #8,000 to #20,000
+all match -- so it depends on the shape of the REMASC storage subtree rather
+than being broken outright. Fixing the converter's `addStorageBytes` handling
+would turn the anchor from one end-of-era comparison into a bisection tool.
+
+**Version-tag the database.** A deliberate change to trie encoding or key
+mapping legitimately changes every recorded root; without a schema tag that
+reads as 1,591,000 failures instead of one "baseline is stale".
+
+### 8.1 Cost
+
+`cargo run --release -p rustock-cli --example pre_unitrie_roots -- <block-dir>
+<trie-dir> <count> [orchid-interval] [csv]` replays from genesis, recording the
+computed root per block and optionally running the Orchid check.
+
+| | |
+|---|---|
+| Replay rate, first 20,000 blocks | **99 blocks/s** |
+| Orchid conversion at 20,000 blocks | 214 ms, growing with trie size |
+| Baseline database | ~51 MB |
+
+Early blocks run 20x faster than Unitrie-era ones (4--5 blocks/s): they are
+nearly empty and the whole trie stays resident, which is the same locality
+effect §6.5 measures from the other side.
+
+## 9. What this does not answer
+
+- **The Orchid converter.** §8 wants it for per-block ground truth below
+  #1,591,000, and it does not currently reproduce the header root. Whether the
+  #1,591,000 anchor itself holds is also untested -- nobody has replayed the era
+  from genesis to the end.
 - **The projected 60--85 blocks/s.** §6.5 measures the I/O saved and the CPU
   headroom available, not the rate a real segment store achieves.
 - **Bodies.** Replay also reads a header and a body per block from the 35 GB
