@@ -336,6 +336,58 @@ depend on. Capping `max_open_files` fixes the memory and costs 4.6x in file
 churn. A bounded block cache holding index and filter blocks does both, and is
 what `open_read_only` now configures.
 
+### 6.10 Sliding-window miss rate
+
+The build design Sergio proposed keeps the last few block-ranges' nodes in RAM
+and falls back further only on a miss, so the whole thing turns on a number:
+what fraction of reads touch state older than the resident window.
+
+`trie_window` records, for every read, how many blocks ago that node was last
+written during the replay, and histograms it. A window of `W` blocks then misses
+on everything older than `W`, plus everything never written during the replay --
+counted separately, because that floor is genuinely cold state that no window
+size reaches.
+
+Recent era (#9,150,000), 40,000 blocks with the first 10,000 discarded as
+warm-up: 52,668,616 reads counted, 9,276,067 writes, 1,756 reads/block.
+
+| Window | Size @16.8 KB/blk | Miss rate | Misses/block |
+|---|---|---|---|
+| 256 blk | 4 MB | 9.75% | 171 |
+| 1,024 | 17 MB | 6.52% | 115 |
+| 4,096 | 67 MB | 4.27% | 75 |
+| 8,192 | 135 MB | 3.75% | 66 |
+| 16,384 | 269 MB | 3.47% | 61 |
+| **32,768** | **538 MB** | **3.31%** | **58** |
+| 65,536+ | 1 GB+ | 3.309% | 58 |
+
+**The curve saturates at ~32,768 blocks, about 540 MB.** Beyond that the window
+buys nothing: what remains is the cold floor of 3.309%.
+
+A pilot at #2,500,000 gave a floor of 3.74% on a much shorter sample, so the
+shape looks era-independent.
+
+### 6.11 Why the fallback target decides the design
+
+58 misses per block reads like a verdict: at the 0.78 ms of §6.8 that is 45
+ms/block against a ~32 ms CPU-bound budget (§6.6), which is I/O-bound again.
+
+But those are *reads*, and reads repeat 10.2x on the same range (§6.1:
+30,556,982 reads over 2,985,485 distinct nodes). So it is ~5.7 distinct cold
+nodes per block, and whether the repeats are absorbed decides everything:
+
+| Fallback target | Useful nodes per 16 KB device read | Cost per block |
+|---|---|---|
+| The 131 GB archive | ~1 (152x amplification, §6.5) | ~45 ms -- **I/O-bound** |
+| A dense sealed segment | ~120 | ~4.4 ms -- **14% overhead** |
+
+The amplification does not change the latency of one cold read; it changes
+whether the page cache can absorb the other 9.2. That is the whole argument for
+sealed dense tables over the archive as the miss path, and it is the difference
+between a 14% tax and losing about 40% of throughput.
+
+Keep the archive reachable as a correctness net that should never fire.
+
 ## 7. Answers
 
 ### 7.1 Segment size `S`
@@ -352,6 +404,11 @@ On this machine, ~4.5 GB is usable with the node running, and §6.2 puts the
 throughput peak at eight workers, with sixteen OOM-killed. That gives
 **S = 512 MB**, ~176 segments over the Unitrie era, spanning ~30,000 blocks in
 the recent era and ~74,000 in the early one.
+
+§6.10 arrives at the same figure independently and for a better reason: the
+miss-rate curve saturates at a window of ~32,768 recent-era blocks, ~540 MB.
+Below that, misses rise steeply -- 58/block at 32k against 171/block at 256 --
+and above it the window buys nothing at all.
 
 Err small rather than large. A larger `S` barely reduces duplication — 2.4% of
 the total at 512 MB against 1.2% at 1 GB, about 1 GB of difference — and costs
