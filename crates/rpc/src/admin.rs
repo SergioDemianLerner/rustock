@@ -86,13 +86,17 @@ pub fn rsk_collect_trie(
         .map(|h| h.number)
         .unwrap_or(at);
     let store_for_task = es.clone();
-    tokio::task::spawn_blocking(move || match store_for_task.collect(root, at, head_now) {
-        Ok(s) => tracing::info!(
-            target: "rustock::gc",
-            "Forced collection complete: marked {}, drained {}, reclaimed {} MB",
-            s.marked, s.drained, s.reclaimed_bytes / (1 << 20)
-        ),
-        Err(e) => tracing::error!(target: "rustock::gc", "Forced collection failed: {e:?}"),
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || store_for_task.collect(root, at, head_now)).await
+        {
+            Ok(Ok(s)) => tracing::info!(
+                target: "rustock::gc",
+                "Forced collection complete: marked {}, drained {}, reclaimed {} MB",
+                s.marked, s.drained, s.reclaimed_bytes / (1 << 20)
+            ),
+            Ok(Err(e)) => tracing::error!(target: "rustock::gc", "Forced collection failed: {e:?}"),
+            Err(join) => tracing::error!(target: "rustock::gc", "Forced collection panicked: {join}"),
+        }
     });
 
     JsonRpcResponse::success(
@@ -180,13 +184,22 @@ pub fn rsk_prune_blocks(
     let clamped = effective != depth;
 
     let cfg = PruneConfig { keep_depth: effective, max_batch };
+    // Await the join handle rather than firing and forgetting. A panic inside a
+    // detached spawn_blocking is swallowed whole: the first run of this method
+    // wrote a floor, deleted nothing, and reported nothing at all, which is
+    // indistinguishable from success until someone reads the data back.
     let store_for_task = store.clone();
-    tokio::task::spawn_blocking(move || match store_for_task.prune_blocks(&cfg, head) {
-        Ok(s) => tracing::info!(
-            target: "rustock::prune",
-            "Forced prune complete: {} blocks removed (#{}..#{})", s.blocks, s.from, s.to
-        ),
-        Err(e) => tracing::error!(target: "rustock::prune", "Forced prune failed: {e:?}"),
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || store_for_task.prune_blocks(&cfg, head)).await {
+            Ok(Ok(s)) => tracing::info!(
+                target: "rustock::prune",
+                "Forced prune complete: {} blocks removed (#{}..#{})", s.blocks, s.from, s.to
+            ),
+            Ok(Err(e)) => tracing::error!(target: "rustock::prune", "Forced prune failed: {e:?}"),
+            Err(join) => tracing::error!(
+                target: "rustock::prune", "Forced prune panicked: {join}"
+            ),
+        }
     });
 
     JsonRpcResponse::success(
