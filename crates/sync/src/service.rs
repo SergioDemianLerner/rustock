@@ -42,6 +42,14 @@ const BODY_RECLAIM_TIMEOUT: Duration = Duration::from_secs(12);
 /// minute rather than the twenty hours it cost on mainnet.
 const FOLLOW_GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long execution may stand still, with blocks downloaded and nothing in
+/// flight, before the pipeline is restarted.
+///
+/// Generous enough that a slow batch is never interrupted -- executing a few
+/// hundred mainnet blocks takes seconds, not minutes -- and short enough that a
+/// stall costs minutes rather than the twenty hours it cost unfixed.
+const EXEC_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 const CANONICAL_REPAIR_MARGIN: u64 = 64;
 
 const MAX_BODY_REQUESTS_PER_PEER: usize = 16;
@@ -205,6 +213,13 @@ pub struct SyncService {
     /// processor is attached; tests may override it to control timing/outcome.
     exec_fn: Option<ExecFn>,
     pub(crate) last_body_height: u64,
+    /// Executed height at the last check, with when it was last seen to move.
+    ///
+    /// Every other trigger in this service measures the *downloaded* head, which
+    /// sits at the tip whether or not a single block is being executed. Nothing
+    /// watched execution itself, so it could stop and no mechanism would notice.
+    pub(crate) last_exec_height: u64,
+    pub(crate) last_exec_progress: std::time::Instant,
     /// When the follow buffer was first seen blocked behind a missing block.
     ///
     /// A block arriving before its predecessor is normal -- a gap-pull fires
@@ -252,6 +267,8 @@ impl SyncService {
             pending_exec: None,
             exec_fn: None,
             last_body_height: 0,
+            last_exec_height: 0,
+            last_exec_progress: Instant::now(),
             follow_gap_since: None,
             pending_follow_bodies: HashMap::new(),
             follow_buffer: BTreeMap::new(),
@@ -388,6 +405,8 @@ impl SyncService {
         // Reap a finished background execution before driving the state machine
         // so a parked next batch can start executing and downloads can resume.
         self.poll_execution().await;
+
+        self.check_execution_progress();
 
         match &self.state {
             SyncState::Idle => {
@@ -585,6 +604,67 @@ impl SyncService {
              rolled executed head back to #{} ({:?})",
             header.number, exec_hash, child.number, child.parent_hash, parent.number, parent_hash
         );
+    }
+
+    /// Restart the pipeline if execution has stopped while blocks are waiting.
+    ///
+    /// This is a watchdog over the one thing nothing else measures. Header
+    /// download, the "fell behind" check and the resync trigger all compare the
+    /// *downloaded* head against peers; when execution stops, that head keeps
+    /// climbing and every trigger reports health. A node in that state logs a
+    /// new tip every thirty seconds and executes nothing -- twenty hours of it
+    /// went unnoticed on mainnet, and the only symptom was a log line that never
+    /// appeared.
+    ///
+    /// Recovery is the same as after an execution failure: rewind the body
+    /// cursor to the executed head and leave whatever state we are in, so a
+    /// fresh round re-queues the blocks between there and the tip.
+    fn check_execution_progress(&mut self) {
+        let exec_height = self
+            .manager
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| self.manager.store.header(hash).ok().flatten())
+            .map(|h| h.number);
+        let Some(exec_height) = exec_height else { return };
+
+        if exec_height != self.last_exec_height {
+            self.last_exec_height = exec_height;
+            self.last_exec_progress = Instant::now();
+            return;
+        }
+
+        // Standing still is only a fault if there is something to execute.
+        let downloaded = self.our_head_number();
+        if downloaded <= exec_height {
+            self.last_exec_progress = Instant::now();
+            return;
+        }
+
+        // Executing a batch, or holding one ready, is progress in flight.
+        if self.executing.is_some() || self.pending_exec.is_some() {
+            self.last_exec_progress = Instant::now();
+            return;
+        }
+
+        if self.last_exec_progress.elapsed() < EXEC_STALL_TIMEOUT {
+            return;
+        }
+
+        warn!(
+            target: "rustock::sync",
+            "Execution has not advanced past #{exec_height} for {}s while #{downloaded} is \
+             downloaded; restarting the block pipeline",
+            self.last_exec_progress.elapsed().as_secs()
+        );
+        self.follow_buffer.clear();
+        self.follow_gap_since = None;
+        self.last_body_height = exec_height;
+        self.pending_exec = None;
+        self.state = SyncState::Idle;
+        self.last_exec_progress = Instant::now();
     }
 
     /// Rebuild the canonical pointers from the best downloaded head down past

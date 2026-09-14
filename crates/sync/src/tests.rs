@@ -352,6 +352,88 @@ async fn test_follow_buffer_keeps_waiting_on_a_same_height_reorg() {
     assert!(matches!(service.state, SyncState::Following), "stays in follow mode");
 }
 
+#[tokio::test]
+async fn test_execution_watchdog_restarts_a_stalled_pipeline() {
+    // Nothing in this service measured execution itself. Header download, the
+    // "fell behind" check and the resync trigger all compare the *downloaded*
+    // head against peers, and that head keeps climbing while execution is
+    // stopped -- so every trigger reported health through twenty hours of a node
+    // executing nothing.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut parent = genesis.clone();
+    for n in 1..=20u64 {
+        let h = dummy_header(n, parent.hash(), U256::from(1));
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(n, h.hash()).unwrap();
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        parent = h;
+    }
+    // Downloaded to #20, executed only #5.
+    let exec = store.canonical_hash(5).unwrap().unwrap();
+    let exec_hdr = store.header(exec).unwrap().unwrap();
+    store.set_exec_head(exec, exec_hdr.state_root).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    service.last_body_height = 20;
+
+    // A fresh observation only starts the clock.
+    service.on_tick().await;
+    assert!(matches!(service.state, SyncState::Following), "not yet a fault");
+    assert_eq!(service.last_body_height, 20);
+
+    // Once it has stood still long enough with blocks waiting, restart.
+    service.last_exec_progress = std::time::Instant::now() - std::time::Duration::from_secs(300);
+    service.on_tick().await;
+
+    assert_eq!(
+        service.last_body_height, 5,
+        "the body cursor must rewind to the executed head so the range re-queues"
+    );
+    assert!(
+        !matches!(service.state, SyncState::Following),
+        "must leave follow mode so a sync round can start"
+    );
+}
+
+#[tokio::test]
+async fn test_execution_watchdog_is_quiet_when_there_is_nothing_to_execute() {
+    // A node at the tip executes nothing because there is nothing to execute.
+    // Restarting the pipeline for that would be a permanent loop.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let h1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&h1).unwrap();
+    store.put_canonical_hash(1, h1.hash()).unwrap();
+    store.update_head(&h1, U256::from(2)).unwrap();
+    store.set_exec_head(h1.hash(), h1.state_root).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    service.last_body_height = 1;
+    service.last_exec_progress = std::time::Instant::now() - std::time::Duration::from_secs(600);
+
+    service.on_tick().await;
+
+    assert!(matches!(service.state, SyncState::Following), "caught up is not stalled");
+    assert_eq!(service.last_body_height, 1, "cursor untouched");
+}
+
 // -- SyncHandler tests (event forwarding) --------------------------------
 
 #[tokio::test]
