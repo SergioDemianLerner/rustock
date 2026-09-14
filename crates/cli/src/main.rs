@@ -8,7 +8,7 @@ use rustock_trie::{AccountState, TrieKeySlice, TrieNode, TrieStore, account_key}
 use std::sync::Arc;
 use alloy_primitives::U256;
 use anyhow::{Result, Context};
-use tracing::info;
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 /// Reads block bodies from a synced rskj `blocks` LevelDB (keyed by block
@@ -320,6 +320,59 @@ struct Args {
     #[arg(long)]
     trie_tool_copy_overwrite: bool,
 
+    /// Directory for a detached trie store.
+    ///
+    /// Used by --trie-backend external and epoch. Defaults to
+    /// <data-dir>/trie-<backend>. Pointing this at different directories is how
+    /// one switches between trie stores -- a full archival one and a collected
+    /// one, say -- without touching headers, bodies or the chain index.
+    #[arg(long)]
+    trie_dir: Option<String>,
+
+    /// Trie storage backend: "single" (in the main database), "external" (its
+    /// own database, no collection) or "epoch" (its own databases, collected).
+    ///
+    /// Defaults to single, which is what the node has always done: one
+    /// database, every historical version retained, unbounded growth. The epoch
+    /// backend bounds the size by periodically reclaiming state older than the
+    /// retention window -- which means historical state queries below that
+    /// window stop working. That is a real trade, so it is opt-in.
+    #[arg(long, default_value = "single")]
+    trie_backend: String,
+
+    /// Epochs to keep with --trie-backend epoch. Minimum 3.
+    ///
+    /// More epochs means smaller, more frequent sweeps and less duplication,
+    /// at the cost of one more place a read miss has to look.
+    #[arg(long, default_value_t = 4)]
+    gc_epochs: usize,
+
+    /// Rotate the newest epoch once it reaches this many MB.
+    #[arg(long, default_value_t = 1024)]
+    gc_rotate_mb: u64,
+
+    /// Blocks a state root must be buried by before it is collected against.
+    ///
+    /// Must exceed the deepest reorganisation worth surviving: collecting
+    /// against a root that is later reorganised away discards the state the
+    /// chain needs to rebuild.
+    #[arg(long, default_value_t = 4_000)]
+    gc_burial: u64,
+
+    /// Enable administrative JSON-RPC methods.
+    ///
+    /// Off by default. These act on the node rather than answering questions
+    /// about the chain -- rsk_collectTrie deletes a database -- and the RPC
+    /// server binding to localhost is a deployment detail, not an access
+    /// control decision. With this off the methods report as unknown, so a node
+    /// without them is indistinguishable from one that never had them.
+    #[arg(long)]
+    rpc_admin: bool,
+
+    /// Seconds between checks of whether the store needs collecting.
+    #[arg(long, default_value_t = 60)]
+    gc_check_secs: u64,
+
     /// Print everything about the node at this path, then exit.
     ///
     /// Path notation is <hex>/<bits>, e.g. "a3f0/13"; bare hex means four bits
@@ -580,8 +633,125 @@ async fn main() -> Result<()> {
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let sync_handler = Arc::new(SyncHandler::new(sync_manager.clone(), event_tx));
-    let trie_store_for_pool: Arc<dyn rustock_trie::TrieStore> =
-        Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone()));
+    let gc_config = rustock_storage::epoch_store::EpochConfig {
+        epochs: args.gc_epochs,
+        burial_depth: args.gc_burial,
+        rotate_bytes: args.gc_rotate_mb * (1 << 20),
+    };
+    let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
+
+    // The node only ever holds an `Arc<dyn TrieStore>`, so this is the entire
+    // extent of the choice: nothing downstream knows which store it got.
+    let trie_dir = args.trie_dir.clone().unwrap_or_else(|| {
+        let suffix = if backend.is_collecting() { "trie-epochs" } else { "trie" };
+        std::path::Path::new(&args.data_dir).join(suffix).to_string_lossy().into_owned()
+    });
+    // Always say where the trie is. With three backends and a migration in the
+    // field, "which trie is this node actually reading?" is the first question
+    // worth answering in any log, and the answer should not depend on which
+    // backend happens to be selected.
+    match &backend {
+        rustock_storage::epoch_store::TrieBackend::Single => info!(
+            "Trie store: single backend (trie_nodes column family inside {})",
+            args.data_dir
+        ),
+        rustock_storage::epoch_store::TrieBackend::External => {
+            info!("Trie store: external backend at {trie_dir} (no collection)")
+        }
+        rustock_storage::epoch_store::TrieBackend::Epochs(cfg) => info!(
+            "Trie store: epoch backend at {trie_dir} (collecting; N={}, rotate at {} MB, burial {} blocks)",
+            cfg.epochs,
+            cfg.rotate_bytes / (1 << 20),
+            cfg.burial_depth
+        ),
+    }
+
+    // Refuse configurations that would come up with no state instead of failing.
+    //
+    // RocksDB is asked to create missing column families, so opening a database
+    // whose trie was moved out recreates `trie_nodes` empty and the node starts
+    // against a blank trie -- no error, no missing file, just a node that cannot
+    // execute anything and looks like it needs a resync. That is worth stopping
+    // for; the operator can always choose a backend, but they cannot recover
+    // state that was quietly declared absent.
+    {
+        let has_chain = store.exec_head()?.is_some() || store.head()?.is_some();
+        let detached_dir_populated = std::path::Path::new(&trie_dir)
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+
+        if !backend.is_detached() && has_chain && store.trie_cf_is_empty() {
+            anyhow::bail!(
+                "This database has no trie in it, but --trie-backend is \"{}\".\n\
+                 \n\
+                 Its trie column family is empty, which means the trie was moved \
+                 into its own database (see examples/detach_trie.rs) and this \
+                 column family was recreated empty on open. Starting like this \
+                 would run the node against a blank trie.\n\
+                 \n\
+                 Start it against the detached trie instead:\n\
+                 \x20   --trie-backend external --trie-dir <path-to-trie-db>\n\
+                 \x20   --trie-backend epoch    --trie-dir <path-to-epoch-store>",
+                args.trie_backend
+            );
+        }
+
+        if backend.is_detached() && has_chain && !detached_dir_populated && !store.trie_cf_is_empty() {
+            anyhow::bail!(
+                "--trie-backend {} points at {}, which is empty, while this \
+                 database still holds its own trie.\n\
+                 \n\
+                 Starting would create an empty trie store and the node would be \
+                 unable to execute. Move the trie out first:\n\
+                 \n\
+                 \x20   cargo run --release --example detach_trie -- {} {}\n\
+                 \n\
+                 then start with the same --trie-dir. The source database is \
+                 opened read-only and is not modified.",
+                args.trie_backend, trie_dir, args.data_dir, trie_dir
+            );
+        }
+    }
+
+    let epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>> = match &backend {
+        rustock_storage::epoch_store::TrieBackend::Epochs(cfg) => {
+            Some(Arc::new(rustock_storage::epoch_store::EpochTrieStore::open(
+                &trie_dir,
+                cfg.clone(),
+            )?))
+        }
+        _ => None,
+    };
+    let external_store: Option<Arc<dyn rustock_trie::TrieStore>> = match &backend {
+        rustock_storage::epoch_store::TrieBackend::External => Some(Arc::new(
+            rustock_storage::RocksDbTrieStore::open(std::path::Path::new(&trie_dir))?,
+        )),
+        _ => None,
+    };
+    let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> = match &epoch_store {
+        // No write cache in front of the epoch store yet: CachedTrieStore wraps
+        // a RocksDB handle rather than a TrieStore, so it cannot sit on top of
+        // this one without a refactor. Execution therefore pays a real read and
+        // write per node here, which is a known cost of turning the collector on.
+        Some(e) => e.clone(),
+        None => match &external_store {
+            Some(e) => e.clone(),
+            None => Arc::new(rustock_storage::CachedTrieStore::with_defaults(store.db().clone())),
+        },
+    };
+
+    // The pool and RPC read state too. With a detached trie they must read the
+    // same store as execution, or they answer from a trie the node is no longer
+    // writing to.
+    let detached_for_readers: Option<Arc<dyn rustock_trie::TrieStore>> =
+        if backend.is_detached() { Some(trie_store_for_exec.clone()) } else { None };
+
+
+    let trie_store_for_pool: Arc<dyn rustock_trie::TrieStore> = match &detached_for_readers {
+        Some(t) => t.clone(),
+        None => Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone())),
+    };
     let pool = Arc::new(rustock_sync::TransactionPool::new(
         rustock_sync::txpool::PoolConfig::default(),
         config.chain_id.into(),
@@ -596,11 +766,65 @@ async fn main() -> Result<()> {
     );
     info!("Block processor wired (hardfork config: {:?})", hardfork_cfg);
 
-    let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> =
-        Arc::new(rustock_storage::CachedTrieStore::with_defaults(store.db().clone()));
-
     let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
+
+    // Background collection. Kept out of the block-processing path on purpose:
+    // mark and drain only read the oldest epoch and write the newest, and block
+    // processing also writes the newest, so the two need no coordination beyond
+    // the brief lock the sweep takes.
+    if let Some(es) = epoch_store.clone() {
+        let store_for_gc = store.clone();
+        let burial = args.gc_burial;
+        let every = std::time::Duration::from_secs(args.gc_check_secs.max(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                if !es.should_collect() {
+                    continue;
+                }
+                // Collect against a buried block, never the head. Collecting
+                // against the head would leave nothing to fall back to if the
+                // chain reorganised past it.
+                let root = (|| {
+                    let head_hash = store_for_gc.head().ok().flatten()?;
+                    let head = store_for_gc.header(head_hash).ok().flatten()?;
+                    let target = head.number.checked_sub(burial)?;
+                    let hash = store_for_gc.canonical_hash(target).ok().flatten()?;
+                    let header = store_for_gc.header(hash).ok().flatten()?;
+                    Some((header.state_root, target))
+                })();
+                let Some((root, at)) = root else {
+                    debug!(target: "rustock::gc", "No block buried {burial} deep yet; not collecting");
+                    continue;
+                };
+                let head_now = store_for_gc
+                    .head()
+                    .ok()
+                    .flatten()
+                    .and_then(|h| store_for_gc.header(h).ok().flatten())
+                    .map(|h| h.number)
+                    .unwrap_or(at);
+                // A root the store cannot resolve is normal for a while after
+                // seeding: the burial depth reaches below the seeded block until
+                // the chain advances past it. That is a "not yet", not a fault,
+                // and logging it as an error once a minute would bury the real
+                // ones.
+                if rustock_trie::TrieStore::get(es.as_ref(), root.as_slice()).is_none() {
+                    debug!(
+                        target: "rustock::gc",
+                        "Collection root #{at} is not in the store yet; waiting for the \
+                         chain to advance past the seeded block"
+                    );
+                    continue;
+                }
+                info!(target: "rustock::gc", "Collecting against #{at} ({root:?})");
+                if let Err(e) = es.collect(root, at, head_now) {
+                    error!(target: "rustock::gc", "Collection failed: {e:?}");
+                }
+            }
+        });
+    }
 
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_tx_pool(pool.clone())
@@ -627,8 +851,10 @@ async fn main() -> Result<()> {
     });
 
     if !args.no_rpc {
-        let trie_store: Arc<dyn rustock_trie::TrieStore> =
-            Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone()));
+        let trie_store: Arc<dyn rustock_trie::TrieStore> = match &detached_for_readers {
+            Some(t) => t.clone(),
+            None => Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone())),
+        };
 
         let rpc_state = rustock_rpc::server::RpcState {
             store: store.clone(),
@@ -639,6 +865,10 @@ async fn main() -> Result<()> {
             hardfork_cfg: Some(hardfork_cfg),
             filter_store: Arc::new(rustock_rpc::logs::FilterStore::new()),
             tx_pool: Some(Arc::new(PoolAdapter(pool.clone()))),
+
+            epoch_store: epoch_store.clone(),
+            admin_enabled: args.rpc_admin,
+            gc_burial: args.gc_burial,
         };
         let rpc_host = args.rpc_host.clone();
         let rpc_port = args.rpc_port;

@@ -52,6 +52,9 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        epoch_store: None,
+        admin_enabled: false,
+        gc_burial: 4000,
     };
     (state, tmp)
 }
@@ -557,6 +560,9 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        epoch_store: None,
+        admin_enabled: false,
+        gc_burial: 4000,
     };
 
     let req = make_request("eth_sendRawTransaction", json!(["0xdeadbeef"]));
@@ -596,6 +602,9 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        epoch_store: None,
+        admin_enabled: false,
+        gc_burial: 4000,
     };
 
     let req = make_request("eth_sendRawTransaction", json!(["0xZZZZ"]));
@@ -659,6 +668,9 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        epoch_store: None,
+        admin_enabled: false,
+        gc_burial: 4000,
     };
     (state, tmp)
 }
@@ -783,6 +795,9 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        epoch_store: None,
+        admin_enabled: false,
+        gc_burial: 4000,
     };
     (state, tmp, tx_hash)
 }
@@ -909,6 +924,9 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        epoch_store: None,
+        admin_enabled: false,
+        gc_burial: 4000,
     };
     (state, tmp)
 }
@@ -1127,6 +1145,9 @@ async fn test_receipt_dto_failed_status() {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        epoch_store: None,
+        admin_enabled: false,
+        gc_burial: 4000,
     };
 
     let hash_str = format!("{:#x}", tx_hash);

@@ -3,6 +3,7 @@ pub mod dto;
 pub mod eth;
 pub mod helpers;
 pub mod logs;
+pub mod admin;
 pub mod net;
 pub mod rsk;
 pub mod server;

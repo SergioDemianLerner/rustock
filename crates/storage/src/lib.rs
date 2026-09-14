@@ -5,6 +5,7 @@ pub use trie_store::RocksDbTrieStore;
 pub mod trie_tool;
 pub mod trie_snapshot;
 pub mod trie_inspect;
+pub mod epoch_store;
 pub use cached_trie_store::CachedTrieStore;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
@@ -22,6 +23,9 @@ const CF_TD: &str = "total_difficulty";
 const CF_BODIES: &str = "block_bodies";
 const CF_RECEIPTS: &str = "receipts";
 const CF_TX_INDEX: &str = "tx_index";
+/// The trie column family, owned by `trie_store` but named here so the store can
+/// tell an emptied trie apart from one that is simply absent.
+const CF_TRIE_NODES: &str = "trie_nodes";
 const KEY_HEAD: &[u8] = b"head";
 const KEY_EXEC_HEAD: &[u8] = b"exec_head";
 
@@ -290,6 +294,20 @@ impl BlockStore {
     pub fn put_total_difficulty(&self, hash: B256, td: U256) -> Result<()> {
         self.db.put_cf(self.cf(CF_TD)?, hash.as_slice(), encode_td(td))
             .context("Failed to write total difficulty")
+    }
+
+    /// True when the in-database trie column family holds no entries.
+    ///
+    /// Distinguishes a database whose trie was moved out (and whose column
+    /// family RocksDB then silently recreated, empty, on the next open) from one
+    /// that still holds its trie. Cheap: it reads one key, not a count.
+    pub fn trie_cf_is_empty(&self) -> bool {
+        let Some(cf) = self.db.cf_handle(CF_TRIE_NODES) else {
+            return true;
+        };
+        let mut it = self.db.raw_iterator_cf(cf);
+        it.seek_to_first();
+        !it.valid()
     }
 
     pub fn total_difficulty(&self, hash: B256) -> Result<Option<U256>> {
