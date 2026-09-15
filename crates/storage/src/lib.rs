@@ -6,6 +6,7 @@ pub mod trie_tool;
 pub mod trie_snapshot;
 pub mod trie_inspect;
 pub mod epoch_store;
+pub mod window_store;
 pub use cached_trie_store::CachedTrieStore;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
