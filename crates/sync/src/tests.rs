@@ -247,6 +247,250 @@ async fn test_difficulty_is_checked_against_the_true_parent() {
     );
 }
 
+#[tokio::test]
+async fn test_follow_buffer_gap_triggers_refetch_instead_of_stalling() {
+    // The silent stall. In follow mode the lowest buffered block is executed
+    // only if it builds on the executed head; if it does not, the old code
+    // returned and nothing ever fetched the block in between. Later blocks piled
+    // up behind the hole and execution stopped permanently -- observed on
+    // mainnet as a node that executed nothing for twenty hours while downloading
+    // tips the whole time, with no error logged.
+    //
+    // The resync trigger cannot catch it: that compares the *downloaded* head
+    // against peers, and the downloaded head is at the tip.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    // Executed head at #10.
+    let mut parent = genesis.clone();
+    for n in 1..=10u64 {
+        let h = dummy_header(n, parent.hash(), U256::from(1));
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(n, h.hash()).unwrap();
+        parent = h;
+    }
+    let head10 = parent.clone();
+    store.set_exec_head(head10.hash(), head10.state_root).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    service.last_body_height = 99;
+
+    // Buffer #12 and #13 -- #11 never arrived, so nothing links to #10.
+    let b11 = dummy_header(11, head10.hash(), U256::from(1));
+    let b12 = dummy_header(12, b11.hash(), U256::from(1));
+    let b13 = dummy_header(13, b12.hash(), U256::from(1));
+    service.follow_buffer.insert(12, (b12.hash(), b12.clone(), vec![], vec![]));
+    service.follow_buffer.insert(13, (b13.hash(), b13.clone(), vec![], vec![]));
+
+    // First observation only starts the clock: an out-of-order response may
+    // still be on its way.
+    service.drain_follow_buffer().await;
+    assert_eq!(service.follow_buffer.len(), 2, "a fresh gap must be given time");
+    assert!(matches!(service.state, SyncState::Following));
+
+    // Once it has outlived any plausible in-flight response, re-fetch.
+    service.follow_gap_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+    service.drain_follow_buffer().await;
+
+    assert!(
+        service.follow_buffer.is_empty(),
+        "the stale buffer must be dropped so the missing range can be re-fetched"
+    );
+    assert_eq!(
+        service.last_body_height, 10,
+        "the body cursor must rewind to the executed head so the sync path \
+         re-fetches #11 onward"
+    );
+    assert!(
+        matches!(service.state, SyncState::Idle),
+        "must leave follow mode so a sync round can start; staying in Following \
+         is what made this stall permanent"
+    );
+}
+
+#[tokio::test]
+async fn test_follow_buffer_keeps_waiting_on_a_same_height_reorg() {
+    // The other reason the lowest buffered block may not link: it is the very
+    // next block but builds on a different block at our head's height. That is a
+    // reorg, handled by the reconcile path, and must NOT trigger a re-fetch --
+    // otherwise every tip reorg would throw away the follow buffer.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let a1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&a1).unwrap();
+    store.set_exec_head(a1.hash(), a1.state_root).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    service.last_body_height = 1;
+
+    // #2 building on a *different* #1.
+    let mut fork1 = dummy_header(1, genesis.hash(), U256::from(2));
+    fork1.timestamp = 4242;
+    let b2 = dummy_header(2, fork1.hash(), U256::from(1));
+    service.follow_buffer.insert(2, (b2.hash(), b2.clone(), vec![], vec![]));
+
+    service.drain_follow_buffer().await;
+
+    assert_eq!(service.follow_buffer.len(), 1, "buffer kept: this is a reorg, not a gap");
+    assert_eq!(service.last_body_height, 1, "cursor untouched");
+    assert!(matches!(service.state, SyncState::Following), "stays in follow mode");
+}
+
+#[tokio::test]
+async fn test_execution_watchdog_restarts_a_stalled_pipeline() {
+    // Nothing in this service measured execution itself. Header download, the
+    // "fell behind" check and the resync trigger all compare the *downloaded*
+    // head against peers, and that head keeps climbing while execution is
+    // stopped -- so every trigger reported health through twenty hours of a node
+    // executing nothing.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut parent = genesis.clone();
+    for n in 1..=20u64 {
+        let h = dummy_header(n, parent.hash(), U256::from(1));
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(n, h.hash()).unwrap();
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        parent = h;
+    }
+    // Downloaded to #20, executed only #5.
+    let exec = store.canonical_hash(5).unwrap().unwrap();
+    let exec_hdr = store.header(exec).unwrap().unwrap();
+    store.set_exec_head(exec, exec_hdr.state_root).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    service.last_body_height = 20;
+
+    // A fresh observation only starts the clock.
+    service.on_tick().await;
+    assert!(matches!(service.state, SyncState::Following), "not yet a fault");
+    assert_eq!(service.last_body_height, 20);
+
+    // Once it has stood still long enough with blocks waiting, restart.
+    service.last_exec_progress = std::time::Instant::now() - std::time::Duration::from_secs(300);
+    service.on_tick().await;
+
+    assert_eq!(
+        service.last_body_height, 5,
+        "the body cursor must rewind to the executed head so the range re-queues"
+    );
+    assert!(
+        !matches!(service.state, SyncState::Following),
+        "must leave follow mode so a sync round can start"
+    );
+}
+
+#[tokio::test]
+async fn test_execution_watchdog_is_quiet_when_there_is_nothing_to_execute() {
+    // A node at the tip executes nothing because there is nothing to execute.
+    // Restarting the pipeline for that would be a permanent loop.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let h1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&h1).unwrap();
+    store.put_canonical_hash(1, h1.hash()).unwrap();
+    store.update_head(&h1, U256::from(2)).unwrap();
+    store.set_exec_head(h1.hash(), h1.state_root).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    service.last_body_height = 1;
+    service.last_exec_progress = std::time::Instant::now() - std::time::Duration::from_secs(600);
+
+    service.on_tick().await;
+
+    assert!(matches!(service.state, SyncState::Following), "caught up is not stalled");
+    assert_eq!(service.last_body_height, 1, "cursor untouched");
+}
+
+#[tokio::test]
+async fn test_unanswered_follow_body_requests_expire() {
+    // The root cause of the stall. A follow-mode body request a peer never
+    // answered stayed in the map forever: the block was never re-requested, and
+    // both recovery paths stand down while the map is non-empty, so one stuck
+    // entry disabled every mechanism that could have noticed.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    let h = dummy_header(1, genesis.hash(), U256::from(1));
+    // A fresh request is left alone.
+    service.pending_follow_bodies.insert(7, (h.hash(), h.clone(), std::time::Instant::now()));
+    service.on_tick().await;
+    assert_eq!(service.pending_follow_bodies.len(), 1, "a fresh request must not be dropped");
+
+    // One that has gone unanswered is dropped, so the block can be re-requested
+    // and the recovery paths can see an idle pipeline.
+    service.pending_follow_bodies.insert(
+        7,
+        (h.hash(), h, std::time::Instant::now() - std::time::Duration::from_secs(120)),
+    );
+    service.on_tick().await;
+    assert!(
+        service.pending_follow_bodies.is_empty(),
+        "an unanswered request must not block the pipeline forever"
+    );
+}
+
+#[test]
+fn test_backlog_decision() {
+    // Follow mode cannot execute a backlog already in the store, so a node that
+    // executes must clear one before following. This is the decision that made
+    // the mainnet stall self-sustaining: both recovery paths rewound the cursor
+    // and dropped to Idle, and the next tick saw a small gap and returned to
+    // follow mode having executed nothing.
+    use super::service::backlog_needs_executing;
+
+    // Blocks downloaded past the executed head: must be executed first.
+    assert!(backlog_needs_executing(true, 10, 4));
+    assert!(backlog_needs_executing(true, 5, 4), "even one block counts");
+
+    // Caught up: nothing to do.
+    assert!(!backlog_needs_executing(true, 4, 4));
+
+    // A node that does not execute cannot fall behind on execution.
+    assert!(!backlog_needs_executing(false, 10, 4));
+}
+
 // -- SyncHandler tests (event forwarding) --------------------------------
 
 #[tokio::test]
@@ -1700,7 +1944,7 @@ async fn test_follow_mode_buffers_out_of_order_body() {
 
     // Body for #102 arrives while #101 is still missing.
     let req_id = 42u64;
-    service.pending_follow_bodies.insert(req_id, (h102_hash, h102));
+    service.pending_follow_bodies.insert(req_id, (h102_hash, h102, std::time::Instant::now()));
     service.on_body_response(req_id, vec![], vec![]).await;
 
     // #102 must remain buffered (parent #101 is not our head), not executed.
@@ -1776,6 +2020,176 @@ async fn test_reconcile_rolls_back_orphaned_exec_head() {
         "exec head should roll back to common ancestor b1, got {:?}", rolled_hash);
     assert_eq!(service.last_body_height_for_test(), 1,
         "body cursor should follow the rolled-back head");
+}
+
+#[tokio::test]
+async fn test_follow_mode_tick_reconciles_orphaned_exec_head() {
+    // Same 1-block tip reorg as above, but the node is in follow mode -- the
+    // state it is in whenever a reorg orphans the tip it just executed.
+    //
+    // Follow mode used to have no way to notice: the reconcile that rolls the
+    // executed head back was reachable only from `try_start_sync`, which runs
+    // in `Idle`, so the node stood still until the backlog check or the
+    // execution watchdog forced it out. A tick in `Following` must reconcile
+    // and hand the chain back to the body pipeline, which is the only path
+    // that can re-fetch the canonical blocks.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.update_head(&b1, U256::from(2)).unwrap();
+
+    // Orphan fork: a2 on top of b1 -- the block we executed.
+    let mut a2 = dummy_header(2, b1_hash, U256::from(1));
+    a2.extra_data = vec![0xAA].into();
+    let a2_hash = a2.hash();
+    store.put_header(&a2).unwrap();
+    store.put_total_difficulty(a2_hash, U256::from(3)).unwrap();
+
+    // Canonical fork: b2(#2) <- b3(#3), heavier.
+    let mut b2 = dummy_header(2, b1_hash, U256::from(5));
+    b2.extra_data = vec![0xBB].into();
+    let b2_hash = b2.hash();
+    store.put_header(&b2).unwrap();
+    store.put_total_difficulty(b2_hash, U256::from(7)).unwrap();
+    let b3 = dummy_header(3, b2_hash, U256::from(5));
+    store.update_head(&b3, U256::from(12)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(b1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    store.set_exec_head(a2_hash, a2.state_root).unwrap();
+    service.state = SyncState::Following;
+
+    service.on_tick().await;
+
+    let (rolled_hash, _) = store.exec_head().unwrap().unwrap();
+    assert_eq!(rolled_hash, b1_hash,
+        "a tick in follow mode should roll the orphaned exec head back to b1, got {:?}",
+        rolled_hash);
+    assert!(matches!(service.state, SyncState::Idle),
+        "after rolling back, follow mode must hand over to the body pipeline, state is {:?}",
+        std::mem::discriminant(&service.state));
+    assert_eq!(service.last_body_height_for_test(), 1,
+        "body cursor should follow the rolled-back head");
+}
+
+#[tokio::test]
+async fn test_follow_mode_tick_keeps_following_when_head_is_canonical() {
+    // The reconcile now runs on every follow-mode tick, so it must be inert
+    // when the executed head is on the canonical chain: no rollback, and no
+    // drop out of follow mode.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.update_head(&b1, U256::from(2)).unwrap();
+    let b2 = dummy_header(2, b1_hash, U256::from(1));
+    let b2_hash = b2.hash();
+    store.update_head(&b2, U256::from(3)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(b1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    // Executed head is b1, and the canonical child b2 builds on it.
+    store.set_exec_head(b1_hash, b1.state_root).unwrap();
+    service.state = SyncState::Following;
+
+    service.on_tick().await;
+
+    assert_eq!(store.exec_head().unwrap().map(|(h, _)| h), Some(b1_hash),
+        "a canonical exec head must not be rolled back");
+    assert!(matches!(service.state, SyncState::Following),
+        "the node should still be following");
+    let _ = b2_hash;
+}
+
+#[tokio::test]
+async fn test_follow_drain_waits_for_background_execution() {
+    // A batch executing in the background commits each block as it goes, so
+    // `exec_head` advances in the store while `current_state_root` -- the
+    // in-memory root follow mode executes against -- still holds the pre-batch
+    // state until `poll_execution` reaps the job on a later tick.
+    //
+    // In that window a follow-mode block whose parent IS the freshly committed
+    // head would pass the link check and execute against an older state,
+    // computing a wrong state root for a perfectly valid block. Seen on mainnet
+    // at #9238768, which re-executed cleanly from the pipeline two minutes
+    // later.
+    //
+    // The drain must stand down while a batch is executing or parked. Staying
+    // buffered is the correct behaviour: `follow_buffer` still holds the block.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.update_head(&b1, U256::from(2)).unwrap();
+    // b2 builds directly on the executed head, so only the guard can hold it.
+    let b2 = dummy_header(2, b1_hash, U256::from(1));
+    let b2_hash = b2.hash();
+    store.update_head(&b2, U256::from(3)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(b1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    store.set_exec_head(b1_hash, b1.state_root).unwrap();
+    service.state = SyncState::Following;
+    service.follow_buffer.insert(2, (b2_hash, b2, vec![], vec![]));
+
+    // A batch is parked waiting to run: the trie state is not ours to use.
+    service.park_empty_batch_for_test();
+    service.drain_follow_buffer().await;
+
+    assert!(service.follow_buffer.contains_key(&2),
+        "the drain must leave the block buffered while a batch is parked; \
+         removing it means execution was attempted against a stale root");
+    assert_eq!(store.exec_head().unwrap().map(|(h, _)| h), Some(b1_hash),
+        "the executed head must not move while a batch owns the trie state");
 }
 
 // -- Peer serving tests (BlockHeadersRequest, BlockHashRequest, SkeletonRequest) --

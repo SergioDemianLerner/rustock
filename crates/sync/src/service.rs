@@ -34,6 +34,49 @@ const BODY_RECLAIM_TIMEOUT: Duration = Duration::from_secs(12);
 /// pipeline deeply without the whole window piling onto one slow peer.
 /// Extra blocks to re-assert below the executed head when repairing the
 /// canonical index, so a repair is not defeated by damage just below the hole.
+/// How long a follow-mode gap must persist, with nothing in flight that could
+/// fill it, before the missing range is re-fetched.
+///
+/// Long enough that ordinary out-of-order responses are never disturbed --
+/// those land within seconds -- and short enough that a permanent gap costs a
+/// minute rather than the twenty hours it cost on mainnet.
+const FOLLOW_GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long execution may stand still, with blocks downloaded and nothing in
+/// flight, before the pipeline is restarted.
+///
+/// Generous enough that a slow batch is never interrupted -- executing a few
+/// hundred mainnet blocks takes seconds, not minutes -- and short enough that a
+/// stall costs minutes rather than the twenty hours it cost unfixed.
+const EXEC_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a follow-mode body request may go unanswered before it is dropped
+/// and the block re-requested.
+///
+/// Comfortably longer than any healthy round trip, and far shorter than
+/// forever, which is what it was.
+const FOLLOW_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Unexecuted blocks tolerated in follow mode before switching to the body
+/// pipeline.
+///
+/// One or two is ordinary -- a tip has arrived and is about to be executed.
+/// More than that means blocks were missed, and follow mode has no way to go
+/// back for them.
+const FOLLOW_BACKLOG_TOLERANCE: u64 = 2;
+
+/// Whether downloaded-but-unexecuted blocks must be executed before following.
+///
+/// Follow mode only executes blocks that arrive as fresh announcements; it has
+/// no path for a backlog already in the store. Entering it with one leaves those
+/// blocks unexecuted forever, and the backlog grows with every new tip.
+///
+/// Only applies to a node that executes: without a block processor there is no
+/// execution to fall behind.
+pub(crate) fn backlog_needs_executing(has_processor: bool, downloaded: u64, executed: u64) -> bool {
+    has_processor && downloaded > executed
+}
+
 const CANONICAL_REPAIR_MARGIN: u64 = 64;
 
 const MAX_BODY_REQUESTS_PER_PEER: usize = 16;
@@ -196,8 +239,31 @@ pub struct SyncService {
     /// Closure run on a blocking thread to execute a batch. Set when a block
     /// processor is attached; tests may override it to control timing/outcome.
     exec_fn: Option<ExecFn>,
-    last_body_height: u64,
-    pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header)>,
+    pub(crate) last_body_height: u64,
+    /// Executed height at the last check, with when it was last seen to move.
+    ///
+    /// Every other trigger in this service measures the *downloaded* head, which
+    /// sits at the tip whether or not a single block is being executed. Nothing
+    /// watched execution itself, so it could stop and no mechanism would notice.
+    pub(crate) last_exec_height: u64,
+    pub(crate) last_exec_progress: std::time::Instant,
+    /// When the follow buffer was first seen blocked behind a missing block.
+    ///
+    /// A block arriving before its predecessor is normal -- a gap-pull fires
+    /// several body requests and the responses land out of order -- so a gap is
+    /// only treated as permanent once it has outlived any plausible in-flight
+    /// response.
+    pub(crate) follow_gap_since: Option<std::time::Instant>,
+    /// Follow-mode body requests awaiting a response, with when each was sent.
+    ///
+    /// The timestamp is the point. Entries used to be removed only when a
+    /// matching response arrived, so a request a peer never answered -- it
+    /// disconnected, or the response was dropped -- stayed here forever. The
+    /// block was never re-requested, every later block piled up behind the hole
+    /// it left, and execution stopped for good. Worse, two separate recovery
+    /// paths check this map for in-flight work and stand down when it is
+    /// non-empty, so a single stuck entry disabled both of them.
+    pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header, Instant)>,
     /// Follow-mode blocks whose bodies have arrived, keyed by block number so
     /// they execute in strict order. Body responses for the several headers a
     /// gap-pull requests can land out of order; executing them as they arrive
@@ -237,6 +303,9 @@ impl SyncService {
             pending_exec: None,
             exec_fn: None,
             last_body_height: 0,
+            last_exec_height: 0,
+            last_exec_progress: Instant::now(),
+            follow_gap_since: None,
             pending_follow_bodies: HashMap::new(),
             follow_buffer: BTreeMap::new(),
             tx_pool: None,
@@ -324,6 +393,13 @@ impl SyncService {
         self.pending_exec.is_some()
     }
 
+    /// Park an empty batch so tests can exercise the paths that must stand
+    /// down while a background execution owns the trie state.
+    #[cfg(test)]
+    pub(crate) fn park_empty_batch_for_test(&mut self) {
+        self.pending_exec = Some((Vec::new(), 0));
+    }
+
     #[cfg(test)]
     pub(crate) fn last_body_height_for_test(&self) -> u64 {
         self.last_body_height
@@ -373,6 +449,9 @@ impl SyncService {
         // so a parked next batch can start executing and downloads can resume.
         self.poll_execution().await;
 
+        self.expire_stale_follow_bodies();
+        self.check_execution_progress();
+
         match &self.state {
             SyncState::Idle => {
                 // Don't kick off a fresh sync round while a batch is executing
@@ -383,7 +462,30 @@ impl SyncService {
                 }
             }
             SyncState::Following => {
-                self.check_follow_gap().await;
+                // A tip reorg can orphan the block we last executed, and follow
+                // mode has no path that notices: `drain_follow_buffer` sees the
+                // next tip fail to link and returns, while the reconcile that
+                // rolls the executed head back is reachable only from
+                // `try_start_sync`, which runs in `Idle`. The node therefore
+                // stands still until the backlog check or the execution
+                // watchdog forces it out -- ninety seconds at best. Observed on
+                // mainnet: twenty orphaned executions in three hours, each
+                // costing that wait, holding the node fifteen to twenty-five
+                // blocks behind the tip.
+                //
+                // Reconcile here, and leave follow mode when it rolls back:
+                // follow mode only executes blocks as they are announced and
+                // cannot re-fetch the canonical ones we now need -- only the
+                // body pipeline can.
+                let before = self.manager.store.exec_head().ok().flatten().map(|(h, _)| h);
+                self.reconcile_exec_head_with_canonical().await;
+                let after = self.manager.store.exec_head().ok().flatten().map(|(h, _)| h);
+                if before != after {
+                    self.state = SyncState::Idle;
+                } else {
+                    self.check_follow_gap().await;
+                    self.leave_follow_if_backlog().await;
+                }
             }
             SyncState::DownloadingBodies { .. } => {
                 // Per-request timeout: re-send only the individually-stalled
@@ -571,6 +673,148 @@ impl SyncService {
         );
     }
 
+    /// Drop follow-mode body requests a peer never answered.
+    ///
+    /// Without this the entry lives forever: the block is never re-requested,
+    /// and the two recovery paths that treat a non-empty map as "work in
+    /// flight" never act. Expiring lets the next tip re-request the body and
+    /// lets those recoveries see an idle pipeline.
+    fn expire_stale_follow_bodies(&mut self) {
+        let before = self.pending_follow_bodies.len();
+        self.pending_follow_bodies
+            .retain(|_, (_, _, sent)| sent.elapsed() < FOLLOW_BODY_TIMEOUT);
+        let expired = before - self.pending_follow_bodies.len();
+        if expired > 0 {
+            warn!(
+                target: "rustock::sync",
+                "Expired {expired} follow-mode body request(s) with no response; \
+                 the blocks will be re-requested"
+            );
+        }
+    }
+
+    /// Leave follow mode when a backlog has built up behind the tip.
+    ///
+    /// Follow mode executes blocks as they are announced and has no way to fetch
+    /// ones it missed. When the chain moves faster than announcements are
+    /// processed, the blocks in between are never requested and execution falls
+    /// behind for good.
+    ///
+    /// The execution watchdog does eventually notice, but only after two minutes
+    /// of standing still, so the node spent most of its time stalled and
+    /// recovering rather than following. This catches it within a tick.
+    ///
+    /// The tolerance matters: a single unexecuted block is the ordinary state
+    /// between a tip arriving and being executed, and reacting to that would
+    /// fight follow mode rather than help it.
+    async fn leave_follow_if_backlog(&mut self) {
+        if self.block_processor.is_none() || self.executing.is_some() || self.pending_exec.is_some()
+        {
+            return;
+        }
+        let executed = match self
+            .manager
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(h, _)| self.manager.store.header(h).ok().flatten())
+        {
+            Some(h) => h.number,
+            None => return,
+        };
+        let downloaded = self.our_head_number();
+        if downloaded <= executed + FOLLOW_BACKLOG_TOLERANCE {
+            return;
+        }
+        info!(
+            target: "rustock::sync",
+            "Follow mode is {} blocks behind execution (#{} executed, #{} downloaded); \
+             switching to the body pipeline",
+            downloaded - executed, executed, downloaded
+        );
+        self.follow_buffer.clear();
+        self.follow_gap_since = None;
+        self.last_body_height = executed;
+        self.state = SyncState::Idle;
+    }
+
+    /// Restart the pipeline if execution has stopped while blocks are waiting.
+    ///
+    /// This is a watchdog over the one thing nothing else measures. Header
+    /// download, the "fell behind" check and the resync trigger all compare the
+    /// *downloaded* head against peers; when execution stops, that head keeps
+    /// climbing and every trigger reports health. A node in that state logs a
+    /// new tip every thirty seconds and executes nothing -- twenty hours of it
+    /// went unnoticed on mainnet, and the only symptom was a log line that never
+    /// appeared.
+    ///
+    /// Recovery is the same as after an execution failure: rewind the body
+    /// cursor to the executed head and leave whatever state we are in, so a
+    /// fresh round re-queues the blocks between there and the tip.
+    fn check_execution_progress(&mut self) {
+        let exec_height = self
+            .manager
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| self.manager.store.header(hash).ok().flatten())
+            .map(|h| h.number);
+        let Some(exec_height) = exec_height else { return };
+
+        if exec_height != self.last_exec_height {
+            self.last_exec_height = exec_height;
+            self.last_exec_progress = Instant::now();
+            return;
+        }
+
+        // Standing still is only a fault if there is something to execute.
+        let downloaded = self.our_head_number();
+        if downloaded <= exec_height {
+            self.last_exec_progress = Instant::now();
+            return;
+        }
+
+        // Executing a batch, or holding one ready, is progress in flight.
+        //
+        // Report rather than silently reset: a batch that never finishes looks
+        // exactly like one making progress, and treating it as healthy is how a
+        // watchdog ends up never firing. If this line repeats, execution is
+        // wedged inside the pipeline rather than starved of work.
+        if self.executing.is_some() || self.pending_exec.is_some() {
+            if self.last_exec_progress.elapsed() >= EXEC_STALL_TIMEOUT {
+                warn!(
+                    target: "rustock::sync",
+                    "Execution stuck at #{exec_height} for {}s with #{downloaded} downloaded, \
+                     but a batch is {} -- watchdog deferring",
+                    self.last_exec_progress.elapsed().as_secs(),
+                    if self.executing.is_some() { "in flight" } else { "parked" }
+                );
+            }
+            return;
+        }
+
+        if self.last_exec_progress.elapsed() < EXEC_STALL_TIMEOUT {
+            return;
+        }
+
+        warn!(
+            target: "rustock::sync",
+            "Execution has not advanced past #{exec_height} for {}s while #{downloaded} is \
+             downloaded (state {:?}, body cursor #{}); restarting the block pipeline",
+            self.last_exec_progress.elapsed().as_secs(),
+            std::mem::discriminant(&self.state),
+            self.last_body_height
+        );
+        self.follow_buffer.clear();
+        self.follow_gap_since = None;
+        self.last_body_height = exec_height;
+        self.pending_exec = None;
+        self.state = SyncState::Idle;
+        self.last_exec_progress = Instant::now();
+    }
+
     /// Rebuild the canonical pointers from the best downloaded head down past
     /// `exec_number`, so execution has a contiguous chain to follow again.
     ///
@@ -650,6 +894,27 @@ impl SyncService {
         // or above the executed head.
         if self.block_processor.is_some() {
             self.last_body_height = head.number;
+        }
+
+        // Blocks may already be downloaded but not yet executed. Follow mode
+        // only executes blocks that arrive as fresh announcements -- it has no
+        // path for a backlog already sitting in the store -- so entering it here
+        // leaves those blocks unexecuted forever, and the backlog grows with
+        // every new tip.
+        //
+        // This is what made the stall self-sustaining. Both recovery paths
+        // rewound the cursor to the executed head and dropped to Idle, and the
+        // very next tick came back through here, saw a small gap, and returned
+        // to follow mode without executing anything.
+        let downloaded = self.our_head_number();
+        if backlog_needs_executing(self.block_processor.is_some(), downloaded, head.number) {
+            info!(
+                target: "rustock::sync",
+                "{} block(s) downloaded but not executed (#{} -> #{}); executing before following",
+                downloaded - head.number, head.number, downloaded
+            );
+            self.start_body_downloads(metadata.best_number).await;
+            return;
         }
 
         if head.number >= metadata.best_number {
@@ -1426,7 +1691,8 @@ impl SyncService {
                 let (req_id, msg) = create_body_request(hash);
                 let peer = &peers[0];
                 self.peer_store.send_to_peer(peer, msg).await;
-                self.pending_follow_bodies.insert(req_id, (hash, header.clone()));
+                self.pending_follow_bodies
+                    .insert(req_id, (hash, header.clone(), Instant::now()));
             }
         }
     }
@@ -1667,7 +1933,7 @@ impl SyncService {
             }
             SyncState::Following => {
                 self.state = SyncState::Following;
-                if let Some((hash, header)) = self.pending_follow_bodies.remove(&request_id) {
+                if let Some((hash, header, _sent)) = self.pending_follow_bodies.remove(&request_id) {
                     if let Err(e) = self.manager.store.put_body(hash, &transactions, &uncles) {
                         error!(
                             target: "rustock::sync",
@@ -1699,7 +1965,30 @@ impl SyncService {
     /// starting from the executed head. Stops at the first gap (a buffered
     /// block whose parent isn't our current head — its predecessor hasn't
     /// arrived yet) or the first execution failure.
-    async fn drain_follow_buffer(&mut self) {
+    pub(crate) async fn drain_follow_buffer(&mut self) {
+        // Never execute a follow-mode block while a batch is executing in the
+        // background or parked waiting to run.
+        //
+        // The batch thread commits each block as it goes, so `exec_head` in the
+        // store advances while `self.current_state_root` -- the in-memory trie
+        // root this path executes against -- still holds the pre-batch state
+        // until `poll_execution` reaps the job on a later tick. In that window
+        // the parent-link check below passes against the freshly committed head
+        // while execution would start from an older state, and the block fails
+        // with a state root mismatch.
+        //
+        // Observed on mainnet at #9238768: the batch for #9238765-#9238767
+        // committed at 09:16:24, the body for #9238768 arrived 3.4s later and
+        // executed against the state after #9238764, computing
+        // 0x2c5ab80b... against a header root of 0x8b2b2497.... Re-executed
+        // from the pipeline two minutes later it produced the header's root, so
+        // the block was fine -- the state it ran against was not.
+        //
+        // Staying buffered costs nothing: the next drain runs after
+        // `poll_execution` has installed the batch's root.
+        if self.executing.is_some() || self.pending_exec.is_some() {
+            return;
+        }
         loop {
             let head_hash = match self.manager.store.exec_head().ok().flatten() {
                 Some((hash, _)) => hash,
@@ -1716,8 +2005,70 @@ impl SyncService {
                 .get(&next_num)
                 .is_some_and(|(_, header, _, _)| header.parent_hash == head_hash);
             if !links {
+                // The lowest buffered block does not build on what we executed.
+                // Two quite different situations produce that, and only one of
+                // them resolves on its own.
+                let exec_number = self
+                    .manager
+                    .store
+                    .header(head_hash)
+                    .ok()
+                    .flatten()
+                    .map(|h| h.number)
+                    .unwrap_or(0);
+
+                // Wait while responses that could fill the gap are still in
+                // flight; out-of-order arrival is ordinary and the buffer exists
+                // precisely to hold those blocks.
+                if !self.pending_follow_bodies.is_empty() {
+                    return;
+                }
+
+                let waited = match self.follow_gap_since {
+                    Some(t) => t.elapsed(),
+                    None => {
+                        self.follow_gap_since = Some(std::time::Instant::now());
+                        return;
+                    }
+                };
+                if waited < FOLLOW_GAP_TIMEOUT {
+                    return;
+                }
+
+                if next_num > exec_number + 1 {
+                    // A gap: the block right after our executed head was never
+                    // buffered -- missed while the node was busy or restarting,
+                    // or simply never announced. Nothing in the follow path ever
+                    // fetches it, so every later block piles up behind a hole
+                    // and execution stops for good. Observed on mainnet: a node
+                    // executed nothing for twenty hours while downloading tips
+                    // the whole time, with no error logged.
+                    //
+                    // The sync trigger cannot notice, because it compares the
+                    // *downloaded* head against peers and that is at the tip.
+                    // Recover the way an execution failure does: rewind the body
+                    // cursor to the executed head and let the normal sync round
+                    // re-fetch and re-execute the missing range.
+                    warn!(
+                        target: "rustock::sync",
+                        "Follow buffer starts at #{next_num} but the executed head is \
+                         #{exec_number}; blocks #{}..#{} are missing. Rewinding to \
+                         re-fetch them.",
+                        exec_number + 1,
+                        next_num - 1
+                    );
+                    self.follow_buffer.clear();
+                    self.last_body_height = exec_number;
+                    self.pending_exec = None;
+                    self.follow_gap_since = None;
+                    self.state = SyncState::Idle;
+                }
+                // Otherwise `next_num` is the very next block and simply does
+                // not extend our head -- a reorg at that height, which the
+                // reconcile path handles by rolling the executed head back.
                 return;
             }
+            self.follow_gap_since = None;
             let (hash, header, txs, uncles) = self.follow_buffer.remove(&next_num).unwrap();
             if !self.process_single_block(hash, &header, txs, uncles).await {
                 // Real divergence: head didn't advance, so looping would spin.
@@ -1748,6 +2099,24 @@ impl SyncService {
             (Some(p), Some(ts), Some(sr)) => (p, ts.clone(), sr.clone()),
             _ => return false,
         };
+
+        // The in-memory root must be the state the executed head committed.
+        // Executing against anything else silently computes a wrong state root
+        // for a perfectly valid block -- the failure looks like a bad block and
+        // is not. The drain guard above should make this unreachable; check
+        // anyway, because the cost of being wrong here is a consensus error.
+        if let Ok(Some((_, committed_root))) = self.manager.store.exec_head() {
+            let in_memory = state_root.compute_hash(trie_store.as_ref());
+            if in_memory != committed_root {
+                warn!(
+                    target: "rustock::sync",
+                    "Refusing to execute #{} in follow mode: in-memory state root {:?} \
+                     is not the executed head's committed root {:?}",
+                    header.number, in_memory, committed_root
+                );
+                return false;
+            }
+        }
 
         let block = Block {
             header: header.clone(),
