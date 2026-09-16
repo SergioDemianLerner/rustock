@@ -1355,13 +1355,10 @@ fn start_pegout_alerts(
         info!("Peg-out alerts will be logged only (email disabled)");
     }
 
-    let change_scripts = cfg
-        .federation_change_scripts
-        .iter()
-        .map(|h| hex::decode(h.trim_start_matches("0x")))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("federation_change_scripts must be hex: {e}"))?;
+    let change_scripts = cfg.change_scripts()?;
 
-    let watcher = Watcher::new(store, trie, cfg, sinks, change_scripts)?;
+    // Thresholds are retuned by editing the file: the watcher re-reads it when
+    // its modification time changes, so a threshold change needs no restart.
+    let watcher = Watcher::new(store, trie, cfg, sinks, change_scripts)?.reloading_from(path);
     Ok(Some(tokio::spawn(watcher.run())))
 }

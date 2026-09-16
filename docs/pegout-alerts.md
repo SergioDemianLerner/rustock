@@ -73,6 +73,44 @@ The alternative -- alerting whenever the total changes -- was rejected: the
 total also moves *downwards* as peg-outs reach their 4000 confirmations and
 leave the queue, which would mail you about peg-outs completing normally.
 
+## Changing thresholds without a restart
+
+The watcher stats its configuration file on every poll and re-reads it when the
+modification time changes. Edit the file and the new values take effect on the
+next poll — no restart, no dropped blocks.
+
+Only settings that can take effect immediately are adopted:
+
+| Live | Needs a restart |
+|---|---|
+| `pegout_alert_btc` | `enabled` |
+| `output_alert_btc` | `start_block` |
+| `in_transit_alert_btc` | `max_queued_alerts` |
+| `confirmations` | everything under `[pegout_alerts.email]` |
+| `poll_interval_secs` | |
+| `federation_change_scripts` | |
+
+An edit in the second column is **not** silently ignored: it is logged as a
+warning naming the field and saying a restart is required. Mail settings are
+deliberately excluded because the transport is built once at startup, and
+because the running configuration holds credentials already expanded from the
+env file — re-reading the file yields the `${SMTP_PASSWORD}` placeholder, not
+the secret, so adopting it would break delivery.
+
+A file that does not parse, or whose `federation_change_scripts` are not hex,
+leaves the running configuration untouched and logs an error. The modification
+time is recorded even when the parse fails, so a broken file is reported once
+rather than on every poll. Both cases keep the watcher alive: a monitoring
+component that exits because of a typo in its own settings is worse than one
+that keeps watching with the previous thresholds.
+
+What is logged on a successful reload:
+
+```
+INFO reloaded /etc/rustock/pegout-alerts.toml: pegout_alert_btc: 100 -> 0.01
+WARN /etc/rustock/pegout-alerts.toml changed email.to: a@b -> c@d, which needs a node restart to take effect
+```
+
 ## Credentials
 
 **Secrets never go in the configuration file.** It sits next to the code and
