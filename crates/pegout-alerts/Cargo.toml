@@ -1,0 +1,22 @@
+[package]
+name = "rustock-pegout-alerts"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustock-core = { path = "../core" }
+rustock-storage = { path = "../storage" }
+rustock-trie = { path = "../trie" }
+rustock-execution = { path = "../execution" }
+alloy-primitives = { workspace = true }
+anyhow = { workspace = true }
+bitcoin = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+toml = "0.8.19"
+lettre = { version = "0.11.10", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

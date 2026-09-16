@@ -1,0 +1,65 @@
+# Peg-out monitoring and alerting.
+#
+#   rustock --pegout-alerts-config ./pegout-alerts.toml ...
+#
+# Entirely optional. The watcher reads blocks, receipts and Bridge state the
+# node has already committed; it is not wired into execution or sync, so it
+# cannot affect consensus or slow block processing. If the mail server is
+# unreachable the node does not notice.
+
+[pegout_alerts]
+enabled = true
+
+# How often to look for newly executed blocks.
+poll_interval_secs = 5
+
+# Where to start. Omit to begin at the node's current executed head, which is
+# almost always what you want — otherwise the first sweep replays the chain and
+# alerts on history.
+# start_block = 9200000
+
+# Alert when a single peg-out request exceeds this many BTC.
+pegout_alert_btc = 100.0
+
+# Alert when any single non-change output of a peg-out Bitcoin transaction
+# awaiting signature exceeds this many BTC.
+output_alert_btc = 100.0
+
+# Alert when the total value of peg-outs in transit exceeds this many BTC.
+# "In transit" means built by the Bridge but not yet confirmed, so not yet
+# handed to the signers.
+in_transit_alert_btc = 200.0
+
+# Confirmations a peg-out needs before it stops counting as in transit.
+# Mainnet uses 4,000.
+confirmations = 4000
+
+# scriptPubKeys (hex) that are federation change rather than a transfer to an
+# end user. Outputs paying these are excluded from the per-output check and from
+# the in-transit total.
+#
+# Leave empty and EVERY output is treated as a user output. That over-alerts
+# whenever the federation's change exceeds the threshold, but it can never hide
+# a real transfer — the safe direction. Fill it in to silence change precisely.
+federation_change_scripts = [
+  # "a914...87",
+]
+
+[pegout_alerts.email]
+# Until this is true, alerts are logged and nothing is sent.
+enabled = false
+
+to = ["you@example.com"]
+from = "rustock-node@example.com"
+
+smtp_host = "smtp.example.com"
+smtp_port = 587
+
+# username = "..."
+# password = "..."
+
+# none | starttls | implicit
+tls = "starttls"
+
+# Prefix subjects with "[rustock peg-out] " so they filter easily.
+subject_prefix_enabled = true

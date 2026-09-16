@@ -8,6 +8,7 @@ members = [
     "crates/rpc",
     "crates/trie",
     "crates/execution",
+    "crates/pegout-alerts",
 ]
 resolver = "2"
 

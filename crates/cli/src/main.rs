@@ -197,6 +197,15 @@ struct Args {
     #[arg(long)]
     import_auto_compaction: bool,
 
+    /// Path to a TOML configuration file for peg-out monitoring and alerting.
+    ///
+    /// Entirely optional: without it no watcher runs and nothing changes. The
+    /// watcher only reads blocks, receipts and Bridge state the node has
+    /// already committed, so it cannot affect consensus or block processing.
+    /// See `docs/pegout-alerts.md` and `pegout-alerts.example.toml`.
+    #[arg(long)]
+    pegout_alerts_config: Option<String>,
+
     /// Background flush/compaction threads during import. 0 uses the CPU count.
     #[arg(long, default_value_t = 0)]
     import_parallelism: usize,
@@ -756,7 +765,7 @@ async fn main() -> Result<()> {
         rustock_sync::txpool::PoolConfig::default(),
         config.chain_id.into(),
         store.clone(),
-        trie_store_for_pool,
+        trie_store_for_pool.clone(),
     ));
 
     let hardfork_cfg = rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
@@ -839,6 +848,23 @@ async fn main() -> Result<()> {
     let mut node = Node::with_peer_store(node_config, peer_store.clone());
     node.add_handler(sync_handler);
     node.add_handler(tx_relay.clone());
+
+    // Peg-out monitoring. Deliberately not wired into execution or sync: it
+    // polls what has already been committed, so a slow mail server or a bug in
+    // it cannot delay a block.
+    if let Some(path) = &args.pegout_alerts_config {
+        match start_pegout_alerts(path, store.clone(), trie_store_for_pool.clone()) {
+            Ok(Some(handle)) => {
+                info!("Peg-out alert watcher started from {path}");
+                let _ = handle;
+            }
+            Ok(None) => info!("Peg-out alerts configured but disabled in {path}"),
+            // A malformed alert configuration must not stop the node: it is an
+            // observability feature, and a node that refuses to start because
+            // its mail settings are wrong is worse than one that runs unwatched.
+            Err(e) => error!("Peg-out alerts disabled — {path}: {e:#}"),
+        }
+    }
 
     // Supervise the sync task: a panic inside it would otherwise be swallowed
     // by tokio and leave the node running but silently stalled.
@@ -1296,4 +1322,43 @@ fn run_trie_node(source: &str, block: Option<u64>, path: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Build and spawn the peg-out watcher. Returns `None` when the file disables
+/// it. Errors mean a bad configuration and are reported without stopping the
+/// node.
+fn start_pegout_alerts(
+    path: &str,
+    store: Arc<BlockStore>,
+    trie: Arc<dyn rustock_trie::TrieStore>,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    use rustock_pegout_alerts::{AlertSink, Config, LogSink, SmtpSink, Watcher};
+
+    let config = Config::load(path)?;
+    let cfg = config.pegout_alerts;
+    if !cfg.enabled {
+        return Ok(None);
+    }
+
+    // The log sink is always present, so the record exists even if mail fails.
+    let mut sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(LogSink)];
+    if cfg.email.enabled {
+        sinks.push(Box::new(SmtpSink::new(&cfg.email)?));
+        info!(
+            "Peg-out alerts will be emailed to {} via {}:{}",
+            cfg.email.to.join(", "), cfg.email.smtp_host, cfg.email.smtp_port
+        );
+    } else {
+        info!("Peg-out alerts will be logged only (email disabled)");
+    }
+
+    let change_scripts = cfg
+        .federation_change_scripts
+        .iter()
+        .map(|h| hex::decode(h.trim_start_matches("0x")))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("federation_change_scripts must be hex: {e}"))?;
+
+    let watcher = Watcher::new(store, trie, cfg, sinks, change_scripts)?;
+    Ok(Some(tokio::spawn(watcher.run())))
 }
