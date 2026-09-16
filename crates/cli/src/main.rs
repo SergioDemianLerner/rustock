@@ -1332,7 +1332,7 @@ fn start_pegout_alerts(
     store: Arc<BlockStore>,
     trie: Arc<dyn rustock_trie::TrieStore>,
 ) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
-    use rustock_pegout_alerts::{AlertSink, Config, LogSink, SmtpSink, Watcher};
+    use rustock_pegout_alerts::{AlertSink, Config, LogSink, Watcher};
 
     let config = Config::load(path)?;
     let cfg = config.pegout_alerts;
@@ -1343,7 +1343,10 @@ fn start_pegout_alerts(
     // The log sink is always present, so the record exists even if mail fails.
     let mut sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(LogSink)];
     if cfg.email.enabled {
-        sinks.push(Box::new(SmtpSink::new(&cfg.email)?));
+        #[cfg(feature = "smtp")]
+        sinks.push(Box::new(rustock_pegout_alerts::SmtpSink::new(&cfg.email)?));
+        #[cfg(not(feature = "smtp"))]
+        return Err(rustock_pegout_alerts::sink::smtp_unavailable());
         info!(
             "Peg-out alerts will be emailed to {} via {}:{}",
             cfg.email.to.join(", "), cfg.email.smtp_host, cfg.email.smtp_port

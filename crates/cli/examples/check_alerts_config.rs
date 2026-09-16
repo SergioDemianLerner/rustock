@@ -32,8 +32,17 @@ fn main() -> anyhow::Result<()> {
         };
         println!("  username             {}", shown(&cfg.email.username));
         println!("  password             {}", shown(&cfg.email.password));
-        rustock_pegout_alerts::SmtpSink::new(&cfg.email)?;
-        println!("\n  SMTP transport builds. No mail was sent.");
+        #[cfg(feature = "smtp")]
+        {
+            rustock_pegout_alerts::SmtpSink::new(&cfg.email)?;
+            println!("\n  SMTP transport builds. No mail was sent.");
+        }
+        #[cfg(not(feature = "smtp"))]
+        println!(
+            "\n  NOTE: this binary was built without the `smtp` feature, so the\n  \
+             transport was not checked and the node would refuse to start the\n  \
+             watcher with email enabled. Rebuild with --features smtp."
+        );
     }
     Ok(())
 }

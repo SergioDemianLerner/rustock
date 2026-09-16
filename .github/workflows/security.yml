@@ -54,7 +54,7 @@ jobs:
           pkgs=$(grep -c '^\[\[package\]\]' Cargo.lock)
           sums=$(grep -c '^checksum = ' Cargo.lock)
           members=$(cargo metadata --locked --no-deps --format-version 1 \
-            | grep -o '"name":"rustock-[a-z]*"' | sort -u | wc -l)
+            | grep -o '"name":"rustock-[a-z-]*"' | sort -u | wc -l)
           echo "packages=$pkgs checksummed=$sums workspace_members=$members"
           if [ "$((pkgs - sums))" -ne "$members" ]; then
             echo "::error::Unchecksummed dependencies found outside the workspace."

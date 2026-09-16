@@ -23,4 +23,6 @@ pub mod watch;
 pub use alert::Alert;
 pub use config::{Config, PegoutAlerts};
 pub use service::Watcher;
-pub use sink::{AlertSink, LogSink, SmtpSink};
+pub use sink::{AlertSink, LogSink};
+#[cfg(feature = "smtp")]
+pub use sink::SmtpSink;

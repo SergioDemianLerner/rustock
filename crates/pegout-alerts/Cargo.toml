@@ -15,8 +15,17 @@ hex = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 toml = "0.8.19"
-lettre = { version = "0.11.10", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+lettre = { version = "0.11.10", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"], optional = true }
 tracing = { workspace = true }
+
+[features]
+# Off by default. Email pulls in rustls, ring, webpki-roots and the ICU/idna
+# stack -- 55 crates, a 13% increase in the dependency tree of a consensus
+# node -- which is not a reasonable default for an optional alerting feature.
+# Build with `--features smtp` on the host that needs to send mail. Without it
+# the watcher still runs and logs everything; only delivery is unavailable.
+default = []
+smtp = ["dep:lettre"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

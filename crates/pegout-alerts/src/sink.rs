@@ -6,7 +6,9 @@
 //! outage drops alerts rather than growing without limit.
 
 use crate::alert::Alert;
-use crate::config::{EmailConfig, TlsMode};
+use crate::config::EmailConfig;
+#[cfg(feature = "smtp")]
+use crate::config::TlsMode;
 
 /// Somewhere an alert can be delivered.
 pub trait AlertSink: Send + Sync {
@@ -29,11 +31,23 @@ impl AlertSink for LogSink {
     fn name(&self) -> &'static str { "log" }
 }
 
+/// Returned when the configuration asks for email but the binary was built
+/// without it, so the failure names the cause instead of silently logging only.
+#[cfg(not(feature = "smtp"))]
+pub fn smtp_unavailable() -> anyhow::Error {
+    anyhow::anyhow!(
+        "email is enabled in the configuration but this binary was built without \
+         the `smtp` feature; rebuild with `--features smtp` (or set \
+         pegout_alerts.email.enabled = false to log only)"
+    )
+}
+
 /// SMTP delivery.
 ///
 /// Built once and reused. Credentials are taken from configuration and never
 /// logged; a delivery failure reports the server's message, which may name the
 /// recipient but not the password.
+#[cfg(feature = "smtp")]
 pub struct SmtpSink {
     to: Vec<lettre::message::Mailbox>,
     from: lettre::message::Mailbox,
@@ -41,6 +55,7 @@ pub struct SmtpSink {
     subject_prefix: Option<&'static str>,
 }
 
+#[cfg(feature = "smtp")]
 impl SmtpSink {
     pub fn new(cfg: &EmailConfig) -> anyhow::Result<Self> {
         use lettre::transport::smtp::authentication::Credentials;
@@ -84,6 +99,7 @@ impl SmtpSink {
     }
 }
 
+#[cfg(feature = "smtp")]
 impl AlertSink for SmtpSink {
     fn deliver(&self, alert: &Alert) -> anyhow::Result<()> {
         use lettre::Transport;
@@ -110,6 +126,7 @@ impl AlertSink for SmtpSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::config::EmailConfig;
 
     /// Records what it was given, so the watcher's behaviour can be tested
@@ -129,6 +146,7 @@ mod tests {
         assert!(LogSink.deliver(&a).is_ok());
     }
 
+    #[cfg(feature = "smtp")]
     #[test]
     fn an_unparseable_from_address_is_rejected_at_construction() {
         let cfg = EmailConfig {
@@ -141,6 +159,7 @@ mod tests {
         assert!(SmtpSink::new(&cfg).is_err(), "bad `from` must fail at startup, not at alert time");
     }
 
+    #[cfg(feature = "smtp")]
     #[test]
     fn a_valid_config_builds_without_contacting_the_server() {
         let cfg = EmailConfig {

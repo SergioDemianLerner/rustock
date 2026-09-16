@@ -89,4 +89,9 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
+    # webpki-roots, which carries Mozilla's CA bundle, under the optional
+    # `smtp` feature only. CDLA-Permissive-2.0 is a permissive data licence
+    # with no copyleft or attribution burden; it covers the certificate data,
+    # not code. A default build does not pull it in.
+    "CDLA-Permissive-2.0",
 ]
