@@ -141,32 +141,69 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // registering anything. Mirror that — these are a no-op success, not a
     // failed tx. Only a malformed BTC tx (parsed below, a separate
     // exception) propagates and fails the tx.
-    let validation = (|| -> Result<(), PrecompileError> {
-        // Check if already processed
+    // rskj's validation failures are NOT all equivalent, and treating them as
+    // if they were diverged mainnet #9,227,292.
+    //
+    // `BridgeSupport.registerBtcTransaction` wraps its body in
+    // `catch (RegisterBtcTransactionException e) { log }`, so a validation that
+    // *returns false* is a silent no-op success. But
+    // `validationsForRegisterBtcTransaction` also **throws**
+    // `BridgeIllegalArgumentException` for a malformed partial merkle tree, and
+    // that is not a `RegisterBtcTransactionException` -- it escapes the catch,
+    // reaches `Bridge.execute`'s outer handler, becomes a `VMException`, and
+    // charges the sender the full gas limit (quirks-frozen-bugs.md §9d).
+    //
+    // Order is load-bearing too: rskj validates height and confirmations FIRST
+    // and returns false there, so a transaction with bad confirmations *and* a
+    // malformed PMT is swallowed, never reaching the throw.
+    enum Invalid {
+        /// `return false` in rskj: logged, call succeeds, nothing registered.
+        Swallowed(&'static str),
+        /// `throw BridgeIllegalArgumentException`: escapes the catch and fails
+        /// the transaction with the full gas limit charged.
+        Thrown(&'static str),
+    }
+
+    let validation = (|| -> Result<(), Invalid> {
+        // Check if already processed (rskj: RegisterBtcTransactionException).
         if is_btc_tx_processed(ctx, &btc_tx_hash) {
-            return Err(PrecompileError::other("transaction already processed"));
+            return Err(Invalid::Swallowed("transaction already processed"));
         }
 
-        // Validate PMT
-        if !PartialMerkleTree::has_expected_size(&pmt_data) {
-            return Err(PrecompileError::other("invalid PMT size"));
+        // Height and confirmations come first, and are swallowed
+        // (BridgeUtils.validateHeightAndConfirmations -> return false). The
+        // block itself counts as one confirmation, and the CALLER-supplied
+        // height is what gets validated.
+        let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
+        let confirmations = best_height as i64 - btc_block_height as i64 + 1;
+        if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
+            return Err(Invalid::Swallowed("insufficient confirmations"));
         }
+
+        // PMT size: rskj THROWS BridgeIllegalArgumentException here.
+        if !PartialMerkleTree::has_expected_size(&pmt_data) {
+            return Err(Invalid::Thrown("PartialMerkleTree doesn't have expected size"));
+        }
+        // `BridgeUtils.calculateMerkleRoot` constructs the PMT and walks it;
+        // a VerificationException from either is rethrown as
+        // BridgeIllegalArgumentException, so both of these throw.
         let pmt = PartialMerkleTree::parse(&pmt_data)
-            .ok_or_else(|| PrecompileError::other("failed to parse PMT"))?;
+            .ok_or(Invalid::Thrown("failed to parse PMT"))?;
         let pmt_result = pmt
             .extract_matches()
-            .ok_or_else(|| PrecompileError::other("PMT verification failed"))?;
+            .ok_or(Invalid::Thrown("PMT verification failed"))?;
 
-        // Check tx hash is in PMT matched hashes
+        // Tx not among the matched hashes: `calculateMerkleRoot` returns null,
+        // so the caller returns false -- swallowed.
         if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
-            return Err(PrecompileError::other("tx not in PMT"));
+            return Err(Invalid::Swallowed("tx not in PMT"));
         }
 
         // Look up the BTC block on the main chain at the caller-supplied
         // height (walks the chain pre-RSKIP199, indexed lookup afterwards).
         let stored_block =
             super::btc_chain::stored_block_at_main_chain_height(ctx, btc_block_height as u32, rskip199)
-                .ok_or_else(|| PrecompileError::other("BTC block not found at height"))?;
+                .ok_or(Invalid::Swallowed("BTC block not found at height"))?;
         let block_hash = stored_block.header.block_hash();
 
         // Verify merkle root matches
@@ -199,22 +236,26 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             }
         };
         if !root_valid {
-            return Err(PrecompileError::other("merkle root mismatch"));
-        }
-
-        // Check confirmations (rskj BridgeUtils.validateHeightAndConfirmations:
-        // the block itself counts as one confirmation, and the CALLER-supplied
-        // height is what gets validated).
-        let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
-        let confirmations = best_height as i64 - btc_block_height as i64 + 1;
-        if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
-            return Err(PrecompileError::other("insufficient confirmations"));
+            return Err(Invalid::Swallowed("merkle root mismatch"));
         }
         Ok(())
     })();
-    if let Err(e) = validation {
-        tracing::debug!("registerBtcTransaction: {e}; returning success (rskj swallows RegisterBtcTransactionException)");
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    match validation {
+        Ok(()) => {}
+        Err(Invalid::Swallowed(m)) => {
+            tracing::debug!(
+                "registerBtcTransaction: {m}; returning success \
+                 (rskj swallows RegisterBtcTransactionException)"
+            );
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
+        Err(Invalid::Thrown(m)) => {
+            tracing::debug!(
+                "registerBtcTransaction: {m}; throwing \
+                 (rskj BridgeIllegalArgumentException escapes the catch)"
+            );
+            return Err(PrecompileError::other(m));
+        }
     }
 
     // Parse the BTC transaction
