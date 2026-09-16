@@ -1,0 +1,119 @@
+# Peg-out monitoring and alerting
+
+Watches the two-way peg and reports movements above configurable thresholds.
+Off unless configured.
+
+```
+rustock --pegout-alerts-config ./pegout-alerts.toml ...
+```
+
+See [`pegout-alerts.example.toml`](../pegout-alerts.example.toml) for a
+commented file.
+
+## What it watches
+
+| | default | source |
+|---|---|---|
+| A single peg-out request | > 100 BTC | `release_requested` log |
+| A single output of a peg-out transaction awaiting signature | > 100 BTC | `pegoutsWaitingForSignatures` |
+| Total value in transit | > 200 BTC | `pegoutsWaitingForConfirmations` |
+
+Every peg-out event is logged regardless of threshold —
+`release_request_received`, `release_requested`, `release_btc`,
+`pegout_confirmed`, `pegout_transaction_created` — at `info` on target
+`rustock::pegout_alerts`.
+
+**In transit** is the set of peg-outs whose Bitcoin transaction the Bridge has
+built but which have not yet reached the required confirmations (4,000 on
+mainnet), so they have not yet been handed to the signers. Entries older than
+that have been confirmed and moved on, and stop counting.
+
+**Outputs awaiting signature** are read from the set the signers are handed, so
+the per-output check sees the transaction as the PowHSM will.
+
+## It cannot slow the node down
+
+There is no hook in execution or sync. The watcher is a separate task that polls
+the node's own database for blocks it has already committed, then reads
+receipts and Bridge state at that block's state root. Consequences worth being
+explicit about:
+
+- A blocked or slow mail server delays only further alerts.
+- A panic or a bug in this module cannot change what the node computes.
+- Alerts lag by up to `poll_interval_secs`, which is the price of that isolation.
+
+## Federation change
+
+A peg-out transaction pays end users and may also return change to the
+federation. Change is not a transfer to anyone and should not alert, but the raw
+transaction alone does not say which output is which.
+
+So change scripts are configured explicitly, in
+`federation_change_scripts`. **When the list is empty every output is treated as
+a user output.** That over-alerts on a large change output and never hides a
+real transfer — the safe direction to fail. The alert body names the
+`scriptPubKey` so a change output can be added to the list.
+
+A future improvement is deriving the federation's script from Bridge state
+automatically; it was left out deliberately rather than guessed at, because a
+wrong derivation would *suppress* alerts.
+
+## Repeated alerts
+
+A condition that persists is reported once, not once per poll. Peg-out and
+output alerts are keyed by transaction and output index; the in-transit alert is
+keyed by its total, so it re-alerts when the number changes rather than on every
+sweep.
+
+## Credentials
+
+**Secrets never go in the configuration file.** It sits next to the code and
+gets copied, diffed and pasted. Put them in a file owned by the node user with
+mode 0600 and refer to them as `${NAME}`:
+
+```toml
+[pegout_alerts.email]
+env_file = "/etc/rustock/pegout-alerts.env"
+username = "${SMTP_USER}"
+password = "${SMTP_PASSWORD}"
+```
+
+```
+# /etc/rustock/pegout-alerts.env, chmod 600
+SMTP_USER=...
+SMTP_PASSWORD=...
+```
+
+The file is `KEY=VALUE`, tolerating `export `, quotes, blanks and `#` comments,
+so a shell can source the same file. Values also fall back to the process
+environment.
+
+Two refusals, both deliberate:
+
+- **A group- or world-readable env file is refused, not warned about.** A
+  credential other users on the box can read is already disclosed, and starting
+  anyway would imply otherwise.
+- **An unresolved `${NAME}` is an error.** Leaving the literal text as the
+  password would authenticate as that string and fail later with a confusing
+  message from the server.
+
+Validate before restarting the node, without sending anything:
+
+```
+cargo run --release -p rustock-cli --example check_alerts_config -- /etc/rustock/pegout-alerts.toml
+```
+
+It reports whether each secret resolved and its length — never its value.
+
+`.gitignore` covers `*.env` and `pegout-alerts.toml` so a stray copy in the
+working tree cannot be committed.
+
+## Email
+
+Off until `[pegout_alerts.email] enabled = true` and a host, sender and at least
+one recipient are set; a configuration claiming to send mail without them is
+rejected at startup rather than at the moment an alert needs to go out. `tls`
+is `none`, `starttls` or `implicit`.
+
+A bad alert configuration logs an error and leaves the node running. An
+observability feature should not stop a node from syncing.
