@@ -157,7 +157,12 @@ miss is usually answered without touching disk.
 ```
 collect():
     H    := choose_block(head, D)      # number(head) - number(H) >= D
-    L    := mark(root(H))              # §4.4
+
+    require not already collecting     # I10
+    require root(H) is readable        # precondition P1
+    require last_block(E₀) <= number(H) # precondition P2, see I8
+
+    L    := mark(root(H))              # §4.4; fails if L is incomplete
     drain(E₀, L)                       # §4.5
     sweep_and_rotate()                 # §4.6
 ```
@@ -165,6 +170,25 @@ collect():
 The cycle may run concurrently with block processing. Mark and drain only read
 `E₀` and write `E_{N-1}`; block processing also writes `E_{N-1}`. No coordination
 is needed beyond the sweep — see [§4.6](#46-sweep-and-rotate).
+
+**The three preconditions are not defensive programming; each one, omitted,
+deletes live state.**
+
+**P1 — the collection root must be readable.** If `root(H)` is absent, the mark
+returns a live set containing almost nothing, the drain copies almost nothing
+forward, and the sweep deletes an epoch that was entirely reachable. A root can
+legitimately be unreadable: a store seeded from a snapshot holds no state below
+the snapshot's block, so `H` is out of range until the chain advances past it.
+The correct response is to decline and wait, not to collect.
+
+**P2 — `E₀` must not hold writes for blocks above `H`.** See
+[I8](#5-invariants). This is the precondition whose absence caused the failure
+recorded in [§8](#8-failure-and-recovery).
+
+**The mark must be complete.** If any referenced entry is missing while marking,
+`L` is a subset of the true live set and collecting on it deletes reachable
+state. A missing entry is a hard error, not a warning: the store is already
+damaged, and proceeding compounds it.
 
 ### 4.4 Mark
 
@@ -204,6 +228,11 @@ sweep_and_rotate():
 The sweep is **O(1) in the number of dead entries** — it is a directory removal,
 not a per-entry deletion.
 
+It is also the only irreversible step in the cycle, and the only one that can
+destroy data. Mark and drain may be abandoned or repeated at will; a sweep
+cannot be undone. Every precondition in [§4.3](#43-collection-cycle) exists to
+be checked before this point.
+
 The only coordination required is that no reader may be mid-lookup in `E₀` when
 it is closed. A read-write lock over the epoch list, held briefly for the
 renumbering, is sufficient.
@@ -241,6 +270,47 @@ present in some epoch. Equivalently: deleting `E₀` removes no entry that is in
 **I7 — Drain idempotence.** Running a drain twice produces the same store state
 as running it once. Follows from I1.
 
+**I8 — Write separation.** `E₀` may be swept only if every block whose writes
+went into `E₀` is at or below `H`.
+
+*Why it is needed.* I4 keeps later state alive by writing it unconditionally to
+the newest epoch — which protects nothing if the newest epoch **is** the epoch
+being swept. The correctness argument in [§6](#6-correctness-argument) says "a
+copy of `k` exists outside `E₀`", and that step is only true when the writes for
+blocks above `H` landed somewhere other than `E₀`.
+
+*How it is satisfied.* Each epoch records the highest block whose writes went
+into it, fixed at the moment it stops being the newest. A sweep is refused
+unless that block is at or below `number(H)`. An epoch with no such record can
+never be swept: unknown is treated as unsafe.
+
+*Corollary — a sizing constraint, not just a check.* `E₀` stops receiving writes
+`N−1` rotations before it is swept, so I8 holds automatically when
+
+```
+    (N − 1) × blocks_per_rotation   >   D
+```
+
+i.e. **the retention window must exceed the burial depth**. With epochs that
+fill in days and a burial depth of hours this is satisfied by a wide margin and
+the check never fires. It is worth stating because the failure mode is silent:
+nothing about a store that violates it looks wrong until state is already gone.
+
+**I9 — Seed immutability.** An epoch populated from outside the store — a trie
+snapshot used to seed a new one — never receives writes.
+
+*Why.* A seeded store begins with a single epoch, which makes that epoch both
+the newest (the write target) and the oldest (the first sweep candidate). Those
+are the two roles `N ≥ 3` exists to keep apart. Rotating immediately on open,
+before any write can land, restores the separation and makes the seed's highest
+block exactly the snapshot's block — which is what I8 needs in order to ever
+permit a sweep.
+
+**I10 — One cycle at a time.** At most one collection cycle runs against a store.
+
+*Why.* Two concurrent cycles each drain and sweep `E₀`. The second deletes an
+epoch the first has not finished copying out of.
+
 ---
 
 ## 6. Correctness argument
@@ -263,7 +333,15 @@ moment the sweep runs, `k`'s bytes are in at least one epoch. Two cases:
   executing a block after `H`. Creating that reference required writing the
   referring node, and by **I4** the write path also wrote `k` itself to
   `E_{N-1}`, unconditionally, rather than skipping it because it already existed
-  in `E₀`. So a copy of `k` exists outside `E₀`, and it survives.
+  in `E₀`. By **I8**, `E_{N-1}` at that moment was not `E₀` — the block was
+  above `H`, and `E₀` holds no writes for blocks above `H`. So a copy of `k`
+  exists outside `E₀`, and it survives.
+
+  *This is the step that fails without I8.* "A copy exists outside `E₀`" is not
+  a consequence of I4 alone: if `E₀` was still the newest epoch when that block
+  executed, the unconditional write put the only copy of `k` **into `E₀`**, and
+  the sweep deletes it. I4 and I8 are both required, and neither implies the
+  other.
 
 ∎
 
@@ -290,6 +368,20 @@ arbitrary blocks cannot use this scheme.
 | `D` | Burial depth | Must exceed the deepest survivable reorganisation. On a merged-mined chain, be conservative. |
 | Rotation trigger | When a cycle begins | Size-based is more predictable than time-based; see [§11](#11-other-suggestions). |
 
+`N` and the rotation trigger are not independent of `D`. Together they set the
+retention window, and **I8** requires
+
+```
+    (N − 1) × blocks_per_rotation   >   D
+```
+
+Worked example, RSK mainnet: measured churn is ~40 KB of trie per block, so a
+1 GB epoch fills in ~26,000 blocks. With `N = 4` the retention window is ~78,000
+blocks against a burial depth of 4,000 — a margin of ~20x. Shrinking epochs to
+force more frequent collection shrinks that margin proportionally; at 128 MB
+epochs the window falls to ~9,800 blocks, still clear of `D` but no longer
+comfortably.
+
 ---
 
 ## 8. Failure and recovery
@@ -306,6 +398,44 @@ list derivable from directory names — rather than in a separate manifest — m
 this trivial and removes a consistency risk.
 
 **Crash after sweep, before creating the new `E_{N-1}`.** Create it at startup.
+
+### 8.1 Recorded failure: sweeping the write target (2026-09-14)
+
+A production migration violated **I8** and destroyed state. It is recorded here
+because the sequence looks reasonable at every individual step.
+
+```
+seed a new store with one epoch, from a snapshot at block 9,234,226
+start the node; it executes 9,234,227 → 9,238,014
+  ⚠ one epoch exists, so it is both newest and oldest:
+    every one of those writes lands in E₀
+force rotations to reach N = 4
+force a cycle against root(9,234,400)
+  ⚠ marks only what block 9,234,400 reaches; sweeps E₀
+    → deletes every node written for blocks 9,234,400 → 9,238,014
+      that existed only there
+```
+
+The node did not crash. It executed on, reading zeros where state had been,
+taking cheaper code paths, and computed **176,127 gas for a block whose header
+said 328,664**. The damage surfaced as a consensus mismatch roughly twenty
+minutes after the sweep, with nothing in between to indicate a problem.
+
+Three observations worth carrying:
+
+- **The design was not at fault; the procedure was.** `N ≥ 3` exists to keep the
+  write target and the sweep candidate apart. Seeding a single epoch and writing
+  into it collapsed them by hand.
+- **Silent until far downstream.** No error at sweep time, none at the next
+  block, none until execution happened to read a deleted subtree. A destroyed
+  trie announces itself only when something needs the part that is gone.
+- **Recovery depended entirely on an outside copy.** The store itself held no
+  redundancy — content addressing means one copy per epoch and no more. The node
+  was restored from a separate archival trie in minutes; without it, the only
+  route back would have been a full re-import.
+
+I8, I9 and P1/P2 in [§4.3](#43-collection-cycle) are the response. A store that
+cannot prove `E₀` safe to delete now refuses to delete it.
 
 ---
 
@@ -540,7 +670,9 @@ nothing downstream knows which one it got.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--trie-backend` | `single` | `single` keeps everything; `epoch` collects |
+| `--trie-backend` | `single` | `single` keeps everything in the node's own database; `external` keeps everything in a database of its own; `epoch` collects |
+| `--trie-dir` | `<data-dir>/trie-epochs` | Where a detached or epoch store lives |
+| `--rpc-admin` | off | Enables `rsk_collectTrie` and `rsk_collectTrieStatus` |
 | `--gc-epochs` | 4 | `N`, at least 3 |
 | `--gc-rotate-mb` | 1024 | rotate once the newest epoch reaches this size |
 | `--gc-burial` | 4000 | `D`, confirmations before a root may be collected against |
@@ -560,10 +692,83 @@ make on an operator's behalf silently.
   epoch-000000000010/     <- newest, receives all writes
 ```
 
+Each epoch directory also holds `epoch-last-block`: the highest block whose
+writes went into it, written once as it stops being the newest. **I8** is checked
+against this file. A seeded epoch has no such file and instead carries the
+snapshot's own `trie_snapshot.json`, whose `block` field serves the same purpose
+— which is why seeding must leave that file in place.
+
 Epochs are named by a monotonic sequence rather than by position, so a rotation
 never renames a directory. The ordered list is recovered on startup by sorting
 the directory names, which means a crash mid-cycle needs no recovery beyond
 restarting the cycle -- there is no partial state to repair, by I7.
+
+### Guards
+
+Each precondition in [§4.3](#43-collection-cycle) and each of I8–I10 is enforced
+in code, and every one of them refuses rather than proceeding:
+
+| Guard | Enforces | Behaviour |
+|---|---|---|
+| Collection root readable | P1 | `collect` returns an error naming the root; the background collector treats it as "not yet" and waits, at debug level, since it is expected while a seeded store waits for the chain to pass its snapshot block |
+| Mark completeness | §4.3 | Any referenced entry missing during the mark aborts the cycle; the live set is incomplete and cannot be used to decide deletions |
+| `E₀` write separation | P2, I8 | Refused unless `epoch-last-block` ≤ `number(H)`; an epoch with no record is never swept |
+| Seed rotation on open | I9 | A store opened with a single non-empty epoch rotates before any write can reach it |
+| Single cycle | I10 | Compare-and-swap; a second caller is refused, not queued |
+
+Two further checks sit at node startup rather than in the collector, and exist
+because the failure they prevent is silent rather than loud:
+
+- `--trie-backend single` against a database whose trie column family is empty.
+  RocksDB is opened with `create_missing_column_families`, so a database whose
+  trie was detached has the family recreated **empty** on the next open, and the
+  node would run against a blank trie with no error at all. It refuses, and
+  names the backends that can read the detached store.
+- `--trie-backend external` or `epoch` pointing at an empty directory while the
+  database still holds its own trie. It refuses and prints the command that
+  moves the trie out.
+
+Neither fires on a fresh node or on an unmigrated one, and an unmigrated
+database is deliberately not warned about: `single` remains the default and
+keeps working, and a warning on a working configuration teaches operators to
+ignore warnings.
+
+### Forcing a cycle
+
+Collection is triggered by size, which on a chain writing ~40 KB of trie per
+block means an epoch fills in days. `rsk_collectTrie` starts a cycle on demand
+without stopping the node, and `rsk_collectTrieStatus` reports progress and the
+last cycle's figures. Both require `--rpc-admin`; without it they report as
+unknown methods rather than as forbidden ones, so a node without them is
+indistinguishable from one that never had them.
+
+The call returns as soon as the cycle starts. Marking a mainnet live set takes
+minutes — measured at 266 s for 11.2M nodes — which is far longer than an RPC
+should hold a connection open.
+
+The same preconditions apply to a forced cycle as to an automatic one. In
+particular, forcing does not override I8: a cycle whose root sits below `E₀`'s
+highest written block is refused, with the offending block named.
+
+### Migrating an existing node
+
+The procedure that produced the failure in [§8.1](#81-recorded-failure-sweeping-the-write-target-2026-09-14),
+corrected:
+
+1. Detach the trie into a database of its own and verify the node runs against
+   it (`--trie-backend external`). This copy is the fallback for everything
+   that follows.
+2. Seed a new epoch store from a trie snapshot, **keeping `trie_snapshot.json`**.
+3. Point `exec_head` at the snapshot's block, so the node re-executes forward
+   from state the store actually holds.
+4. Start with `--trie-backend epoch`. I9 rotates the seed away from the write
+   path before the first write.
+5. Leave the archival copy in place until the collected store has run through
+   several cycles.
+
+Step 1 is not optional. The store holds one copy of each entry by construction,
+so it contains no redundancy of its own; recovery from a bad cycle depends
+entirely on a copy kept outside it.
 
 ### Deviations from the specification above
 
@@ -583,6 +788,31 @@ Reading the epoch in key order and testing membership costs one pass regardless
 of how many survive.
 
 ### Testing
+
+Unit tests in `crates/storage/src/epoch_store.rs` pin one invariant each:
+
+| Test | Pins |
+|---|---|
+| `unconditional_writes_keep_a_revived_subtree_alive` | I4 — a state reverting to an earlier value rebuilds a subtree byte-identical to one living only in `E₀`, and must survive |
+| `refuses_to_sweep_an_epoch_holding_writes_above_the_root` | I8 — reproduces [§8.1](#81-recorded-failure-sweeping-the-write-target-2026-09-14) |
+| `a_seeded_epoch_is_rotated_before_it_can_be_written_to` | I9 — the seed is byte-identical after a write lands |
+| `refuses_to_collect_against_an_unresolvable_root` | P1 — and asserts nothing was swept |
+| `collection_keeps_the_state_it_collected_against` | I6 |
+| `collection_drops_state_older_than_the_collection_root` | that collection actually reclaims, rather than quietly keeping everything |
+| `reads_find_entries_in_older_epochs` | the read path across epochs |
+| `rejects_fewer_than_three_epochs` | `N ≥ 3` |
+
+Two notes on writing these, both learned the hard way:
+
+- **A test for a guard must fail for the right reason.** The first version of
+  the I8 test used `N = 3`, which made its third call a *real* cycle that
+  legitimately swept the old state — so the P1 guard fired instead of the guard
+  under test, and the test passed while proving nothing. It uses `N = 4` so all
+  three preparatory calls are growth rotations.
+- **Verify a regression test fails without the fix.** Checking this is itself
+  easy to get wrong: `git stash push <path>` on a clean tree exits 0 without
+  stashing, so a "revert, re-run, confirm failure" step can silently test the
+  fixed code twice and report green.
 
 `crates/cli/examples/gc_bench.rs` drives a synthetic chain whose every block
 increments 1000 sequential storage slots of one contract. Two workloads:
