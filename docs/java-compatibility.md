@@ -19,6 +19,10 @@ The catalogue is split by the *nature* of each quirk:
   constants, frontier-forever account semantics, Bridge/peg semantics.
 - [`wire-protocol.md`](./wire-protocol.md) — RLPx framing, message encoding,
   sync protocol, and discovery (interop-load-bearing, mostly non-consensus).
+- [`execution-model.md`](./execution-model.md) — **structural** differences in
+  how a block is executed: when the trie is written, why `REVERT` never reaches
+  it, the per-transaction commit boundary rskj has and rustock must simulate,
+  and the raw-storage overlay.
 
 Section numbers (§N) are historical and shared across the whole catalogue —
 cross-references like "see §30" resolve through the map below. Numbering is not
