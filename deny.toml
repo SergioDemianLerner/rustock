@@ -94,4 +94,8 @@ allow = [
     # with no copyleft or attribution burden; it covers the certificate data,
     # not code. A default build does not pull it in.
     "CDLA-Permissive-2.0",
+    # quoted_printable, via lettre, under the optional `smtp` feature only.
+    # 0BSD is the BSD licence with the attribution clause removed -- OSI
+    # approved, no conditions at all. A default build does not pull it in.
+    "0BSD",
 ]
