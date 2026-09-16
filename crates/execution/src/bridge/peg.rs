@@ -141,32 +141,69 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // registering anything. Mirror that — these are a no-op success, not a
     // failed tx. Only a malformed BTC tx (parsed below, a separate
     // exception) propagates and fails the tx.
-    let validation = (|| -> Result<(), PrecompileError> {
-        // Check if already processed
+    // rskj's validation failures are NOT all equivalent, and treating them as
+    // if they were diverged mainnet #9,227,292.
+    //
+    // `BridgeSupport.registerBtcTransaction` wraps its body in
+    // `catch (RegisterBtcTransactionException e) { log }`, so a validation that
+    // *returns false* is a silent no-op success. But
+    // `validationsForRegisterBtcTransaction` also **throws**
+    // `BridgeIllegalArgumentException` for a malformed partial merkle tree, and
+    // that is not a `RegisterBtcTransactionException` -- it escapes the catch,
+    // reaches `Bridge.execute`'s outer handler, becomes a `VMException`, and
+    // charges the sender the full gas limit (quirks-frozen-bugs.md §9d).
+    //
+    // Order is load-bearing too: rskj validates height and confirmations FIRST
+    // and returns false there, so a transaction with bad confirmations *and* a
+    // malformed PMT is swallowed, never reaching the throw.
+    enum Invalid {
+        /// `return false` in rskj: logged, call succeeds, nothing registered.
+        Swallowed(&'static str),
+        /// `throw BridgeIllegalArgumentException`: escapes the catch and fails
+        /// the transaction with the full gas limit charged.
+        Thrown(&'static str),
+    }
+
+    let validation = (|| -> Result<(), Invalid> {
+        // Check if already processed (rskj: RegisterBtcTransactionException).
         if is_btc_tx_processed(ctx, &btc_tx_hash) {
-            return Err(PrecompileError::other("transaction already processed"));
+            return Err(Invalid::Swallowed("transaction already processed"));
         }
 
-        // Validate PMT
-        if !PartialMerkleTree::has_expected_size(&pmt_data) {
-            return Err(PrecompileError::other("invalid PMT size"));
+        // Height and confirmations come first, and are swallowed
+        // (BridgeUtils.validateHeightAndConfirmations -> return false). The
+        // block itself counts as one confirmation, and the CALLER-supplied
+        // height is what gets validated.
+        let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
+        let confirmations = best_height as i64 - btc_block_height as i64 + 1;
+        if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
+            return Err(Invalid::Swallowed("insufficient confirmations"));
         }
+
+        // PMT size: rskj THROWS BridgeIllegalArgumentException here.
+        if !PartialMerkleTree::has_expected_size(&pmt_data) {
+            return Err(Invalid::Thrown("PartialMerkleTree doesn't have expected size"));
+        }
+        // `BridgeUtils.calculateMerkleRoot` constructs the PMT and walks it;
+        // a VerificationException from either is rethrown as
+        // BridgeIllegalArgumentException, so both of these throw.
         let pmt = PartialMerkleTree::parse(&pmt_data)
-            .ok_or_else(|| PrecompileError::other("failed to parse PMT"))?;
+            .ok_or(Invalid::Thrown("failed to parse PMT"))?;
         let pmt_result = pmt
             .extract_matches()
-            .ok_or_else(|| PrecompileError::other("PMT verification failed"))?;
+            .ok_or(Invalid::Thrown("PMT verification failed"))?;
 
-        // Check tx hash is in PMT matched hashes
+        // Tx not among the matched hashes: `calculateMerkleRoot` returns null,
+        // so the caller returns false -- swallowed.
         if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
-            return Err(PrecompileError::other("tx not in PMT"));
+            return Err(Invalid::Swallowed("tx not in PMT"));
         }
 
         // Look up the BTC block on the main chain at the caller-supplied
         // height (walks the chain pre-RSKIP199, indexed lookup afterwards).
         let stored_block =
             super::btc_chain::stored_block_at_main_chain_height(ctx, btc_block_height as u32, rskip199)
-                .ok_or_else(|| PrecompileError::other("BTC block not found at height"))?;
+                .ok_or(Invalid::Swallowed("BTC block not found at height"))?;
         let block_hash = stored_block.header.block_hash();
 
         // Verify merkle root matches
@@ -199,22 +236,26 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             }
         };
         if !root_valid {
-            return Err(PrecompileError::other("merkle root mismatch"));
-        }
-
-        // Check confirmations (rskj BridgeUtils.validateHeightAndConfirmations:
-        // the block itself counts as one confirmation, and the CALLER-supplied
-        // height is what gets validated).
-        let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
-        let confirmations = best_height as i64 - btc_block_height as i64 + 1;
-        if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
-            return Err(PrecompileError::other("insufficient confirmations"));
+            return Err(Invalid::Swallowed("merkle root mismatch"));
         }
         Ok(())
     })();
-    if let Err(e) = validation {
-        tracing::debug!("registerBtcTransaction: {e}; returning success (rskj swallows RegisterBtcTransactionException)");
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    match validation {
+        Ok(()) => {}
+        Err(Invalid::Swallowed(m)) => {
+            tracing::debug!(
+                "registerBtcTransaction: {m}; returning success \
+                 (rskj swallows RegisterBtcTransactionException)"
+            );
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
+        Err(Invalid::Thrown(m)) => {
+            tracing::debug!(
+                "registerBtcTransaction: {m}; throwing \
+                 (rskj BridgeIllegalArgumentException escapes the catch)"
+            );
+            return Err(PrecompileError::other(m));
+        }
     }
 
     // Parse the BTC transaction
@@ -3680,6 +3721,42 @@ pub(crate) fn genesis_federation_keys(config: &BridgeConstants) -> Vec<[u8; 33]>
 ///
 /// The BTC P2SH-multisig scriptSig format (per input):
 ///   OP_0 <der_sig_1> <der_sig_2> ... <redeemScript>
+/// Does `sig` parse the way bitcoinj's `ECDSASignature.decodeFromDER` requires?
+///
+/// bitcoinj reads one ASN.1 object and casts it to a sequence, then casts the
+/// first two elements to integers; anything else throws. It does *not* check
+/// for trailing data, and it reads r and s with `getPositiveValue()`, so a
+/// negative encoding is tolerated rather than rejected. This mirrors that: a
+/// DER SEQUENCE whose first two elements are INTEGERs, with lengths that stay
+/// inside the buffer. Stricter checks would reject signatures rskj accepts.
+fn is_der_signature(sig: &[u8]) -> bool {
+    // SEQUENCE tag plus a definite-length byte.
+    if sig.len() < 2 || sig[0] != 0x30 {
+        return false;
+    }
+    let (seq_len, mut i) = match sig[1] {
+        n if n < 0x80 => (n as usize, 2usize),
+        0x81 if sig.len() >= 3 => (sig[2] as usize, 3usize),
+        _ => return false, // longer forms never appear in a 32-byte-scalar signature
+    };
+    if seq_len > sig.len() - i {
+        return false;
+    }
+    let end = i + seq_len;
+    // Two INTEGERs.
+    for _ in 0..2 {
+        if i + 2 > end || sig[i] != 0x02 {
+            return false;
+        }
+        let len = sig[i + 1] as usize;
+        if len == 0 || len >= 0x80 || i + 2 + len > end {
+            return false;
+        }
+        i += 2 + len;
+    }
+    true
+}
+
 pub fn add_signature<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -3726,6 +3803,29 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     let sigs = parse_bytes_array(args, sigs_offset);
     if sigs.is_empty() {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
+
+    // rskj `Bridge.addSignature` (Bridge.java:632) runs every signature through
+    // `BtcECKey.ECDSASignature.decodeFromDER` before `bridgeSupport` sees it,
+    // and a parse failure throws `BridgeIllegalArgumentException`. `Bridge.execute`
+    // wraps that in a `VMException`, which `TransactionExecutor` records as
+    // `result.setException` -- marking the execution summary failed, so the
+    // sender is charged the FULL gas limit with no leftover refund, while the
+    // receipt still reports SUCCESS because its status comes from
+    // `executionError` (TransactionExecutor.java:565), which this path never
+    // sets. Returning the error here lets the existing depth-aware marker turn
+    // it into exactly those semantics.
+    //
+    // Mainnet #9,217,796 tx[1] submits a 71-byte signature beginning 0x9f
+    // rather than a DER SEQUENCE. Without this check rustock reached the
+    // pegouts-waiting-for-signatures lookup, missed, returned quietly and
+    // refunded 104,512 gas the chain had charged -- diverging the state root.
+    for sig in &sigs {
+        if !is_der_signature(sig) {
+            return Err(PrecompileError::other(
+                "addSignature: signature could not be parsed as DER",
+            ));
+        }
     }
 
     // RSKIP419: if the SVP is ongoing and this RSK tx hash is the one that
@@ -5037,6 +5137,62 @@ mod tests {
     /// throws and processSigning returns. The signature itself verifies
     /// against the federator's own key, so only redeem membership blocks it.
     #[test]
+    /// Mainnet #9,217,796 tx[1]: a federator submits a 71-byte "signature"
+    /// beginning 0x9f, not a DER SEQUENCE. rskj's `Bridge.addSignature` runs
+    /// every element through `BtcECKey.ECDSASignature.decodeFromDER` and throws
+    /// on failure, which becomes an invisible exception: receipt SUCCESS, but
+    /// the sender charged the full gas limit with no refund.
+    ///
+    /// rustock accepted it, reached the pegouts-waiting-for-signatures lookup,
+    /// missed, returned quietly and refunded 104,512 gas the chain had charged
+    /// -- diverging the state root by exactly that fee.
+    #[test]
+    fn mainnet_9217796_signature_is_not_der() {
+        let sig = hex::decode(
+            "9f2c0070c9e4c56639df9eb25efec97a1e4886a848f49a38fcdc970c7aec9274             821124693dc8ec5c699ddee0283c71331d86b5f61b6865182e0618dfb7bb52b2             65158d1987d0e1".replace(' ', "").replace('\n', ""),
+        )
+        .unwrap();
+        assert_eq!(sig.len(), 71, "the signature from the block is 71 bytes");
+        assert!(!is_der_signature(&sig), "0x9f is not a DER SEQUENCE tag");
+    }
+
+    #[test]
+    fn der_signature_accepts_a_real_signature() {
+        // 0x30 len 0x02 r(32) 0x02 s(32)
+        let mut sig = vec![0x30, 0x44, 0x02, 0x20];
+        sig.extend_from_slice(&[0x11u8; 32]);
+        sig.extend_from_slice(&[0x02, 0x20]);
+        sig.extend_from_slice(&[0x22u8; 32]);
+        assert!(is_der_signature(&sig));
+    }
+
+    #[test]
+    fn der_signature_accepts_a_leading_zero_pad() {
+        // r needs a 0x00 pad when its top bit is set: 33-byte integer.
+        let mut sig = vec![0x30, 0x45, 0x02, 0x21, 0x00];
+        sig.extend_from_slice(&[0xFFu8; 32]);
+        sig.extend_from_slice(&[0x02, 0x20]);
+        sig.extend_from_slice(&[0x22u8; 32]);
+        assert!(is_der_signature(&sig));
+    }
+
+    #[test]
+    fn der_signature_rejects_malformed_shapes() {
+        assert!(!is_der_signature(&[]), "empty");
+        assert!(!is_der_signature(&[0x30]), "tag only");
+        assert!(!is_der_signature(&[0x31, 0x44]), "wrong tag");
+        // sequence length runs past the buffer
+        assert!(!is_der_signature(&[0x30, 0x44, 0x02, 0x20, 0x01]), "truncated");
+        // second element is not an INTEGER
+        let mut sig = vec![0x30, 0x44, 0x02, 0x20];
+        sig.extend_from_slice(&[0x11u8; 32]);
+        sig.extend_from_slice(&[0x03, 0x20]);
+        sig.extend_from_slice(&[0x22u8; 32]);
+        assert!(!is_der_signature(&sig), "second element must be INTEGER");
+        // zero-length integer
+        assert!(!is_der_signature(&[0x30, 0x04, 0x02, 0x00, 0x02, 0x00]), "empty integer");
+    }
+
     fn add_signature_rejects_key_not_in_redeem_script() {
         use k256::ecdsa::signature::hazmat::PrehashSigner;
         use k256::ecdsa::{Signature, SigningKey};
