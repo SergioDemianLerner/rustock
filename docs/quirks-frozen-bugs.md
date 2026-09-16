@@ -75,6 +75,43 @@ real consensus check is the unitrie root from wasabi100 onward — but it means
 until the converter's `addStorageBytes` handling is aligned with rskj. Logged in
 TODO.
 
+### 9d. `addSignature` with a non-DER signature: success receipt, full-limit fee
+
+`Bridge.addSignature` (Bridge.java:632) runs every element of the `bytes[]`
+through `BtcECKey.ECDSASignature.decodeFromDER` *before* `bridgeSupport` sees
+it, and throws `BridgeIllegalArgumentException` on failure. `Bridge.execute`
+wraps that in a `VMException`, and `TransactionExecutor` records it as
+`result.setException`.
+
+Two independent things then happen, and they disagree:
+
+- `buildTransactionExecutionSummary` sees `result.getException() != null` and
+  calls `markAsFailed()`. A failed summary returns **zero** from `getLeftover()`
+  and `getRefund()`, so the sender is charged the **full gas limit** and REMASC
+  receives `gasLimit * gasPrice`.
+- The receipt's status comes from a different source —
+  `executionError.isEmpty()` (TransactionExecutor.java:565) — and `executionError`
+  is set only by `execError()`, which this path never calls. So the receipt
+  reports **SUCCESS**, with `gasUsed = requiredGas + basicTxCost`.
+
+A transaction that reports success while its sender pays the entire gas limit is
+not defensible behaviour; it is an rskj bug. It is also what mainnet did, so it
+is consensus.
+
+**Mainnet #9,217,796** tx[1] submits a 71-byte signature beginning `0x9f`.
+rustock had no DER check, so it reached the pegouts-waiting-for-signatures
+lookup, missed, returned quietly and refunded the unused 104,512 gas — leaving
+the sender 2,724,167,987,200 wei richer than the chain and REMASC the same
+amount poorer, and diverging the state root. Receipts root and gas used matched
+throughout; only the fee settlement differed.
+
+Handled in `crates/execution/src/bridge/peg.rs` (`is_der_signature`, applied in
+`add_signature`), which raises the existing `INVISIBLE_EXCEPTION_MARKER` — the
+marker that already carried exactly these semantics for the parse-failure and
+local-only-method paths (§9c neighbours). Found by the whole-chain replay
+described in [`trie-segments-design.md`](./trie-segments-design.md) §10: one
+divergence in 7,626,860 verified state roots.
+
 ---
 
 ## 10. Storage-Prefix Marker Only for Genuine Contract Creations
