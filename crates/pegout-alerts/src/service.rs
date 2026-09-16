@@ -4,7 +4,6 @@
 //! lock the node needs, and its only inputs are blocks the node has already
 //! committed — so no failure here can affect consensus or block rate.
 
-use crate::alert::Alert;
 use crate::config::PegoutAlerts;
 use crate::sink::AlertSink;
 use crate::watch;
@@ -12,8 +11,9 @@ use alloy_primitives::B256;
 use rustock_storage::BlockStore;
 use rustock_trie::{TrieNode, TrieStore};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Peg-out events worth recording, whether or not they breach a threshold.
 /// Requirement: *every* peg-out is logged.
@@ -29,6 +29,11 @@ fn pegout_event_names() -> Vec<(B256, &'static str)> {
     ]
 }
 
+/// Modification time of `path`, or `None` if it cannot be read right now.
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 pub struct Watcher {
     store: Arc<BlockStore>,
     trie: Arc<dyn TrieStore>,
@@ -39,6 +44,12 @@ pub struct Watcher {
     /// reported once rather than every few seconds.
     seen: HashSet<String>,
     next_block: u64,
+    /// Configuration file to re-read when it changes on disk. `None` means the
+    /// watcher keeps whatever it was built with.
+    config_path: Option<PathBuf>,
+    /// Modification time of that file as last seen — whether or not it parsed,
+    /// so a broken edit is reported once rather than on every poll.
+    config_seen_mtime: Option<SystemTime>,
 }
 
 impl Watcher {
@@ -58,7 +69,88 @@ impl Watcher {
             .map(|h| h.number)
             .unwrap_or(0);
         let next_block = cfg.start_block.unwrap_or(head.saturating_add(1));
-        Ok(Self { store, trie, cfg, sinks, change_scripts, seen: HashSet::new(), next_block })
+        Ok(Self {
+            store,
+            trie,
+            cfg,
+            sinks,
+            change_scripts,
+            seen: HashSet::new(),
+            next_block,
+            config_path: None,
+            config_seen_mtime: None,
+        })
+    }
+
+    /// Re-read `path` whenever its modification time changes, so thresholds can
+    /// be retuned against a running node.
+    ///
+    /// Only the fields that can take effect immediately are adopted; a change
+    /// to how mail is delivered, or to whether the watcher runs at all, is
+    /// reported as needing a restart rather than half-applied.
+    pub fn reloading_from(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        self.config_seen_mtime = file_mtime(&path);
+        self.config_path = Some(path);
+        self
+    }
+
+    fn reload_config_if_changed(&mut self) {
+        let Some(path) = self.config_path.clone() else { return };
+        // Unreadable right now (being rewritten, say): keep running on what we
+        // have and look again next poll.
+        let Some(mtime) = file_mtime(&path) else { return };
+        if Some(mtime) == self.config_seen_mtime {
+            return;
+        }
+        self.config_seen_mtime = Some(mtime);
+
+        let new = match crate::config::Config::load(&path) {
+            Ok(c) => c.pegout_alerts,
+            Err(e) => {
+                tracing::error!(
+                    target: "rustock::pegout_alerts",
+                    "{} changed but does not load; keeping the running configuration: {e:#}",
+                    path.display()
+                );
+                return;
+            }
+        };
+        let scripts = match new.change_scripts() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    target: "rustock::pegout_alerts",
+                    "{} changed but is unusable; keeping the running configuration: {e:#}",
+                    path.display()
+                );
+                return;
+            }
+        };
+
+        let (live, restart) = self.cfg.describe_changes(&new);
+        if live.is_empty() && restart.is_empty() {
+            tracing::info!(
+                target: "rustock::pegout_alerts",
+                "{} changed but no setting differs", path.display()
+            );
+            return;
+        }
+        for change in &restart {
+            tracing::warn!(
+                target: "rustock::pegout_alerts",
+                "{} changed {change}, which needs a node restart to take effect",
+                path.display()
+            );
+        }
+        if !live.is_empty() {
+            self.cfg.adopt_live(&new);
+            self.change_scripts = scripts;
+            tracing::info!(
+                target: "rustock::pegout_alerts",
+                "reloaded {}: {}", path.display(), live.join(", ")
+            );
+        }
     }
 
     /// Run until cancelled. Every error is logged and swallowed: a watcher that
@@ -70,9 +162,10 @@ impl Watcher {
             self.next_block, self.cfg.pegout_alert_btc, self.cfg.output_alert_btc,
             self.cfg.in_transit_alert_btc, self.cfg.confirmations
         );
-        let interval = Duration::from_secs(self.cfg.poll_interval_secs);
         loop {
-            tokio::time::sleep(interval).await;
+            // Read inside the loop so poll_interval_secs is itself reloadable.
+            tokio::time::sleep(Duration::from_secs(self.cfg.poll_interval_secs)).await;
+            self.reload_config_if_changed();
             if let Err(e) = self.sweep() {
                 tracing::warn!(target: "rustock::pegout_alerts", "sweep failed, will retry: {e:#}");
             }
@@ -162,13 +255,20 @@ impl Watcher {
                     alerts.extend(watch::check_outputs(
                         number, &waiting_txs, &self.cfg, &self.change_scripts,
                     ));
+                    // In transit is a running total, so it would otherwise
+                    // re-alert on every change -- including when the total
+                    // FALLS as peg-outs reach their confirmations. Evaluate it
+                    // only when this block requested a new peg-out: that is the
+                    // moment the number goes up and is worth knowing about.
                     let (total, alert) = watch::check_in_transit(number, &in_transit, &self.cfg);
                     tracing::debug!(
                         target: "rustock::pegout_alerts",
                         block = number, in_transit_sats = total,
                         waiting_txs = waiting_txs.len(), "bridge peg-out state"
                     );
-                    alerts.extend(alert);
+                    if !pegouts.is_empty() {
+                        alerts.extend(alert);
+                    }
                 }
                 Err(e) => tracing::warn!(
                     target: "rustock::pegout_alerts",

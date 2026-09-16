@@ -114,10 +114,11 @@ handed to the signers.",
                 format!("pegout:{}:{}", hex::encode(rsk_tx_hash), hex::encode(btc_tx_hash)),
             Alert::LargeOutput { btc_txid, output_index, .. } =>
                 format!("output:{btc_txid}:{output_index}"),
-            // In transit is a running total, so it is keyed by the value: it
-            // re-alerts when the number changes, not on every poll.
-            Alert::InTransitAboveThreshold { total_sats, .. } =>
-                format!("intransit:{total_sats}"),
+            // Raised only for a block that requested a new peg-out (see
+            // Watcher::process_block), so the block number is the event: one
+            // alert per new peg-out, never a re-alert as the total drifts.
+            Alert::InTransitAboveThreshold { block, .. } =>
+                format!("intransit:{block}"),
         }
     }
 }
@@ -139,12 +140,16 @@ mod tests {
     }
 
     #[test]
-    fn a_persisting_condition_dedups_but_a_changed_total_does_not() {
-        let a = Alert::InTransitAboveThreshold { block: 1, total_sats: 5, threshold_sats: 1, pegout_count: 2 };
-        let same_total_later_block = Alert::InTransitAboveThreshold { block: 9, total_sats: 5, threshold_sats: 1, pegout_count: 2 };
-        let different_total = Alert::InTransitAboveThreshold { block: 9, total_sats: 6, threshold_sats: 1, pegout_count: 3 };
-        assert_eq!(a.dedup_key(), same_total_later_block.dedup_key());
-        assert_ne!(a.dedup_key(), different_total.dedup_key());
+    fn in_transit_is_keyed_by_the_block_that_requested_a_new_pegout() {
+        // The alert is only ever raised for a block that requested a new
+        // peg-out, so one key per block is one alert per new peg-out. Keying
+        // by the total instead would re-alert every time the running total
+        // drifted -- including downwards, as peg-outs reach confirmation.
+        let a = Alert::InTransitAboveThreshold { block: 9, total_sats: 5, threshold_sats: 1, pegout_count: 2 };
+        let same_block_bigger_total = Alert::InTransitAboveThreshold { block: 9, total_sats: 6, threshold_sats: 1, pegout_count: 3 };
+        let later_block = Alert::InTransitAboveThreshold { block: 10, total_sats: 5, threshold_sats: 1, pegout_count: 2 };
+        assert_eq!(a.dedup_key(), same_block_bigger_total.dedup_key());
+        assert_ne!(a.dedup_key(), later_block.dedup_key());
     }
 
     #[test]

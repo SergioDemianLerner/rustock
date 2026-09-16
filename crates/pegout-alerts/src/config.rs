@@ -163,6 +163,65 @@ impl PegoutAlerts {
         Ok(())
     }
 
+    /// Decode `federation_change_scripts` from hex.
+    pub fn change_scripts(&self) -> anyhow::Result<Vec<Vec<u8>>> {
+        self.federation_change_scripts
+            .iter()
+            .map(|h| hex::decode(h.trim_start_matches("0x")))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("federation_change_scripts must be hex: {e}"))
+    }
+
+    /// What differs between this configuration and `new`, split into what the
+    /// running watcher can adopt and what it cannot.
+    ///
+    /// The live set is the tuning you actually want to change against a running
+    /// node: thresholds, the confirmation depth, the change-script list and the
+    /// poll interval. The restart set is everything whose effect was decided
+    /// when the watcher was built — whether it runs at all, where it started,
+    /// and how mail is delivered. Reporting the second set is the point: a
+    /// silently ignored edit is worse than one that says it needs a restart.
+    pub fn describe_changes(&self, new: &PegoutAlerts) -> (Vec<String>, Vec<String>) {
+        let mut live = Vec::new();
+        let mut restart = Vec::new();
+        let mut f = |name: &str, a: String, b: String, live_field: bool| {
+            if a != b {
+                let line = format!("{name}: {a} -> {b}");
+                if live_field { live.push(line) } else { restart.push(line) }
+            }
+        };
+        f("pegout_alert_btc", self.pegout_alert_btc.to_string(), new.pegout_alert_btc.to_string(), true);
+        f("output_alert_btc", self.output_alert_btc.to_string(), new.output_alert_btc.to_string(), true);
+        f("in_transit_alert_btc", self.in_transit_alert_btc.to_string(), new.in_transit_alert_btc.to_string(), true);
+        f("confirmations", self.confirmations.to_string(), new.confirmations.to_string(), true);
+        f("poll_interval_secs", self.poll_interval_secs.to_string(), new.poll_interval_secs.to_string(), true);
+        f(
+            "federation_change_scripts",
+            format!("{} entries", self.federation_change_scripts.len()),
+            format!("{} entries", new.federation_change_scripts.len()),
+            true,
+        );
+        f("enabled", self.enabled.to_string(), new.enabled.to_string(), false);
+        f("start_block", format!("{:?}", self.start_block), format!("{:?}", new.start_block), false);
+        f("max_queued_alerts", self.max_queued_alerts.to_string(), new.max_queued_alerts.to_string(), false);
+        f("email.enabled", self.email.enabled.to_string(), new.email.enabled.to_string(), false);
+        f("email.smtp_host", self.email.smtp_host.clone(), new.email.smtp_host.clone(), false);
+        f("email.smtp_port", self.email.smtp_port.to_string(), new.email.smtp_port.to_string(), false);
+        f("email.to", self.email.to.join(","), new.email.to.join(","), false);
+        (live, restart)
+    }
+
+    /// Adopt the fields `describe_changes` reports as live, leaving everything
+    /// else — notably the mail settings and the resolved secrets — untouched.
+    pub fn adopt_live(&mut self, new: &PegoutAlerts) {
+        self.pegout_alert_btc = new.pegout_alert_btc;
+        self.output_alert_btc = new.output_alert_btc;
+        self.in_transit_alert_btc = new.in_transit_alert_btc;
+        self.confirmations = new.confirmations;
+        self.poll_interval_secs = new.poll_interval_secs;
+        self.federation_change_scripts = new.federation_change_scripts.clone();
+    }
+
     /// Reject a configuration that cannot do what it claims, at startup rather
     /// than at the moment an alert needs to go out.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -277,6 +336,49 @@ fn expand(value: &str, vars: &std::collections::HashMap<String, String>) -> anyh
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_threshold_edit_is_live_but_a_mail_edit_needs_a_restart() {
+        let old = PegoutAlerts::default();
+        let mut new = old.clone();
+        new.pegout_alert_btc = 0.01;
+        new.confirmations = 10;
+        new.email.smtp_host = "elsewhere.example".into();
+        new.enabled = !old.enabled;
+
+        let (live, restart) = old.describe_changes(&new);
+        assert!(live.iter().any(|c| c.starts_with("pegout_alert_btc")), "{live:?}");
+        assert!(live.iter().any(|c| c.starts_with("confirmations")), "{live:?}");
+        assert!(restart.iter().any(|c| c.starts_with("email.smtp_host")), "{restart:?}");
+        assert!(restart.iter().any(|c| c.starts_with("enabled")), "{restart:?}");
+        assert!(!live.iter().any(|c| c.starts_with("email")), "mail must never be live: {live:?}");
+    }
+
+    #[test]
+    fn an_unchanged_file_reports_nothing() {
+        let a = PegoutAlerts::default();
+        let (live, restart) = a.describe_changes(&a.clone());
+        assert!(live.is_empty() && restart.is_empty(), "{live:?} {restart:?}");
+    }
+
+    #[test]
+    fn adopting_live_fields_leaves_the_resolved_credentials_alone() {
+        let mut running = PegoutAlerts::default();
+        running.email.password = Some("already-resolved-secret".into());
+        running.email.smtp_host = "smtp.live".into();
+
+        // A file re-read has the unexpanded placeholder, not the secret.
+        let mut from_disk = PegoutAlerts::default();
+        from_disk.pegout_alert_btc = 0.01;
+        from_disk.email.password = Some("${SMTP_PASSWORD}".into());
+        from_disk.email.smtp_host = "smtp.other".into();
+
+        running.adopt_live(&from_disk);
+        assert_eq!(running.pegout_alert_btc, 0.01);
+        assert_eq!(running.email.password.as_deref(), Some("already-resolved-secret"));
+        assert_eq!(running.email.smtp_host, "smtp.live");
+    }
+
     use super::*;
 
     #[test]
