@@ -132,6 +132,28 @@ Verified independently: a from-scratch re-execution of this block reproduces the
 chain's state root only when the full gas limit is charged, and reproduces the
 chain's `gasUsed` and receipts root either way.
 
+## A second occurrence, in a different method
+
+The same asymmetry produced a second divergence at **block #9,227,292**,
+transaction index 5, calling `registerBtcTransaction(bytes,int256,bytes)`
+(selector `0x43dc0656`) with a partial merkle tree of the wrong size.
+
+`BridgeSupport.registerBtcTransaction` catches `RegisterBtcTransactionException`
+and logs it, but `validationsForRegisterBtcTransaction` throws
+`BridgeIllegalArgumentException` for a malformed PMT — a different type, which
+escapes that catch and reaches `Bridge.execute`'s wrapper.
+
+```
+gas limit 60,455      gas used 46,504      gas price 26,065,600
+receipt status 0x1 (SUCCESS)
+sender charged the full 60,455: 363,641,185,600 wei unrefunded
+```
+
+We note it because it shows the behaviour is not specific to one method or one
+argument check: it applies to every throw that reaches `Bridge.execute`, and
+`Bridge.java` has 27 `throw new VMException` sites plus the
+`BridgeIllegalArgumentException` paths that funnel into the same wrapper.
+
 ## Impact
 
 1. **Receipt status is wrong.** A caller whose Bridge arguments are malformed is

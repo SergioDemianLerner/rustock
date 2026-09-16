@@ -548,16 +548,17 @@ The whole-chain build ran 15-16 September 2026 on the machine described in §6:
 
 | | |
 |---|---|
-| Blocks executed | **9,217,860** of 9,230,008 |
-| State roots checked (>= #1,591,000) | **7,626,860** |
-| Divergences found | **1** — block #9,217,796 (§10.4) |
-| Chunks | 96 of 97 complete, 1 failed at the divergence |
+| Blocks executed | **9,230,008** — the whole chain |
+| State roots checked (>= #1,591,000) | **7,639,009** |
+| Divergences found | **2** — blocks #9,217,796 and #9,227,292 (§10.4) |
+| Chunks | 97 of 97, after two Bridge fixes |
 | Segments | 1,517 across 97 chunk databases |
 | Size on disk | **137 GB** |
 | Elapsed | 36h 29m |
 
-Blocks #9,217,796--#9,229,943 (12,148) are unverified: the failing chunk stopped
-at the mismatch, by design.
+The first pass stopped chunk 095 at #9,217,796. With the first fix it reached
+#9,227,292 and stopped again; with both, the chunk completed — 96,596 blocks,
+96,596 state roots verified. Nothing is left unverified.
 
 ### 10.2 Why 137 GB and not 88
 
@@ -592,9 +593,34 @@ A second pass using `process_block` closes that gap, and reading from dense
 local segments rather than the archive it should cost **~15--19 h on this
 machine, ~7.5 h on eight cores** -- against the 36.5 h this build took.
 
-### 10.4 The divergence
+### 10.4 The divergences
 
-Block **#9,217,796**: computed `0x34ef1353...`, header `0x0c47553b...`.
+**Two**, both in the Bridge, both the same shape: receipts root and gas used
+matched the chain exactly, and only `paid_fees` differed — by precisely the gas
+the chain did not refund. Neither was a state or storage disagreement.
+
+| Block | Method | Unrefunded | Cause |
+|---|---|---|---|
+| #9,217,796 | `addSignature` | 104,512 gas | signature not DER; rskj validates, rustock did not |
+| #9,227,292 | `registerBtcTransaction` | 13,951 gas | malformed PMT throws `BridgeIllegalArgumentException`; rustock swallowed it |
+
+Both trace to one rskj asymmetry, catalogued as `quirks-frozen-bugs.md` §9d: a
+precompile that throws has its exception recorded for *fee* purposes
+(`result.setException` → summary marked failed → no refund) but not for
+*receipt* purposes (`executionError`, which only `execError()` sets). So the
+receipt reports SUCCESS while the sender is charged the full gas limit. The VM
+path calls both; the precompile path calls only one. Reported upstream in
+[`rskj-report-precompile-receipt-status.md`](./rskj-report-precompile-receipt-status.md).
+
+The second fix also exposed a latent ordering bug in rustock: rskj validates
+height and confirmations *first* and swallows that failure, so a transaction
+with bad confirmations *and* a malformed PMT never reaches the throw. rustock
+checked confirmations last — invisible while every failure was swallowed, and
+guaranteed to diverge once any of them threw.
+
+#### #9,217,796 in detail
+
+Computed `0x34ef1353...`, header `0x0c47553b...`.
 
 Genuine, not an artifact:
 
