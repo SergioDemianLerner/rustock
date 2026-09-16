@@ -255,6 +255,20 @@ argument in §1. A 512 MB segment spanning ~30,000 recent-era blocks costs 512 M
 of device reads once and then serves from RAM. The same 30,000 blocks against
 the archive cost ~99 GB of device reads — **roughly 190x more I/O**.
 
+### 6.5a A prediction that did not survive measurement
+
+The materialized `TrieNode` tree that execution carries forward was identified
+as ~800 MB per worker of the ~1.1 GB resident, and re-rooting from the hash
+every 500 blocks was expected to reclaim most of it. **It did not.** With
+re-rooting in place, resident set stayed at ~1.1 GB against a ~150 MB window,
+and the memory turned out to be 1,083 MB of private dirty heap spread across
+many allocations rather than one structure.
+
+The re-rooting was kept -- it is cheap and bounds a structure that is otherwise
+unbounded -- but the ~800 MB attribution was arithmetic, not measurement, and it
+was wrong. What did halve throughput and then recover it was swap pressure from
+four workers, not the tree.
+
 ### 6.6 What a resident working set actually does
 
 A 100-block range, replayed three times, small enough that its footprint fits in
@@ -419,14 +433,15 @@ replay stops being latency-bound.
 
 ### 7.2 Total size
 
-**~88 GB** of raw key+value bytes over the Unitrie era. As sealed mmap files
-with a flat hash index (~12 B/entry over ~859M entries) that is **~98 GB**; in
-RocksDB with compression, ~70 GB. Either fits the 253 GB free on `/var/lib`.
+**Measured: 137 GB** across 97 chunk databases and 1,517 sealed segments
+(§10). The projection below was 88 GB raw / ~98 GB with an index, and it was
+low by 40% -- see §10.2 for why.
 
-This is *less* than the 131 GB archive, not more. The proposal assumed
-duplication would dominate; the measurement says duplication is 1--2%, and that
-the segments additionally drop nodes canonical replay never reads (§6.4). Budget
-for 131 GB and expect to use ~98 GB.
+The projection reasoned that the segments would come out *smaller* than the
+131 GB archive, because duplication is 1--2% (§6.10) and canonical replay never
+reads the non-canonical state rskj wrote (§6.4). Both of those hold. What the
+projection missed is that a build split into 97 independently-seeded chunks pays
+a cold start each time; see §10.2.
 
 ### 7.3 What it buys
 
@@ -521,3 +536,96 @@ effect §6.5 measures from the other side.
 - **Bodies.** Replay also reads a header and a body per block from the 35 GB
   block store, also keyed by hash and so also scattered. At ~2 reads/block
   against ~1,400 trie reads/block this is noise, but it is not zero.
+
+---
+
+## 10. The build, as it actually ran
+
+The whole-chain build ran 15-16 September 2026 on the machine described in §6:
+4 vCPU, 7.7 GB RAM, production node running throughout.
+
+### 10.1 Result
+
+| | |
+|---|---|
+| Blocks executed | **9,217,860** of 9,230,008 |
+| State roots checked (>= #1,591,000) | **7,626,860** |
+| Divergences found | **1** — block #9,217,796 (§10.4) |
+| Chunks | 96 of 97 complete, 1 failed at the divergence |
+| Segments | 1,517 across 97 chunk databases |
+| Size on disk | **137 GB** |
+| Elapsed | 36h 29m |
+
+Blocks #9,217,796--#9,229,943 (12,148) are unverified: the failing chunk stopped
+at the mismatch, by design.
+
+### 10.2 Why 137 GB and not 88
+
+The projection (§6.4) modelled one continuous window over the whole era. The
+build instead ran 97 independently-seeded chunks, and **each chunk pays a cold
+start**: its window begins empty, so every node it reads from the archive is
+copied into that chunk's own database. Nodes live in the working set of several
+adjacent chunks get written once per chunk rather than once overall.
+
+That cost was understood -- §6.10 measures a cold window at ~40% slower for its
+first 10,000 blocks, which is why workers prefer the adjacent chunk -- but its
+effect on *size* was not modelled. The 1--2% duplication figure in §6.10 is the
+duplication *within* a continuous window; across chunk boundaries it is much
+larger.
+
+The fix, if the artifact is rebuilt, is fewer and larger chunks, or merging
+adjacent chunk databases afterwards from the recorded boundaries. Neither
+requires re-executing anything.
+
+### 10.3 What the pass does and does not verify
+
+It compares **only the state root**. `execute_block` validates nothing;
+`process_block` is the one that also checks transactions root, ommers hash, gas
+used, receipts root and logs bloom. The tool called the former.
+
+So the result is: **no divergence in the state transition** across the Unitrie
+era. Receipts roots, gas used and blooms are unchecked, as are all headers
+(no `HeaderVerifier` runs) and every block below #1,591,000 except through the
+cumulative anchor (§8).
+
+A second pass using `process_block` closes that gap, and reading from dense
+local segments rather than the archive it should cost **~15--19 h on this
+machine, ~7.5 h on eight cores** -- against the 36.5 h this build took.
+
+### 10.4 The divergence
+
+Block **#9,217,796**: computed `0x34ef1353...`, header `0x0c47553b...`.
+
+Genuine, not an artifact:
+
+- the header matches public-node.rsk.co exactly (hash, state root, parent,
+  3 txs, 0 uncles, 151,732 gas);
+- the parent #9,217,795 verified, so the pre-state was right;
+- reproduced from an independent seed (#9,217,789) with an empty segment store,
+  producing the same computed root -- so not a `WindowStore` artifact;
+- 84,448 blocks in the same chunk verified before it.
+
+The block's second transaction calls the Bridge (`0x01000006`) with selector
+`0xf10b9c59`, which decodes as
+`addSignature(bytes federatorPublicKey, bytes[] signatures, bytes rskTxHash)` --
+a federator signing a peg-out release. 95,488 gas, status success, **zero logs**,
+which suggests this signature did not complete the release, so the divergence is
+in how partial-signature state is recorded rather than in the release path.
+
+Unfixed and uninvestigated beyond this. The next steps would be to diff
+post-block Bridge storage against the chain to localise the cell, and to check
+whether other `addSignature` calls diverge -- one occurrence in 7.6M verified
+roots suggests a specific condition rather than a broken method.
+
+### 10.5 Operational notes
+
+- **Work stealing was necessary.** Static balancing failed twice: on
+  trie-nodes-touched one worker drew a 142-hour range against another's 8, and
+  rebalanced on sampled gas it was still 44 against 24. Cost per block tracks
+  EVM gas, and gas buys different amounts of work in different eras.
+- **Four workers were worse than three.** Measured, the fourth contributed ~4%
+  of throughput for 25% of the memory; removing it cost 0.9 blocks/s and the
+  freed page cache returned more than that.
+- **The run survived an OOM kill** (a `cargo` link step on the same box took the
+  memory) and several restarts, because chunks are claimed and checkpointed.
+  A killed worker re-takes its own chunk and resumes.
