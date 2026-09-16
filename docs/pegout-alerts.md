@@ -61,9 +61,17 @@ wrong derivation would *suppress* alerts.
 ## Repeated alerts
 
 A condition that persists is reported once, not once per poll. Peg-out and
-output alerts are keyed by transaction and output index; the in-transit alert is
-keyed by its total, so it re-alerts when the number changes rather than on every
-sweep.
+output alerts are keyed by transaction and output index.
+
+The in-transit alert is different in kind: it is a running total, not an event.
+It is therefore evaluated **only for a block that requested a new peg-out**, and
+keyed by that block. That gives one alert per new peg-out that leaves the total
+above the threshold. The total is still logged at debug level on every block
+that touches the Bridge, so the running figure is observable without mail.
+
+The alternative -- alerting whenever the total changes -- was rejected: the
+total also moves *downwards* as peg-outs reach their 4000 confirmations and
+leave the queue, which would mail you about peg-outs completing normally.
 
 ## Credentials
 

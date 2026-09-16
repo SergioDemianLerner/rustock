@@ -162,13 +162,20 @@ impl Watcher {
                     alerts.extend(watch::check_outputs(
                         number, &waiting_txs, &self.cfg, &self.change_scripts,
                     ));
+                    // In transit is a running total, so it would otherwise
+                    // re-alert on every change -- including when the total
+                    // FALLS as peg-outs reach their confirmations. Evaluate it
+                    // only when this block requested a new peg-out: that is the
+                    // moment the number goes up and is worth knowing about.
                     let (total, alert) = watch::check_in_transit(number, &in_transit, &self.cfg);
                     tracing::debug!(
                         target: "rustock::pegout_alerts",
                         block = number, in_transit_sats = total,
                         waiting_txs = waiting_txs.len(), "bridge peg-out state"
                     );
-                    alerts.extend(alert);
+                    if !pegouts.is_empty() {
+                        alerts.extend(alert);
+                    }
                 }
                 Err(e) => tracing::warn!(
                     target: "rustock::pegout_alerts",
