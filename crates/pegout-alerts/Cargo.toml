@@ -2,12 +2,13 @@
 name = "rustock-pegout-alerts"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
-rustock-core = { path = "../core" }
-rustock-storage = { path = "../storage" }
-rustock-trie = { path = "../trie" }
-rustock-execution = { path = "../execution" }
+rustock-core = { version = "0.1.0", path = "../core" }
+rustock-storage = { version = "0.1.0", path = "../storage" }
+rustock-trie = { version = "0.1.0", path = "../trie" }
+rustock-execution = { version = "0.1.0", path = "../execution" }
 alloy-primitives = { workspace = true }
 anyhow = { workspace = true }
 bitcoin = { workspace = true }
