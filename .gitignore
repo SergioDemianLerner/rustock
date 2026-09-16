@@ -29,3 +29,10 @@ data/
 data-*/
 tmp/
 /data
+
+# Alert credentials and local node configuration. Secrets belong in a
+# root-owned file under /etc, referenced from the config as ${NAME} — never
+# committed. These patterns stop a stray copy in the working tree.
+*.env
+pegout-alerts.toml
+!pegout-alerts.example.toml

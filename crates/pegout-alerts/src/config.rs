@@ -95,6 +95,15 @@ impl Default for PegoutAlerts {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct EmailConfig {
+    /// Path to a `KEY=VALUE` file holding the secrets this section refers to.
+    ///
+    /// Credentials must never be written into the configuration file, because
+    /// that file lives next to the code and gets copied, diffed and pasted.
+    /// Put them in a file owned by the node user with mode 0600 and refer to
+    /// them here as `${SMTP_PASSWORD}`; the watcher expands those at startup
+    /// and the expanded values are never logged.
+    #[serde(default)]
+    pub env_file: Option<String>,
     /// When false (the default) alerts are logged and nothing is sent, which is
     /// how this runs until SMTP credentials are supplied.
     #[serde(default)]
@@ -132,6 +141,28 @@ impl PegoutAlerts {
     pub fn output_alert_sats(&self) -> u64 { btc_to_sats(self.output_alert_btc) }
     pub fn in_transit_alert_sats(&self) -> u64 { btc_to_sats(self.in_transit_alert_btc) }
 
+    /// Load the referenced env file and expand every `${NAME}` in the email
+    /// section. Runs before `validate`, so a reference that resolves to an
+    /// empty string is caught as a missing setting.
+    pub fn resolve_secrets(&mut self) -> anyhow::Result<()> {
+        let vars = match &self.email.env_file {
+            Some(p) => read_env_file(Path::new(p))?,
+            None => std::collections::HashMap::new(),
+        };
+        self.email.from = expand(&self.email.from, &vars)?;
+        self.email.smtp_host = expand(&self.email.smtp_host, &vars)?;
+        for t in self.email.to.iter_mut() {
+            *t = expand(t, &vars)?;
+        }
+        if let Some(u) = &self.email.username {
+            self.email.username = Some(expand(u, &vars)?);
+        }
+        if let Some(p) = &self.email.password {
+            self.email.password = Some(expand(p, &vars)?);
+        }
+        Ok(())
+    }
+
     /// Reject a configuration that cannot do what it claims, at startup rather
     /// than at the moment an alert needs to go out.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -168,11 +199,80 @@ impl Config {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        let cfg: Config = toml::from_str(&text)
+        let mut cfg: Config = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        cfg.pegout_alerts.resolve_secrets()?;
         cfg.pegout_alerts.validate()?;
         Ok(cfg)
     }
+}
+
+/// Read a `KEY=VALUE` file. Blank lines and `#` comments are skipped, values
+/// may be quoted, and a `export ` prefix is tolerated so the same file can be
+/// sourced by a shell.
+fn read_env_file(path: &Path) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o077;
+        if mode != 0 {
+            // Refuse rather than warn: a credential readable by other users on
+            // the box is already disclosed, and continuing would imply it is
+            // not.
+            anyhow::bail!(
+                "{} is readable by group or others (mode {:o}); chmod 600 it",
+                path.display(),
+                meta.permissions().mode() & 0o777
+            );
+        }
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    let mut out = std::collections::HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        if let Some((k, v)) = line.split_once('=') {
+            let v = v.trim();
+            let v = v
+                .strip_prefix('"').and_then(|x| x.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
+                .unwrap_or(v);
+            out.insert(k.trim().to_string(), v.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Replace every `${NAME}` with a value from `vars`, falling back to the
+/// process environment. An unresolved reference is an error: silently leaving
+/// `${SMTP_PASSWORD}` as the literal password would authenticate as that string
+/// and fail with a confusing message much later.
+fn expand(value: &str, vars: &std::collections::HashMap<String, String>) -> anyhow::Result<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            anyhow::bail!("unterminated ${{ in configuration value");
+        };
+        let name = &after[..end];
+        let resolved = vars
+            .get(name)
+            .cloned()
+            .or_else(|| std::env::var(name).ok())
+            .ok_or_else(|| anyhow::anyhow!("${{{name}}} is not set in the env file or environment"))?;
+        out.push_str(&resolved);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -242,5 +342,90 @@ mod example_file_tests {
         cfg.pegout_alerts.validate().expect("example must validate");
         assert!(cfg.pegout_alerts.enabled);
         assert!(!cfg.pegout_alerts.email.enabled, "example must not mail by default");
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn env_file(body: &str, mode: u32) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        f
+    }
+
+    #[test]
+    fn secrets_come_from_the_env_file_not_the_config() {
+        let f = env_file("SMTP_USER=someuser\nSMTP_PASSWORD=s3cr3t\n", 0o600);
+        let mut c = PegoutAlerts {
+            email: EmailConfig {
+                enabled: true,
+                env_file: Some(f.path().display().to_string()),
+                to: vec!["ops@example.com".into()],
+                from: "node@example.com".into(),
+                smtp_host: "smtp.example.com".into(),
+                username: Some("${SMTP_USER}".into()),
+                password: Some("${SMTP_PASSWORD}".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        c.resolve_secrets().unwrap();
+        assert_eq!(c.email.username.as_deref(), Some("someuser"));
+        assert_eq!(c.email.password.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn a_world_readable_env_file_is_refused() {
+        let f = env_file("SMTP_PASSWORD=s3cr3t\n", 0o644);
+        let mut c = PegoutAlerts {
+            email: EmailConfig {
+                enabled: true,
+                env_file: Some(f.path().display().to_string()),
+                password: Some("${SMTP_PASSWORD}".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = c.resolve_secrets().unwrap_err().to_string();
+        assert!(err.contains("readable by group or others"), "{err}");
+    }
+
+    #[test]
+    fn an_unresolved_reference_is_an_error_not_a_literal_password() {
+        let f = env_file("SMTP_USER=someuser\n", 0o600);
+        let mut c = PegoutAlerts {
+            email: EmailConfig {
+                enabled: true,
+                env_file: Some(f.path().display().to_string()),
+                password: Some("${SMTP_PASSWORD}".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = c.resolve_secrets().unwrap_err().to_string();
+        assert!(err.contains("SMTP_PASSWORD"), "{err}");
+    }
+
+    #[test]
+    fn quoted_and_exported_lines_parse() {
+        let f = env_file("export SMTP_USER=\"quoted user\"\n# a comment\n\nSMTP_PASSWORD=plain\n", 0o600);
+        let vars = read_env_file(f.path()).unwrap();
+        assert_eq!(vars.get("SMTP_USER").unwrap(), "quoted user");
+        assert_eq!(vars.get("SMTP_PASSWORD").unwrap(), "plain");
+    }
+
+    #[test]
+    fn a_from_address_with_a_display_name_survives_expansion() {
+        let f = env_file("SMTP_FROM=Alerts <alerts@example.com>\n", 0o600);
+        let vars = read_env_file(f.path()).unwrap();
+        assert_eq!(expand("${SMTP_FROM}", &vars).unwrap(), "Alerts <alerts@example.com>");
     }
 }

@@ -49,14 +49,25 @@ federation_change_scripts = [
 # Until this is true, alerts are logged and nothing is sent.
 enabled = false
 
+# Secrets do NOT belong in this file. Put them in a root-owned file with mode
+# 0600 and refer to them below as ${NAME}; they are resolved at startup and
+# never logged. The node refuses to start the watcher if this file is readable
+# by group or others.
+#
+#   /etc/rustock/pegout-alerts.env
+#     SMTP_USER=...
+#     SMTP_PASSWORD=...
+#
+# env_file = "/etc/rustock/pegout-alerts.env"
+
 to = ["you@example.com"]
 from = "rustock-node@example.com"
 
 smtp_host = "smtp.example.com"
 smtp_port = 587
 
-# username = "..."
-# password = "..."
+# username = "${SMTP_USER}"
+# password = "${SMTP_PASSWORD}"
 
 # none | starttls | implicit
 tls = "starttls"

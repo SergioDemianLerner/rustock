@@ -65,6 +65,49 @@ output alerts are keyed by transaction and output index; the in-transit alert is
 keyed by its total, so it re-alerts when the number changes rather than on every
 sweep.
 
+## Credentials
+
+**Secrets never go in the configuration file.** It sits next to the code and
+gets copied, diffed and pasted. Put them in a file owned by the node user with
+mode 0600 and refer to them as `${NAME}`:
+
+```toml
+[pegout_alerts.email]
+env_file = "/etc/rustock/pegout-alerts.env"
+username = "${SMTP_USER}"
+password = "${SMTP_PASSWORD}"
+```
+
+```
+# /etc/rustock/pegout-alerts.env, chmod 600
+SMTP_USER=...
+SMTP_PASSWORD=...
+```
+
+The file is `KEY=VALUE`, tolerating `export `, quotes, blanks and `#` comments,
+so a shell can source the same file. Values also fall back to the process
+environment.
+
+Two refusals, both deliberate:
+
+- **A group- or world-readable env file is refused, not warned about.** A
+  credential other users on the box can read is already disclosed, and starting
+  anyway would imply otherwise.
+- **An unresolved `${NAME}` is an error.** Leaving the literal text as the
+  password would authenticate as that string and fail later with a confusing
+  message from the server.
+
+Validate before restarting the node, without sending anything:
+
+```
+cargo run --release -p rustock-cli --example check_alerts_config -- /etc/rustock/pegout-alerts.toml
+```
+
+It reports whether each secret resolved and its length — never its value.
+
+`.gitignore` covers `*.env` and `pegout-alerts.toml` so a stray copy in the
+working tree cannot be committed.
+
 ## Email
 
 Off until `[pegout_alerts.email] enabled = true` and a host, sender and at least
