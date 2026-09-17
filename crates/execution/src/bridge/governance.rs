@@ -753,7 +753,7 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
 
 /// Base58Check P2SH address string for a script hash (rskj
 /// `Address.toBase58`; mainnet version 0x05, testnet/regtest 0xc4).
-fn p2sh_base58_address(hash160: &[u8; 20], config: &super::constants::BridgeConstants) -> String {
+pub(crate) fn p2sh_base58_address(hash160: &[u8; 20], config: &super::constants::BridgeConstants) -> String {
     let version: u8 = match config.btc_network {
         super::constants::BtcNetwork::Mainnet => 5,
         _ => 196,

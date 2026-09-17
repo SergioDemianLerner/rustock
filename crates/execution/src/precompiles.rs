@@ -882,6 +882,16 @@ pub struct BridgeTxContext {
     pub btc_sender_hash160: [u8; 20],
     /// RSK sender address of the executing transaction (Bridge event payloads).
     pub rsk_sender: Address,
+    /// Whether this is a *local* call -- rskj's `Transaction.isLocalCall`,
+    /// set by `ReversibleTransactionExecutor` (the `eth_call`/`estimateGas`
+    /// path) via `TransactionExecutor.setLocalCall(true)`.
+    ///
+    /// Bridge methods marked `LocalOnly` execute only for such a call and
+    /// throw for anything on-chain (`Bridge.validateLocalCall`,
+    /// Bridge.java:431). It is false for every transaction in a block, so it
+    /// can never change consensus; it only decides whether a read-only query
+    /// over RPC is answered or rejected.
+    pub local_call: bool,
 }
 
 /// RSKIP197 (iris300): the `requiredGas` (rskj `getGasForData`) charged to a

@@ -713,7 +713,11 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     // local-only getter invoked on-chain always throws here and returns empty
     // (mainnet #6,223,900: a relay plain-CALLs `getFederationAddress`, which
     // rskj empties so the relay's RETURNDATASIZE check sees 0).
-    if method_only_allows_local_calls(method.permission, hardfork_cfg, block_number) {
+    // `!isLocalCall()` in rskj's condition: a local call (eth_call,
+    // estimateGas) reaches these getters, on-chain execution never does.
+    if !tx_ctx.local_call
+        && method_only_allows_local_calls(method.permission, hardfork_cfg, block_number)
+    {
         use revm::context_interface::JournalTr;
         if ctx.journal().depth() == 1 {
             return Err(marker_with_gas(INVISIBLE_EXCEPTION_MARKER, gas_cost));
@@ -946,7 +950,7 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getEstimatedFeesForPegOutAmount" => peg::get_estimated_fees_for_pegout_amount(ctx, args, gas_cost, config, hardfork_cfg),
 
         // Local-only getters with real storage reads
-        "getFederationAddress" => getters::get_federation_address(ctx, gas_cost),
+        "getFederationAddress" => getters::get_federation_address(ctx, gas_cost, config, hardfork_cfg),
         "getFederationSize" => getters::get_federation_size(ctx, gas_cost),
         "getFederationThreshold" => getters::get_federation_threshold(ctx, gas_cost),
         "getFederationCreationBlockNumber" => getters::get_federation_creation_block_number(ctx, gas_cost),
@@ -956,7 +960,7 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getFeePerKb" => getters::get_fee_per_kb(ctx, gas_cost),
         "getLockingCap" => getters::get_locking_cap(ctx, gas_cost, config),
         "getMinimumLockTxValue" => getters::get_minimum_lock_tx_value(gas_cost, config),
-        "getRetiringFederationAddress" => getters::get_retiring_federation_address(ctx, gas_cost),
+        "getRetiringFederationAddress" => getters::get_retiring_federation_address(ctx, gas_cost, config, hardfork_cfg),
         "getRetiringFederationSize" => getters::get_retiring_federation_size(ctx, gas_cost),
         "getRetiringFederationThreshold" => getters::get_retiring_federation_threshold(ctx, gas_cost),
         "getPendingFederationSize" => getters::get_pending_federation_size(ctx, gas_cost),

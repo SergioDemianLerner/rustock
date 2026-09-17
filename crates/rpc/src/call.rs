@@ -27,7 +27,7 @@ pub fn eth_call(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse 
     let tx = build_call_tx(&call_req, &header, &root, sender, state);
     let executor = RskExecutor::new(hardfork_cfg, state.store.clone());
 
-    match executor.execute_tx(&header, &tx, sender, &root, trie_store) {
+    match executor.execute_local_call(&header, &tx, sender, &root, trie_store) {
         Ok(result) => {
             if result.output.is_empty() {
                 JsonRpcResponse::success(id, json!("0x"))
@@ -65,7 +65,7 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
     // First check if the transaction even succeeds at the gas cap
     let mut tx = build_call_tx(&call_req, &header, &root, sender, state);
     tx.gas_limit = U256::from(hi);
-    match executor.execute_tx(&header, &tx, sender, &root, trie_store.clone()) {
+    match executor.execute_local_call(&header, &tx, sender, &root, trie_store.clone()) {
         Ok(result) if result.success => {}
         Ok(_) => {
             return JsonRpcResponse::error(id, INTERNAL_ERROR, "Transaction would revert");
@@ -80,7 +80,7 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
         let mut probe_tx = build_call_tx(&call_req, &header, &root, sender, state);
         probe_tx.gas_limit = U256::from(mid);
 
-        match executor.execute_tx(&header, &probe_tx, sender, &root, trie_store.clone()) {
+        match executor.execute_local_call(&header, &probe_tx, sender, &root, trie_store.clone()) {
             Ok(result) if result.success => hi = mid,
             _ => lo = mid,
         }

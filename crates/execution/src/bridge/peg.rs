@@ -3542,7 +3542,7 @@ fn store_utxos_at<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str, utxos: &[B
 /// federation's STORED format version (rskj `getActiveFederation().getRedeemScript()`).
 /// During the activation window the active federation is still the OLD one, so its
 /// format cell (and keys) must be used.
-fn active_federation_keys_and_redeem<CTX: crate::RskContextTr>(
+pub(crate) fn active_federation_keys_and_redeem<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
@@ -3574,7 +3574,7 @@ fn active_federation_keys_and_redeem<CTX: crate::RskContextTr>(
 /// Stored format version of whichever federation is currently active (the same
 /// new/old selection as `active_federation_keys_and_redeem`). Used to decide the
 /// active federation's output type (P2SH vs P2SH-P2WSH) and segwit spending.
-fn active_federation_format<CTX: crate::RskContextTr>(
+pub(crate) fn active_federation_format<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
@@ -3600,7 +3600,15 @@ fn active_federation_format<CTX: crate::RskContextTr>(
 /// Retiring federation keys + redeem (rskj `getRetiringFederation().getRedeemScript()`).
 /// The retiring federation is the OLD federation once the new one has activated;
 /// its redeem script follows the OLD federation's stored format version.
-fn retiring_federation_keys_and_redeem<CTX: crate::RskContextTr>(
+/// Stored format version under `key`, for callers outside this module.
+pub(crate) fn federation_format_version_pub<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    key: &str,
+) -> u64 {
+    federation_format_version(ctx, key)
+}
+
+pub(crate) fn retiring_federation_keys_and_redeem<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
