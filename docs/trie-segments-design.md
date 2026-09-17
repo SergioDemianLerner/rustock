@@ -655,3 +655,113 @@ roots suggests a specific condition rather than a broken method.
 - **The run survived an OOM kill** (a `cargo` link step on the same box took the
   memory) and several restarts, because chunks are claimed and checkpointed.
   A killed worker re-takes its own chunk and resumes.
+
+## 11. Where the segment databases live, and why
+
+The 137 GB of chunk databases are split across **two volumes**. The split is not
+cosmetic and not a backup: the two sets are disjoint, and together they are the
+whole chain. Losing either loses part of the coverage.
+
+| Volume | Path | Chunks | Size |
+|---|---|---:|---:|
+| `/dev/sdb` | `/var/lib/rustock/segbuild` | 56 | 84 GB |
+| `/dev/sdc` | `/mnt/import/segbuild` | 41 | 53 GB |
+
+Completion markers live separately, in `/mnt/import/replay/chunks`, one empty
+file per chunk named `<idx>-<start>-<end>.done`.
+
+### 11.1 Why two volumes
+
+Not for space. Either volume could have been made to hold all 137 GB, though
+only just in one case:
+
+| | capacity | free if `segbuild` removed | fits 137 GB? |
+|---|---:|---:|---|
+| `/dev/sdb` | 295 GB | 254 GB | yes, comfortably |
+| `/dev/sdc` | 492 GB | 141 GB | only barely — 4 GB margin |
+
+The reason is I/O. The archival trie the workers **read** from throughout the
+build — `/mnt/import/rustock-trie`, 131 GB — is on `sdc`. Writing every segment
+to `sdc` as well would have put heavy random reads and heavy sequential writes
+on one device, with the workers on both ends of the contention. Sending half the
+write load to `sdb` splits it across two spindles.
+
+There is a measurable trace of this: the run finished **56 chunks on `sdb`
+against 41 on `sdc`**. Chunks were claimed dynamically from a shared queue, so
+with equally fast volumes the counts should be near parity; the volume that was
+also serving the archive reads got through a quarter fewer. That asymmetry is
+the contention, visible after the fact.
+
+**This rationale is reconstructed, not recorded.** The choice was made per worker
+at launch — `build_segments` takes `out_root` as its fifth argument and writes
+wherever it is told — so nothing in the code or the original notes states it.
+The reconstruction rests on the capacity figures and the 56/41 split above. It is
+written down here so the next person does not have to infer it again, and does
+not "tidy" the two directories into one.
+
+### 11.2 Chunk-to-volume assignment is interleaved
+
+```
+sdb: 000 001 003 005 009 014 017 020 021 024 026 027 029 031 032 037 ...
+sdc: 002 004 006 007 008 010 011 012 013 015 016 018 019 022 023 025 ...
+```
+
+Not a range split. Workers claimed the next free chunk from a shared queue and
+wrote to whichever `out_root` their own invocation named, so the interleaving is
+a side effect of which worker happened to be free. **There is no rule to
+rediscover** — the assignment is arbitrary, and the only authority on which
+volume holds a chunk is the filesystem.
+
+### 11.3 Verifying the set is intact
+
+These four properties are what "the segment store is complete" means. All four
+hold as of 2026-09-17:
+
+```
+chunks      : 97          (56 on sdb + 41 on sdc)
+overlap     : none        no chunk exists on both volumes
+markers     : 97 .done    every database has a marker, every marker a database
+covers      : #1 .. #9,230,008, 9,230,008 blocks, no gaps, no overlaps
+```
+
+Reproduce with:
+
+```sh
+ls /var/lib/rustock/segbuild | grep -v WRITE_TEST | sort > /tmp/sdb.txt
+ls /mnt/import/segbuild | grep -v truncated-superseded | sort > /tmp/sdc.txt
+comm -12 /tmp/sdb.txt /tmp/sdc.txt            # must be empty: no overlap
+cat /tmp/sdb.txt /tmp/sdc.txt | sort > /tmp/union.txt
+ls /mnt/import/replay/chunks | sed 's/\.done$//' | sort > /tmp/markers.txt
+diff /tmp/union.txt /tmp/markers.txt           # must be empty: markers match data
+```
+
+A chunk database is `checkpoint`, `segments.csv` and `sealed/` (a sealed RocksDB).
+Note that **`checkpoint` is a resume point, not a completion record** — it is
+written periodically and is not updated when a chunk finishes, so a complete
+chunk can carry a checkpoint well short of its last block. Chunk 095 and its
+re-run both show `last_block=9183347` despite one being truncated and the other
+complete. To judge completeness, compare the last row of `segments.csv` against
+the chunk's end block, or read the worker log.
+
+### 11.4 Chunk 095 was consolidated on 2026-09-17
+
+Chunk 095 (`#9,133,348..#9,229,943`) failed twice during the original build for
+the two Bridge reasons in §10.4, and was completed by a re-run under
+`/mnt/import/verify-fix` once both fixes were in — 96,596 blocks, 96,596 state
+roots verified, 17 segments.
+
+That left the truncated first attempt sitting in `segbuild` under the chunk's
+name while the good data lived elsewhere, and the marker read `.failed`. The two
+were reconciled by renaming only — nothing was copied or deleted, and both
+directories were on `sdc` so the moves were atomic:
+
+| | |
+|---|---|
+| `segbuild/095-9133348-9229943` | the **complete** re-run (17 segments, 27 SSTs, 1.6 GB) |
+| `segbuild/095-9133348-9229943.truncated-superseded-20260917` | the first attempt, kept (15 segments, 1.4 GB) |
+| `replay/chunks/095-....done` | was `.failed` |
+
+The truncated copy is retained deliberately rather than deleted: it is the
+artifact that the two Bridge consensus bugs produced, and it costs 1.4 GB. It is
+excluded from the verification commands in §11.3 by its suffix. Delete it only
+deliberately.
