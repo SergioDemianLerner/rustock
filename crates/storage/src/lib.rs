@@ -778,13 +778,15 @@ impl BlockStore {
     /// Indexes all transactions in a block body for fast lookup by tx hash.
     /// Computes each transaction's hash from its RLP encoding.
     pub fn index_block_transactions(&self, block_hash: B256, transactions: &[Transaction]) -> Result<()> {
-        use sha3::{Digest, Keccak256};
-
         for (i, tx) in transactions.iter().enumerate() {
-            let mut buf = Vec::new();
-            tx.encode(&mut buf);
-            let tx_hash = B256::from_slice(&Keccak256::digest(&buf));
-            self.put_tx_index(tx_hash, block_hash, i as u32)?;
+            // `tx.tx_hash()` hashes `rlp_for_trie()`, which returns the ORIGINAL
+            // bytes when they were cached at decode time. Re-encoding here
+            // instead would key the index by a hash that differs from the
+            // canonical one for any transaction whose RLP does not round-trip
+            // byte-for-byte -- and reproducing rskj's non-canonical encodings is
+            // exactly why `cached_rlp` exists. The index must be keyed by the
+            // hash callers actually have.
+            self.put_tx_index(tx.tx_hash(), block_hash, i as u32)?;
         }
         Ok(())
     }
@@ -1637,6 +1639,63 @@ mod tests {
     }
 
     // --- Transaction Index tests ---
+
+    /// The index must be keyed by the canonical transaction hash -- the one
+    /// callers pass to `eth_getTransactionReceipt` and the one
+    /// `eth_getBlockByNumber` hands out.
+    ///
+    /// `Transaction::tx_hash()` hashes `rlp_for_trie()`, which returns the
+    /// ORIGINAL bytes when they were cached at decode time. An earlier version
+    /// of `index_block_transactions` re-encoded instead, so for any transaction
+    /// whose RLP does not round-trip byte-for-byte it stored a key nobody would
+    /// ever look up. Reproducing rskj's non-canonical encodings is precisely why
+    /// `cached_rlp` exists, so such transactions are expected, not hypothetical.
+    #[test]
+    fn index_block_transactions_keys_by_the_canonical_hash_not_a_reencode() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let block_hash = B256::repeat_byte(0xAB);
+
+        let mut tx = Transaction {
+            nonce: 7,
+            gas_price: U256::from(1),
+            gas_limit: U256::from(21_000),
+            to: Bytes::copy_from_slice(Address::repeat_byte(0xCC).as_slice()),
+            value: U256::from(5),
+            input: Bytes::new(),
+            v: 27,
+            r: U256::from(1),
+            s: U256::from(2),
+            cached_rlp: None,
+        };
+
+        // Bytes that deliberately differ from what re-encoding would produce,
+        // standing in for a transaction whose stored RLP is not reproducible.
+        let mut reencoded = Vec::new();
+        tx.encode(&mut reencoded);
+        let mut original = reencoded.clone();
+        original.push(0x00);
+        tx.cached_rlp = Some(original);
+
+        let canonical = tx.tx_hash();
+        assert_ne!(
+            canonical,
+            {
+                use sha3::Digest;
+                B256::from_slice(&sha3::Keccak256::digest(&reencoded))
+            },
+            "fixture is pointless unless the two hashes differ"
+        );
+
+        store.index_block_transactions(block_hash, &[tx]).unwrap();
+
+        let (found, idx) = store
+            .tx_location(canonical)
+            .unwrap()
+            .expect("index must be reachable by the canonical hash");
+        assert_eq!(found, block_hash);
+        assert_eq!(idx, 0);
+    }
 
     #[test]
     fn test_tx_index_put_and_get() {
