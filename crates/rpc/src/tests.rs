@@ -911,6 +911,25 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
     );
     assert_eq!(found["hash"], json!(reported));
     assert_eq!(found["blockNumber"], json!("0x1"));
+
+    // Every RPC that reports a transaction hash must report the SAME one.
+    // eth_getTransactionByBlockNumberAndIndex had its own third copy of the
+    // hash computation and disagreed with eth_getBlockByNumber about the very
+    // same transaction, handing out a hash that resolved to nothing.
+    for method in ["eth_getTransactionByBlockNumberAndIndex", "eth_getTransactionByBlockHashAndIndex"] {
+        let first = if method.ends_with("NumberAndIndex") {
+            json!(["0x1", "0x0"])
+        } else {
+            json!([format!("{:#x}", block_hash), "0x0"])
+        };
+        let req = make_request(method, first);
+        let resp = dispatch_for_test(&state, req).await;
+        let got = resp.result.unwrap();
+        assert_eq!(
+            got["hash"], json!(reported),
+            "{method} must agree with eth_getBlockByNumber on the transaction hash"
+        );
+    }
 }
 
 #[tokio::test]
