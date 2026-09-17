@@ -686,18 +686,29 @@ to `sdc` as well would have put heavy random reads and heavy sequential writes
 on one device, with the workers on both ends of the contention. Sending half the
 write load to `sdb` splits it across two spindles.
 
-There is a measurable trace of this: the run finished **56 chunks on `sdb`
-against 41 on `sdc`**. Chunks were claimed dynamically from a shared queue, so
-with equally fast volumes the counts should be near parity; the volume that was
-also serving the archive reads got through a quarter fewer. That asymmetry is
-the contention, visible after the fact.
+**The assignment is recorded, in `/mnt/import/replay/launch.sh`**: four workers,
+two pointed at each volume, all four reading the archival trie on `sdc`.
 
-**This rationale is reconstructed, not recorded.** The choice was made per worker
-at launch — `build_segments` takes `out_root` as its fifth argument and writes
-wherever it is told — so nothing in the code or the original notes states it.
-The reconstruction rests on the capacity figures and the 56/41 split above. It is
-written down here so the next person does not have to infer it again, and does
-not "tidy" the two directories into one.
+```sh
+$B 1 ... /var/lib/rustock/segbuild ...   # w1 -> sdb
+$B 2 ... /var/lib/rustock/segbuild ...   # w2 -> sdb
+$B 3 ... /mnt/import/segbuild      ...   # w3 -> sdc
+$B 4 ... /mnt/import/segbuild      ...   # w4 -> sdc
+```
+
+A deliberate, symmetric 2+2 split of the write load across two devices while
+reading from one of them. The *reason* is still not written down anywhere — the
+script says what, not why — so the I/O explanation above remains an inference,
+but the capacity figures make it the only one that fits.
+
+**Do not read the 56/41 chunk split as evidence of contention.** An earlier
+version of this section did, and it was wrong: worker time across the two
+volumes was not equal. `w4.log` ends mid-chunk on 15 September after a single
+chunk, and `w3.log` ends on the chunk 095 state-root mismatch at #9,217,796 —
+so `sdc` lost both of its workers early, while `sdb`'s kept going. The run was
+also restarted at least once, and because `launch.sh` redirects with `>` rather
+than `>>`, the restart overwrote the logs: only 65 `finished` lines survive for
+97 chunks. The chunk counts measure worker survival, not device speed.
 
 ### 11.2 Chunk-to-volume assignment is interleaved
 
