@@ -802,6 +802,117 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
     (state, tmp, tx_hash)
 }
 
+/// The hash `eth_getBlockBy*` reports must be the hash `eth_getTransactionByHash`
+/// can find -- a round trip through the production code, with nothing computed
+/// by hand in the test.
+///
+/// This broke because three different hash implementations existed: the
+/// canonical `Transaction::tx_hash()` (which hashes the ORIGINAL bytes when
+/// cached at decode time) and two RPC-local helpers that re-encoded instead.
+/// The index is keyed by the canonical hash, so for every transaction whose RLP
+/// does not round-trip byte-for-byte -- about 42% of mainnet transactions when
+/// measured on the production node -- the RPC handed out a hash that it could
+/// not then resolve.
+///
+/// The fixture deliberately uses a transaction whose cached RLP differs from a
+/// re-encoding, and indexes it with `index_block_transactions`, the function the
+/// commit path uses, rather than calling `put_tx_index` by hand.
+#[tokio::test]
+async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+
+    let mut tx = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::from(1),
+        gas_limit: U256::from(21_000),
+        to: alloy_primitives::Bytes::from(vec![0x12; 20]),
+        value: U256::from(1_000_000),
+        input: alloy_primitives::Bytes::default(),
+        v: 27,
+        r: U256::from(100),
+        s: U256::from(200),
+        cached_rlp: None,
+    };
+    // Non-canonical but perfectly decodable bytes: `r` carries a leading zero,
+    // which is what Java's BigInteger.toByteArray() produces for a positive
+    // number whose top bit is set. rustock decodes it leniently (see
+    // rlp_compat) to the same value, but re-encoding drops the zero -- so the
+    // stored bytes and a re-encoding hash differently. This is the real shape
+    // of the divergence, not a synthetic one.
+    let mut payload: Vec<u8> = Vec::new();
+    payload.push(0x80);                                   // nonce 0
+    payload.push(0x01);                                   // gas_price 1
+    payload.extend_from_slice(&[0x82, 0x52, 0x08]);       // gas_limit 21000
+    payload.push(0x94);                                   // to: 20-byte string
+    payload.extend_from_slice(&[0x12; 20]);
+    payload.extend_from_slice(&[0x83, 0x0f, 0x42, 0x40]); // value 1_000_000
+    payload.push(0x80);                                   // input: empty
+    payload.push(0x1b);                                   // v 27
+    payload.extend_from_slice(&[0x82, 0x00, 0x80]);       // r 128, WITH a leading zero
+    payload.extend_from_slice(&[0x81, 0xc8]);             // s 200
+    let mut original = vec![0xc0 + payload.len() as u8];
+    original.extend_from_slice(&payload);
+
+    tx.r = U256::from(128);
+    tx.cached_rlp = Some(original);
+
+    let mut reencoded = Vec::new();
+    alloy_rlp::Encodable::encode(&tx, &mut reencoded);
+    assert_ne!(
+        tx.tx_hash(),
+        {
+            use sha3::Digest;
+            B256::from_slice(&sha3::Keccak256::digest(&reencoded))
+        },
+        "fixture is pointless unless the two hashes differ"
+    );
+
+    let header = test_header(1);
+    let block_hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(1, block_hash).unwrap();
+    store.set_head(block_hash).unwrap();
+    store.put_total_difficulty(block_hash, U256::from(1000)).unwrap();
+    store.put_body(block_hash, std::slice::from_ref(&tx), &[]).unwrap();
+    // The production indexer, not a hand-written index entry.
+    store.index_block_transactions(block_hash, std::slice::from_ref(&tx)).unwrap();
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: None,
+        trie_store: None,
+        hardfork_cfg: None,
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
+        epoch_store: None,
+        admin_enabled: false,
+        gc_burial: 4000,
+    };
+
+    // Ask the node for the block, take the hash it reports...
+    let req = make_request("eth_getBlockByNumber", json!(["0x1", false]));
+    let resp = dispatch_for_test(&state, req).await;
+    let block = resp.result.clone();
+    let reported = match resp.result.as_ref().and_then(|r| r["transactions"].get(0)).and_then(|v| v.as_str()) {
+        Some(h) => h.to_string(),
+        None => panic!("block response had no transactions: {block:?} err={:?}", resp.error),
+    };
+
+    // ...and require that the same hash resolves.
+    let req = make_request("eth_getTransactionByHash", json!([reported.clone()]));
+    let resp = dispatch_for_test(&state, req).await;
+    let found = resp.result.unwrap();
+    assert!(
+        !found.is_null(),
+        "the hash reported by eth_getBlockByNumber ({reported}) must be resolvable"
+    );
+    assert_eq!(found["hash"], json!(reported));
+    assert_eq!(found["blockNumber"], json!("0x1"));
+}
+
 #[tokio::test]
 async fn test_eth_get_transaction_by_hash() {
     let (state, _tmp, tx_hash) = setup_state_with_tx();

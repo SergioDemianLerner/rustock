@@ -134,11 +134,17 @@ impl BlockResultDto {
 }
 
 /// Compute the keccak256 hash of a transaction's RLP encoding.
+/// The canonical transaction hash.
+///
+/// Must be `Transaction::tx_hash()`, which hashes `rlp_for_trie()` -- the
+/// ORIGINAL bytes when they were cached at decode time. Re-encoding here
+/// instead produced a different hash for every transaction whose RLP does not
+/// round-trip byte-for-byte (~42% of mainnet transactions when measured), so
+/// `eth_getBlockBy*` reported hashes that `eth_getTransactionByHash` and
+/// `eth_getTransactionReceipt` could not then find, because the index is keyed
+/// by the canonical hash.
 fn tx_hash(tx: &rustock_core::Transaction) -> B256 {
-    use sha3::{Digest, Keccak256};
-    let mut buf = Vec::new();
-    alloy_rlp::Encodable::encode(tx, &mut buf);
-    B256::from_slice(&Keccak256::digest(&buf))
+    tx.tx_hash()
 }
 
 /// Format a transaction as a JSON object for `eth_getBlockBy*` (full tx mode).
