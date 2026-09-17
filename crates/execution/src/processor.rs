@@ -320,6 +320,14 @@ impl BlockProcessor {
         self.block_store
             .put_receipts(hash, &result.receipts)
             .map_err(ProcessError::Storage)?;
+        // Receipts are stored by block hash, so without this the only way to
+        // reach one is to already know which block it is in:
+        // `eth_getTransactionReceipt` resolves a transaction hash through
+        // `tx_location` first. Until this call existed, that lookup returned
+        // nothing for every block the node had ever executed.
+        self.block_store
+            .index_block_transactions(hash, &block.transactions)
+            .map_err(ProcessError::Storage)?;
         Ok(result)
     }
 
@@ -894,6 +902,86 @@ mod tests {
             result.unwrap_err(),
             ProcessError::OmmersHashMismatch { .. }
         ));
+    }
+
+    /// `eth_getTransactionReceipt` resolves a transaction hash through
+    /// `tx_location` before it can reach the receipt, which is stored by block
+    /// hash. Nothing on the commit path wrote that index, so the lookup
+    /// returned nothing for every block the node had ever executed -- receipts
+    /// were computed, verified against the header and stored, and then
+    /// unreachable by the only key callers have.
+    ///
+    /// The existing `test_process_and_commit_stores_receipts` did not catch it
+    /// because it calls `execute_and_commit`, which is used by no production
+    /// path.
+    #[test]
+    fn process_and_commit_indexes_transactions_so_receipts_are_reachable() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+        let chain_id = 33;
+
+        let key = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
+        let sender = sender_address(&key);
+        let root = put_account(
+            &TrieNode::empty(), store.as_ref(), &sender, 0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+
+        let mut tx = Transaction {
+            nonce: 0,
+            gas_price: U256::from(1),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(Address::repeat_byte(0xBB).as_slice()),
+            value: U256::from(1),
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign_tx(&mut tx, &key, chain_id);
+        let tx_hash = tx.tx_hash();
+
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone());
+
+        // Execute once to learn the roots, then build a header that agrees with
+        // them so `process_and_commit` gets past its own validation.
+        let probe = Block {
+            header: dummy_header(8_000_000),
+            transactions: vec![tx.clone()],
+            ommers: vec![],
+        };
+        let correct = processor.execute_block(&probe, &root, store.clone()).unwrap();
+
+        let mut header = dummy_header(8_000_000);
+        header.transactions_root = ordered_tx_trie_root(&[tx.clone()], true);
+        header.ommers_hash = compute_ommers_hash(&[]);
+        header.receipts_root = correct.receipts_root;
+        header.state_root = correct.state_root_hash;
+        header.logs_bloom = correct.logs_bloom;
+        header.gas_used = correct.gas_used;
+        header.paid_fees = correct.paid_fees;
+
+        let block = Block { header: header.clone(), transactions: vec![tx], ommers: vec![] };
+        let hash = block.hash();
+        block_store.put_header(&header).unwrap();
+        processor.process_and_commit(&block, &root, store).unwrap();
+
+        // The whole point: reach the receipt from the transaction hash alone.
+        let (found_block, index) = block_store
+            .tx_location(tx_hash)
+            .unwrap()
+            .expect("committing a block must index its transactions");
+        assert_eq!(found_block, hash);
+        assert_eq!(index, 0);
+
+        let receipts = block_store.receipts(found_block).unwrap().unwrap();
+        assert!(
+            receipts.get(index as usize).is_some(),
+            "tx_location must point at a receipt that exists"
+        );
     }
 
     #[test]
