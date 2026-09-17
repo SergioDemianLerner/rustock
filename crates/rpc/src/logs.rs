@@ -3,9 +3,7 @@ use crate::helpers::{parse_b256, parse_block_number, to_hex_b256, to_hex_u64};
 use crate::server::RpcState;
 use crate::types::*;
 use alloy_primitives::{Address, B256};
-use alloy_rlp::Encodable;
 use serde_json::{json, Value};
-use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -304,10 +302,11 @@ fn parse_address_filter(v: Option<&Value>) -> Vec<Address> {
     }
 }
 
+/// The canonical transaction hash -- see `helpers::tx_hash`. A log's
+/// `transactionHash` must match what the transaction is indexed under, or a
+/// caller cannot fetch the transaction a log came from.
 fn compute_tx_hash(tx: &rustock_core::Transaction) -> B256 {
-    let mut buf = Vec::new();
-    tx.encode(&mut buf);
-    B256::from_slice(&Keccak256::digest(&buf))
+    tx.tx_hash()
 }
 
 fn head_number(store: &rustock_storage::BlockStore) -> Option<u64> {

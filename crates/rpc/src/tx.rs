@@ -3,9 +3,7 @@ use crate::helpers::{parse_b256, parse_block_number};
 use crate::server::RpcState;
 use crate::types::*;
 use alloy_primitives::{Address, B256};
-use alloy_rlp::Encodable;
 use serde_json::Value;
-use sha3::{Digest, Keccak256};
 
 pub fn eth_get_transaction_by_hash(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
     let Some(tx_hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
@@ -141,10 +139,13 @@ fn head_number(store: &rustock_storage::BlockStore) -> Option<u64> {
         .map(|h| h.number)
 }
 
+/// The canonical transaction hash -- see `helpers::tx_hash`. This one feeds
+/// `eth_getTransactionByBlockHashAndIndex` and
+/// `eth_getTransactionByBlockNumberAndIndex`, which reported a hash that
+/// disagreed with `eth_getBlockBy*` for the same transaction and resolved to
+/// nothing.
 fn compute_tx_hash(tx: &rustock_core::Transaction) -> B256 {
-    let mut buf = Vec::new();
-    tx.encode(&mut buf);
-    B256::from_slice(&Keccak256::digest(&buf))
+    tx.tx_hash()
 }
 
 fn recover_sender_or_zero(tx: &rustock_core::Transaction) -> Address {
