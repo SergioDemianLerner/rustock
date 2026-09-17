@@ -90,6 +90,25 @@ struct Args {
     #[arg(long)]
     secret_key: Option<String>,
 
+    /// Run a one-off repair against the database and exit, instead of starting
+    /// the node. The node must be stopped: RocksDB allows a single writer.
+    ///
+    /// Tasks:
+    ///   tx-index   rebuild the transaction index from block bodies, so
+    ///              eth_getTransactionByHash and eth_getTransactionReceipt can
+    ///              find transactions in blocks that were imported rather than
+    ///              executed. Touches no trie and executes nothing.
+    #[arg(long, value_name = "TASK")]
+    repair: Option<String>,
+
+    /// First block for --repair (default 1).
+    #[arg(long)]
+    repair_from: Option<u64>,
+
+    /// Last block for --repair (default: the chain head).
+    #[arg(long)]
+    repair_to: Option<u64>,
+
     /// Log level: trace, debug, info, warn, error.
     /// Can also use RUST_LOG-style directives, e.g. "info,rustock_sync=debug".
     #[arg(long, default_value = "info")]
@@ -436,6 +455,15 @@ async fn main() -> Result<()> {
     // Block-hash computation (RSKIP92) needs the activation heights before
     // any header is decoded.
     config.activation_heights.clone().install();
+
+    if let Some(task) = args.repair.clone() {
+        let store = Arc::new(BlockStore::open(&args.data_dir)?);
+        match task.as_str() {
+            "tx-index" => run_repair_tx_index(&store, args.repair_from, args.repair_to)?,
+            other => anyhow::bail!("unknown repair task {other:?}; known tasks: tx-index"),
+        }
+        return Ok(());
+    }
 
     if args.metadata_in_memory {
         let store = Arc::new(BlockStore::open(&args.data_dir)?);
@@ -1361,4 +1389,66 @@ fn start_pegout_alerts(
     // its modification time changes, so a threshold change needs no restart.
     let watcher = Watcher::new(store, trie, cfg, sinks, change_scripts)?.reloading_from(path);
     Ok(Some(tokio::spawn(watcher.run())))
+}
+
+
+/// Rebuild the transaction index over a block range, reporting progress.
+///
+/// Reads bodies only -- no trie, no execution -- so it can repair the history a
+/// node imported rather than executed. Single-threaded on purpose: it is I/O
+/// bound on one RocksDB instance that allows a single writer anyway.
+fn run_repair_tx_index(
+    store: &Arc<BlockStore>,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    let head = match store.head()? {
+        Some(hash) => store.header(hash)?.map(|h| h.number).unwrap_or(0),
+        None => 0,
+    };
+    let from = from.unwrap_or(1);
+    let to = to.unwrap_or(head);
+    if to < from {
+        anyhow::bail!("--repair-to ({to}) is below --repair-from ({from})");
+    }
+    let total = to - from + 1;
+
+    info!("repair tx-index: blocks #{from}..#{to} ({total} blocks), chain head #{head}");
+    info!("repair tx-index: reading block bodies only; no trie access, no execution");
+
+    let started = Instant::now();
+    let report_every = 10_000u64;
+    let (blocks, txs, skipped) = store.repair_tx_index(from, to, report_every, |block, done, txs| {
+        let elapsed = started.elapsed().as_secs_f64();
+        let scanned = block.saturating_sub(from) + 1;
+        let pct = scanned as f64 * 100.0 / total as f64;
+        let bps = scanned as f64 / elapsed.max(0.001);
+        let tps = txs as f64 / elapsed.max(0.001);
+        let eta = if bps > 0.0 { (total - scanned) as f64 / bps } else { 0.0 };
+        info!(
+            "repair tx-index: {pct:.2}% (#{block}) | {done} blocks indexed, {txs} txs | \
+             {bps:.0} blocks/s, {tps:.0} tx/s | elapsed {} | ETA {}",
+            fmt_duration(elapsed),
+            fmt_duration(eta)
+        );
+    })?;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    info!(
+        "repair tx-index: DONE in {} | {blocks} blocks indexed, {txs} transactions, \
+         {skipped} blocks skipped (no canonical hash or no body) | {:.0} blocks/s, {:.0} tx/s",
+        fmt_duration(elapsed),
+        blocks as f64 / elapsed.max(0.001),
+        txs as f64 / elapsed.max(0.001),
+    );
+    Ok(())
+}
+
+/// Seconds as `2h 04m 31s`, for progress lines a human reads.
+fn fmt_duration(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 { format!("{h}h {m:02}m {sec:02}s") } else if m > 0 { format!("{m}m {sec:02}s") } else { format!("{sec}s") }
 }

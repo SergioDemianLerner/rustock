@@ -791,6 +791,53 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Rebuild the transaction index for canonical blocks in `[from, to]`.
+    ///
+    /// Reads each canonical block's body and writes one `tx_index` entry per
+    /// transaction. It touches no trie and executes nothing: the index is
+    /// derived entirely from block bodies, which is why this can repair history
+    /// a node imported rather than executed.
+    ///
+    /// `progress` is called every `report_every` blocks with
+    /// `(block, blocks_done, txs_indexed)` so a caller can log a rate and an
+    /// ETA. Blocks with no canonical hash or no stored body are skipped and
+    /// counted rather than failing the run -- a gap in an imported database
+    /// should not abort a repair that can still fix everything around it.
+    ///
+    /// Returns `(blocks_indexed, txs_indexed, blocks_skipped)`.
+    ///
+    /// RocksDB allows a single writer, so the node must not be running.
+    pub fn repair_tx_index<F>(
+        &self,
+        from: u64,
+        to: u64,
+        report_every: u64,
+        mut progress: F,
+    ) -> Result<(u64, u64, u64)>
+    where
+        F: FnMut(u64, u64, u64),
+    {
+        let (mut blocks, mut txs, mut skipped) = (0u64, 0u64, 0u64);
+        for number in from..=to {
+            let Some(hash) = self.canonical_hash(number)? else {
+                skipped += 1;
+                continue;
+            };
+            match self.body(hash)? {
+                Some((transactions, _ommers)) => {
+                    txs += transactions.len() as u64;
+                    self.index_block_transactions(hash, &transactions)?;
+                    blocks += 1;
+                }
+                None => skipped += 1,
+            }
+            if report_every > 0 && number % report_every == 0 {
+                progress(number, blocks, txs);
+            }
+        }
+        Ok((blocks, txs, skipped))
+    }
+
     /// Returns a reference to the underlying RocksDB instance.
     pub fn db(&self) -> &Arc<DB> {
         &self.db
@@ -1695,6 +1742,65 @@ mod tests {
             .expect("index must be reachable by the canonical hash");
         assert_eq!(found, block_hash);
         assert_eq!(idx, 0);
+    }
+
+    /// The repair rebuilds the index from bodies alone, which is the whole
+    /// point: a node that imported its history rather than executing it has
+    /// bodies for every block and index entries for none.
+    ///
+    /// Also pins that a gap (a height with no canonical hash, or a block whose
+    /// body is missing) is skipped and counted rather than aborting the run.
+    #[test]
+    fn repair_tx_index_rebuilds_from_bodies_and_skips_gaps() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let mk_tx = |nonce: u64| Transaction {
+            nonce,
+            gas_price: U256::from(1),
+            gas_limit: U256::from(21_000),
+            to: Bytes::copy_from_slice(Address::repeat_byte(0xCC).as_slice()),
+            value: U256::from(nonce),
+            input: Bytes::new(),
+            v: 27,
+            r: U256::from(nonce + 1),
+            s: U256::from(nonce + 2),
+            cached_rlp: None,
+        };
+
+        // #1 and #3 are complete; #2 is a gap with no canonical hash at all.
+        let mut expected = Vec::new();
+        for number in [1u64, 3] {
+            let header = dummy_header(number);
+            let hash = B256::repeat_byte(number as u8);
+            let txs = vec![mk_tx(number * 10), mk_tx(number * 10 + 1)];
+            store.put_header_with_hash(hash, &header).unwrap();
+            store.put_canonical_hash(number, hash).unwrap();
+            store.put_body(hash, &txs, &[]).unwrap();
+            for (i, tx) in txs.iter().enumerate() {
+                expected.push((tx.tx_hash(), hash, i as u32));
+            }
+        }
+
+        // Nothing is indexed yet -- exactly the state of an imported chain.
+        for (tx_hash, _, _) in &expected {
+            assert!(store.tx_location(*tx_hash).unwrap().is_none());
+        }
+
+        let mut reports = 0;
+        let (blocks, txs, skipped) = store
+            .repair_tx_index(1, 3, 1, |_, _, _| reports += 1)
+            .unwrap();
+
+        assert_eq!(blocks, 2, "two blocks had bodies");
+        assert_eq!(txs, 4, "two transactions each");
+        assert_eq!(skipped, 1, "#2 has no canonical hash and must be skipped, not fatal");
+        assert!(reports > 0, "progress must be reported");
+
+        for (tx_hash, block_hash, index) in expected {
+            let found = store.tx_location(tx_hash).unwrap();
+            assert_eq!(found, Some((block_hash, index)), "every transaction must be findable");
+        }
     }
 
     #[test]
