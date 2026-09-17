@@ -10,20 +10,56 @@ use super::constants::BridgeConstants;
 use super::serialization;
 use super::storage::*;
 
-/// `getFederationAddress()` → string (ABI-encoded)
+/// `getFederationAddress()` → string (ABI-encoded), the Base58Check P2SH
+/// address of the **active** federation (rskj `Bridge.getFederationAddress`,
+/// `Federation.getAddress().toBase58()`).
+///
+/// This is deliberately built from the same two functions the peg-out path
+/// uses to decide where change goes — `active_federation_keys_and_redeem` and
+/// `active_federation_format` — so the address reported here cannot disagree
+/// with the script the Bridge actually pays to. They carry the parts that are
+/// easy to get wrong: the new/old selection by activation age, the stored
+/// format version, the genesis-federation fallback when nothing is stored, and
+/// the P2SH-P2WSH hashing for format ≥ 4000 (RSKIP305).
 pub fn get_federation_address<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let fed_data = bridge_load_bytes_named(ctx, NEW_FEDERATION_KEY);
-    if fed_data.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
-    // The federation address is derived from the serialized federation data.
-    // For now, return the raw federation data as-is (the caller can decode it).
-    // A full implementation would compute the P2SH address from member keys.
-    let output = abi_encode_bytes(&fed_data);
-    Ok(PrecompileOutput::new(gas_cost, output.into()))
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let (_keys, redeem) =
+        super::peg::active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
+    let format = super::peg::active_federation_format(ctx, config, hardfork_cfg, block_number);
+    let hash160 = super::peg::federation_output_hash160(&redeem, format);
+    let address = super::governance::p2sh_base58_address(&hash160, config);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_string(&address).into()))
+}
+
+/// `getRetiringFederationAddress()` → string (ABI-encoded).
+///
+/// rskj returns the empty string when there is no retiring federation
+/// (`Bridge.getRetiringFederationAddress` → `NON_EXISTING_RETIRING_FEDERATION`),
+/// which is the common case outside a migration.
+pub fn get_retiring_federation_address<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let Some((_keys, redeem)) =
+        super::peg::retiring_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number)
+    else {
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_string("").into()));
+    };
+    let format = super::peg::federation_format_version_pub(
+        ctx,
+        super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY,
+    );
+    let hash160 = super::peg::federation_output_hash160(&redeem, format);
+    let address = super::governance::p2sh_base58_address(&hash160, config);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_string(&address).into()))
 }
 
 /// `getFederationSize()` → int256
@@ -142,19 +178,6 @@ pub fn get_minimum_lock_tx_value(
     Ok(PrecompileOutput::new(gas_cost, abi_encode_u256(wei)))
 }
 
-/// `getRetiringFederationAddress()` → string
-pub fn get_retiring_federation_address<CTX: crate::RskContextTr>(
-    ctx: &mut CTX,
-    gas_cost: u64,
-) -> Result<PrecompileOutput, PrecompileError> {
-    let fed_data = bridge_load_bytes_named(ctx, OLD_FEDERATION_KEY);
-    if fed_data.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(-1)));
-    }
-    let output = abi_encode_bytes(&fed_data);
-    Ok(PrecompileOutput::new(gas_cost, output.into()))
-}
-
 /// `getRetiringFederationSize()` → int256
 pub fn get_retiring_federation_size<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
@@ -263,6 +286,12 @@ fn abi_encode_bool(value: bool) -> Bytes {
         output[31] = 1;
     }
     Bytes::copy_from_slice(&output)
+}
+
+/// ABI-encode a `string`. rskj's `SolidityType.StringType` extends `BytesType`
+/// and encodes the UTF-8 bytes, so the layout is identical to `abi_encode_bytes`.
+fn abi_encode_string(s: &str) -> Vec<u8> {
+    abi_encode_bytes(s.as_bytes())
 }
 
 fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {

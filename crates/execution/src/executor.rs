@@ -92,6 +92,7 @@ impl RskExecutor {
     }
 
     /// Execute a single transaction against the given state root.
+    /// Execute a transaction outside a block, as an ordinary (non-local) call.
     pub fn execute_tx(
         &self,
         header: &Header,
@@ -99,6 +100,41 @@ impl RskExecutor {
         sender: Address,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
+    ) -> Result<TxExecutionResult, ExecutionError> {
+        self.execute_tx_inner(header, tx, sender, state_root, trie_store, false)
+    }
+
+    /// Execute a transaction as a **local call** -- rskj's
+    /// `ReversibleTransactionExecutor`, which serves `eth_call` and
+    /// `eth_estimateGas` and marks the transaction with
+    /// `TransactionExecutor.setLocalCall(true)`.
+    ///
+    /// The only behavioural difference is that Bridge methods marked
+    /// `LocalOnly` run instead of throwing (`Bridge.validateLocalCall`,
+    /// Bridge.java:431). Those are the read-only getters -- the federation
+    /// address, the BTC blockchain head, the peg-out queue sizes -- which rskj
+    /// deliberately refuses to answer on-chain so that no contract can depend
+    /// on them. Nothing here is reachable from block execution, so it cannot
+    /// affect consensus.
+    pub fn execute_local_call(
+        &self,
+        header: &Header,
+        tx: &rustock_core::Transaction,
+        sender: Address,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+    ) -> Result<TxExecutionResult, ExecutionError> {
+        self.execute_tx_inner(header, tx, sender, state_root, trie_store, true)
+    }
+
+    fn execute_tx_inner(
+        &self,
+        header: &Header,
+        tx: &rustock_core::Transaction,
+        sender: Address,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        local_call: bool,
     ) -> Result<TxExecutionResult, ExecutionError> {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
@@ -122,6 +158,13 @@ impl RskExecutor {
             self.remasc_config.clone(),
         )
         .with_bridge_config(self.bridge_constants.clone());
+        // rskj sets this on the transaction itself; the Bridge reads it out of
+        // the per-transaction context, so that is where it goes here.
+        if local_call {
+            if let Ok(mut guard) = precompile_provider.bridge_tx_context_slot().lock() {
+                guard.local_call = true;
+            }
+        }
         let invisible_flag = precompile_provider.invisible_exception_flag();
         let active_precompiles: Vec<Address> =
             rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
@@ -380,7 +423,13 @@ impl RskExecutor {
                     .btc_sender_hash160(self.hardfork_cfg.chain_id)
                     .unwrap_or([0u8; 20]);
                 if let Ok(mut guard) = bridge_ctx_slot.lock() {
-                    *guard = BridgeTxContext { rsk_tx_hash, btc_sender_hash160, rsk_sender: *sender };
+                    *guard = BridgeTxContext {
+                        rsk_tx_hash,
+                        btc_sender_hash160,
+                        rsk_sender: *sender,
+                        // A transaction in a block is never a local call.
+                        local_call: false,
+                    };
                 }
             }
 
@@ -818,6 +867,72 @@ mod tests {
         let key = TrieKeySlice::from_key(&key_bytes);
         let acct = AccountState::new(U256::from(nonce), balance);
         root.put(&key, &acct.encode(), store)
+    }
+
+    /// rskj `Bridge.validateLocalCall` (Bridge.java:431) lets a LOCAL-ONLY
+    /// getter run for `eth_call`/`estimateGas` and throws for anything on-chain.
+    /// rustock had the throw but no way to say "this is a local call", so the
+    /// getters were unreachable from every caller.
+    ///
+    /// The state here is empty, so the Bridge falls back to the genesis
+    /// federation (`active_federation_keys_and_redeem`, the same function the
+    /// peg-out path uses to place change) and its address is deterministic.
+    #[test]
+    fn local_only_getter_answers_a_local_call_and_throws_on_chain() {
+        // keccak256("getFederationAddress()")[..4]
+        const GET_FEDERATION_ADDRESS: [u8; 4] = [0x69, 0x23, 0xfa, 0x85];
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let root = put_account(
+            &root, store.as_ref(), &sender, 0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(6_000_000);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(600_000),
+            to: Bytes::copy_from_slice(bridge.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::copy_from_slice(&GET_FEDERATION_ADDRESS),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // On-chain: rskj empties the return data (the "invisible exception"),
+        // which is what a contract's RETURNDATASIZE check sees.
+        let on_chain = executor
+            .execute_tx(&header, &tx, sender, &root, store.clone())
+            .expect("execution completes");
+        assert!(
+            on_chain.output.is_empty(),
+            "a local-only getter must stay unreachable on-chain, got {} bytes",
+            on_chain.output.len()
+        );
+
+        // Local call: the getter runs and returns an ABI-encoded string.
+        let local = executor
+            .execute_local_call(&header, &tx, sender, &root, store)
+            .expect("execution completes");
+        assert!(!local.output.is_empty(), "a local call must reach the getter");
+
+        // ABI string: offset, length, then the UTF-8 bytes.
+        let len = U256::from_be_slice(&local.output[32..64]).to::<usize>();
+        let text = std::str::from_utf8(&local.output[64..64 + len]).expect("utf-8");
+        assert!(
+            text.starts_with('3'),
+            "mainnet federation is P2SH, so its Base58 address starts with 3; got {text}"
+        );
+        assert_eq!(text.len(), 34, "P2SH Base58Check addresses are 34 characters");
     }
 
     /// Regression for mainnet block #356,285 (gas used mismatch 65,024 vs
