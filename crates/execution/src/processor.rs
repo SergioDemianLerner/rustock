@@ -35,6 +35,11 @@ pub enum ProcessError {
     OmmersHashMismatch { header: B256, computed: B256 },
     #[error("logs bloom mismatch")]
     LogsBloomMismatch,
+    /// The block's balance changes do not conserve the native supply: more
+    /// rBTC exists after it than before. The peg is backed 1:1 by bitcoin, so
+    /// this cannot be legitimate however the block was produced.
+    #[error("supply increased by {created} wei in block #{number}: native BTC created from nothing")]
+    SupplyCreated { number: u64, created: alloy_primitives::U256 },
     #[error("storage error: {0}")]
     Storage(#[from] anyhow::Error),
 }
@@ -138,6 +143,22 @@ impl BlockProcessor {
                 logs_bloom,
                 logs,
             ));
+        }
+
+        // Conservation of the native supply, checked before anything is
+        // written. The Bridge holds the whole 21 M bitcoin, so a peg-in moves
+        // value rather than minting it and the total must never grow.
+        let supply = crate::supply::account_supply_change(
+            state_root,
+            trie_store.as_ref(),
+            &exec_result.state_changes,
+        );
+        if !supply.is_balanced() {
+            crate::supply::report(header.number, &supply);
+        }
+        if supply.created_supply() {
+            let (_, created) = supply.net();
+            return Err(ProcessError::SupplyCreated { number: header.number, created });
         }
 
         let mut new_state_root = apply_state_changes(

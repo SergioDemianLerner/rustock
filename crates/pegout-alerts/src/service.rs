@@ -4,6 +4,7 @@
 //! lock the node needs, and its only inputs are blocks the node has already
 //! committed — so no failure here can affect consensus or block rate.
 
+use crate::alert::Alert;
 use crate::config::PegoutAlerts;
 use crate::sink::AlertSink;
 use crate::watch;
@@ -47,6 +48,12 @@ pub struct Watcher {
     /// Configuration file to re-read when it changes on disk. `None` means the
     /// watcher keeps whatever it was built with.
     config_path: Option<PathBuf>,
+    /// Out-of-band alerts pushed in from block processing (supply violations).
+    ///
+    /// The sender is called on the thread executing blocks, so it must never
+    /// block: it drops into this queue and returns, and delivery happens here
+    /// on the watcher's own task like any other alert.
+    inbox: Option<std::sync::mpsc::Receiver<Alert>>,
     /// Modification time of that file as last seen — whether or not it parsed,
     /// so a broken edit is reported once rather than on every poll.
     config_seen_mtime: Option<SystemTime>,
@@ -79,7 +86,24 @@ impl Watcher {
             next_block,
             config_path: None,
             config_seen_mtime: None,
+            inbox: None,
         })
+    }
+
+    /// Accept alerts raised outside the watcher, such as a block that failed
+    /// the supply check.
+    pub fn with_inbox(mut self, rx: std::sync::mpsc::Receiver<Alert>) -> Self {
+        self.inbox = Some(rx);
+        self
+    }
+
+    /// Deliver anything pushed in from block processing.
+    fn drain_inbox(&mut self) {
+        let Some(rx) = &self.inbox else { return };
+        let pending: Vec<Alert> = rx.try_iter().collect();
+        for alert in pending {
+            self.deliver(alert);
+        }
     }
 
     /// Re-read `path` whenever its modification time changes, so thresholds can
@@ -166,6 +190,7 @@ impl Watcher {
             // Read inside the loop so poll_interval_secs is itself reloadable.
             tokio::time::sleep(Duration::from_secs(self.cfg.poll_interval_secs)).await;
             self.reload_config_if_changed();
+            self.drain_inbox();
             if let Err(e) = self.sweep() {
                 tracing::warn!(target: "rustock::pegout_alerts", "sweep failed, will retry: {e:#}");
             }
@@ -278,20 +303,24 @@ impl Watcher {
         }
 
         for alert in alerts {
-            let key = alert.dedup_key();
-            if !self.seen.insert(key) {
-                continue;
-            }
-            for sink in &self.sinks {
-                if let Err(e) = sink.deliver(&alert) {
-                    tracing::error!(
-                        target: "rustock::pegout_alerts",
-                        "sink {} failed to deliver {:?}: {e:#}", sink.name(), alert.subject()
-                    );
-                }
-            }
+            self.deliver(alert);
         }
         Ok(())
+    }
+
+    /// Deduplicate and hand one alert to every sink.
+    fn deliver(&mut self, alert: Alert) {
+        if !self.seen.insert(alert.dedup_key()) {
+            return;
+        }
+        for sink in &self.sinks {
+            if let Err(e) = sink.deliver(&alert) {
+                tracing::error!(
+                    target: "rustock::pegout_alerts",
+                    "sink {} failed to deliver {:?}: {e:#}", sink.name(), alert.subject()
+                );
+            }
+        }
     }
 
     /// Read the two peg-out queues straight out of the unitrie at `state_root`.
