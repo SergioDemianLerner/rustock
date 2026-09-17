@@ -22,6 +22,20 @@ pub enum Alert {
         amount_sats: u64,
         threshold_sats: u64,
     },
+    /// A block whose balance changes do not conserve the native supply.
+    ///
+    /// Not a peg-out finding, but it travels the same delivery path: it is the
+    /// most serious thing the node can notice, and the operator wants it by
+    /// mail for the same reason.
+    SupplyNotConserved {
+        block: u64,
+        /// True when rBTC was created (block rejected), false when destroyed.
+        created: bool,
+        /// Imbalance in wei.
+        amount_wei: String,
+        /// The accounts that moved most, as `address before -> after`.
+        top_accounts: Vec<String>,
+    },
     /// Total value of peg-outs requested but not yet confirmed.
     InTransitAboveThreshold {
         block: u64,
@@ -41,6 +55,12 @@ impl Alert {
             Alert::LargeOutput { amount_sats, block, output_index, .. } => format!(
                 "Large peg-out output: {} BTC (output {output_index}) at block #{block}",
                 sats_to_btc_string(*amount_sats)
+            ),
+            Alert::SupplyNotConserved { block, created: true, amount_wei, .. } => format!(
+                "REJECTED BLOCK #{block}: {amount_wei} wei of rBTC created from nothing"
+            ),
+            Alert::SupplyNotConserved { block, created: false, amount_wei, .. } => format!(
+                "Block #{block} destroyed {amount_wei} wei of rBTC"
             ),
             Alert::InTransitAboveThreshold { total_sats, block, .. } => format!(
                 "Peg-outs in transit: {} BTC at block #{block}",
@@ -88,6 +108,25 @@ from this check; if this output IS federation change, add its scriptPubKey to
                     sats_to_btc_string(*amount_sats),
                     sats_to_btc_string(*threshold_sats))
             }
+            Alert::SupplyNotConserved { block, created, amount_wei, top_accounts } => {
+                let what = if *created {
+                    "MORE rBTC exists after this block than before it. The peg is backed 1:1 by\n                     bitcoin and the Bridge holds the entire supply, so no legitimate block can\n                     do this. The block was REJECTED and not applied."
+                } else {
+                    "Less rBTC exists after this block than before it. This is not necessarily\n                     wrong -- REMASC burns a share of fees, and some EVM cases destroy balance --\n                     so the block was accepted and this is a record, not a failure."
+                };
+                format!(
+"Native supply changed in block #{block}.
+
+{what}
+
+  imbalance   {amount_wei} wei
+
+Accounts that moved most:
+{}
+",
+                    top_accounts.iter().map(|a| format!("  {a}")).collect::<Vec<_>>().join("\n")
+                )
+            }
             Alert::InTransitAboveThreshold { block, total_sats, threshold_sats, pegout_count } => {
                 format!(
 "The total value of peg-outs in transit is above the configured threshold.
@@ -119,6 +158,8 @@ handed to the signers.",
             // alert per new peg-out, never a re-alert as the total drifts.
             Alert::InTransitAboveThreshold { block, .. } =>
                 format!("intransit:{block}"),
+            // One per block: a block is either conserved or it is not.
+            Alert::SupplyNotConserved { block, .. } => format!("supply:{block}"),
         }
     }
 }

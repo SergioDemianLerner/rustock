@@ -29,4 +29,5 @@ pub use precompiles::{
 };
 pub use processor::{BlockProcessor, ProcessError, ProcessedBlock};
 pub use remasc::RemascConfig;
+pub mod supply;
 pub use state::apply_state_changes;

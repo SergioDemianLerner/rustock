@@ -1387,7 +1387,28 @@ fn start_pegout_alerts(
 
     // Thresholds are retuned by editing the file: the watcher re-reads it when
     // its modification time changes, so a threshold change needs no restart.
-    let watcher = Watcher::new(store, trie, cfg, sinks, change_scripts)?.reloading_from(path);
+    // Block processing raises supply violations on its own thread; it must not
+    // block there, so it pushes into this queue and the watcher delivers.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Err(e) = rustock_execution::supply::set_observer(move |v| {
+        let top: Vec<String> = v.deltas.iter().take(8)
+            .map(|d| format!("{} {} -> {}", d.address, d.before, d.after))
+            .collect();
+        // send() fails only once the watcher is gone; nothing to do about it
+        // here, and the violation is already in the log.
+        let _ = tx.send(rustock_pegout_alerts::Alert::SupplyNotConserved {
+            block: v.block,
+            created: v.created,
+            amount_wei: v.amount.to_string(),
+            top_accounts: top,
+        });
+    }) {
+        tracing::warn!("supply observer not installed: {e}");
+    }
+
+    let watcher = Watcher::new(store, trie, cfg, sinks, change_scripts)?
+        .reloading_from(path)
+        .with_inbox(rx);
     Ok(Some(tokio::spawn(watcher.run())))
 }
 
