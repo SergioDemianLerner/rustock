@@ -1092,3 +1092,292 @@ pub fn rebuild_chain_metadata(dest: &BlockStore, tip: B256, csv: Option<&mut dyn
     );
     Ok(tip_number)
 }
+
+/// Open a source store for RANDOM access, unlike `open_source`.
+///
+/// `open_source` bounds the table cache to 256 because it serves sequential
+/// full scans, where the hit rate hardly matters. Receipt import is the
+/// opposite: one point lookup per transaction, scattered across 435 SSTs. With
+/// a cache smaller than the table count RocksDB reopens tables continuously,
+/// which measured ~83 blocks/s -- about 31 hours for the chain. Keep every
+/// table open and give it a real block cache instead.
+fn open_source_random(path: &Path) -> Result<DB> {
+    let mut opts = Options::default();
+    opts.create_if_missing(false);
+    opts.set_max_open_files(-1);
+    let cache = rocksdb::Cache::new_lru_cache(512 * 1024 * 1024);
+    let mut bb = rocksdb::BlockBasedOptions::default();
+    bb.set_block_cache(&cache);
+    // The index and filter blocks are what a point lookup consults first;
+    // pinning them keeps the common path off the disk entirely.
+    bb.set_cache_index_and_filter_blocks(true);
+    bb.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    opts.set_block_based_table_factory(&bb);
+    DB::open_for_read_only(&opts, path, false)
+        .with_context(|| format!("opening rskj datasource at {} for random access", path.display()))
+}
+
+/// Import rskj's receipts into rustock's own `receipts` column family.
+///
+/// The two store receipts differently, so this is a conversion rather than a
+/// copy:
+///
+/// - rskj keys by transaction: `txHash ++ blockHash -> RLP[receipt, blockHash,
+///   index]` (the "V2" combined key; older entries are keyed by `txHash` alone
+///   and hold a *list* of those triples, one per block that included the tx).
+/// - rustock keys by block: `blockHash -> RLP[receipt, ...]` in transaction
+///   order, which is why it needs `tx_index` to find one from a tx hash.
+///
+/// So the walk is driven by rustock's own blocks: for each canonical block take
+/// its transaction hashes in order, look each one up in the source, and write
+/// the assembled list. That keeps memory bounded regardless of chain length --
+/// the alternative, scanning the source and grouping by block, would have to
+/// hold 21 M entries somewhere.
+///
+/// Blocks whose receipts are already present are skipped, so a run can be
+/// resumed and a node that executed part of the chain keeps what it computed.
+///
+/// Returns `(blocks_written, receipts_written, blocks_skipped, txs_missing)`.
+pub fn import_receipts<F>(
+    dest: &BlockStore,
+    src_dir: &Path,
+    from: u64,
+    to: u64,
+    report_every: u64,
+    mut progress: F,
+) -> Result<(u64, u64, u64, u64)>
+where
+    F: FnMut(u64, u64, u64),
+{
+    use rustock_core::Receipt;
+
+    let src = open_source_random(src_dir)?;
+    let (mut blocks, mut receipts_total, mut skipped, mut missing) = (0u64, 0u64, 0u64, 0u64);
+
+    // Batch with the WAL off, as the other bulk importers do. One committed
+    // write per block, each journalled, is what made the first version run at
+    // ~90 blocks/s. This is a bulk load that can simply be re-run if it is
+    // interrupted -- it already skips blocks that have receipts -- so the
+    // journal buys nothing.
+    let wo = WalMode::Disabled.write_options();
+    let mut batch = WriteBatch::default();
+    let mut batched = 0usize;
+    let cf_receipts = dest
+        .db()
+        .cf_handle("receipts")
+        .context("destination has no receipts column family")?;
+
+    // Random point lookups against a 27 GB store cost ~2.8 ms each, which is
+    // 28 hours for the chain -- and the node cannot run while it happens.
+    // Sorting the keys into the source's own order first turns that into
+    // near-sequential reads: gather a window of blocks, sort every transaction
+    // hash, fetch in that order, then assemble.
+    const WINDOW: u64 = 100_000;
+
+    let mut number = from;
+    while number <= to {
+        if shutdown_requested() {
+            info!(target: "rustock::import", "receipts import interrupted at #{number}");
+            break;
+        }
+        let win_end = (number + WINDOW - 1).min(to);
+
+        // Collect the window's work: which block each transaction belongs to,
+        // and where in it.
+        let mut wanted: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        let mut win_blocks: Vec<(u64, B256, usize)> = Vec::new();
+        for n in number..=win_end {
+            let Some(hash) = dest.canonical_hash(n)? else { skipped += 1; continue };
+            if dest.receipts(hash)?.is_some() { skipped += 1; continue }
+            let Some((txs, _ommers)) = dest.body(hash)? else { skipped += 1; continue };
+            let slot = win_blocks.len();
+            for (i, tx) in txs.iter().enumerate() {
+                let mut key = tx.tx_hash().as_slice().to_vec();
+                key.extend_from_slice(hash.as_slice());
+                wanted.push((key, slot, i));
+            }
+            win_blocks.push((n, hash, txs.len()));
+        }
+
+        // Sorted fetch. RocksDB serves keys in order far more cheaply than
+        // scattered ones: the same SST and index blocks stay hot.
+        wanted.sort_by(|a, b| a.0.cmp(&b.0));
+        let keys: Vec<&[u8]> = wanted.iter().map(|(k, _, _)| k.as_slice()).collect();
+        let fetched = src.multi_get(keys);
+
+        let mut assembled: Vec<Vec<Option<Receipt>>> =
+            win_blocks.iter().map(|(_, _, n)| vec![None; *n]).collect();
+        for ((key, slot, idx), got) in wanted.iter().zip(fetched.into_iter()) {
+            let Ok(Some(bytes)) = got else { continue };
+            let block_hash = &key[32..];
+            if let Some(rlp) = transaction_info_receipt(&bytes, Some(block_hash)) {
+                if let Ok(r) = Receipt::decode(&mut rlp.as_slice()) {
+                    assembled[*slot][*idx] = Some(r);
+                }
+            }
+        }
+
+        for (slot, (n, hash, count)) in win_blocks.iter().enumerate() {
+            let got = &assembled[slot];
+            if got.iter().any(|r| r.is_none()) {
+                // A partial list is worse than none: receipts are read by
+                // index, so a short list silently returns the wrong receipt.
+                missing += got.iter().filter(|r| r.is_none()).count() as u64;
+                skipped += 1;
+                let _ = (n, count);
+                continue;
+            }
+            let out: Vec<&Receipt> = got.iter().map(|r| r.as_ref().unwrap()).collect();
+            let mut payload = Vec::new();
+            for r in &out {
+                alloy_rlp::Encodable::encode(*r, &mut payload);
+            }
+            let mut buf = Vec::with_capacity(payload.len() + 5);
+            alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut buf);
+            buf.extend_from_slice(&payload);
+            batch.put_cf(&cf_receipts, hash.as_slice(), &buf);
+            batched += 1;
+            blocks += 1;
+            receipts_total += out.len() as u64;
+        }
+
+        if batched >= 2000 {
+            dest.db().write_opt(std::mem::take(&mut batch), &wo)?;
+            batched = 0;
+        }
+        if report_every > 0 {
+            progress(win_end, blocks, receipts_total);
+        }
+        number = win_end + 1;
+    }
+
+    if batched > 0 {
+        dest.db().write_opt(batch, &wo)?;
+    }
+    dest.db().flush()?;
+
+    Ok((blocks, receipts_total, skipped, missing))
+}
+
+/// Fetch one receipt's RLP from rskj's store, handling both key layouts.
+///
+/// V2 keys are `txHash ++ blockHash` and hold a single `TransactionInfo`.
+/// V1 keys are `txHash` alone and hold a list of them, one per block that
+/// included the transaction, so the right one is selected by block hash.
+fn lookup_receipt(src: &DB, tx_hash: &[u8], block_hash: &[u8]) -> Result<Option<Vec<u8>>> {
+    use alloy_rlp::Header as RlpHeader;
+    let mut combined = tx_hash.to_vec();
+    combined.extend_from_slice(block_hash);
+    if let Some(bytes) = src.get(&combined)? {
+        return Ok(transaction_info_receipt(&bytes, Some(block_hash)));
+    }
+    if let Some(bytes) = src.get(tx_hash)? {
+        // A list of TransactionInfo, or a single one: try as a list first.
+        let mut buf = bytes.as_slice();
+        if let Ok(outer) = RlpHeader::decode(&mut buf) {
+            if outer.list {
+                let mut body = &buf[..outer.payload_length.min(buf.len())];
+                while !body.is_empty() {
+                    let start: &[u8] = body;
+                    let Ok(h) = RlpHeader::decode(&mut body) else { break };
+                    let consumed = start.len() - body.len();
+                    let end = consumed + h.payload_length;
+                    if end > start.len() {
+                        break;
+                    }
+                    let item = &start[..end];
+                    if let Some(r) = transaction_info_receipt(item, Some(block_hash)) {
+                        return Ok(Some(r));
+                    }
+                    body = &start[end..];
+                }
+            }
+        }
+        return Ok(transaction_info_receipt(&bytes, Some(block_hash)));
+    }
+    Ok(None)
+}
+
+/// Extract the receipt RLP from `RLP[receiptRLP, blockHash, index]`, requiring
+/// the block hash to match when one is given.
+fn transaction_info_receipt(bytes: &[u8], want_block: Option<&[u8]>) -> Option<Vec<u8>> {
+    use alloy_rlp::Header as RlpHeader;
+
+    let mut buf = bytes;
+    let outer = RlpHeader::decode(&mut buf).ok()?;
+    if !outer.list {
+        return None;
+    }
+    let mut body = &buf[..outer.payload_length.min(buf.len())];
+
+    // First element: the receipt, itself a list.
+    let start: &[u8] = body;
+    let h = RlpHeader::decode(&mut body).ok()?;
+    let consumed = start.len() - body.len();
+    let receipt_len = consumed + h.payload_length;
+    if receipt_len > start.len() {
+        return None;
+    }
+    let receipt_rlp = start[..receipt_len].to_vec();
+    body = &start[receipt_len..];
+
+    // Second element: the block hash.
+    if let Some(want) = want_block {
+        let bh_start: &[u8] = body;
+        let bh = RlpHeader::decode(&mut body).ok()?;
+        let bh_consumed = bh_start.len() - body.len();
+        let value = &bh_start[bh_consumed..bh_consumed + bh.payload_length];
+        if value != want {
+            return None;
+        }
+    }
+    Some(receipt_rlp)
+}
+
+/// Build the Bridge event index from stored receipts.
+///
+/// Walks canonical blocks, keeps every log emitted by the Bridge, and writes it
+/// under `topic0 || block || tx_index || log_index`. Afterwards "find every
+/// peg-in" is a prefix scan of a few thousand entries instead of a walk over
+/// 9 M blocks of receipts -- the difference between seconds and hours.
+///
+/// Requires receipts to be present; blocks without them contribute nothing and
+/// are counted, so a partially-imported chain is visible rather than silently
+/// producing a thin index.
+///
+/// Returns `(blocks_scanned, events_indexed, blocks_without_receipts)`.
+pub fn build_bridge_event_index<F>(
+    dest: &BlockStore,
+    bridge: alloy_primitives::Address,
+    from: u64,
+    to: u64,
+    report_every: u64,
+    mut progress: F,
+) -> Result<(u64, u64, u64)>
+where
+    F: FnMut(u64, u64, u64),
+{
+    let (mut scanned, mut events, mut no_receipts) = (0u64, 0u64, 0u64);
+
+    for number in from..=to {
+        if shutdown_requested() {
+            info!(target: "rustock::import", "bridge index interrupted at #{number}");
+            break;
+        }
+        let Some(hash) = dest.canonical_hash(number)? else { continue };
+        let Some(receipts) = dest.receipts(hash)? else {
+            no_receipts += 1;
+            continue;
+        };
+        scanned += 1;
+
+        let txs = dest.body(hash)?.map(|(t, _)| t).unwrap_or_default();
+        events += dest.index_bridge_events(number, &receipts, &txs, bridge)?;
+
+        if report_every > 0 && number % report_every == 0 {
+            progress(number, scanned, events);
+        }
+    }
+
+    Ok((scanned, events, no_receipts))
+}

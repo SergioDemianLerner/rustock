@@ -90,6 +90,33 @@ struct Args {
     #[arg(long)]
     secret_key: Option<String>,
 
+    /// Build the Bridge event index from stored receipts and exit.
+    ///
+    /// Indexes every log the Bridge emitted, keyed by event signature, so
+    /// "find every peg-in" becomes a prefix scan rather than a walk over every
+    /// receipt in the chain. Requires receipts (see --import-rskj-receipts).
+    /// The node must be stopped.
+    #[arg(long, default_value_t = false)]
+    build_bridge_index: bool,
+
+    /// Import rskj's receipts from an extracted snapshot directory and exit.
+    ///
+    /// rustock only writes receipts for blocks it EXECUTES, so a node that
+    /// imported its history has none for those blocks. rskj keys receipts by
+    /// transaction and rustock by block, so this converts rather than copies.
+    /// Point it at `database/mainnet/receipts` from an extracted snapshot.
+    /// The node must be stopped: RocksDB allows a single writer.
+    #[arg(long, value_name = "DIR")]
+    import_rskj_receipts: Option<String>,
+
+    /// First block for --import-rskj-receipts (default 1).
+    #[arg(long)]
+    receipts_from: Option<u64>,
+
+    /// Last block for --import-rskj-receipts (default: the chain head).
+    #[arg(long)]
+    receipts_to: Option<u64>,
+
     /// Run a one-off repair against the database and exit, instead of starting
     /// the node. The node must be stopped: RocksDB allows a single writer.
     ///
@@ -455,6 +482,20 @@ async fn main() -> Result<()> {
     // Block-hash computation (RSKIP92) needs the activation heights before
     // any header is decoded.
     config.activation_heights.clone().install();
+
+    if args.build_bridge_index {
+        let store = Arc::new(BlockStore::open(&args.data_dir)?);
+        rustock_storage::rskj_import::install_signal_handlers();
+        run_build_bridge_index(&store, args.receipts_from, args.receipts_to)?;
+        return Ok(());
+    }
+
+    if let Some(dir) = args.import_rskj_receipts.clone() {
+        let store = Arc::new(BlockStore::open(&args.data_dir)?);
+        rustock_storage::rskj_import::install_signal_handlers();
+        run_import_receipts(&store, &dir, args.receipts_from, args.receipts_to)?;
+        return Ok(());
+    }
 
     if let Some(task) = args.repair.clone() {
         let store = Arc::new(BlockStore::open(&args.data_dir)?);
@@ -1472,4 +1513,112 @@ fn fmt_duration(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
     if h > 0 { format!("{h}h {m:02}m {sec:02}s") } else if m > 0 { format!("{m}m {sec:02}s") } else { format!("{sec}s") }
+}
+
+/// Import rskj's receipts, reporting progress the way the repair does.
+fn run_import_receipts(
+    store: &Arc<BlockStore>,
+    dir: &str,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    let head = match store.head()? {
+        Some(hash) => store.header(hash)?.map(|h| h.number).unwrap_or(0),
+        None => 0,
+    };
+    let from = from.unwrap_or(1);
+    let to = to.unwrap_or(head);
+    anyhow::ensure!(to >= from, "--receipts-to ({to}) is below --receipts-from ({from})");
+    let total = to - from + 1;
+
+    info!("import receipts: blocks #{from}..#{to} ({total} blocks) from {dir}");
+    info!("import receipts: blocks that already have receipts are skipped, so this resumes");
+
+    let started = Instant::now();
+    let (blocks, receipts, skipped, missing) = rustock_storage::rskj_import::import_receipts(
+        store,
+        std::path::Path::new(dir),
+        from,
+        to,
+        10_000,
+        |block, done, receipts| {
+            let elapsed = started.elapsed().as_secs_f64();
+            let scanned = block.saturating_sub(from) + 1;
+            let pct = scanned as f64 * 100.0 / total as f64;
+            let bps = scanned as f64 / elapsed.max(0.001);
+            let eta = if bps > 0.0 { (total - scanned) as f64 / bps } else { 0.0 };
+            info!(
+                "import receipts: {pct:.2}% (#{block}) | {done} blocks, {receipts} receipts | \
+                 {bps:.0} blocks/s | elapsed {} | ETA {}",
+                fmt_duration(elapsed), fmt_duration(eta)
+            );
+        },
+    )?;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    info!(
+        "import receipts: DONE in {} | {blocks} blocks written, {receipts} receipts, \
+         {skipped} blocks skipped, {missing} transactions not found in the source",
+        fmt_duration(elapsed)
+    );
+    if missing > 0 {
+        tracing::warn!(
+            "import receipts: {missing} transactions had no receipt in the source; \
+             those blocks were left without receipts rather than written partially"
+        );
+    }
+    Ok(())
+}
+
+/// Build the Bridge event index, reporting progress like the other bulk tasks.
+fn run_build_bridge_index(
+    store: &Arc<BlockStore>,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    let head = match store.head()? {
+        Some(hash) => store.header(hash)?.map(|h| h.number).unwrap_or(0),
+        None => 0,
+    };
+    let from = from.unwrap_or(1);
+    let to = to.unwrap_or(head);
+    anyhow::ensure!(to >= from, "range is empty");
+    let total = to - from + 1;
+    let bridge = rustock_execution::precompiles::BRIDGE_ADDR;
+
+    info!("bridge index: blocks #{from}..#{to} ({total} blocks), Bridge at {bridge}");
+
+    let started = Instant::now();
+    let (scanned, events, no_receipts) = rustock_storage::rskj_import::build_bridge_event_index(
+        store, bridge, from, to, 100_000,
+        |block, scanned, events| {
+            let elapsed = started.elapsed().as_secs_f64();
+            let done = block.saturating_sub(from) + 1;
+            let bps = done as f64 / elapsed.max(0.001);
+            info!(
+                "bridge index: {:.2}% (#{block}) | {scanned} blocks with receipts, {events} events | \
+                 {bps:.0} blocks/s | elapsed {} | ETA {}",
+                done as f64 * 100.0 / total as f64,
+                fmt_duration(elapsed),
+                fmt_duration(if bps > 0.0 { (total - done) as f64 / bps } else { 0.0 })
+            );
+        },
+    )?;
+
+    info!(
+        "bridge index: DONE in {} | {scanned} blocks scanned, {events} Bridge events indexed, \
+         {no_receipts} blocks had no receipts",
+        fmt_duration(started.elapsed().as_secs_f64())
+    );
+    if no_receipts > 0 {
+        tracing::warn!(
+            "bridge index: {no_receipts} blocks had no receipts and contributed nothing; \
+             run --import-rskj-receipts first for a complete index"
+        );
+    }
+    Ok(())
 }

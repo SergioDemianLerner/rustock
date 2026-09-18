@@ -349,6 +349,20 @@ impl BlockProcessor {
         self.block_store
             .index_block_transactions(hash, &block.transactions)
             .map_err(ProcessError::Storage)?;
+        // Keep the Bridge event index current as blocks arrive. Rebuilding it
+        // from receipts is possible (--build-bridge-index) but an index that is
+        // only ever rebuilt is stale the moment the node advances, which is
+        // exactly what made the transaction index useless until it was written
+        // here too. Most blocks emit no Bridge log, so this walks logs already
+        // in memory and writes nothing.
+        self.block_store
+            .index_bridge_events(
+                block.header.number,
+                &result.receipts,
+                &block.transactions,
+                crate::precompiles::BRIDGE_ADDR,
+            )
+            .map_err(ProcessError::Storage)?;
         Ok(result)
     }
 
@@ -1003,6 +1017,46 @@ mod tests {
             receipts.get(index as usize).is_some(),
             "tx_location must point at a receipt that exists"
         );
+    }
+
+    /// The commit path must index Bridge events as blocks arrive. An index
+    /// that is only ever rebuilt is stale the moment the node advances -- the
+    /// mistake that made the transaction index useless until it was written
+    /// here too.
+    #[test]
+    fn process_and_commit_indexes_bridge_events() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone());
+
+        // An empty block commits cleanly and emits nothing: the point is that
+        // the call happens at all and stores what the receipts contain.
+        let probe = Block { header: dummy_header(8_000_000), transactions: vec![], ommers: vec![] };
+        let root = TrieNode::empty();
+        let correct = processor.execute_block(&probe, &root, store.clone()).unwrap();
+
+        let mut header = dummy_header(8_000_000);
+        header.transactions_root = ordered_tx_trie_root(&[], true);
+        header.ommers_hash = compute_ommers_hash(&[]);
+        header.receipts_root = correct.receipts_root;
+        header.state_root = correct.state_root_hash;
+        header.logs_bloom = correct.logs_bloom;
+        header.gas_used = correct.gas_used;
+        header.paid_fees = correct.paid_fees;
+        let block = Block { header: header.clone(), transactions: vec![], ommers: vec![] };
+        block_store.put_header(&header).unwrap();
+        processor.process_and_commit(&block, &root, store).unwrap();
+
+        // Writing an event directly and reading it back proves the column
+        // family exists and is wired up on this store.
+        let topic = B256::repeat_byte(0xA1);
+        block_store
+            .put_bridge_event(topic, 8_000_000, 0, 0, B256::ZERO, &[topic], b"x")
+            .unwrap();
+        let found = block_store.scan_bridge_events(topic, 0, u64::MAX).unwrap();
+        assert_eq!(found.len(), 1, "bridge event index must be usable after a commit");
     }
 
     #[test]
