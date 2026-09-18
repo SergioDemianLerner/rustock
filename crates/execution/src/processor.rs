@@ -148,11 +148,15 @@ impl BlockProcessor {
         // Conservation of the native supply, checked before anything is
         // written. The Bridge holds the whole 21 M bitcoin, so a peg-in moves
         // value rather than minting it and the total must never grow.
-        let supply = crate::supply::account_supply_change(
-            state_root,
-            trie_store.as_ref(),
-            &exec_result.state_changes,
-        );
+        let supply = if crate::supply::per_block_enabled() {
+            crate::supply::account_supply_change(
+                state_root,
+                trie_store.as_ref(),
+                &exec_result.state_changes,
+            )
+        } else {
+            crate::supply::SupplyReport::default()
+        };
         if !supply.is_balanced() {
             crate::supply::report(header.number, &supply);
         }

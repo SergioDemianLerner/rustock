@@ -22,6 +22,37 @@ use alloy_primitives::{Address, U256};
 use revm::state::{AccountStatus, EvmState};
 use rustock_trie::{account_key, AccountState, TrieKeySlice, TrieNode, TrieStore};
 
+/// Which supply checks run.
+///
+/// Per-transaction is the default because block-level netting can hide a
+/// creation: a transaction that mints N and another that destroys N sum to zero
+/// over the block, and only the per-transaction view sees either. Block-level
+/// is kept on as well, as a cross-check that the per-transaction deltas account
+/// for the block's whole change -- a difference means value moved outside any
+/// transaction, which is itself worth knowing.
+static CHECK_PER_TRANSACTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static CHECK_PER_BLOCK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Enable or disable the per-transaction check. On by default.
+pub fn set_per_transaction(enabled: bool) {
+    CHECK_PER_TRANSACTION.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Enable or disable the per-block check. On by default.
+pub fn set_per_block(enabled: bool) {
+    CHECK_PER_BLOCK.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn per_transaction_enabled() -> bool {
+    CHECK_PER_TRANSACTION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn per_block_enabled() -> bool {
+    CHECK_PER_BLOCK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One account's contribution to the net supply change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountDelta {
@@ -231,6 +262,67 @@ mod tests {
         a
     }
 
+    /// The per-transaction check reads `original_info`, a revm field documented
+    /// as serving Block Access Lists. This pins the property we actually depend
+    /// on -- that it is a per-transaction baseline -- so a revm upgrade that
+    /// changes when it is refreshed fails here rather than silently
+    /// mis-accounting every block.
+    #[test]
+    fn per_transaction_baseline_holds() {
+        let who = Address::repeat_byte(0x77);
+
+        // An account whose balance rose from 100 to 140 during transaction 3.
+        let mut acct = Account::from(AccountInfo { balance: U256::from(100), ..Default::default() });
+        acct.original_info = Box::new(AccountInfo { balance: U256::from(100), ..Default::default() });
+        acct.info.balance = U256::from(140);
+        acct.transaction_id = 3;
+        acct.mark_touch();
+
+        // An account touched by a DIFFERENT transaction must not be counted.
+        let other = Address::repeat_byte(0x88);
+        let mut untouched = Account::from(AccountInfo { balance: U256::from(9), ..Default::default() });
+        untouched.original_info = Box::new(AccountInfo { balance: U256::from(1), ..Default::default() });
+        untouched.transaction_id = 2;
+        untouched.mark_touch();
+
+        let mut state = EvmState::default();
+        state.insert(who, acct);
+        state.insert(other, untouched);
+
+        let r = transaction_supply_change(&state, 3);
+        assert_eq!(r.net(), (true, U256::from(40)), "only transaction 3's change: {r:?}");
+        assert_eq!(r.deltas.len(), 1);
+        assert_eq!(r.deltas[0].address, who);
+    }
+
+    /// A fee-paying transaction nets to zero: the gas leaving the sender is
+    /// credited to the block beneficiary (REMASC) inside the same transaction,
+    /// so it never looks like a burn.
+    #[test]
+    fn a_fee_paying_transaction_nets_to_zero() {
+        let sender = Address::repeat_byte(0xAA);
+        let remasc = crate::precompiles::REMASC_ADDR;
+
+        let mut s_acct = Account::from(AccountInfo { balance: U256::from(1_000), ..Default::default() });
+        s_acct.original_info = Box::new(AccountInfo { balance: U256::from(1_000), ..Default::default() });
+        s_acct.info.balance = U256::from(979);     // paid 21 in gas
+        s_acct.transaction_id = 1;
+        s_acct.mark_touch();
+
+        let mut r_acct = Account::from(AccountInfo { balance: U256::ZERO, ..Default::default() });
+        r_acct.original_info = Box::new(AccountInfo { balance: U256::ZERO, ..Default::default() });
+        r_acct.info.balance = U256::from(21);      // received the fee
+        r_acct.transaction_id = 1;
+        r_acct.mark_touch();
+
+        let mut state = EvmState::default();
+        state.insert(sender, s_acct);
+        state.insert(remasc, r_acct);
+
+        let r = transaction_supply_change(&state, 1);
+        assert!(r.is_balanced(), "a fee is a transfer, not a burn: {r:?}");
+    }
+
     #[test]
     fn a_plain_transfer_conserves_supply() {
         let (from, to) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xBB));
@@ -325,5 +417,86 @@ mod tests {
 
         let r = account_supply_change(&root, &store, &state);
         assert!(r.is_balanced(), "a peg-in must not change the total: {r:?}");
+    }
+}
+
+/// Account for the balance changes one transaction made.
+///
+/// Unlike the block-level check this needs no database reads. revm refreshes an
+/// account's `original_info` when it is cold-loaded *within a transaction*
+/// (`JournalInner::load_account_mut_optional`), so for every account a
+/// transaction touched, `info.balance - original_info.balance` is exactly that
+/// transaction's effect. `transaction_id` identifies which transaction last
+/// touched an account, so the block's accumulated state map can be filtered
+/// down to the one just executed.
+///
+/// A fee-paying transaction nets to zero: rustock credits the block beneficiary
+/// (REMASC) inside the same transaction (`RskHandler::reward_beneficiary`), so
+/// the gas leaving the sender arrives in the same accounting.
+///
+/// **This reads a revm internal.** `original_info` is public but documented as
+/// serving Block Access Lists, so a future revm could change when it is
+/// refreshed without considering it breaking. `per_transaction_baseline_holds`
+/// pins the behaviour: if it ever stops being a per-transaction baseline that
+/// test fails, rather than the check silently mis-accounting.
+pub fn transaction_supply_change(state: &EvmState, transaction_id: usize) -> SupplyReport {
+    let mut report = SupplyReport::default();
+
+    for (addr, account) in state {
+        if account.transaction_id != transaction_id {
+            continue; // untouched by this transaction
+        }
+        let before = account.original_info.balance;
+        let after = if account.status.contains(AccountStatus::SelfDestructed) {
+            U256::ZERO
+        } else {
+            account.info.balance
+        };
+        if before == after {
+            continue;
+        }
+        if after > before {
+            report.inflow += after - before;
+        } else {
+            report.outflow += before - after;
+        }
+        report.deltas.push(AccountDelta { address: *addr, before, after });
+    }
+
+    report
+}
+
+/// Log and hand on a per-transaction imbalance.
+pub fn report_transaction(block: u64, index: usize, report: &SupplyReport) {
+    let (positive, amount) = report.net();
+    if positive {
+        tracing::error!(
+            target: "rustock::supply",
+            block, tx = index, amount = %amount,
+            "SUPPLY CREATED: transaction {index} of block #{block} creates {amount} wei; rejecting the block"
+        );
+    } else {
+        tracing::warn!(
+            target: "rustock::supply",
+            block, tx = index, amount = %amount,
+            "supply destroyed: transaction {index} of block #{block} burns {amount} wei"
+        );
+    }
+    for d in report.deltas.iter().take(8) {
+        tracing::info!(
+            target: "rustock::supply",
+            block, tx = index, account = %d.address,
+            before = %d.before, after = %d.after,
+            "  {} {}", if d.is_increase() { "gained" } else { "lost" }, d.magnitude()
+        );
+    }
+    let violation = SupplyViolation {
+        block,
+        created: positive,
+        amount,
+        deltas: report.deltas.clone(),
+    };
+    if let Some(obs) = OBSERVER.get() {
+        obs(&violation);
     }
 }

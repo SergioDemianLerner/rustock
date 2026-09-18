@@ -90,6 +90,16 @@ struct Args {
     #[arg(long)]
     secret_key: Option<String>,
 
+    /// Supply conservation checking: per-transaction, per-block, both or off.
+    ///
+    /// Per-transaction is the default and is strictly more sensitive:
+    /// block-level netting hides a creation when one transaction mints and
+    /// another destroys the same amount. Per-block is kept on as a cross-check
+    /// that the per-transaction deltas account for the whole block -- a
+    /// disagreement means value moved outside any transaction.
+    #[arg(long, value_name = "MODE", default_value = "both")]
+    supply_check: String,
+
     /// Build the Bridge event index from stored receipts and exit.
     ///
     /// Indexes every log the Bridge emitted, keyed by event signature, so
@@ -482,6 +492,25 @@ async fn main() -> Result<()> {
     // Block-hash computation (RSKIP92) needs the activation heights before
     // any header is decoded.
     config.activation_heights.clone().install();
+
+    match args.supply_check.as_str() {
+        "both" => {}
+        "per-transaction" | "tx" => rustock_execution::supply::set_per_block(false),
+        "per-block" | "block" => rustock_execution::supply::set_per_transaction(false),
+        "off" | "none" => {
+            rustock_execution::supply::set_per_transaction(false);
+            rustock_execution::supply::set_per_block(false);
+            tracing::warn!("supply conservation checking is DISABLED");
+        }
+        other => anyhow::bail!(
+            "unknown --supply-check {other:?}; expected both, per-transaction, per-block or off"
+        ),
+    }
+    info!(
+        "supply check: per-transaction {}, per-block {}",
+        rustock_execution::supply::per_transaction_enabled(),
+        rustock_execution::supply::per_block_enabled()
+    );
 
     if args.build_bridge_index {
         let store = Arc::new(BlockStore::open(&args.data_dir)?);

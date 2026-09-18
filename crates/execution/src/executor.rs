@@ -239,6 +239,30 @@ impl RskExecutor {
     }
 
     /// Execute all transactions in a block.
+    /// Account for one transaction's balance changes, rejecting the block if it
+    /// created rBTC.
+    ///
+    /// Runs on the journal as it stands immediately after the transaction, so
+    /// the balances are the ones that transaction produced. No database reads:
+    /// the baseline comes from revm's per-transaction `original_info`.
+    fn check_tx_supply(
+        state: &revm::state::EvmState,
+        transaction_id: usize,
+        number: u64,
+        index: usize,
+    ) -> Result<(), ExecutionError> {
+        let report = crate::supply::transaction_supply_change(state, transaction_id);
+        if report.is_balanced() {
+            return Ok(());
+        }
+        crate::supply::report_transaction(number, index, &report);
+        if report.created_supply() {
+            let (_, created) = report.net();
+            return Err(ExecutionError::SupplyCreated { number, index, created });
+        }
+        Ok(())
+    }
+
     pub fn execute_block(
         &self,
         header: &Header,
@@ -343,6 +367,13 @@ impl RskExecutor {
         }
 
         for (i, (tx, sender)) in transactions.iter().enumerate() {
+            // The journal stamps each account with the transaction that last
+            // touched it; capture the id in force for this one, before it is
+            // incremented at commit.
+            let supply_tid = {
+                use revm::context_interface::ContextTr;
+                evm.ctx.journal_mut().inner.transaction_id
+            };
             {
                 use revm::context_interface::ContextTr;
                 evm.ctx.chain_mut().raw_storage.begin_tx();
@@ -406,6 +437,11 @@ impl RskExecutor {
                     logs,
                     created_address: None,
                 });
+            if crate::supply::per_transaction_enabled() {
+                use revm::context_interface::ContextTr;
+                let st = &evm.ctx.journal_mut().inner.state;
+                Self::check_tx_supply(st, supply_tid, header.number, i)?;
+            }
                 continue;
             }
 
@@ -576,6 +612,11 @@ impl RskExecutor {
                     logs,
                     created_address: None,
                 });
+                if crate::supply::per_transaction_enabled() {
+                    use revm::context_interface::ContextTr;
+                    let st = &evm.ctx.journal_mut().inner.state;
+                    Self::check_tx_supply(st, supply_tid, header.number, i)?;
+                }
                 continue;
             }
 
@@ -655,6 +696,11 @@ impl RskExecutor {
                 created_address,
             });
 
+            if crate::supply::per_transaction_enabled() {
+                use revm::context_interface::ContextTr;
+                let st = &evm.ctx.journal_mut().inner.state;
+                Self::check_tx_supply(st, supply_tid, header.number, i)?;
+            }
             // rskj TransactionExecutor.finalization deletes suicided accounts
             // at the END of each transaction (track.delete), so a LATER tx in
             // the same block sees the address as nonexistent and re-creates a
@@ -745,6 +791,10 @@ pub enum ExecutionError {
     Database(#[from] crate::database::RskDbError),
     #[error("evm error: {0}")]
     Evm(String),
+    /// A transaction increased the native supply. Rejected before the block's
+    /// state is written; see `crate::supply`.
+    #[error("transaction {index} of block #{number} created {created} wei of rBTC")]
+    SupplyCreated { number: u64, index: usize, created: alloy_primitives::U256 },
 }
 
 /// Derives an RSK address from a secp256k1 public key in SEC1 hex
