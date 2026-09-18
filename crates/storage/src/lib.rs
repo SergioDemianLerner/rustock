@@ -27,6 +27,14 @@ const CF_TX_INDEX: &str = "tx_index";
 /// The trie column family, owned by `trie_store` but named here so the store can
 /// tell an emptied trie apart from one that is simply absent.
 const CF_TRIE_NODES: &str = "trie_nodes";
+/// Bridge events, indexed for scanning by event type.
+///
+/// Key: `topic0 (32) || block (8 BE) || tx_index (4 BE) || log_index (4 BE)`.
+/// Putting the event signature first makes "every occurrence of this event, in
+/// block order" a prefix scan, and a block range within it a seek -- which is
+/// what answering "when did peg-ins happen" needs. Without it the only way to
+/// find one is to walk every receipt in the chain.
+const CF_BRIDGE_EVENTS: &str = "bridge_events";
 const KEY_HEAD: &[u8] = b"head";
 const KEY_EXEC_HEAD: &[u8] = b"exec_head";
 
@@ -173,6 +181,7 @@ impl BlockStore {
             CF_BODIES,
             CF_RECEIPTS,
             CF_TX_INDEX,
+            CF_BRIDGE_EVENTS,
             "trie_nodes",
         ];
         // `false`: do not fail when the writer's WAL files are present.
@@ -210,6 +219,7 @@ impl BlockStore {
             ColumnFamilyDescriptor::new(CF_BODIES, cf_opts()),
             ColumnFamilyDescriptor::new(CF_RECEIPTS, cf_opts()),
             ColumnFamilyDescriptor::new(CF_TX_INDEX, cf_opts()),
+            ColumnFamilyDescriptor::new(CF_BRIDGE_EVENTS, cf_opts()),
             ColumnFamilyDescriptor::new("trie_nodes", cf_opts()),
         ];
 
@@ -250,7 +260,7 @@ impl BlockStore {
     /// auto-compaction disabled, otherwise the database is left as a deep stack
     /// of un-merged levels and every subsequent read pays for it.
     pub fn compact_all(&self) -> Result<()> {
-        for name in [CF_HEADERS, CF_NUMBERS, CF_TD, CF_BODIES, CF_RECEIPTS, CF_TX_INDEX, "trie_nodes"] {
+        for name in [CF_HEADERS, CF_NUMBERS, CF_TD, CF_BODIES, CF_RECEIPTS, CF_TX_INDEX, CF_BRIDGE_EVENTS, "trie_nodes"] {
             if let Some(cf) = self.db.cf_handle(name) {
                 self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
             }
@@ -836,6 +846,120 @@ impl BlockStore {
             }
         }
         Ok((blocks, txs, skipped))
+    }
+
+    /// Record one Bridge event. See `CF_BRIDGE_EVENTS` for the key layout.
+    pub fn put_bridge_event(
+        &self,
+        topic0: B256,
+        block: u64,
+        tx_index: u32,
+        log_index: u32,
+        tx_hash: B256,
+        topics: &[B256],
+        data: &[u8],
+    ) -> Result<()> {
+        let mut key = Vec::with_capacity(48);
+        key.extend_from_slice(topic0.as_slice());
+        key.extend_from_slice(&block.to_be_bytes());
+        key.extend_from_slice(&tx_index.to_be_bytes());
+        key.extend_from_slice(&log_index.to_be_bytes());
+
+        let mut val = Vec::with_capacity(64 + data.len());
+        val.extend_from_slice(tx_hash.as_slice());
+        val.push(topics.len() as u8);
+        for t in topics {
+            val.extend_from_slice(t.as_slice());
+        }
+        val.extend_from_slice(data);
+
+        self.db
+            .put_cf(self.cf(CF_BRIDGE_EVENTS)?, key, val)
+            .context("Failed to write bridge event")
+    }
+
+    /// Index every Bridge log in one block's receipts.
+    ///
+    /// The single place events enter the index: the commit path calls it as
+    /// blocks are executed, and `--build-bridge-index` calls it when rebuilding
+    /// from stored receipts, so the two cannot drift apart.
+    ///
+    /// Receipts carry no transaction hash, so they are paired with the body by
+    /// position -- the same ordering the receipts root commits to.
+    ///
+    /// Returns how many events were written. Cheap for the common block: it
+    /// only walks logs that are already in memory, and most blocks emit none.
+    pub fn index_bridge_events(
+        &self,
+        block: u64,
+        receipts: &[Receipt],
+        transactions: &[Transaction],
+        bridge: alloy_primitives::Address,
+    ) -> Result<u64> {
+        let mut written = 0u64;
+        for (tx_index, receipt) in receipts.iter().enumerate() {
+            for (log_index, log) in receipt.logs.iter().enumerate() {
+                if log.address != bridge {
+                    continue;
+                }
+                let Some(topic0) = log.topics.first().copied() else { continue };
+                let tx_hash = transactions.get(tx_index).map(|t| t.tx_hash()).unwrap_or_default();
+                self.put_bridge_event(
+                    topic0, block, tx_index as u32, log_index as u32,
+                    tx_hash, &log.topics, &log.data,
+                )?;
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
+    /// Every occurrence of one event type, in block order, optionally bounded.
+    ///
+    /// Returns `(block, tx_index, log_index, tx_hash, topics, data)`.
+    #[allow(clippy::type_complexity)]
+    pub fn scan_bridge_events(
+        &self,
+        topic0: B256,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<(u64, u32, u32, B256, Vec<B256>, Vec<u8>)>> {
+        let cf = self.cf(CF_BRIDGE_EVENTS)?;
+        let mut start = Vec::with_capacity(40);
+        start.extend_from_slice(topic0.as_slice());
+        start.extend_from_slice(&from_block.to_be_bytes());
+
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (k, v) = item?;
+            if k.len() < 48 || &k[..32] != topic0.as_slice() {
+                break; // left this event type: the prefix is exhausted
+            }
+            let block = u64::from_be_bytes(k[32..40].try_into().unwrap());
+            if block > to_block {
+                break;
+            }
+            let tx_index = u32::from_be_bytes(k[40..44].try_into().unwrap());
+            let log_index = u32::from_be_bytes(k[44..48].try_into().unwrap());
+            if v.len() < 33 {
+                continue;
+            }
+            let tx_hash = B256::from_slice(&v[..32]);
+            let n = v[32] as usize;
+            let mut topics = Vec::with_capacity(n);
+            let mut off = 33;
+            for _ in 0..n {
+                if off + 32 > v.len() { break }
+                topics.push(B256::from_slice(&v[off..off + 32]));
+                off += 32;
+            }
+            out.push((block, tx_index, log_index, tx_hash, topics, v[off..].to_vec()));
+        }
+        Ok(out)
     }
 
     /// Returns a reference to the underlying RocksDB instance.
@@ -1801,6 +1925,63 @@ mod tests {
             let found = store.tx_location(tx_hash).unwrap();
             assert_eq!(found, Some((block_hash, index)), "every transaction must be findable");
         }
+    }
+
+    /// A scan by event type must return only that event, in block order, and
+    /// must stop at the range end rather than walking the rest of the index.
+    #[test]
+    fn bridge_events_scan_by_type_and_range() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let pegin = B256::repeat_byte(0xA1);
+        let pegout = B256::repeat_byte(0xB2);
+        let txh = B256::repeat_byte(0xCC);
+
+        for (topic, block) in [(pegin, 10u64), (pegout, 11), (pegin, 12), (pegin, 500), (pegout, 501)] {
+            store.put_bridge_event(topic, block, 0, 0, txh, &[topic], b"payload").unwrap();
+        }
+
+        let all = store.scan_bridge_events(pegin, 0, u64::MAX).unwrap();
+        assert_eq!(all.iter().map(|e| e.0).collect::<Vec<_>>(), vec![10, 12, 500],
+                   "only peg-ins, in block order");
+        assert_eq!(all[0].3, txh);
+        assert_eq!(all[0].5, b"payload");
+
+        let bounded = store.scan_bridge_events(pegin, 11, 499).unwrap();
+        assert_eq!(bounded.iter().map(|e| e.0).collect::<Vec<_>>(), vec![12],
+                   "range must bound both ends");
+
+        let none = store.scan_bridge_events(B256::repeat_byte(0xFF), 0, u64::MAX).unwrap();
+        assert!(none.is_empty(), "an event type never seen returns nothing");
+    }
+
+    /// Only the Bridge's own logs are indexed; a log from another contract in
+    /// the same receipt must not appear.
+    #[test]
+    fn index_bridge_events_ignores_other_contracts() {
+        use rustock_core::Log;
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let bridge = Address::repeat_byte(0x06);
+        let other = Address::repeat_byte(0x99);
+        let topic = B256::repeat_byte(0xA1);
+
+        let receipt = Receipt {
+            post_tx_state: vec![1], cumulative_gas_used: 0, gas_used: 0,
+            logs_bloom: alloy_primitives::Bloom::ZERO, status: true,
+            logs: vec![
+                Log { address: other,  topics: vec![topic], data: vec![].into() },
+                Log { address: bridge, topics: vec![topic], data: b"mine".to_vec().into() },
+            ],
+        };
+        let n = store.index_bridge_events(7, &[receipt], &[], bridge).unwrap();
+        assert_eq!(n, 1, "exactly one Bridge log");
+
+        let found = store.scan_bridge_events(topic, 0, u64::MAX).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, 7);
+        assert_eq!(found[0].5, b"mine");
+        assert_eq!(found[0].2, 1, "log index within the receipt is preserved");
     }
 
     #[test]
