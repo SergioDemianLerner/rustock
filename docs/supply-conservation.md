@@ -1,28 +1,99 @@
 # Supply conservation: rejecting blocks that create rBTC
 
-## The requirement
+## Specification
 
-As originally stated:
+Written as a specification rather than a narrative so it can be implemented
+independently — by rskj, or by any other RSK node.
 
-> When a transaction is processed, I guess there is a moment where a set of
-> changes to the state are applied. At that point it should be possible to
-> account for all native balance changes and make sure that no bitcoins were
-> created from thin air. I recall that the bridge has the full 21M bitcoins in
-> its balance, so when a peg-in occurs, and bitcoins are unlocked, the net
-> change should also be zero. Let B be OUTFLOWS-INFLOWS. [...] If B is positive
-> (meaning the transaction created more native BTC than existed before), then
-> mark the block as invalid, and log it. If the net balance is negative, then
-> log it. It could be the case of a SELFDESTRUCT destroying paying itself or
-> other EVM rarity. [...] A special case may be the REMASC transaction, which
-> can burn rBTC, but I don't think it can have a positive B.
+### Rationale
 
-The premise is exact: the peg is backed 1:1 by bitcoin and the Bridge holds the
-entire 21 M supply, so a peg-in **moves** value out of the Bridge rather than
-minting any. The sum of every account balance must never grow.
+The RSK peg is backed 1:1 by bitcoin. The Bridge contract holds the entire
+supply, and a peg-in transfers value *out of* the Bridge's balance rather than
+creating it. It follows that no block may increase the total of all account
+balances. A node that enforces this detects any bug — in the Bridge, in a
+precompile, in fee accounting, in the EVM itself — whose effect is to conjure
+native currency, regardless of how the bug was reached.
+
+### Definition
+
+For a scope S (one transaction, or one block), over every account whose balance
+the scope modifies:
+
+```
+  inflow(S)  = Σ max(0, balance_after − balance_before)
+  outflow(S) = Σ max(0, balance_before − balance_after)
+  B(S)       = inflow(S) − outflow(S)
+```
+
+`balance_before` is the balance at the start of S; `balance_after` the balance
+at its end. An account destroyed within S and not subsequently re-created has
+`balance_after = 0`. Accounts merely read are excluded: they are not modified,
+so including them would report changes that did not occur.
+
+### Required behaviour
+
+| Condition | Meaning | Required action |
+|---|---|---|
+| `B > 0` | native currency was created | **Reject the block.** Log the amount and the accounts that gained. |
+| `B < 0` | native currency was destroyed | **Accept the block.** Log the amount and the accounts that lost. |
+| `B = 0` | conserved | Proceed silently. |
+
+Rejection must occur **before** the block's state changes are persisted, so a
+rejected block leaves no trace in the state database.
+
+`B < 0` is deliberately not an error. Destruction has legitimate causes — a
+contract self-destructing to itself, and any burn of fees — and destroying
+currency cannot steal from anyone. It is logged because an unexplained burn is
+still worth knowing about.
+
+### Scope: per transaction and per block
+
+Both scopes must be checked, and neither subsumes the other.
+
+**Per transaction** is the primary check. Block-level netting conceals a
+creation whenever one transaction mints an amount and another destroys the same
+amount: `B(block)` is then zero while two transactions are individually wrong.
+
+**Per block** is a cross-check. If `Σ B(transaction) ≠ B(block)`, value moved
+outside any transaction — for example in block-level bookkeeping performed
+outside the transaction loop. That discrepancy is itself a finding and should be
+reported.
+
+### Cases an implementation must get right
+
+1. **Fees must not appear as burns.** Where an implementation debits gas from
+   the sender and credits it to the block beneficiary within the same
+   transaction, `B = 0`. If instead fees were debited per transaction and
+   credited later, every ordinary transaction would report `B < 0` and the
+   crediting transaction `B > 0` — the latter being indistinguishable from an
+   actual mint. An implementation whose fee flow works that way must model the
+   fee explicitly rather than treat the crediting step as a creation.
+
+2. **The fee-distribution contract (REMASC on RSK) must not appear to mint.**
+   It pays out currency it already holds: its own balance falls while
+   recipients' rise, so `B ≤ 0`.
+
+3. **Peg-in must net to zero.** The Bridge's balance falls by exactly what the
+   recipient gains. A peg-in that produced `B > 0` would mean the peg was no
+   longer 1:1 backed, which is the condition this check exists to detect.
+
+4. **Destroyed-then-recreated accounts.** An account destroyed and re-created
+   within the same block must be accounted once, at its final balance, not
+   twice.
+
+5. **Accounts that are read but not written must be excluded**, or ordinary
+   blocks will report spurious changes.
+
+### Non-goals
+
+The check does not verify that value moved *legitimately*, only that none was
+created. A transaction that steals another account's balance conserves supply
+and will not be caught here.
 
 ## What is computed
 
-For each block, over exactly the accounts that block writes:
+For each scope -- each transaction, and each block -- over exactly the accounts
+it modifies:
 
 ```
 B = Σ (balance_after − balance_before)
@@ -46,41 +117,68 @@ touched again ends at zero, while one touched afterwards ends at its new balance
 (mainnet #3,173,807). Accounts merely *read* during execution are ignored —
 they are not written, so counting them would invent changes that never happened.
 
-## Why per block, not per transaction
+## Implementation: both scopes
 
-The requirement supposed changes are applied per transaction. They are not.
+Both are implemented and both are on by default, selectable with
+`--supply-check both|per-transaction|per-block|off`.
 
-The executor holds a **single revm journal across the whole block**. Each
-transaction mutates that journal, and the merged state is written once, in
-`apply_state_changes`, called from `execute_block`. There is no per-transaction
-application step to hook.
+### Per transaction (primary)
 
-Per-transaction deltas are not simply available either:
+Runs after each transaction, inside `execute_block`, at all three points a
+transaction can leave the loop — the REMASC system call, the
+free-bridge-transaction path, and the normal path (the first two `continue`
+rather than falling through).
 
-- `revm`'s `Account` carries `original_info`, which *is* refreshed on cold load
-  within each transaction — so it does encode a per-transaction baseline. But it
-  is documented as serving Block Access Lists, not as a general "balance before
-  this transaction" contract. Building a consensus-affecting rejection rule on
-  an internal whose purpose is something else is the kind of coupling that
-  breaks silently on a dependency bump.
-- Reconstructing per-transaction balances independently would mean snapshotting
-  every touched account's balance after each transaction — real cost on the
-  hot path, for attribution rather than detection.
+**It needs no database reads.** revm refreshes an account's `original_info`
+when the account is cold-loaded *within a transaction*
+(`JournalInner::load_account_mut_optional`), so for every account a transaction
+touched, `info.balance − original_info.balance` is that transaction's effect,
+already in memory. `Account::transaction_id` records which transaction last
+touched an account, so the block's accumulated state map filters down to the
+transaction just executed.
 
-**The block is also the right unit for the action.** What gets rejected is a
-block, not a transaction: a block is what the node accepts or refuses. A
-per-transaction check would still have to reject the whole block.
+This reads a revm internal. The field is public, but its doc comment describes
+it as serving Block Access Lists, and the refresh happens to sit in the general
+cold-load path rather than a BAL-specific one. A future revm could change that
+without considering it breaking, so `per_transaction_baseline_holds` pins the
+property actually depended on: if `original_info` stops being a per-transaction
+baseline, that test fails rather than the check silently mis-accounting.
 
-Attribution is not lost. The log names the accounts that moved, largest first,
-which is more useful than a transaction index when the question is *where the
-value came from* — a transaction index tells you where to look, an account tells
-you what happened.
+### Per block (cross-check)
+
+Runs in `execute_block` before `apply_state_changes`, reading each modified
+account's pre-block balance from the trie.
+
+Kept on alongside the per-transaction check because the executor touches the
+journal *outside* `transact_one` — loading and touching REMASC before the system
+call, bumping the sender's nonce in the free-bridge path, warming the Bridge
+account. Those are outside any transaction, so a pure per-transaction sum would
+miss any balance change made there. If the per-transaction deltas ever fail to
+account for the block's real change, the difference is exactly that, and worth
+surfacing.
+
+### An earlier, mistaken conclusion
+
+An earlier version of this document argued the check *could not* be done per
+transaction, on the grounds that the executor keeps one journal for the whole
+block and that `original_info` served BAL. The first is true and irrelevant; the
+second is contradicted by the code. Recorded here because the argument was
+plausible and someone will make it again.
 
 ## Cost
 
-One trie read per account the block writes, against the pre-block root whose
-nodes execution has just walked, so the reads are cache hits. A block touching a
-dozen accounts pays a dozen lookups on top of writes it was already doing.
+**Per transaction: no I/O at all**, the baselines being in memory. CPU is
+O(transactions x accounts) per block, since revm clears its per-transaction
+entry log at commit and the block's accumulated account map must be filtered
+instead. RSK's 6.8 M block gas limit bounds that at roughly 200,000 pointer
+comparisons for a maximally full block -- under a millisecond against the tens
+of milliseconds such a block takes to execute -- and about twenty comparisons
+for a typical block of 2.14 transactions.
+
+**Per block: one trie read per account the block writes**, against the pre-block
+root whose nodes execution has just walked, so the reads are cache hits. A block
+touching a dozen accounts pays a dozen lookups on top of writes it was already
+doing.
 
 No measurable effect was observed on replay throughput (13,925 blocks at 36
 blocks/s with the check active, against 23 blocks/s for an earlier 4,000-block
@@ -109,6 +207,13 @@ silent and sends no mail whatever it finds.
 
 `examples/check_supply` replays a block range through the same `execute_block`
 the node uses, with a trie store that discards writes.
+
+The figures below were produced with the **per-block** check; the
+per-transaction check is newer and has not yet been run against replayed
+mainnet blocks, because the database has been occupied building the Bridge
+event index. Its attribution across the REMASC and free-bridge paths is exactly
+the kind of thing fixtures cannot settle, so that run is required before it
+should be trusted in production.
 
 | range | blocks | result |
 |---|---:|---|
