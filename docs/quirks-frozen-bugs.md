@@ -1,5 +1,10 @@
 # Accidental rskj Code Paths Frozen into Consensus
 
+
+> rskj citations below (`File.java:NNN`) refer to the pinned revision in
+> [`rskj-reference.md`](rskj-reference.md). Line numbers are meaningless
+> against any other revision.
+
 Behaviors that **are visible in rskj's source** but were clearly never a design
 decision — unconditional writes, missed resets, omitted merges, exception paths
 that still mutate state — and that hardened into consensus because historical

@@ -1,5 +1,10 @@
 # RSK Consensus Port Log (RSKIP Feature Slices)
 
+
+> rskj citations below (`File.java:NNN`) refer to the pinned revision in
+> [`rskj-reference.md`](rskj-reference.md). Line numbers are meaningless
+> against any other revision.
+
 Log of RSKIP-specified features ported to rustock to keep the RSK Mainnet sync
 advancing from genesis to tip: bridge peg-in/peg-out handling, federation
 lifecycle, SVP, segwit (reed800), Bridge event emissions, and hardfork opcode
