@@ -206,14 +206,12 @@ silent and sends no mail whatever it finds.
 ## Validation
 
 `examples/check_supply` replays a block range through the same `execute_block`
-the node uses, with a trie store that discards writes.
+the node uses, with a trie store that discards writes. State comes from the
+epoch backend (`--trie-dir`) for recent blocks, or the archival unitrie
+(`--archive-trie`) for anything older than the epoch window — which is
+everything interesting, since peg-ins are old.
 
-The figures below were produced with the **per-block** check; the
-per-transaction check is newer and has not yet been run against replayed
-mainnet blocks, because the database has been occupied building the Bridge
-event index. Its attribution across the REMASC and free-bridge paths is exactly
-the kind of thing fixtures cannot settle, so that run is required before it
-should be trusted in production.
+Both checks have been run against replayed mainnet blocks.
 
 | range | blocks | result |
 |---|---:|---|
@@ -232,6 +230,33 @@ The second range was chosen to contain two complete peg-out lifecycles:
 `B` was exactly zero on every block, including all 2,783 `update_collections`
 and 10 `add_signature` blocks. Every state root also matched its header, which
 independently confirms the read-only harness does not perturb the replay.
+
+### Peg-ins
+
+The peg-in direction is the one where a bug would *mint* rather than move, since
+it is where the Bridge pays out. Four were replayed, spanning both event eras
+and nearly seven million blocks of history:
+
+| block | event | note | `B` |
+|---|---:|---|---|
+| #2,395,450 | `lock_btc` | the first peg-in in the chain | 0 |
+| #3,600,471 | `lock_btc` | legacy era | 0 |
+| #9,209,189 | `pegin_btc` | modern era | 0 |
+| #9,227,761 | `pegin_btc` | most recent | 0 |
+
+All conserved. The Bridge pays out of its own 21 M balance rather than creating
+anything — verified rather than argued from design. These runs had the
+per-transaction check active, so they also exercise its attribution across the
+REMASC and free-bridge paths on real blocks, which fixtures cannot settle.
+
+Locating them was the hard part until the Bridge event index existed. Peg-ins
+are rare: 1,945 in the chain's history (408 `lock_btc`, 1,537 `pegin_btc`)
+against 992,261 `update_collections`, which is why none fell in the 18,000-block
+window reachable before. With the index it is a prefix scan taking
+milliseconds; the equivalent `eth_getLogs` sweep was killed for memory.
+
+State for these blocks comes from the archival unitrie
+(`--archive-trie`), the epoch backend having long since collected it.
 
 **REMASC did not burn in this range.** The requirement anticipated it might; in
 13,925 blocks it never produced a negative `B`, so its fee handling is a
@@ -270,11 +295,10 @@ Three ways to extend it:
    re-verification pass carries it for free. The pending receipts-root pass
    would cover the chain at no extra cost.
 
-**The peg-in direction is untested by replay.** No `lock_btc` or `pegin_btc`
-event occurs in any block that can currently be both located and replayed. This
-matters: a peg-in is where the Bridge *pays out*, and a bug there would mint
-rather than move. The unit test
-`a_bridge_payout_moves_value_rather_than_creating_it` covers the arithmetic, but
-no real peg-in has been run through the check. Closing that gap needs a peg-in
-at or below #9,230,000 replayed against the archival trie — now findable via the
-Bridge event index.
+**The peg-in direction is now covered** (see Validation above): four peg-ins
+across both event eras, all conserving. That was the gap worth closing first,
+and the Bridge event index is what made the blocks findable.
+
+What remains unverified is *breadth*, not direction: the checks have seen a few
+tens of thousands of blocks out of 9.25 M. Every era and every peg direction has
+been sampled, but most blocks have not been replayed.
