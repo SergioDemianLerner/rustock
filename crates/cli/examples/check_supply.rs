@@ -19,6 +19,8 @@
 //! Usage: check_supply <data-dir> <count> [end-block] [--trie-dir DIR]
 //!   count       how many blocks back from the end to replay
 //!   end-block   last block to replay (default: the executed head)
+//!   --archive-trie  a plain (non-epoch) trie store, such as the archival
+//!               unitrie, which is the only place state for older blocks lives
 //!   --trie-dir  epoch-backend trie directory, when the node keeps state
 //!               outside the main database (as the production node does)
 
@@ -116,10 +118,14 @@ fn main() -> anyhow::Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut positional: Vec<String> = Vec::new();
     let mut trie_dir: Option<String> = None;
+    let mut archive_trie: Option<String> = None;
     let mut i = 0;
     while i < argv.len() {
         if argv[i] == "--trie-dir" {
             trie_dir = argv.get(i + 1).cloned();
+            i += 2;
+        } else if argv[i] == "--archive-trie" {
+            archive_trie = argv.get(i + 1).cloned();
             i += 2;
         } else {
             positional.push(argv[i].clone());
@@ -149,12 +155,18 @@ fn main() -> anyhow::Result<()> {
 
     // The node may keep state in the epoch backend rather than the main
     // database; open whichever actually holds the seed root.
-    let backing: Arc<dyn TrieStore> = match &trie_dir {
+    let backing: Arc<dyn TrieStore> = match (&archive_trie, &trie_dir) {
+        (Some(dir), _) => {
+            tracing::info!("supply check: archival trie at {dir} (read-only)");
+            Arc::new(rustock_storage::RocksDbTrieStore::open_read_only(dir)?)
+        }
+        (None, d) => match d {
         Some(dir) => {
             tracing::info!("supply check: epoch trie backend at {dir}");
             Arc::new(ReadOnlyEpochs::open(dir)?)
         }
         None => Arc::new(CachedTrieStore::with_defaults(store.db().clone())),
+        },
     };
     let trie_store: Arc<dyn TrieStore> = Arc::new(ReadOnly(backing.clone()));
     let root_data = backing.get(seed_header.state_root.as_slice()).unwrap_or_else(|| {
