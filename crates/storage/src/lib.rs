@@ -962,6 +962,35 @@ impl BlockStore {
         Ok(out)
     }
 
+    /// Every distinct event type present in the Bridge event index, with its
+    /// occurrence count and block span.
+    ///
+    /// The index stores every Bridge log regardless of topic, so this
+    /// enumerates what is actually there rather than what a caller thought to
+    /// ask for. Returns `(topic0, count, first_block, last_block)`.
+    pub fn bridge_event_topics(&self) -> Result<Vec<(B256, u64, u64, u64)>> {
+        use std::collections::BTreeMap;
+        let cf = self.cf(CF_BRIDGE_EVENTS)?;
+        let mut acc: BTreeMap<[u8; 32], (u64, u64, u64)> = BTreeMap::new();
+        for item in self.db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+            let (k, _) = item?;
+            if k.len() < 40 {
+                continue;
+            }
+            let mut topic = [0u8; 32];
+            topic.copy_from_slice(&k[..32]);
+            let block = u64::from_be_bytes(k[32..40].try_into().unwrap());
+            let e = acc.entry(topic).or_insert((0, u64::MAX, 0));
+            e.0 += 1;
+            e.1 = e.1.min(block);
+            e.2 = e.2.max(block);
+        }
+        Ok(acc
+            .into_iter()
+            .map(|(t, (c, first, last))| (B256::from(t), c, first, last))
+            .collect())
+    }
+
     /// Returns a reference to the underlying RocksDB instance.
     pub fn db(&self) -> &Arc<DB> {
         &self.db
