@@ -763,36 +763,74 @@ show `last_block=9183347` despite one being truncated and the other complete. To
 judge completeness, compare the last row of `segments.csv` against the chunk's
 end block, or read the worker log.
 
-### 11.3a Each chunk is self-contained for its own range
+### 11.3a Each chunk is self-contained for the read set that built it
 
-The property that makes the set useful, and it is deliberate: during the build
-every node **read** is copied into the current window, not only every node
-written. A read served from an older in-memory table, from the chunk's own
+The build copies every node **read** into the current window, not only every
+node written: a read served from an older in-memory table, from the chunk's own
 sealed store, or from the archival fallback is re-inserted before being
-returned, so by the time a chunk seals it holds every node its range touched.
+returned. So a sealed chunk holds every node **rustock touched** while executing
+its range.
 
-For a consumer this means: **to execute or verify blocks `[first..last]`, open
-that one chunk and nothing else.** No cross-chunk probing, no fallback trie. The
-archival unitrie was needed by the *producer*, to serve first-touch reads; it is
-not needed to read a finished chunk.
+That qualifier is the whole of it, and the first version of this section left it
+out. Copy-on-read captures the producer's read set exactly — and a read set is a
+property of an implementation, not of the chain. A client that issues one read
+rustock did not issue walks off the captured subtree.
 
-Verified by replaying 30 blocks from inside chunk 075's range against its
-`sealed/` store alone, with no fallback: every state root matched its header,
-which could not happen if one node were missing.
+**What that cost, measured 2026-09-20.** Against chunk 075 before repair:
 
-```sh
-check_supply /var/lib/rustock 30 7250000 \
-    --archive-trie /var/lib/rustock/segbuild/075-7237813-7306518/sealed
-```
+| | |
+|---|---|
+| The chunk could not seed itself | The parent state root of the chunk's own **first** block was missing, in **96 of 97 chunks**. `build_segments.rs` reads that one node straight from the fallback (`fallback.get(p.state_root)`, then `from_message(&data, fallback)`) instead of through the window — the single read in the whole build that escapes capture. Replaying block #7,237,813 against chunk 075 alone failed at step one. |
+| Accounts that exist read as absent | `0x…01000009`, `0x…01000010`, `0x…01000011` are in the archival trie; the chunk said no such account. rustock loads a precompile's account only when that precompile is actually *called* (`precompiles.rs`, `run_stateful`), and those three go whole ranges uncalled. Bridge and REMASC were fine — they are touched constantly. |
+| Absence that could not be proved | Every probed Bridge storage cell returned the archive's answer, but reached it by dying on a missing node rather than at a real dead end. |
 
-A miss inside a chunk's own range therefore means corruption, not an absent key,
-and a reader must treat it as an error rather than as empty — silently treating
-a missing node as empty computes a wrong state root instead of failing.
+The third row is the dangerous one, and it generalises: **a walk that dies on a
+missing node is indistinguishable, at the API, from one that reaches a genuine
+absence.** Both return `None`. An incomplete chunk therefore does not fail — it
+answers wrongly, and the verifier built on it computes a wrong state root and
+blames consensus.
 
-The full on-disk format, written for an independent implementer (rskj or
-otherwise), is specified separately; it covers the RSKIP107 node message, the
-`trie_nodes` keyspace shared by node messages and long values, and the 44-byte
-embedding threshold.
+The unifying cause is not "Bridge state" and not "precompiles". rustock has no
+concept of a storage version, so it never reads one; it touches a precompile's
+account only on a real call. Those are the reads it does not make, and they are
+exactly the gaps.
+
+Why the earlier 30-block replay looked like proof: it replayed with *rustock*,
+whose read set is precisely what was captured, and it started mid-range, so it
+never exercised the seed node either. It proved the chunk self-contained for
+rustock's own re-execution. It could not have caught any of the three rows
+above.
+
+### 11.3b Repairing the chunks
+
+`crates/cli/examples/repair_chunk.rs` walks, at sampled roots across a chunk's
+range, the paths to a key set rustock does not read: every precompile's account,
+code and slot 0; every named Bridge storage cell; and 128 arbitrary Bridge
+storage slots, whose hashed keys spread across the storage subtree and so pull
+its upper levels in. Anything the chunk cannot serve is fetched from the
+archival unitrie and written in. Purely additive and content-addressed —
+interruptible, idempotent.
+
+Three things made it affordable, each measured rather than assumed:
+
+- **One descent, not 103.** `TrieNode::get` restarts at the root per key, so
+  keys sharing a prefix pay for it repeatedly: 3,592 node reads per root. A
+  combined descent carrying the whole key set down and splitting it at each
+  branch costs 1,258, and finds identically the same gaps.
+- **A node cache in front of the store.** Consecutive roots walk nearly the
+  same nodes; the paths differ only near the top. 99% hit rate, 26 → 176
+  roots/s.
+- **Sampling is sound here.** A missing node is by construction a node of a
+  region rustock never touched, and such regions change rarely, so each missing
+  version is long-lived. On chunk 065 a stride-16 sweep found all 975 missing
+  nodes and a subsequent sweep of all 40,192 roots added none. The repair runs
+  stride 16 over every chunk first, then every root, largest chunk first.
+
+What repair does not promise: the chunk answers the enumerated key set and the
+neighbourhood the spread slots opened. It cannot answer an arbitrary key it was
+never repaired for — nothing short of the whole trie at every root could. A
+consumer that misses should report the node hash, state root and key, which is
+enough to re-run the pass with that key added.
 
 ### 11.4 Chunk 095 was consolidated on 2026-09-17
 
