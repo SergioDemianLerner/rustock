@@ -656,21 +656,25 @@ roots suggests a specific condition rather than a broken method.
   memory) and several restarts, because chunks are claimed and checkpointed.
   A killed worker re-takes its own chunk and resumes.
 
-## 11. Where the segment databases live, and why
+## 11. Where the segment databases live
 
-The 137 GB of chunk databases are split across **two volumes**. The split is not
-cosmetic and not a backup: the two sets are disjoint, and together they are the
-whole chain. Losing either loses part of the coverage.
+**Current layout, since 2026-09-20.** All 97 chunks live in one directory:
 
-| Volume | Path | Chunks | Size |
-|---|---|---:|---:|
-| `/dev/sdb` | `/var/lib/rustock/segbuild` | 56 | 84 GB |
-| `/dev/sdc` | `/mnt/import/segbuild` | 41 | 53 GB |
+```
+/var/lib/rustock/segbuild/          139 GB, 97 chunks
+/mnt/import/replay/chunks/          97 completion markers, <idx>-<start>-<end>.done
+```
 
-Completion markers live separately, in `/mnt/import/replay/chunks`, one empty
-file per chunk named `<idx>-<start>-<end>.done`.
+Plus `095-9133348-9229943.truncated-superseded-20260917`, the retained first
+attempt at chunk 095 (§11.4), which is not one of the 97.
 
-### 11.1 Why two volumes
+The chunks were consolidated from two volumes onto one, verified by a full
+checksum comparison reporting zero differences, then confirmed as 97 chunks
+matching 97 markers and tiling `#1..#9,230,008` with no gaps. Sections 11.1 and
+11.2 below describe the **build-time** layout and are kept because they explain
+why the build ran the way it did, not where anything is now.
+
+### 11.1 Why the build used two volumes (historical)
 
 Not for space. Either volume could have been made to hold all 137 GB, though
 only just in one case:
@@ -710,7 +714,7 @@ also restarted at least once, and because `launch.sh` redirects with `>` rather
 than `>>`, the restart overwrote the logs: only 65 `finished` lines survive for
 97 chunks. The chunk counts measure worker survival, not device speed.
 
-### 11.2 Chunk-to-volume assignment is interleaved
+### 11.2 Chunk-to-volume assignment was interleaved (historical)
 
 ```
 sdb: 000 001 003 005 009 014 017 020 021 024 026 027 029 031 032 037 ...
@@ -725,34 +729,70 @@ volume holds a chunk is the filesystem.
 
 ### 11.3 Verifying the set is intact
 
-These four properties are what "the segment store is complete" means. All four
-hold as of 2026-09-17:
+These three properties are what "the segment store is complete" means. All three
+hold as of 2026-09-20:
 
 ```
-chunks      : 97          (56 on sdb + 41 on sdc)
-overlap     : none        no chunk exists on both volumes
-markers     : 97 .done    every database has a marker, every marker a database
-covers      : #1 .. #9,230,008, 9,230,008 blocks, no gaps, no overlaps
+chunks   : 97          all in /var/lib/rustock/segbuild
+markers  : 97 .done    every database has a marker, every marker a database
+covers   : #1 .. #9,230,008, no gaps, no overlaps
 ```
 
 Reproduce with:
 
 ```sh
-ls /var/lib/rustock/segbuild | grep -v WRITE_TEST | sort > /tmp/sdb.txt
-ls /mnt/import/segbuild | grep -v truncated-superseded | sort > /tmp/sdc.txt
-comm -12 /tmp/sdb.txt /tmp/sdc.txt            # must be empty: no overlap
-cat /tmp/sdb.txt /tmp/sdc.txt | sort > /tmp/union.txt
+ls /var/lib/rustock/segbuild | grep -vE 'WRITE_TEST|truncated-superseded' | sort > /tmp/chunks.txt
 ls /mnt/import/replay/chunks | sed 's/\.done$//' | sort > /tmp/markers.txt
-diff /tmp/union.txt /tmp/markers.txt           # must be empty: markers match data
+diff /tmp/chunks.txt /tmp/markers.txt          # must be empty: markers match data
+
+python3 - <<'EOF'
+import os, re
+names = [n for n in os.listdir('/var/lib/rustock/segbuild') if re.match(r'\d+-\d+-\d+$', n)]
+rs = sorted((int(n.split('-')[1]), int(n.split('-')[2])) for n in names)
+gaps = [(rs[i-1][1], rs[i][0]) for i in range(1, len(rs)) if rs[i][0] != rs[i-1][1] + 1]
+print("chunks %d covers #%d..#%d gaps: %s" % (len(rs), rs[0][0], rs[-1][1], gaps or "none"))
+EOF
 ```
 
-A chunk database is `checkpoint`, `segments.csv` and `sealed/` (a sealed RocksDB).
-Note that **`checkpoint` is a resume point, not a completion record** — it is
-written periodically and is not updated when a chunk finishes, so a complete
-chunk can carry a checkpoint well short of its last block. Chunk 095 and its
-re-run both show `last_block=9183347` despite one being truncated and the other
-complete. To judge completeness, compare the last row of `segments.csv` against
-the chunk's end block, or read the worker log.
+A chunk database is `checkpoint`, `segments.csv` and `sealed/` (a RocksDB).
+
+**`checkpoint` is a resume point, not a completion record** — it is written
+periodically and is not updated when a chunk finishes, so a complete chunk can
+carry a checkpoint well short of its last block. Chunk 095 and its re-run both
+show `last_block=9183347` despite one being truncated and the other complete. To
+judge completeness, compare the last row of `segments.csv` against the chunk's
+end block, or read the worker log.
+
+### 11.3a Each chunk is self-contained for its own range
+
+The property that makes the set useful, and it is deliberate: during the build
+every node **read** is copied into the current window, not only every node
+written. A read served from an older in-memory table, from the chunk's own
+sealed store, or from the archival fallback is re-inserted before being
+returned, so by the time a chunk seals it holds every node its range touched.
+
+For a consumer this means: **to execute or verify blocks `[first..last]`, open
+that one chunk and nothing else.** No cross-chunk probing, no fallback trie. The
+archival unitrie was needed by the *producer*, to serve first-touch reads; it is
+not needed to read a finished chunk.
+
+Verified by replaying 30 blocks from inside chunk 075's range against its
+`sealed/` store alone, with no fallback: every state root matched its header,
+which could not happen if one node were missing.
+
+```sh
+check_supply /var/lib/rustock 30 7250000 \
+    --archive-trie /var/lib/rustock/segbuild/075-7237813-7306518/sealed
+```
+
+A miss inside a chunk's own range therefore means corruption, not an absent key,
+and a reader must treat it as an error rather than as empty — silently treating
+a missing node as empty computes a wrong state root instead of failing.
+
+The full on-disk format, written for an independent implementer (rskj or
+otherwise), is specified separately; it covers the RSKIP107 node message, the
+`trie_nodes` keyspace shared by node messages and long values, and the 44-byte
+embedding threshold.
 
 ### 11.4 Chunk 095 was consolidated on 2026-09-17
 
