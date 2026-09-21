@@ -6049,6 +6049,57 @@ mod tests {
         tx_with(script, vec![vec![], vec![0x30; 71], vec![0x30; 71], redeem])
     }
 
+    /// bitcoinj `Script.isSentToMultiSig`, which decides whether a redeem
+    /// script makes a peg-in a P2SH-multisig (or P2SH-P2WSH) sender. The
+    /// consequence of a false positive is a refund to hash160 of a script that
+    /// is not a real redeem; of a false negative, an unclassifiable sender and
+    /// a peg-in that is not refundable at all. Both are silent.
+    ///
+    /// The shape bitcoinj requires: OP_M, N key pushes, OP_N, OP_CHECKMULTISIG,
+    /// with the chunk count agreeing with N.
+    #[test]
+    fn is_sent_to_multisig_accepts_only_the_bitcoinj_shape() {
+        let ok = multisig_redeem();
+        assert!(is_sent_to_multisig(&ok), "a 2-of-3 redeem is multisig");
+
+        // CHECKMULTISIGVERIFY is accepted alongside CHECKMULTISIG.
+        let mut verify = ok.clone();
+        *verify.last_mut().unwrap() = 0xaf;
+        assert!(is_sent_to_multisig(&verify), "OP_CHECKMULTISIGVERIFY also counts");
+
+        // Wrong terminator.
+        let mut bad_op = ok.clone();
+        *bad_op.last_mut().unwrap() = 0xac; // OP_CHECKSIG
+        assert!(!is_sent_to_multisig(&bad_op), "OP_CHECKSIG is not multisig");
+
+        // N says 3 but only two keys are present, so the chunk count disagrees.
+        let mut short = vec![0x52];
+        for i in 0..2u8 {
+            short.push(33);
+            short.extend_from_slice(&test_pubkey(i));
+        }
+        short.push(0x53);
+        short.push(0xae);
+        assert!(!is_sent_to_multisig(&short), "declared key count must match the pushes");
+
+        // OP_0 is not a valid M: decodeFromOpN only accepts OP_1..OP_16.
+        let mut zero_m = ok.clone();
+        zero_m[0] = 0x00;
+        assert!(!is_sent_to_multisig(&zero_m), "OP_0 is not a valid M");
+
+        // An opcode where a key push belongs.
+        let mut op_in_keys = vec![0x52, 0x51]; // OP_2, then OP_1 instead of a key
+        op_in_keys.push(33);
+        op_in_keys.extend_from_slice(&test_pubkey(0));
+        op_in_keys.push(0x52);
+        op_in_keys.push(0xae);
+        assert!(!is_sent_to_multisig(&op_in_keys), "keys must be data pushes");
+
+        // Too short to be anything, and not a script at all.
+        assert!(!is_sent_to_multisig(&[]), "empty script");
+        assert!(!is_sent_to_multisig(&[0x52, 0xae]), "fewer than four chunks");
+    }
+
     // --- refund targets ---------------------------------------------------
 
     /// Where a rejected peg-in's bitcoin goes, per sender shape. rskj derives
