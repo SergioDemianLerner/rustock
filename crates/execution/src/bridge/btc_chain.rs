@@ -4,13 +4,15 @@
 //! relayers to submit BTC block headers to the Bridge contract, building
 //! an SPV header chain in contract storage.
 //!
-//! Error codes (matching rskj):
-//! -  1: success
-//! - -1: block already known
-//! - -2: called too soon (rate limiting)
-//! - -3: previous block not found
-//! - -4: too far ahead of chain tip
-//! - -5: invalid proof of work
+//! Error codes (matching rskj `BridgeSupport.java:96-100` and
+//! `Bridge.java:243`):
+//! -   0: success
+//! -  -1: called too soon (RSKIP200 rate limiting)
+//! -  -2: block too old
+//! -  -3: previous block not found
+//! -  -4: block previously saved
+//! - -20: header size mismatch (returned by `Bridge`, not `BridgeSupport`)
+//! - -99: unexpected exception
 
 use alloy_primitives::{Bytes, U256};
 use bitcoin::block::Header as BtcHeader;
@@ -35,6 +37,24 @@ const ERR_BLOCK_TOO_OLD: i64 = -2;
 const ERR_PREV_NOT_FOUND: i64 = -3;
 const ERR_ALREADY_KNOWN: i64 = -4;
 const ERR_UNEXPECTED_EXCEPTION: i64 = -99;
+/// rskj `Bridge.RECEIVE_HEADER_ERROR_SIZE_MISTMATCH` (Bridge.java:243).
+/// Unlike the codes above this one is produced by `Bridge.receiveHeader`
+/// itself, before `BridgeSupport` is reached, and is *returned* — the call
+/// succeeds and the caller sees -20 on the stack.
+const ERR_SIZE_MISMATCH: i64 = -20;
+
+/// rskj `BtcTransactionFormatUtils.isBlockHeaderSize`: exactly 80 bytes once
+/// RSKIP124 is active, otherwise 80..=85 (bitcoinj's `makeBlock` tolerated a
+/// trailing transaction-count varint).
+fn is_block_header_size(size: usize, rskip124: bool) -> bool {
+    const MIN_BLOCK_HEADER_SIZE: usize = 80;
+    const MAX_BLOCK_HEADER_SIZE: usize = 85;
+    if rskip124 {
+        size == MIN_BLOCK_HEADER_SIZE
+    } else {
+        (MIN_BLOCK_HEADER_SIZE..=MAX_BLOCK_HEADER_SIZE).contains(&size)
+    }
+}
 
 /// Process a single BTC header submitted via `receiveHeader(bytes)`.
 ///
@@ -63,8 +83,13 @@ pub fn receive_header<CTX: crate::RskContextTr>(
     // Deserialize BTC header (80 bytes). rskj has already parsed the header
     // (Bridge.receiveHeader takes a BtcBlock) by this point, so the order of
     // checks below mirrors BridgeSupport.receiveHeader (BridgeSupport.java:227).
-    if header_bytes.len() < 80 {
-        return Err(PrecompileError::other("receiveHeader: header too short"));
+    // rskj `Bridge.receiveHeader` size gate (Bridge.java:573-576). A wrong
+    // size is NOT an exception: it returns -20 and the call succeeds. rustock
+    // used to raise a precompile error for anything under 80 bytes and to
+    // silently truncate anything over — both fork from rskj, which rejects
+    // 81 bytes just as firmly as it rejects 79.
+    if !is_block_header_size(header_bytes.len(), hardfork_cfg.has_rskip124(block_number)) {
+        return Ok(encode_int_result(gas_cost, ERR_SIZE_MISMATCH));
     }
 
     let btc_header: BtcHeader = deserialize(&header_bytes[..80])
@@ -884,5 +909,29 @@ mod tests {
         assert_eq!(ERR_PREV_NOT_FOUND, -3); // RECEIVE_HEADER_CANT_FOUND_PREVIOUS_BLOCK
         assert_eq!(ERR_ALREADY_KNOWN, -4); // RECEIVE_HEADER_BLOCK_PREVIOUSLY_SAVED
         assert_eq!(ERR_UNEXPECTED_EXCEPTION, -99); // RECEIVE_HEADER_UNEXPECTED_EXCEPTION
+    }
+
+    /// Ground truth: rskj `BtcTransactionFormatUtils.isBlockHeaderSize`.
+    /// Exactly 80 bytes once RSKIP124 is active; 80..=85 before it, because
+    /// bitcoinj's `makeBlock` tolerated a trailing transaction-count varint.
+    /// Anything else makes `Bridge.receiveHeader` return -20 (Bridge.java:575).
+    #[test]
+    fn receive_header_size_rule_matches_rskj() {
+        // RSKIP124 active (wasabi100 onward — every block that can reach
+        // receiveHeader, which needs RSKIP200).
+        assert!(is_block_header_size(80, true));
+        for bad in [0usize, 1, 79, 81, 85, 86, 160] {
+            assert!(!is_block_header_size(bad, true), "size {bad} must be rejected");
+        }
+
+        // Pre-RSKIP124: the MIN..=MAX window.
+        for ok in 80usize..=85 {
+            assert!(is_block_header_size(ok, false), "size {ok} accepted pre-RSKIP124");
+        }
+        for bad in [0usize, 79, 86] {
+            assert!(!is_block_header_size(bad, false), "size {bad} rejected pre-RSKIP124");
+        }
+
+        assert_eq!(ERR_SIZE_MISMATCH, -20); // Bridge.RECEIVE_HEADER_ERROR_SIZE_MISTMATCH
     }
 }

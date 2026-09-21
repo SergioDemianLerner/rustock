@@ -3625,6 +3625,87 @@ mod tests {
         assert_eq!(run(7_338_024), Some(U256::from(MIN_GAS_PRICE)));
     }
 
+    /// Audit finding FRCR-476.
+    ///
+    /// rskj's `Bridge.receiveHeader` (Bridge.java:568-586) checks the argument
+    /// size *before* anything else and, on a mismatch, **returns**
+    /// `RECEIVE_HEADER_ERROR_SIZE_MISTMATCH = -20` (Bridge.java:243). The call
+    /// succeeds; the caller reads -20 off the stack. The size rule is
+    /// `BtcTransactionFormatUtils.isBlockHeaderSize`: exactly 80 bytes once
+    /// RSKIP124 is active.
+    ///
+    /// rustock had neither half. Under 80 bytes it raised a precompile error
+    /// (post-RSKIP197 a revert pushing 0, pre-197 a failed call consuming all
+    /// gas); over 80 bytes it silently truncated to the first 80 and processed
+    /// the header as if it were valid. Both fork from rskj on inputs any
+    /// relayer can submit.
+    #[test]
+    fn test_receive_header_size_mismatch_returns_minus_20() {
+        // ABI-encode `receiveHeader(bytes)` with a payload of `len` bytes.
+        let call_input = |len: usize| -> Vec<u8> {
+            let mut input = crate::bridge::compute_selector("receiveHeader(bytes)").to_vec();
+            let mut off = [0u8; 32];
+            off[31] = 0x20;
+            input.extend_from_slice(&off); // offset to the bytes argument
+            let mut l = [0u8; 32];
+            l[24..].copy_from_slice(&(len as u64).to_be_bytes());
+            input.extend_from_slice(&l); // length
+            let mut payload = vec![0xABu8; len];
+            payload.resize(len.div_ceil(32) * 32, 0); // right-pad to a word
+            input.extend_from_slice(&payload);
+            input
+        };
+
+        // Returns the int256 the Bridge produced, or None if the call failed.
+        let run = |len: usize| -> Option<alloy_primitives::I256> {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0x7E);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(2_000_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(call_input(len)),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r = executor
+                .execute_block(&dummy_header(7_000_000), &[(tx, sender)], &root, store)
+                .expect("block");
+            let res = &r.tx_results[0];
+            if !res.success || res.output.len() != 32 {
+                return None;
+            }
+            Some(alloy_primitives::I256::from_be_bytes::<32>(res.output[..32].try_into().unwrap()))
+        };
+
+        let minus_20 = alloy_primitives::I256::try_from(-20i64).unwrap();
+        // Too short: rskj returns -20, it does not throw.
+        assert_eq!(run(79), Some(minus_20), "79-byte header -> -20");
+        assert_eq!(run(0), Some(minus_20), "empty header -> -20");
+        // Too long: rskj returns -20 rather than truncating to 80.
+        assert_eq!(run(81), Some(minus_20), "81-byte header -> -20");
+        assert_eq!(run(85), Some(minus_20), "85-byte header -> -20 once RSKIP124 is on");
+
+        // Exactly 80 is accepted for processing and must NOT report -20. The
+        // bytes are garbage, so the Bridge reports an ordinary BridgeSupport
+        // code (-3, previous block not found) — the point is that it got that
+        // far.
+        let at_80 = run(80).expect("80-byte header is processed");
+        assert_ne!(at_80, minus_20, "80 bytes must reach BridgeSupport");
+        assert_eq!(
+            at_80,
+            alloy_primitives::I256::try_from(-3i64).unwrap(),
+            "unknown parent -> RECEIVE_HEADER_CANT_FOUND_PREVIOUS_BLOCK"
+        );
+    }
+
     /// Ported from rskj InitcodeCostCalculatorTest.
     /// Validates that contract creation includes initcode word cost at Shanghai.
     #[test]

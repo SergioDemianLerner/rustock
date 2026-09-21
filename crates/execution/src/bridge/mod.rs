@@ -43,7 +43,7 @@ use crate::precompiles::BridgeTxContext;
 // ABI selector helper
 // ---------------------------------------------------------------------------
 
-fn compute_selector(sig: &str) -> [u8; 4] {
+pub(crate) fn compute_selector(sig: &str) -> [u8; 4] {
     let h = Keccak256::digest(sig.as_bytes());
     [h[0], h[1], h[2], h[3]]
 }
