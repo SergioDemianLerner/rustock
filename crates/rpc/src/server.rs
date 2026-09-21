@@ -143,7 +143,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_mining" => eth::eth_mining(id),
         "eth_hashrate" => eth::eth_hashrate(id),
         "eth_accounts" => eth::eth_accounts(id),
-        "eth_coinbase" => eth::eth_coinbase(id),
+        "eth_coinbase" => eth::eth_coinbase(id, &state.miner),
         "eth_getBlockByHash" => eth::eth_get_block_by_hash(id, params, &state.store),
         "eth_getBlockByNumber" => eth::eth_get_block_by_number(id, params, &state.store),
         "eth_getBlockTransactionCountByHash" => eth::eth_get_block_transaction_count_by_hash(id, params, &state.store),

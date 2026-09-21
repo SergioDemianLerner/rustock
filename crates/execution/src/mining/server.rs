@@ -271,6 +271,11 @@ impl MinerServer {
         }
     }
 
+    /// The address block rewards are paid to.
+    pub fn coinbase_address(&self) -> alloy_primitives::Address {
+        self.builder.mining_config().coinbase_address
+    }
+
     /// Build a fresh template on the current best block and make it the work
     /// on offer. Called when the chain advances, when the pool changes, and
     /// on a timer -- and by `get_work` when there is nothing to hand out yet.

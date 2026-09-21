@@ -1328,6 +1328,78 @@ async fn test_log_dto_fields_match_rskj() {
 // are rskj's and the consumers are existing pool daemons, so a field that
 // looks wrong here is a field that breaks a miner.
 
+
+// --- block-count getters, and the header-only distinction --------------------
+//
+// rskj covers these in Web3ImplTest (getBlockTransactionCountByHash and
+// friends). Both were named in no rustock test. The interesting case is not
+// the happy path but the three-way answer: a count, zero for a block whose
+// body is absent, and null for a block that is not here at all -- a caller
+// cannot tell "no transactions" from "no block" unless those differ.
+
+#[tokio::test]
+async fn test_block_transaction_count_by_hash_distinguishes_absent_from_empty() {
+    let (state, _tmp) = setup_state();
+    let known = test_header(42).hash();
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockTransactionCountByHash", json!([format!("{known:?}")])),
+    )
+    .await;
+    assert_eq!(
+        resp.result.unwrap(),
+        json!("0x0"),
+        "a stored header with no body has zero transactions, not null"
+    );
+
+    let unknown = "0x".to_string() + &"11".repeat(32);
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockTransactionCountByHash", json!([unknown])),
+    )
+    .await;
+    assert_eq!(
+        resp.result.unwrap(),
+        serde_json::Value::Null,
+        "a block that is not stored must answer null, not zero"
+    );
+}
+
+#[tokio::test]
+async fn test_block_count_getters_reject_a_malformed_hash() {
+    let (state, _tmp) = setup_state();
+    for method in [
+        "eth_getBlockTransactionCountByHash",
+        "eth_getUncleCountByBlockHash",
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, json!(["not-a-hash"]))).await;
+        assert!(resp.result.is_none(), "{method} must not answer a bad hash");
+        assert_eq!(
+            resp.error.expect("an error is expected").code,
+            -32602,
+            "{method} must report INVALID_PARAMS"
+        );
+
+        let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+        assert_eq!(
+            resp.error.expect("an error is expected").code,
+            -32602,
+            "{method} must report INVALID_PARAMS when the hash is missing"
+        );
+    }
+}
+
+/// eth_hashrate is a fixed zero: rustock does not hash, it hands work to
+/// merged-mining software that does. Pinned so it is not "improved" into
+/// reporting a number the node cannot know.
+#[tokio::test]
+async fn test_eth_hashrate_is_zero() {
+    let (state, _tmp) = setup_state();
+    let resp = dispatch_for_test(&state, make_request("eth_hashrate", json!([]))).await;
+    assert_eq!(resp.result.unwrap(), json!("0x0"));
+}
+
 mod mnr_tests {
     use super::*;
     use crate::mnr::{MiningService, SUBMIT_BLOCK_ERROR};
@@ -1358,6 +1430,11 @@ mod mnr_tests {
     }
 
     impl MiningService for FakeMiner {
+        fn coinbase(&self) -> [u8; 20] {
+            [0x5Au8; 20]
+        }
+
+
         fn get_work(&self) -> Result<MinerWork, SubmitError> {
             self.work
                 .clone()
@@ -1610,5 +1687,159 @@ mod mnr_tests {
 
         let resp = dispatch_for_test(&state, make_request("rpc_modules", json!([]))).await;
         assert_eq!(resp.result.unwrap()["mnr"], json!("1.0"));
+    }
+
+    /// eth_coinbase must report the miner's address once mining is on. With
+    /// mining off the zero address is honest; with mining on it is a lie that
+    /// mining software acts on, so both halves are pinned here.
+    ///
+    /// rskj answers this from the miner configuration in EthModule. rustock
+    /// had it hard-coded to zero, which was correct only for a node that
+    /// never mines -- and stopped being correct when mining landed.
+    #[tokio::test]
+    async fn test_eth_coinbase_reports_the_miner_address() {
+        let (state, _tmp) = setup_state();
+        assert!(state.miner.is_none(), "the default node does not mine");
+        let resp = dispatch_for_test(&state, make_request("eth_coinbase", json!([]))).await;
+        assert_eq!(
+            resp.result.unwrap(),
+            json!("0x0000000000000000000000000000000000000000"),
+            "with no miner the zero address is the honest answer"
+        );
+
+        let (mut state, _tmp2) = setup_state();
+        state.miner = Some(std::sync::Arc::new(FakeMiner::default()));
+        let resp = dispatch_for_test(&state, make_request("eth_coinbase", json!([]))).await;
+        assert_eq!(
+            resp.result.unwrap(),
+            json!("0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"),
+            "with a miner the configured coinbase must be reported"
+        );
+    }
+
+}
+
+// --- administrative methods -------------------------------------------------
+//
+// rskj gates its equivalents behind the `rsk` module being enabled in config
+// and tests that in Web3ImplTest / ModuleDescriptionTest. rustock gates on
+// --rpc-admin. These two methods were named in no test at all, which the
+// coverage document calls the most uncomfortable gap in the RPC surface:
+// rsk_collectTrie DELETES trie epochs.
+
+/// Without --rpc-admin both admin methods must report as unknown, not as
+/// forbidden. The distinction is deliberate: a node that never had them and a
+/// node that has them switched off should be indistinguishable from outside,
+/// so that probing cannot enumerate which nodes are worth attacking.
+#[tokio::test]
+async fn test_admin_methods_are_unknown_without_the_flag() {
+    let (state, _tmp) = setup_state();
+    assert!(!state.admin_enabled, "the default must be off");
+
+    for method in ["rsk_collectTrie", "rsk_collectTrieStatus"] {
+        let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+        assert!(resp.result.is_none(), "{method} must not answer when admin is off");
+        let err = resp.error.expect("an error is expected");
+        assert_eq!(err.code, -32601, "{method} must report METHOD_NOT_FOUND");
+        assert_eq!(
+            err.message, "Method not found",
+            "{method} must not disclose that it exists but is disabled"
+        );
+    }
+}
+
+/// The gate is on the method name, not on the arguments: a request carrying
+/// plausible parameters must be refused exactly the same way. Worth pinning
+/// because rsk_collectTrie with a block number is the shape that deletes
+/// something, and a gate that only covered the no-argument form would look
+/// correct in every other test.
+#[tokio::test]
+async fn test_admin_gate_ignores_the_parameters() {
+    let (state, _tmp) = setup_state();
+    let resp = dispatch_for_test(
+        &state,
+        make_request("rsk_collectTrie", json!(["0x2a"])),
+    )
+    .await;
+    assert!(resp.result.is_none(), "parameters must not open the gate");
+    assert_eq!(resp.error.unwrap().code, -32601);
+}
+
+/// With admin on, the methods must actually dispatch -- otherwise the gate
+/// test above would pass against a node where they were removed entirely, and
+/// prove nothing. This node has no epoch store, so the call reaches the
+/// handler and reports that rather than being refused by the gate.
+#[tokio::test]
+async fn test_admin_methods_dispatch_when_enabled() {
+    let (mut state, _tmp) = setup_state();
+    state.admin_enabled = true;
+
+    let resp = dispatch_for_test(&state, make_request("rsk_collectTrieStatus", json!([]))).await;
+    let refused_by_gate = resp
+        .error
+        .as_ref()
+        .is_some_and(|e| e.code == -32601 && e.message == "Method not found");
+    assert!(
+        !refused_by_gate,
+        "with admin enabled the method must reach its handler, not the gate"
+    );
+}
+
+// --- key custody ------------------------------------------------------------
+//
+// rskj covers the signing surface in Web3ImplTest and the personal module
+// tests, where the node DOES hold keys and unlocking is part of the contract.
+// rustock holds none, and these tests pin that posture rather than the
+// behaviour of a wallet it does not have. The property is worth a test because
+// it is the kind that regresses quietly: someone implements eth_sign for a
+// local tool, and a node that never had custody suddenly has it.
+
+/// No key-holding method may answer. A node with no wallet must refuse to
+/// sign rather than sign with something it happens to have -- the node
+/// identity key, a miner key -- which would be a signature the operator never
+/// authorised.
+#[tokio::test]
+async fn test_the_node_holds_no_keys_and_refuses_to_sign() {
+    let (state, _tmp) = setup_state();
+
+    for (method, params) in [
+        ("eth_sign", json!(["0x0000000000000000000000000000000000000001", "0xdeadbeef"])),
+        ("eth_signTransaction", json!([{"from": "0x0000000000000000000000000000000000000001"}])),
+        ("eth_sendTransaction", json!([{"from": "0x0000000000000000000000000000000000000001"}])),
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, params)).await;
+        assert!(resp.result.is_none(), "{method} must not return a result");
+        assert_eq!(
+            resp.error.expect("an error is expected").code,
+            -32601,
+            "{method} must be refused"
+        );
+    }
+}
+
+/// eth_accounts must be empty, and consistently so: a caller that trusts a
+/// non-empty list would go on to call eth_sign, which cannot work. rskj
+/// returns the wallet's accounts here; rustock has no wallet.
+#[tokio::test]
+async fn test_eth_accounts_is_empty_because_there_is_no_wallet() {
+    let (state, _tmp) = setup_state();
+    let resp = dispatch_for_test(&state, make_request("eth_accounts", json!([]))).await;
+    assert_eq!(
+        resp.result.unwrap(),
+        json!([]),
+        "a node with no wallet must report no accounts"
+    );
+}
+
+/// The Solidity compiler methods are refused rather than answered with an
+/// empty list. rskj removed these upstream; answering "no compilers" would
+/// invite a caller to treat compilation as supported-but-unavailable.
+#[tokio::test]
+async fn test_compiler_methods_are_refused() {
+    let (state, _tmp) = setup_state();
+    for method in ["eth_getCompilers", "eth_compileSolidity"] {
+        let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+        assert!(resp.result.is_none(), "{method} must not answer");
+        assert_eq!(resp.error.unwrap().code, -32601);
     }
 }

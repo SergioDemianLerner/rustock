@@ -233,4 +233,75 @@ mod tests {
         let de = AbiCallSpec::deserialize(&spec.serialize()).unwrap();
         assert_eq!(de, spec);
     }
+
+    /// Java/Guava `SignedBytes.lexicographicalComparator`, which rskj uses to
+    /// order federation members and votes. Bytes compare as SIGNED i8, so
+    /// 0x80..0xff sort BEFORE 0x00..0x7f -- the opposite of Rust's natural
+    /// ordering on u8.
+    ///
+    /// This is worth a test out of proportion to its size. Federation member
+    /// order determines the redeem script, the redeem script determines the
+    /// federation's P2SH address, and compressed public keys begin with 0x02
+    /// or 0x03 -- both positive, so the difference only shows up deeper in the
+    /// key where a naive u8 sort agrees most of the time and disagrees
+    /// occasionally. A node that sorted unsigned would compute a different
+    /// federation address than the rest of the network, and would do it for
+    /// some federations and not others.
+    #[test]
+    fn signed_bytes_cmp_orders_high_bytes_before_low_ones() {
+        use std::cmp::Ordering;
+
+        // The whole point: 0x80 is -128 as i8, so it sorts BELOW 0x00.
+        assert_eq!(signed_bytes_cmp(&[0x80], &[0x00]), Ordering::Less);
+        assert_eq!(signed_bytes_cmp(&[0xff], &[0x00]), Ordering::Less);
+        assert_eq!(signed_bytes_cmp(&[0x7f], &[0x80]), Ordering::Greater);
+        // ... which is the reverse of the unsigned answer in every case above.
+        assert_eq!([0x80u8].cmp(&[0x00u8]), Ordering::Greater);
+
+        // Within the negative range the order is still ascending as i8:
+        // 0x80 (-128) < 0x81 (-127) < 0xff (-1).
+        assert_eq!(signed_bytes_cmp(&[0x80], &[0x81]), Ordering::Less);
+        assert_eq!(signed_bytes_cmp(&[0x81], &[0xff]), Ordering::Less);
+
+        // Within the positive range it matches the unsigned order.
+        assert_eq!(signed_bytes_cmp(&[0x01], &[0x02]), Ordering::Less);
+
+        // Equality, and the prefix rule: a prefix sorts before a longer array
+        // that extends it, whatever the extending byte is -- including a
+        // negative one, where a length-first comparison would differ.
+        assert_eq!(signed_bytes_cmp(&[0x01, 0x02], &[0x01, 0x02]), Ordering::Equal);
+        assert_eq!(signed_bytes_cmp(&[0x01], &[0x01, 0x00]), Ordering::Less);
+        assert_eq!(signed_bytes_cmp(&[0x01], &[0x01, 0x80]), Ordering::Less);
+        assert_eq!(signed_bytes_cmp(&[], &[0x80]), Ordering::Less);
+        assert_eq!(signed_bytes_cmp(&[], &[]), Ordering::Equal);
+
+        // The first differing byte decides, not the last.
+        assert_eq!(
+            signed_bytes_cmp(&[0x00, 0xff], &[0x01, 0x00]),
+            Ordering::Less,
+            "comparison stops at the first difference"
+        );
+    }
+
+    /// Sorting a realistic set of compressed keys must agree with the signed
+    /// comparator end to end, not just pairwise. Keys starting 0x02/0x03 are
+    /// both positive, so any divergence hides in the x-coordinate.
+    #[test]
+    fn signed_bytes_cmp_sorts_compressed_keys_like_java() {
+        let mut keys: Vec<Vec<u8>> = vec![
+            { let mut k = vec![0x02]; k.extend_from_slice(&[0x00; 32]); k },
+            { let mut k = vec![0x02]; k.extend_from_slice(&[0xff; 32]); k },
+            { let mut k = vec![0x03]; k.extend_from_slice(&[0x80; 32]); k },
+            { let mut k = vec![0x02]; k.extend_from_slice(&[0x7f; 32]); k },
+        ];
+        keys.sort_by(|a, b| signed_bytes_cmp(a, b));
+
+        // Within the 0x02 group the second byte decides, signed:
+        // 0xff (-1) < 0x00 (0) < 0x7f (127). Then the 0x03 group follows.
+        assert_eq!(keys[0][1], 0xff, "0xff sorts first among the 0x02 keys");
+        assert_eq!(keys[1][1], 0x00);
+        assert_eq!(keys[2][1], 0x7f);
+        assert_eq!(keys[3][0], 0x03, "the 0x03 prefix sorts last");
+    }
+
 }

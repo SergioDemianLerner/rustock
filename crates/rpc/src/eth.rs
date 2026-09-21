@@ -87,8 +87,18 @@ pub fn eth_accounts(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(id, json!([]))
 }
 
-pub fn eth_coinbase(id: Value) -> JsonRpcResponse {
-    JsonRpcResponse::success(id, json!("0x0000000000000000000000000000000000000000"))
+/// The address block rewards are paid to.
+///
+/// With mining off there is no such address and the zero address is the
+/// honest answer. With mining on, answering zero would tell mining software
+/// the rewards go nowhere, so the miner's configured address is reported --
+/// which is what rskj does.
+pub fn eth_coinbase(
+    id: Value,
+    miner: &Option<std::sync::Arc<dyn crate::mnr::MiningService>>,
+) -> JsonRpcResponse {
+    let addr = miner.as_ref().map(|m| m.coinbase()).unwrap_or([0u8; 20]);
+    JsonRpcResponse::success(id, json!(format!("0x{}", hex::encode(addr))))
 }
 
 pub fn eth_get_block_by_hash(
