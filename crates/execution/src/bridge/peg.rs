@@ -6100,6 +6100,108 @@ mod tests {
         assert!(!is_sent_to_multisig(&[0x52, 0xae]), "fewer than four chunks");
     }
 
+
+    // --- DIVERGENCE: which redeem scripts count as multisig -----------------
+    //
+    // rustock's `is_sent_to_multisig` accepts one shape: OP_M, N key pushes,
+    // OP_N, OP_CHECKMULTISIG[VERIFY]. bitcoinj-thin's `Script.isSentToMultiSig`
+    // is not a shape check at all -- it is
+    //
+    //     getRedeemScriptParser().getM() > 0
+    //
+    // and `RedeemScriptParserFactory.get` returns a parser for FOUR shapes:
+    // standard, flyover (a 32-byte push + OP_DROP wrapping any of the others,
+    // resolved by calling the factory recursively), P2SH-ERP, and non-standard
+    // ERP. Each delegates getM() inward to a StandardRedeemScriptParser, so all
+    // four answer true. Only one script answers false by construction: the
+    // hardcoded testnet federation, whose parser returns -1 on purpose to
+    // preserve testnet consensus.
+    //
+    // So rskj treats an ERP or flyover redeem as a multisig sender and rustock
+    // does not. These tests pin rustock's CURRENT answers. They are not an
+    // assertion that the answers are right.
+    //
+    // Verified against co.rsk.bitcoinj:bitcoinj-thin:0.14.4-rsk-18, the
+    // artifact rskj pins.
+
+    /// A P2SH-ERP redeem: OP_NOTIF <standard body> OP_ELSE <csv push>
+    /// OP_CHECKSEQUENCEVERIFY OP_DROP <erp body> OP_ENDIF.
+    fn p2sh_erp_redeem() -> Vec<u8> {
+        let body = |m: u8, n: u8, seed: u8| {
+            let mut v = vec![0x50 + m];
+            for i in 0..n {
+                v.push(33);
+                v.extend_from_slice(&test_pubkey(seed + i));
+            }
+            v.push(0x50 + n);
+            v.push(0xae); // OP_CHECKMULTISIG
+            v
+        };
+        let mut s = vec![0x64]; // OP_NOTIF
+        s.extend_from_slice(&body(2, 3, 0));
+        s.push(0x67); // OP_ELSE
+        s.push(0x02); // push 2 bytes of CSV delay
+        s.extend_from_slice(&[0x00, 0x20]);
+        s.push(0xb2); // OP_CHECKSEQUENCEVERIFY
+        s.push(0x75); // OP_DROP
+        s.extend_from_slice(&body(1, 2, 10));
+        s.push(0x68); // OP_ENDIF
+        s
+    }
+
+    /// A flyover redeem: <32-byte hash> OP_DROP <standard redeem>.
+    fn flyover_redeem() -> Vec<u8> {
+        let mut s = vec![32];
+        s.extend_from_slice(&[0xAB; 32]);
+        s.push(0x75); // OP_DROP
+        s.extend_from_slice(&multisig_redeem());
+        s
+    }
+
+    #[test]
+    fn is_sent_to_multisig_rejects_erp_and_flyover_redeems_unlike_rskj() {
+        // Sanity: the plain shape is accepted, so the rejections below are
+        // about the wrapper and not about the helper being broken.
+        assert!(is_sent_to_multisig(&multisig_redeem()));
+
+        assert!(
+            !is_sent_to_multisig(&p2sh_erp_redeem()),
+            "CURRENT rustock behaviour. bitcoinj-thin answers TRUE here: \
+             hasP2shErpRedeemScriptStructure matches and getM() delegates to \
+             the inner standard parser. rustock stops at the last chunk, which \
+             is OP_ENDIF rather than OP_CHECKMULTISIG."
+        );
+
+        assert!(
+            !is_sent_to_multisig(&flyover_redeem()),
+            "CURRENT rustock behaviour. bitcoinj-thin answers TRUE here: \
+             hasFlyoverRedeemScriptStructure strips the 32-byte push and \
+             OP_DROP and calls the factory again on the rest. rustock counts \
+             the two prefix chunks against the OP_N key count and fails."
+        );
+    }
+
+    /// A third, narrower difference in the same helper, recorded while the
+    /// others were being established. bitcoinj's `decodePositiveN` accepts a
+    /// PUSHED number as well as OP_1..OP_16; rustock's `decode_op_n` accepts
+    /// only the opcodes. A redeem whose M or N arrives as a one-byte push is
+    /// multisig to rskj and not to rustock.
+    #[test]
+    fn is_sent_to_multisig_requires_op_n_not_a_pushed_number() {
+        let mut s = vec![0x01, 0x02]; // push the number 2, rather than OP_2
+        for i in 0..3u8 {
+            s.push(33);
+            s.extend_from_slice(&test_pubkey(i));
+        }
+        s.push(0x53); // OP_3
+        s.push(0xae);
+        assert!(
+            !is_sent_to_multisig(&s),
+            "CURRENT rustock behaviour; bitcoinj's decodePositiveN accepts a \
+             pushed number and would answer TRUE"
+        );
+    }
+
     // --- refund targets ---------------------------------------------------
 
     /// Where a rejected peg-in's bitcoin goes, per sender shape. rskj derives
