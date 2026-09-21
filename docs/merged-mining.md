@@ -139,6 +139,22 @@ Selection is ported from rskj `FamilyUtils`: take the ancestors within
 `UNCLE_GENERATION_LIMIT` (7), take every block at those heights whose parent is
 the right ancestor, drop the ancestors themselves and anything an ancestor
 already included, sort by height then hash, and cap at `UNCLE_LIST_LIMIT` (10).
+
+**Candidates are filtered by parentage, not by height.** A block sitting at a
+covered height is not thereby an uncle: it is one only if it is a *direct child
+of a block on the chain being mined*. This is what keeps an orphaned fork from
+poisoning the list. A fork that diverged at #7 and ran on to #8, #9 and #10
+contributes exactly one uncle -- #8, whose parent #7 is on our chain. #9 hangs
+off #8 and #10 off #9, so neither is family, and including them would produce a
+block every peer rejects (rskj checks the same thing independently in
+`validateUncleParent`). A fork that diverged below the window contributes
+nothing at all, however many of its blocks sit at covered heights.
+
+The ancestor walk follows `parent_hash` back from the parent being mined on,
+not the store's canonical pointers. That is deliberate, and matches rskj:
+uncles are then selected relative to the chain actually being extended, which
+stays correct mid-reorg when the canonical pointers and the mining parent
+disagree.
 The sort matters: the index returns hashes in whatever order they sit in the
 column family, and two nodes building the same block have to agree on the
 ommer hash.

@@ -1048,6 +1048,82 @@ mod uncle_tests {
         );
     }
 
+    /// The case that distinguishes selecting by parentage from selecting by
+    /// height: a multi-block fork that was orphaned.
+    ///
+    /// A fork diverging at #7 puts blocks at #8, #9 and #10 in the store, all
+    /// at heights the block being mined would look at. Only the first is an
+    /// uncle -- it is a direct child of #7, which is on our chain. Its
+    /// descendants hang off the fork, not off any ancestor, so including them
+    /// would produce a block every peer rejects (rskj `validateUncleParent`).
+    #[test]
+    fn only_the_first_block_of_an_orphaned_fork_is_an_uncle() {
+        let (store, headers, _dir) = chain(10);
+
+        // Fork off #7: 8' -> 9' -> 10', none of them canonical.
+        let forked_8 = sibling_of(&headers[7], 8, 0xF1);
+        let forked_8_hash = store_orphan(&store, &forked_8);
+
+        let mut forked_9 = header_at(9, forked_8_hash, B256::ZERO);
+        forked_9.beneficiary = Address::repeat_byte(0xF2);
+        let forked_9_hash = store_orphan(&store, &forked_9);
+
+        let mut forked_10 = header_at(10, forked_9_hash, B256::ZERO);
+        forked_10.beneficiary = Address::repeat_byte(0xF3);
+        let forked_10_hash = store_orphan(&store, &forked_10);
+
+        // All three sit at heights the search covers, so height alone would
+        // offer all three.
+        assert_eq!(store.hashes_at_height(8).unwrap().len(), 2);
+        assert_eq!(store.hashes_at_height(9).unwrap().len(), 2);
+        assert_eq!(store.hashes_at_height(10).unwrap().len(), 2);
+
+        let selected: Vec<B256> = select_uncles(&store, 11, headers[10].hash())
+            .iter()
+            .map(|u| u.hash())
+            .collect();
+
+        assert_eq!(
+            selected,
+            vec![forked_8_hash],
+            "only the fork's first block is a child of our chain"
+        );
+        assert!(!selected.contains(&forked_9_hash), "9' hangs off 8', not off our chain");
+        assert!(!selected.contains(&forked_10_hash), "10' hangs off 9', not off our chain");
+    }
+
+    /// The same principle one level up: a fork whose divergence point is
+    /// itself outside the generation window contributes nothing at all, even
+    /// though its blocks sit at heights the search covers.
+    #[test]
+    fn a_fork_diverging_before_the_window_contributes_no_uncles() {
+        let (store, headers, _dir) = chain(20);
+
+        // Mining #21, so the window reaches back to #15. Fork off #10, well
+        // below it, and run the fork up through the window.
+        let mut parent_hash = headers[10].hash();
+        let mut forked_hashes = Vec::new();
+        for number in 11..=20u64 {
+            let mut forked = header_at(number, parent_hash, B256::ZERO);
+            forked.beneficiary = Address::repeat_byte(0xD0 + (number - 11) as u8);
+            parent_hash = store_orphan(&store, &forked);
+            forked_hashes.push(parent_hash);
+        }
+
+        let selected: Vec<B256> = select_uncles(&store, 21, headers[20].hash())
+            .iter()
+            .map(|u| u.hash())
+            .collect();
+
+        assert!(
+            selected.is_empty(),
+            "every block of this fork hangs off the fork, not off our chain: {selected:?}"
+        );
+        for hash in forked_hashes {
+            assert!(!selected.contains(&hash));
+        }
+    }
+
     /// A block at the right height on a different fork is not family: its
     /// parent is not one of our ancestors.
     #[test]
