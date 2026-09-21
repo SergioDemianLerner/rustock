@@ -1765,4 +1765,72 @@ mod tests {
         assert!(verify_der_signature(&s0[..s0.len() - 1], &sighash, &key0));
         assert!(verify_der_signature(&s1[..s1.len() - 1], &sighash, &key1));
     }
+
+    /// `parse_chunks` is the script parser the peg-in sender classifier runs on
+    /// attacker-supplied scriptSigs, so its malformed-input behaviour is a
+    /// consensus surface: a panic here halts block execution, and a chunk list
+    /// that differs from bitcoinj's changes how a peg-in is classified.
+    ///
+    /// rskj gets this from bitcoinj `Script.parseIntoChunks`.
+    #[test]
+    fn parse_chunks_refuses_truncated_pushes_without_panicking() {
+        use Chunk::*;
+        assert_eq!(parse_chunks(&[]), Some(vec![]), "empty script parses to nothing");
+        assert_eq!(parse_chunks(&[0x00]), Some(vec![OpZero]));
+        assert_eq!(parse_chunks(&[0x01, 0xAA]), Some(vec![Data(vec![0xAA])]));
+        assert_eq!(parse_chunks(&[0xac]), Some(vec![Op(0xac)]), "OP_CHECKSIG");
+
+        // A direct push claiming more bytes than remain.
+        assert!(parse_chunks(&[0x05, 0xAA, 0xBB]).is_none(), "truncated direct push");
+        assert!(parse_chunks(&[0x4b]).is_none(), "0x4b with no payload at all");
+
+        // PUSHDATA1 with the length byte missing, then with a short payload.
+        assert!(parse_chunks(&[0x4c]).is_none(), "PUSHDATA1 with no length");
+        assert!(parse_chunks(&[0x4c, 0x05, 0xAA]).is_none(), "PUSHDATA1 truncated");
+
+        // PUSHDATA2: missing length, partial length, and an oversized length
+        // that must be rejected rather than used to slice.
+        assert!(parse_chunks(&[0x4d]).is_none(), "PUSHDATA2 with no length");
+        assert!(parse_chunks(&[0x4d, 0x02]).is_none(), "PUSHDATA2 with half a length");
+        assert!(
+            parse_chunks(&[0x4d, 0xFF, 0xFF, 0xAA]).is_none(),
+            "PUSHDATA2 claiming 65535 bytes must be refused, not sliced"
+        );
+
+        // A well-formed PUSHDATA1 and PUSHDATA2 still parse.
+        assert_eq!(
+            parse_chunks(&[0x4c, 0x02, 0xAA, 0xBB]),
+            Some(vec![Data(vec![0xAA, 0xBB])])
+        );
+        assert_eq!(
+            parse_chunks(&[0x4d, 0x02, 0x00, 0xAA, 0xBB]),
+            Some(vec![Data(vec![0xAA, 0xBB])])
+        );
+    }
+
+    /// DIVERGENCE, pinned deliberately rather than asserted as correct.
+    ///
+    /// bitcoinj's parser treats 0x4e (OP_PUSHDATA4) as a push with a 4-byte
+    /// little-endian length. rustock falls through to the catch-all arm and
+    /// records it as a plain opcode, so the chunk list after a 0x4e differs
+    /// between the two implementations.
+    ///
+    /// Reachable in principle: a peg-in scriptSig is attacker-supplied, and
+    /// `classify_pegin_sender` decides the refund address from the chunk list.
+    /// Whether it is reachable in practice depends on whether any such script
+    /// can also satisfy the shape checks downstream, which this test does not
+    /// establish.
+    ///
+    /// Left as-is overnight rather than "fixed": changing how scripts parse is
+    /// a consensus change, and getting it wrong is worse than the divergence
+    /// it would close. Raised for review.
+    #[test]
+    fn parse_chunks_treats_pushdata4_as_an_opcode_unlike_bitcoinj() {
+        use Chunk::*;
+        assert_eq!(
+            parse_chunks(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0xAA]),
+            Some(vec![Op(0x4e), Data(vec![0x00]), OpZero, OpZero, Op(0xAA)]),
+            "documents CURRENT behaviour: 0x4e is not read as a length-prefixed push"
+        );
+    }
 }
