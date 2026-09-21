@@ -197,6 +197,81 @@ the feature. They are not defects and should not be counted as missing tests:
 5. **Test `rsk_collectTrie`** before anything else admin-gated grows, given
    what it does.
 
+---
+
+## Session log: 2026-09-21
+
+Work against this document, in the order it asked for: Bridge core two-way peg,
+then RPC, then Bridge federation. Each test is its own commit.
+
+### Tests added
+
+| area | what | rskj source |
+|---|---|---|
+| Bridge core | peg-in sender classification, all four shapes as one matrix, plus malformed inputs | `P2pkhBtcLockSenderTest`, `P2shMultisigBtcLockSenderTest`, `P2shP2wpkhBtcLockSenderTest`, `P2shP2wshBtcLockSenderTest` |
+| Bridge core | refund targets, including the non-refundable case | `BridgeSupport.refundTxSender` |
+| Bridge core | the multisig redeem shape check | bitcoinj `Script.isSentToMultiSig` |
+| Bridge core | script parser malformed input | bitcoinj `Script.parseIntoChunks` |
+| RPC | the admin gate in front of `rsk_collectTrie` | `Web3ImplTest`, `ModuleDescriptionTest` |
+| RPC | key custody: the node holds no keys and will not sign | `Web3ImplTest`, personal module tests |
+| RPC | block-count getters, absent vs empty | `Web3ImplTest` |
+| Bridge federation | the signed byte comparator that orders members | Guava `SignedBytes` |
+| Bridge federation | federator RSK address derivation | `FederationMemberTest` |
+
+Execution 634 -> 643 tests, RPC 76 -> 86.
+
+The selection principle was not "translate the biggest classes". It was: pure
+functions, no context harness needed, where the failure is silent and the
+consequence is somebody's bitcoin. A wrong sender classification refunds to an
+address the sender does not control; a wrong member sort yields a different
+federation address for some federations and not others; a panic in the script
+parser halts block execution.
+
+### Functionality implemented
+
+**`eth_coinbase` answered from the miner.** It returned the zero address
+unconditionally, which was correct while rustock could not mine and became
+wrong when mining landed: a node configured with `--mining-coinbase` told
+callers its rewards went to `0x0`. `MiningService` gained a `coinbase()`
+accessor. Found only because `eth_coinbase` was on this document's list of 13
+untested methods.
+
+### Raised for review, not acted on
+
+**`parse_chunks` treats `0x4e` (OP_PUSHDATA4) as a plain opcode.** bitcoinj
+reads it as a push with a 4-byte little-endian length, so the chunk lists
+diverge from that byte onward. `classify_pegin_sender` decides a refund address
+from that chunk list, and a peg-in scriptSig is attacker-supplied, so this is
+reachable in principle -- a zero-length PUSHDATA4 is well formed for bitcoinj
+and becomes four separate chunks here.
+
+Not fixed overnight, deliberately. Changing how scripts parse is a consensus
+change and getting it wrong is worse than the divergence it closes. Three
+things would settle it, none of which could be done here:
+
+1. What bitcoinj actually does with `0x4e` when the declared length is zero,
+   and when it exceeds the remaining bytes. bitcoinj source is not on this
+   machine; the rskj side can check in minutes.
+2. Whether any script reaching `classify_pegin_sender` can contain `0x4e` and
+   still satisfy the shape checks downstream.
+3. Whether it has ever occurred on mainnet. The whole chain replays
+   successfully to #9,230,008, so it has not -- this is latent, not active.
+
+The behaviour is pinned by a test so a future change to it is visible.
+
+### Not attempted, and why
+
+**Anything needing an execution context.** The Bridge's largest untested
+surface -- `register_btc_transaction`, the locking cap, the whitelist, replay
+protection via `btcTxHashesAlreadyProcessed` -- all take `&mut CTX`, and no
+test harness builds one. Every bridge test in the tree today is a pure-function
+or serialisation test. Building that harness is the single highest-value thing
+left here and it is a real piece of work, not an evening's: it would unlock
+`BridgeSupportTest` (177 tests), `BridgeSupportRegisterBtcTransactionTest`,
+`BridgeSupportReleaseBtcTest` and most of the 1,606.
+
+That is the decision worth taking deliberately rather than drifting into.
+
 ## Appendix: every rskj test class
 
 642 classes, grouped by area, with the rustock files covering that area. This
