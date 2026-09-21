@@ -71,6 +71,25 @@ impl rustock_rpc::server::TxPoolReader for PoolAdapter {
     }
 }
 
+/// The transaction pool, as the block builder needs it. The pool recovers
+/// every sender on admission, so the builder never has to do it again -- which
+/// matters because a template is rebuilt every minute over the whole pool.
+struct PoolTxSource(Arc<rustock_sync::TransactionPool>);
+
+impl rustock_execution::mining::PendingTransactionSource for PoolTxSource {
+    fn pending(&self) -> Vec<rustock_execution::mining::PendingTransaction> {
+        self.0
+            .pending_transactions()
+            .into_iter()
+            .map(|ptx| rustock_execution::mining::PendingTransaction {
+                tx: ptx.tx,
+                sender: ptx.sender,
+                hash: ptx.hash,
+            })
+            .collect()
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -423,6 +442,31 @@ struct Args {
     /// chain needs to rebuild.
     #[arg(long, default_value_t = 4_000)]
     gc_burial: u64,
+
+    /// Serve the `mnr_*` merged-mining JSON-RPC namespace, so mining software
+    /// can ask this node for work and submit Bitcoin solutions back.
+    ///
+    /// Off by default. With this off the namespace reports as unknown, so a
+    /// node that is not a miner looks exactly like one built without mining.
+    #[arg(long)]
+    mine: bool,
+
+    /// Address block rewards are paid to. Required with --mine: mining to the
+    /// zero address is almost never intended, and silently doing it would burn
+    /// the reward of every block found.
+    #[arg(long, value_name = "ADDRESS")]
+    mining_coinbase: Option<String>,
+
+    /// Bytes to put in each mined block's `extraData`, at most 32.
+    #[arg(long, default_value = "")]
+    mining_extra_data: String,
+
+    /// Seconds between rebuilds of the block template handed to miners.
+    ///
+    /// A template goes stale as the chain advances and as transactions arrive;
+    /// rskj rebuilds once a minute and so does this.
+    #[arg(long, default_value_t = 60)]
+    mining_refresh_secs: u64,
 
     /// Enable administrative JSON-RPC methods.
     ///
@@ -974,6 +1018,78 @@ async fn main() -> Result<()> {
         }
     });
 
+    // The miner. It shares the store and trie store with sync but holds its
+    // own block processor: `BlockProcessor` is a handle over those two, and
+    // the sync service has taken ownership of the one built above.
+    let miner: Option<Arc<rustock_execution::MinerServer>> = if args.mine {
+        let coinbase_address = match &args.mining_coinbase {
+            Some(raw) => raw.parse::<alloy_primitives::Address>().map_err(|e| {
+                anyhow::anyhow!("--mining-coinbase is not an address: {e}")
+            })?,
+            None => anyhow::bail!("--mine requires --mining-coinbase: a miner must say where its rewards go"),
+        };
+        let extra_data = args.mining_extra_data.clone().into_bytes();
+        if extra_data.len() > 32 {
+            anyhow::bail!(
+                "--mining-extra-data is {} bytes; the header field holds at most 32",
+                extra_data.len()
+            );
+        }
+
+        let mining_config = rustock_execution::MiningConfig {
+            coinbase_address,
+            extra_data: alloy_primitives::Bytes::from(extra_data),
+            ..Default::default()
+        };
+        let builder = rustock_execution::BlockTemplateBuilder::new(
+            Arc::new(rustock_execution::BlockProcessor::new(
+                hardfork_cfg.clone(),
+                store.clone(),
+            )),
+            trie_store_for_pool.clone(),
+            config.clone(),
+            hardfork_cfg.clone(),
+            mining_config,
+        );
+        let chain = Arc::new(rustock_execution::mining::StoreChainAccess {
+            store: store.clone(),
+            trie_store: trie_store_for_pool.clone(),
+        });
+        let server = Arc::new(rustock_execution::MinerServer::new(
+            builder,
+            chain,
+            Arc::new(PoolTxSource(pool.clone())),
+            config.clone(),
+        ));
+        info!("Mining enabled; rewards to {coinbase_address}");
+
+        // Rebuild the template on a timer. Nothing else does: the sync service
+        // owns the execution loop and does not know the miner exists, so
+        // without this a pool would keep being handed work for a parent the
+        // chain left behind and every solution would be refused.
+        let refresh = std::time::Duration::from_secs(args.mining_refresh_secs.max(1));
+        let server_for_refresh = server.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(refresh);
+            loop {
+                ticker.tick().await;
+                let server = server_for_refresh.clone();
+                let built = tokio::task::spawn_blocking(move || server.build_work()).await;
+                match built {
+                    Ok(Ok(_)) => {}
+                    // Expected while the node is still syncing: there is no
+                    // executed head to build on yet.
+                    Ok(Err(e)) => debug!(target: "rustock::mining", "No new work: {e}"),
+                    Err(e) => error!(target: "rustock::mining", "Work rebuild panicked: {e}"),
+                }
+            }
+        });
+
+        Some(server)
+    } else {
+        None
+    };
+
     if !args.no_rpc {
         let trie_store: Arc<dyn rustock_trie::TrieStore> = match &detached_for_readers {
             Some(t) => t.clone(),
@@ -991,6 +1107,7 @@ async fn main() -> Result<()> {
             tx_pool: Some(Arc::new(PoolAdapter(pool.clone()))),
 
             epoch_store: epoch_store.clone(),
+            miner: miner.clone().map(|m| m as Arc<dyn rustock_rpc::mnr::MiningService>),
             admin_enabled: args.rpc_admin,
             gc_burial: args.gc_burial,
         };

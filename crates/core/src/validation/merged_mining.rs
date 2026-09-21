@@ -2,11 +2,23 @@ use super::{HeaderValidator, ValidationError};
 use crate::types::header::Header;
 use crate::config::ChainConfig;
 
-const RSK_TAG: &[u8] = b"RSKBLOCK:";
-const MIDSTATE_SIZE_TRIMMED: usize = 40;
-const BLOCK_HEADER_HASH_SIZE: usize = 32;
-const MAX_BYTES_AFTER_MERGED_MINING_HASH: usize = 128;
-const HASH_FOR_MERGED_MINING_PREFIX_LENGTH: usize = 20;
+/// The marker a merged-mining coinbase carries, immediately followed by the
+/// RSK block's merged-mining hash. rskj `RskMiningConstants.RSK_TAG`.
+pub const RSK_TAG: &[u8] = b"RSKBLOCK:";
+/// Length of the BouncyCastle SHA-256 encoded state with `xBuf`/`xBufOff`
+/// (its first eight bytes) stripped: an 8-byte byte count plus H1..H8.
+pub const MIDSTATE_SIZE_TRIMMED: usize = 40;
+/// The merged-mining hash written after the tag is always 32 bytes, whether or
+/// not its tail carries fork-detection data.
+pub const BLOCK_HEADER_HASH_SIZE: usize = 32;
+/// A coinbase may carry at most this much after the tag and hash.
+pub const MAX_BYTES_AFTER_MERGED_MINING_HASH: usize = 128;
+/// From wasabi100 on, only this much of the merged-mining hash is the hash
+/// itself; the remaining 12 bytes are RSKIP110 fork-detection data.
+pub const HASH_FOR_MERGED_MINING_PREFIX_LENGTH: usize = 20;
+/// The tag must begin within the first SHA-256 block of the compressed tail,
+/// which bounds how much of the coinbase a verifier has to be handed.
+pub const MAX_RSK_TAG_POSITION_IN_TAIL: usize = 64;
 
 pub struct MergedMiningRule {
     pub config: std::sync::Arc<ChainConfig>,
@@ -70,7 +82,7 @@ impl HeaderValidator for MergedMiningRule {
         let rsk_tag_position = find_last_subsequence(tail, &expected_tag)
             .ok_or(ValidationError::BitcoinCoinbaseTagInvalid)?;
 
-        if rsk_tag_position >= 64 {
+        if rsk_tag_position >= MAX_RSK_TAG_POSITION_IN_TAIL {
             return Err(ValidationError::BitcoinCoinbaseTagInvalid);
         }
 
@@ -114,7 +126,7 @@ impl HeaderValidator for MergedMiningRule {
     }
 }
 
-fn find_last_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub fn find_last_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.len() > haystack.len() {
         return None;
     }
@@ -136,7 +148,7 @@ fn find_last_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 ///   trimmed[28..32] = H6 (big-endian u32)
 ///   trimmed[32..36] = H7 (big-endian u32)
 ///   trimmed[36..40] = H8 (big-endian u32)
-fn compute_coinbase_hash(compressed: &[u8]) -> [u8; 32] {
+pub fn compute_coinbase_hash(compressed: &[u8]) -> [u8; 32] {
     let trimmed = &compressed[..MIDSTATE_SIZE_TRIMMED];
     let tail = &compressed[MIDSTATE_SIZE_TRIMMED..];
 
@@ -165,8 +177,107 @@ fn compute_coinbase_hash(compressed: &[u8]) -> [u8; 32] {
     result
 }
 
+/// Why a coinbase cannot be compressed: the constraints
+/// [`MergedMiningRule`] enforces, stated from the producing side.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CoinbaseCompressionError {
+    #[error("coinbase carries no {} tag", String::from_utf8_lossy(RSK_TAG))]
+    TagNotFound,
+    /// The tag has to land in the first SHA-256 block of whatever is left
+    /// unhashed, and compression absorbs whole 64-byte blocks only -- so this
+    /// cannot actually happen, and a failure here means the arithmetic below
+    /// stopped agreeing with the verifier's.
+    #[error("tag at offset {offset} in the tail, must be below {max}")]
+    TagTooDeepInTail { offset: usize, max: usize },
+    #[error("tag and hash are truncated: {available} bytes follow the tag, need {needed}")]
+    HashTruncated { available: usize, needed: usize },
+    #[error("{trailing} bytes follow the merged-mining hash, at most {max} allowed")]
+    TooMuchTrailingData { trailing: usize, max: usize },
+}
+
+/// The inverse of [`compute_coinbase_hash`]: turn a whole Bitcoin coinbase
+/// transaction into the compressed form an RSK header carries.
+///
+/// rskj `MinerServerImpl.compressCoinbase`. Whole 64-byte blocks up to the
+/// last boundary at or before the tag are absorbed into a SHA-256 midstate and
+/// dropped; everything from that boundary on is kept verbatim as the tail. A
+/// verifier resumes from the midstate, so it never has to see the bytes that
+/// were dropped -- which is the point, since a coinbase can be large and every
+/// RSK header would otherwise have to carry all of it.
+///
+/// `last_occurrence` picks which `RSKBLOCK:` tag to compress around when a
+/// coinbase carries several (a miner merge-mining more than one RSK fork).
+/// The verifier insists the tag it matched is the last one in the tail, so
+/// production uses `true`; `false` exists to build the coinbase a
+/// two-tag rejection test needs.
+pub fn compress_coinbase(
+    coinbase: &[u8],
+    last_occurrence: bool,
+) -> Result<Vec<u8>, CoinbaseCompressionError> {
+    let tag_position = if last_occurrence {
+        find_last_subsequence(coinbase, RSK_TAG)
+    } else {
+        find_first_subsequence(coinbase, RSK_TAG)
+    }
+    .ok_or(CoinbaseCompressionError::TagNotFound)?;
+
+    let after_tag = tag_position + RSK_TAG.len();
+    let available = coinbase.len().saturating_sub(after_tag);
+    if available < BLOCK_HEADER_HASH_SIZE {
+        return Err(CoinbaseCompressionError::HashTruncated {
+            available,
+            needed: BLOCK_HEADER_HASH_SIZE,
+        });
+    }
+    let trailing = available - BLOCK_HEADER_HASH_SIZE;
+    if trailing > MAX_BYTES_AFTER_MERGED_MINING_HASH {
+        return Err(CoinbaseCompressionError::TooMuchTrailingData {
+            trailing,
+            max: MAX_BYTES_AFTER_MERGED_MINING_HASH,
+        });
+    }
+
+    // Absorb up to the last 64-byte boundary at or before the tag, so the tag
+    // itself always survives into the tail.
+    let bytes_to_hash = (tag_position / 64) * 64;
+    let tail_tag_position = tag_position - bytes_to_hash;
+    if tail_tag_position >= MAX_RSK_TAG_POSITION_IN_TAIL {
+        return Err(CoinbaseCompressionError::TagTooDeepInTail {
+            offset: tail_tag_position,
+            max: MAX_RSK_TAG_POSITION_IN_TAIL,
+        });
+    }
+
+    let mut state = SHA256_INITIAL_STATE;
+    for chunk in coinbase[..bytes_to_hash].chunks_exact(64) {
+        sha256_compress(&mut state, chunk.try_into().unwrap());
+    }
+
+    let mut out = Vec::with_capacity(MIDSTATE_SIZE_TRIMMED + coinbase.len() - bytes_to_hash);
+    out.extend_from_slice(&(bytes_to_hash as u64).to_be_bytes());
+    for word in state {
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+    debug_assert_eq!(out.len(), MIDSTATE_SIZE_TRIMMED);
+    out.extend_from_slice(&coinbase[bytes_to_hash..]);
+    Ok(out)
+}
+
+/// The SHA-256 IV, the state a digest starts from before absorbing anything.
+pub const SHA256_INITIAL_STATE: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+pub fn find_first_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Completes a SHA-256 hash from a midstate.
-fn sha256_from_midstate(state: [u32; 8], byte_count: u64, tail: &[u8]) -> [u8; 32] {
+pub fn sha256_from_midstate(state: [u32; 8], byte_count: u64, tail: &[u8]) -> [u8; 32] {
     let mut h = state;
     let total_len = byte_count + tail.len() as u64;
     let total_bits = total_len * 8;
@@ -194,7 +305,7 @@ fn sha256_from_midstate(state: [u32; 8], byte_count: u64, tail: &[u8]) -> [u8; 3
 /// hashes. Starting from the coinbase hash, combine left-to-right with each
 /// sibling using Bitcoin's double-SHA256 Merkle tree construction, matching
 /// rskj's `combineLeftRight`.
-fn rskip92_merkle_root(coinbase_hash: &[u8; 32], proof_bytes: &[u8]) -> [u8; 32] {
+pub fn rskip92_merkle_root(coinbase_hash: &[u8; 32], proof_bytes: &[u8]) -> [u8; 32] {
     let mut current = *coinbase_hash;
 
     for chunk in proof_bytes.chunks_exact(32) {
@@ -207,7 +318,7 @@ fn rskip92_merkle_root(coinbase_hash: &[u8; 32], proof_bytes: &[u8]) -> [u8; 32]
 
 /// Matches rskj's MerkleTreeUtils.combineLeftRight:
 ///   reverseBytes(left) || reverseBytes(right) → SHA256d → wrapReversed
-fn combine_left_right(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+pub fn combine_left_right(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     use sha2::{Sha256, Digest};
 
     let mut left_rev = *left;
@@ -249,7 +360,7 @@ const K256: [u32; 64] = [
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
+pub fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
     for i in 0..16 {
         w[i] = u32::from_be_bytes(block[i * 4..(i + 1) * 4].try_into().unwrap());
@@ -294,6 +405,142 @@ fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
 mod tests {
     use super::*;
     use sha2::{Sha256, Digest};
+
+    /// A coinbase-shaped buffer with the tag at a chosen offset.
+    fn coinbase_with_tag_at(tag_offset: usize, trailing: usize) -> Vec<u8> {
+        let mut out = vec![0xABu8; tag_offset];
+        out.extend_from_slice(RSK_TAG);
+        out.extend_from_slice(&[0xCD; BLOCK_HEADER_HASH_SIZE]);
+        out.extend(std::iter::repeat(0xEF).take(trailing));
+        out
+    }
+
+    fn double_sha256(data: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&Sha256::digest(Sha256::digest(data)));
+        // The verifier works in display order throughout.
+        out.reverse();
+        out
+    }
+
+    /// The single most error-prone piece: compression has to be the exact
+    /// inverse of the hash the verifier computes, for every alignment of the
+    /// tag against the 64-byte block boundary the midstate is taken at.
+    #[test]
+    fn compression_inverts_the_verifier() {
+        for tag_offset in [0, 1, 63, 64, 65, 127, 128, 129, 200, 511, 512] {
+            for trailing in [0, 1, 128] {
+                let coinbase = coinbase_with_tag_at(tag_offset, trailing);
+                let compressed = compress_coinbase(&coinbase, true)
+                    .unwrap_or_else(|e| panic!("offset {tag_offset}, trailing {trailing}: {e}"));
+
+                assert_eq!(
+                    compute_coinbase_hash(&compressed),
+                    double_sha256(&coinbase),
+                    "offset {tag_offset}, trailing {trailing}"
+                );
+            }
+        }
+    }
+
+    /// Compression drops whole 64-byte blocks and no more, so the tag always
+    /// survives into the tail and always lands within its first block --
+    /// which is exactly the bound the verifier enforces.
+    #[test]
+    fn compression_leaves_the_tag_inside_the_first_tail_block() {
+        for tag_offset in [0, 63, 64, 65, 1000] {
+            let coinbase = coinbase_with_tag_at(tag_offset, 0);
+            let compressed = compress_coinbase(&coinbase, true).unwrap();
+            let tail = &compressed[MIDSTATE_SIZE_TRIMMED..];
+            let position = find_last_subsequence(tail, RSK_TAG).expect("tag survives");
+            assert!(
+                position < MAX_RSK_TAG_POSITION_IN_TAIL,
+                "offset {tag_offset} put the tag at tail position {position}"
+            );
+            assert_eq!(position, tag_offset % 64);
+        }
+    }
+
+    #[test]
+    fn compression_rejects_a_coinbase_without_a_tag() {
+        assert_eq!(
+            compress_coinbase(&[0u8; 100], true),
+            Err(CoinbaseCompressionError::TagNotFound)
+        );
+    }
+
+    #[test]
+    fn compression_rejects_a_truncated_hash() {
+        let mut coinbase = vec![0xAB; 10];
+        coinbase.extend_from_slice(RSK_TAG);
+        coinbase.extend_from_slice(&[0xCD; 31]);
+        assert_eq!(
+            compress_coinbase(&coinbase, true),
+            Err(CoinbaseCompressionError::HashTruncated { available: 31, needed: 32 })
+        );
+    }
+
+    /// The verifier allows at most 128 bytes after the hash; the compressor
+    /// refuses to build what would be rejected rather than emitting it and
+    /// letting the failure surface as an invalid block.
+    #[test]
+    fn compression_rejects_too_much_trailing_data() {
+        assert!(compress_coinbase(&coinbase_with_tag_at(10, 128), true).is_ok());
+        assert_eq!(
+            compress_coinbase(&coinbase_with_tag_at(10, 129), true),
+            Err(CoinbaseCompressionError::TooMuchTrailingData { trailing: 129, max: 128 })
+        );
+    }
+
+    /// With two tags the verifier matches the last one, so that is the one
+    /// compression must keep in range -- and choosing the first, which a
+    /// miner merge-mining two forks might, produces a coinbase this node
+    /// would reject.
+    #[test]
+    fn compression_picks_the_requested_tag_of_two() {
+        let mut coinbase = vec![0xAB; 8];
+        coinbase.extend_from_slice(RSK_TAG);
+        coinbase.extend_from_slice(&[0x11; BLOCK_HEADER_HASH_SIZE]);
+        let second_tag_offset = coinbase.len();
+        coinbase.extend_from_slice(RSK_TAG);
+        coinbase.extend_from_slice(&[0x22; BLOCK_HEADER_HASH_SIZE]);
+
+        let last = compress_coinbase(&coinbase, true).unwrap();
+        let last_tail = &last[MIDSTATE_SIZE_TRIMMED..];
+        let last_position = find_last_subsequence(last_tail, RSK_TAG).unwrap();
+        assert_eq!(
+            &last_tail[last_position + RSK_TAG.len()..last_position + RSK_TAG.len() + 32],
+            &[0x22; 32]
+        );
+
+        let first = compress_coinbase(&coinbase, false).unwrap();
+        // Both tags are inside the first block here, so choosing the first one
+        // changes only the byte count, not which bytes survive.
+        assert_eq!(
+            u64::from_be_bytes(first[0..8].try_into().unwrap()),
+            (8 / 64) * 64
+        );
+        assert_eq!(
+            u64::from_be_bytes(last[0..8].try_into().unwrap()),
+            (second_tag_offset as u64 / 64) * 64
+        );
+        // Whichever tag was chosen, the coinbase still hashes to the same thing.
+        assert_eq!(compute_coinbase_hash(&first), compute_coinbase_hash(&last));
+    }
+
+    /// The midstate the compressor exports is BouncyCastle's encoded state
+    /// with its first eight bytes stripped, which is only well defined because
+    /// compression stops on a block boundary: `xBuf` is empty, so the bytes
+    /// that were stripped held nothing.
+    #[test]
+    fn exported_midstate_starts_at_a_block_boundary() {
+        let coinbase = coinbase_with_tag_at(200, 0);
+        let compressed = compress_coinbase(&coinbase, true).unwrap();
+        let byte_count = u64::from_be_bytes(compressed[0..8].try_into().unwrap());
+        assert_eq!(byte_count % 64, 0);
+        assert_eq!(byte_count, 192);
+        assert_eq!(&compressed[MIDSTATE_SIZE_TRIMMED..], &coinbase[192..]);
+    }
 
     #[test]
     fn sha256_compress_produces_correct_hash() {
