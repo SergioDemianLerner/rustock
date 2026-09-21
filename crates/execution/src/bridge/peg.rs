@@ -5938,6 +5938,203 @@ mod tests {
 
     /// rskj BtcLockSenderProvider: a P2SH-multisig first input (OP_0,
     /// signatures, multisig redeem) classifies as P2SHMULTISIG with the
+    // --- peg-in sender classification -------------------------------------
+    //
+    // Translated from rskj's four BtcLockSender test classes:
+    //   P2pkhBtcLockSenderTest, P2shMultisigBtcLockSenderTest,
+    //   P2shP2wpkhBtcLockSenderTest, P2shP2wshBtcLockSenderTest
+    //
+    // Each of those asserts that its parser accepts its own shape and
+    // *rejects the other three*. rustock has one classifier instead of four
+    // parsers, so the same guarantee is one matrix: every shape must land on
+    // its own variant and no other. This is security-relevant rather than
+    // cosmetic -- the classification picks the address a rejected peg-in is
+    // refunded to, so a shape decoded as the wrong type sends someone else's
+    // bitcoin somewhere they do not control.
+
+    /// A valid-shape compressed key that differs per index. Shape only: the
+    /// x-coordinate is not a curve point, which is all the multisig redeem
+    /// parser looks at.
+    fn test_pubkey(i: u8) -> [u8; 33] {
+        let mut k = [0x02u8; 33];
+        k[32] = i;
+        k
+    }
+
+    /// A real secp256k1 point (the generator G), for the branches that decode
+    /// the key rather than just measuring it.
+    fn real_pubkey() -> [u8; 33] {
+        let mut k = [0u8; 33];
+        k[0] = 0x02;
+        k[1..].copy_from_slice(&[
+            0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95,
+            0xCE, 0x87, 0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9,
+            0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98,
+        ]);
+        k
+    }
+
+    fn multisig_redeem() -> Vec<u8> {
+        let mut redeem = vec![0x52]; // OP_2
+        for i in 0..3u8 {
+            redeem.push(33);
+            redeem.extend_from_slice(&test_pubkey(i));
+        }
+        redeem.push(0x53); // OP_3
+        redeem.push(0xae); // OP_CHECKMULTISIG
+        redeem
+    }
+
+    fn tx_with(script_sig: Vec<u8>, witness_items: Vec<Vec<u8>>) -> BtcTransaction {
+        let mut witness = bitcoin::Witness::new();
+        for item in &witness_items {
+            witness.push(item);
+        }
+        BtcTransaction {
+            version: bitcoin::transaction::Version(1),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: Default::default(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(script_sig),
+                sequence: bitcoin::Sequence::MAX,
+                witness,
+            }],
+            output: vec![],
+        }
+    }
+
+    /// scriptSig = [sig, pubkey]
+    fn p2pkh_tx() -> BtcTransaction {
+        let mut script = vec![71];
+        script.extend_from_slice(&[0x30; 71]);
+        script.push(33);
+        script.extend_from_slice(&real_pubkey());
+        tx_with(script, vec![])
+    }
+
+    /// scriptSig = [redeem-push], witness = [sig, compressed pubkey]
+    fn p2sh_p2wpkh_tx() -> BtcTransaction {
+        // The redeem is the 22-byte witness program 0x0014 || hash160(pubkey),
+        // pushed as the single scriptSig chunk.
+        let mut redeem = vec![0x00, 0x14];
+        redeem.extend_from_slice(&pubkey_hash160(&real_pubkey()));
+        let mut script = vec![redeem.len() as u8];
+        script.extend_from_slice(&redeem);
+        tx_with(script, vec![vec![0x30; 71], real_pubkey().to_vec()])
+    }
+
+    /// scriptSig = [sig, sig, redeem]
+    fn p2sh_multisig_tx() -> BtcTransaction {
+        let redeem = multisig_redeem();
+        let mut script = vec![0x00, 71];
+        script.extend_from_slice(&[0x30; 71]);
+        script.push(71);
+        script.extend_from_slice(&[0x30; 71]);
+        script.push(0x4c);
+        script.push(redeem.len() as u8);
+        script.extend_from_slice(&redeem);
+        tx_with(script, vec![])
+    }
+
+    /// scriptSig = [redeem-push], witness = [empty, sig, sig, redeem]
+    fn p2sh_p2wsh_tx() -> BtcTransaction {
+        use sha2::Digest;
+        let redeem = multisig_redeem();
+        // The scriptSig chunk is the 34-byte witness program
+        // 0x0020 || sha256(redeem).
+        let mut program = vec![0x00, 0x20];
+        program.extend_from_slice(&sha2::Sha256::digest(&redeem));
+        let mut script = vec![program.len() as u8];
+        script.extend_from_slice(&program);
+        tx_with(script, vec![vec![], vec![0x30; 71], vec![0x30; 71], redeem])
+    }
+
+    /// rskj: the `gets_*_btc_lock_sender_from_raw_transaction` case in each of
+    /// the four classes, and every `rejects_*` case in all four, as one matrix.
+    #[test]
+    fn classify_pegin_sender_maps_each_shape_to_exactly_one_variant() {
+        assert!(
+            matches!(classify_pegin_sender(&p2pkh_tx()), Some(PeginSender::P2pkh { .. })),
+            "P2PKH scriptSig [sig, pubkey] must classify as P2PKH"
+        );
+        assert!(
+            matches!(classify_pegin_sender(&p2sh_p2wpkh_tx()), Some(PeginSender::P2shP2wpkh { .. })),
+            "single-chunk scriptSig with a 2-item witness must classify as P2SH-P2WPKH"
+        );
+        assert!(
+            matches!(classify_pegin_sender(&p2sh_multisig_tx()), Some(PeginSender::P2shMultisig { .. })),
+            "scriptSig ending in a multisig redeem must classify as P2SH-multisig"
+        );
+        assert!(
+            matches!(classify_pegin_sender(&p2sh_p2wsh_tx()), Some(PeginSender::P2shP2wsh { .. })),
+            "single-chunk scriptSig with a >=3-item witness ending in a multisig \
+             redeem must classify as P2SH-P2WSH"
+        );
+    }
+
+    /// rskj: `doesnt_parse_if_tx_doesnt_have_inputs`,
+    /// `doesnt_parse_if_tx_doesnt_have_scriptsig`,
+    /// `doesnt_parse_if_transaction_doesnt_have_witness`,
+    /// `doesnt_parse_if_transaction_witness_doesnt_have_two_pushes`,
+    /// `doesnt_parse_if_transaction_has_scriptsig_with_more_than_one_chunk`,
+    /// `doesnt_parse_if_transaction_witness_doesnt_have_at_least_three_pushes`.
+    ///
+    /// rskj's null-transaction cases have no analogue: a `&BtcTransaction`
+    /// cannot be null.
+    #[test]
+    fn classify_pegin_sender_refuses_malformed_inputs() {
+        let no_inputs = BtcTransaction {
+            version: bitcoin::transaction::Version(1),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        assert!(classify_pegin_sender(&no_inputs).is_none(), "no inputs");
+
+        assert!(
+            classify_pegin_sender(&tx_with(vec![], vec![])).is_none(),
+            "empty scriptSig and no witness"
+        );
+
+        // Single-chunk scriptSig but a one-item witness: neither the P2WPKH
+        // shape (needs 2) nor the P2WSH shape (needs >= 3).
+        assert!(
+            classify_pegin_sender(&tx_with(vec![2, 0x00, 0x14], vec![vec![0x30; 71]])).is_none(),
+            "witness with a single push matches no shape"
+        );
+
+        // Witness has two pushes but the second is not a valid compressed key.
+        assert!(
+            classify_pegin_sender(&tx_with(vec![2, 0x00, 0x14],
+                vec![vec![0x30; 71], vec![0xFFu8; 33]])).is_none(),
+            "P2SH-P2WPKH requires the witness key to be a curve point"
+        );
+
+        // Three witness items but the last is not a multisig redeem.
+        assert!(
+            classify_pegin_sender(&tx_with(vec![2, 0x00, 0x20],
+                vec![vec![], vec![0x30; 71], vec![0x01, 0x02, 0x03]])).is_none(),
+            "P2SH-P2WSH requires a multisig redeem as the last witness item"
+        );
+    }
+
+    /// The P2PKH branch accepts only a real curve point. rskj gets this from
+    /// BtcECKey.fromPublicOnly throwing; rustock from `compress_pubkey`
+    /// returning None. Without it a two-chunk scriptSig whose second push is
+    /// arbitrary bytes would be read as P2PKH and refunded to a hash160 of
+    /// data the sender never controlled.
+    #[test]
+    fn classify_pegin_sender_p2pkh_requires_a_valid_public_key() {
+        let mut script = vec![71];
+        script.extend_from_slice(&[0x30; 71]);
+        script.push(33);
+        script.extend_from_slice(&[0xFFu8; 33]); // not on the curve
+        assert!(
+            classify_pegin_sender(&tx_with(script, vec![])).is_none(),
+            "a non-curve 33-byte push must not classify as P2PKH"
+        );
+    }
+
     /// sender address = P2SH(hash160(redeem)) — processable post-RSKIP143
     /// but NOT lockable (refunded). Groundtruth shape from mainnet
     /// #2,851,909 tx 2.
