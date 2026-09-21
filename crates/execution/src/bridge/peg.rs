@@ -6049,6 +6049,80 @@ mod tests {
         tx_with(script, vec![vec![], vec![0x30; 71], vec![0x30; 71], redeem])
     }
 
+    // --- refund targets ---------------------------------------------------
+
+    /// Where a rejected peg-in's bitcoin goes, per sender shape. rskj derives
+    /// this inside each BtcLockSender implementation: P2PKH refunds to
+    /// hash160(pubkey) as a P2PKH address, and all three P2SH shapes refund to
+    /// their script hash as a P2SH address. Getting the *flag* wrong is as bad
+    /// as getting the hash wrong -- the same 20 bytes encode to a different
+    /// address under a different version byte, so the refund is spendable by
+    /// nobody.
+    #[test]
+    fn sender_refund_target_distinguishes_p2pkh_from_the_p2sh_shapes() {
+        let pubkey = real_pubkey().to_vec();
+        let (hash, is_p2sh) = sender_refund_target(&PeginSender::P2pkh { pubkey: pubkey.clone() });
+        assert_eq!(hash, pubkey_hash160(&pubkey), "P2PKH refunds to hash160(pubkey)");
+        assert!(!is_p2sh, "P2PKH is not a P2SH address");
+
+        let marker = [0xABu8; 20];
+        for sender in [
+            PeginSender::P2shP2wpkh { pubkey, p2sh_hash: marker },
+            PeginSender::P2shMultisig { p2sh_hash: marker },
+            PeginSender::P2shP2wsh { p2sh_hash: marker },
+        ] {
+            let (hash, is_p2sh) = sender_refund_target(&sender);
+            assert_eq!(hash, marker, "a P2SH shape refunds to its script hash");
+            assert!(is_p2sh, "a P2SH shape must be flagged P2SH");
+        }
+    }
+
+    /// rskj `BridgeSupport.refundTxSender` for a v1 peg-in, and the reason
+    /// RSKIP170 added the field: the sender of a peg-in need not be its owner.
+    /// When the OP_RETURN carries a refund address it wins over whatever the
+    /// scriptSig says, and when neither is available the peg-in is not
+    /// refundable at all rather than refundable to a guess.
+    #[test]
+    fn v1_refund_target_prefers_the_op_return_address_over_the_sender() {
+        let op_return = [0x11u8; 20];
+        let from_sender = [0x22u8; 20];
+        let with_refund = super::super::pegin_instructions::PeginInstructions {
+            protocol_version: 1,
+            rsk_destination: [0u8; 20],
+            btc_refund_address: Some(super::super::pegin_instructions::BtcRefundAddress {
+                is_p2sh: true,
+                hash160: op_return,
+            }),
+        };
+        let without_refund = super::super::pegin_instructions::PeginInstructions {
+            protocol_version: 1,
+            rsk_destination: [0u8; 20],
+            btc_refund_address: None,
+        };
+        let sender = PeginSender::P2shMultisig { p2sh_hash: from_sender };
+
+        assert_eq!(
+            v1_refund_target(&with_refund, Some(&sender)),
+            Some((op_return, true)),
+            "the OP_RETURN refund address must override the sender"
+        );
+        assert_eq!(
+            v1_refund_target(&with_refund, None),
+            Some((op_return, true)),
+            "and must be used even when the sender could not be classified"
+        );
+        assert_eq!(
+            v1_refund_target(&without_refund, Some(&sender)),
+            Some((from_sender, true)),
+            "with no refund address it falls back to the sender"
+        );
+        assert_eq!(
+            v1_refund_target(&without_refund, None),
+            None,
+            "neither available means NOT refundable -- never refundable to a guess"
+        );
+    }
+
     /// rskj: the `gets_*_btc_lock_sender_from_raw_transaction` case in each of
     /// the four classes, and every `rejects_*` case in all four, as one matrix.
     #[test]
