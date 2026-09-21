@@ -143,6 +143,18 @@ struct Args {
     #[arg(long, default_value_t = false)]
     build_height_index: bool,
 
+    /// Emulate rskj's peg-in sender detection for multisig inputs: `on` or `off`.
+    ///
+    /// On by default, because rskj still does it and a node that stops would
+    /// fork. `off` is for after the RSKIP retiring this path activates, and for
+    /// measuring what the path is worth: with it off, a peg-in that depended on
+    /// it is simply not classified.
+    ///
+    /// Whichever way it is set, a peg-in that exercises the path is logged and,
+    /// if alerting is configured, mailed.
+    #[arg(long, value_name = "on|off", default_value = "on")]
+    rskj_multisig_senders: String,
+
     /// Import rskj's receipts from an extracted snapshot directory and exit.
     ///
     /// rustock only writes receipts for blocks it EXECUTES, so a node that
@@ -1599,6 +1611,7 @@ fn start_pegout_alerts(
     // Block processing raises supply violations on its own thread; it must not
     // block there, so it pushes into this queue and the watcher delivers.
     let (tx, rx) = std::sync::mpsc::channel();
+    let tx2 = tx.clone();
     if let Err(e) = rustock_execution::supply::set_observer(move |v| {
         let top: Vec<String> = v.deltas.iter().take(8)
             .map(|d| format!("{} {} -> {}", d.address, d.before, d.after))
@@ -1613,6 +1626,20 @@ fn start_pegout_alerts(
         });
     }) {
         tracing::warn!("supply observer not installed: {e}");
+    }
+
+    // The same route for a peg-in that leaned on the sender-detection path we
+    // intend to remove. Block processing must not block on mail, so it pushes
+    // into the same queue the watcher drains.
+    if let Err(e) = rustock_execution::bridge::rskj_sender_compat::set_observer(move |s| {
+        let _ = tx2.send(rustock_pegout_alerts::Alert::LegacyMultisigPegin {
+            block: s.block,
+            btc_txid: s.btc_txid.clone(),
+            shape: s.shape.to_string(),
+            refund_hash160: s.refund_hash160.clone(),
+        });
+    }) {
+        tracing::warn!("multisig-sender observer not installed: {e}");
     }
 
     let watcher = Watcher::new(store, trie, cfg, sinks, change_scripts)?
