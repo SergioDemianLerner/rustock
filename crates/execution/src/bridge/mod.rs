@@ -21,6 +21,8 @@ pub mod peg;
 pub mod pegin_instructions;
 pub mod pmt;
 pub mod release_tx;
+/// rskj-compatible peg-in sender detection, isolated so it can be removed.
+pub mod rskj_sender_compat;
 pub mod serialization;
 pub mod storage;
 pub mod tx;

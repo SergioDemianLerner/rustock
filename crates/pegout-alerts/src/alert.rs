@@ -36,6 +36,19 @@ pub enum Alert {
         /// The accounts that moved most, as `address before -> after`.
         top_accounts: Vec<String>,
     },
+    /// A peg-in used the rskj-compatible multisig sender-detection path.
+    ///
+    /// Not a threat in itself: it means a peg-in arrived from a multisig
+    /// address, was classified only because this node emulates rskj's
+    /// redeem-script parsing, and will be refunded. It is worth mail because
+    /// that emulation is scheduled for removal, and this is the evidence that
+    /// removing it would change someone's outcome.
+    LegacyMultisigPegin {
+        block: u64,
+        btc_txid: String,
+        shape: String,
+        refund_hash160: String,
+    },
     /// Total value of peg-outs requested but not yet confirmed.
     InTransitAboveThreshold {
         block: u64,
@@ -61,6 +74,9 @@ impl Alert {
             ),
             Alert::SupplyNotConserved { block, created: false, amount_wei, .. } => format!(
                 "Block #{block} destroyed {amount_wei} wei of rBTC"
+            ),
+            Alert::LegacyMultisigPegin { block, shape, .. } => format!(
+                "Peg-in from a {shape} sender at block #{block} (path scheduled for removal)"
             ),
             Alert::InTransitAboveThreshold { total_sats, block, .. } => format!(
                 "Peg-outs in transit: {} BTC at block #{block}",
@@ -127,6 +143,25 @@ Accounts that moved most:
                     top_accounts.iter().map(|a| format!("  {a}")).collect::<Vec<_>>().join("\n")
                 )
             }
+            Alert::LegacyMultisigPegin { block, btc_txid, shape, refund_hash160 } => {
+                format!(
+"A peg-in was classified using the rskj-compatible multisig sender path.
+
+  RSK block      #{block}
+  BTC tx         {btc_txid}
+  sender shape   {shape}
+  refund to      hash160 {refund_hash160} (P2SH)
+
+This peg-in cannot be credited -- a multisig sender exposes no single public
+key, so no RSK destination exists -- and will be refunded to the address above,
+less the miner fee. That is rskj's behaviour and this node is matching it.
+
+You are being told because the code that produced this classification is
+proposed for deletion. Until now it had never been exercised on mainnet. If
+that proposal is adopted, a peg-in like this one would no longer be refunded
+automatically, so this message is a data point about who that would affect."
+                )
+            }
             Alert::InTransitAboveThreshold { block, total_sats, threshold_sats, pegout_count } => {
                 format!(
 "The total value of peg-outs in transit is above the configured threshold.
@@ -160,6 +195,8 @@ handed to the signers.",
                 format!("intransit:{block}"),
             // One per block: a block is either conserved or it is not.
             Alert::SupplyNotConserved { block, .. } => format!("supply:{block}"),
+            // One per Bitcoin transaction: registering it twice is the same event.
+            Alert::LegacyMultisigPegin { btc_txid, .. } => format!("multisig-pegin:{btc_txid}"),
         }
     }
 }

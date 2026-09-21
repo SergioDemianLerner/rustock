@@ -1870,6 +1870,82 @@ mod tests {
     /// `requiredGas == rounds == 1` (the surplus is refunded), so the whole tx
     /// settles far below the forwarded gas. The CALL result (0) is stored at
     /// slot 0 to prove the failure was observed without aborting the frame.
+        /// What a *failing* top-level Bridge call costs, and what its receipt says.
+    ///
+    /// Not what one would guess. rskj's precompile path in
+    /// `TransactionExecutor.call` sets `gasLeftover = txGasLimit - gasUsed`
+    /// before the try and its catch only calls `result.setException(e)` -- it
+    /// never zeroes the leftover the way the VM path does for a reverted
+    /// contract call. The exception is then recorded for FEE purposes but not
+    /// for RECEIPT purposes, so the transaction:
+    ///
+    ///   * reports status SUCCESS,
+    ///   * reports `gasUsed = requiredGas + basicTxCost`, well under the limit,
+    ///   * yet charges the sender the ENTIRE gas limit, the surplus to REMASC.
+    ///
+    /// That is quirks-frozen-bugs.md §50, reported to the rskj security team in
+    /// docs/rskj-report-precompile-receipt-status.md, and consensus-frozen.
+    ///
+    /// This test exists where it does because the rskj-compat sender path now
+    /// returns `Err` for inputs rskj throws on, and that error flows through
+    /// exactly this mechanism. Pinning it here means a change to the quirk
+    /// cannot silently change what a rejected peg-in costs.
+    #[test]
+    fn a_failing_bridge_call_reports_success_and_spends_only_the_precompile_gas() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xCE);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        // Post-RSKIP136, so this takes revm's ordinary transact path rather than
+        // the direct-bridge branch that handles the free and pre-136 cases.
+        let mut header = dummy_header(7_000_000);
+        header.gas_limit = U256::from(6_800_000);
+
+        // registerBtcTransaction with a truncated argument list: rejected
+        // before any work, which is rskj's BridgeIllegalArgumentException.
+        let mut input = {
+            use sha3::{Digest, Keccak256};
+            let h = Keccak256::digest(b"registerBtcTransaction(bytes,int256,bytes)");
+            h[..4].to_vec()
+        };
+        input.extend_from_slice(&[0u8; 32]); // far short of the 96 bytes required
+
+        let limit = 500_000u64;
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(1),
+            gas_limit: U256::from(limit),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .expect("a rejected Bridge call fails the transaction, never the block");
+
+        assert!(
+            result.success,
+            "the invisible-exception quirk reports SUCCESS even though the call threw"
+        );
+        assert!(
+            result.gas_used < limit,
+            "the receipt must report requiredGas + basicTxCost, not the limit: \
+             got {} of {}",
+            result.gas_used, limit
+        );
+        assert!(
+            result.gas_used > 22_000,
+            "and it must include the Bridge's fixed 22,000: got {}",
+            result.gas_used
+        );
+    }
+
     #[test]
     fn test_rskip197_failing_precompile_refunds_surplus_gas() {
         let store = Arc::new(MemoryTrieStore::new());

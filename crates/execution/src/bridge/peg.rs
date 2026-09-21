@@ -544,7 +544,35 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
 
     // Sender classification (rskj BtcLockSenderProvider). Used by the legacy
     // (v0) path for the destination/refund, and as the v1 fallback refund.
-    let sender = classify_pegin_sender(&btc_tx);
+    let sender = match classify_pegin_sender(&btc_tx) {
+        Ok(s) => s,
+        Err(why) => {
+            // rskj raises an uncaught RuntimeException on this input;
+            // Bridge.execute catches it, panics and rethrows as VMException, so
+            // the whole registerBtcTransaction call fails. Failing here is what
+            // keeps the two nodes agreeing.
+            return Err(PrecompileError::other(format!(
+                "registerBtcTransaction: rskj aborts on this scriptSig ({why})"
+            )));
+        }
+    };
+
+    // Announce any peg-in that depended on the sender-detection path this node
+    // intends to remove, so the operator hears about it before the RSKIP lands
+    // rather than after. Single-key senders -- P2PKH and P2SH-P2WPKH, the ones
+    // that can actually be credited -- are silent.
+    if let Some((shape, hash160)) = match &sender {
+        Some(PeginSender::P2shMultisig { p2sh_hash }) => Some(("P2SH-multisig", *p2sh_hash)),
+        Some(PeginSender::P2shP2wsh { p2sh_hash }) => Some(("P2SH-P2WSH", *p2sh_hash)),
+        _ => None,
+    } {
+        super::rskj_sender_compat::report(&super::rskj_sender_compat::Sighting {
+            block: rsk_height,
+            btc_txid: hex::encode(legacy_txid),
+            shape,
+            refund_hash160: hex::encode(hash160),
+        });
+    }
 
     // rskj `PeginInformation.parse`: the BtcLockSender sets the default
     // (version-0) info; then, if RSKIP170 is active, an RSKT OP_RETURN
@@ -915,16 +943,18 @@ fn is_sent_to_multisig(redeem: &[u8]) -> bool {
 /// P2SH-P2WPKH, then P2SH-MULTISIG, then P2SH-P2WSH — all on the first
 /// input. Returns `None` when no parser matches (rskj then returns from
 /// registerBtcTransaction WITHOUT marking the tx as processed).
-fn classify_pegin_sender(tx: &BtcTransaction) -> Option<PeginSender> {
+fn classify_pegin_sender(
+    tx: &BtcTransaction,
+) -> Result<Option<PeginSender>, &'static str> {
     use super::release_tx::{parse_chunks, Chunk};
-    let first = tx.input.first()?;
-    let chunks = parse_chunks(first.script_sig.as_bytes())?;
+    let Some(first) = tx.input.first() else { return Ok(None) };
+    let Some(chunks) = parse_chunks(first.script_sig.as_bytes()) else { return Ok(None) };
 
     // P2PKH: scriptSig is exactly [sig, pubkey] with a valid curve point
     // (rskj derives both the BTC and RSK addresses from it).
     if let [Chunk::Data(_sig), Chunk::Data(pubkey)] = chunks.as_slice() {
         if compress_pubkey(pubkey).is_some() {
-            return Some(PeginSender::P2pkh { pubkey: pubkey.clone() });
+            return Ok(Some(PeginSender::P2pkh { pubkey: pubkey.clone() }));
         }
     }
 
@@ -937,36 +967,50 @@ fn classify_pegin_sender(tx: &BtcTransaction) -> Option<PeginSender> {
         if pubkey.len() == 33 && compress_pubkey(pubkey).is_some() {
             let mut redeem = vec![0x00, 0x14];
             redeem.extend_from_slice(&pubkey_hash160(pubkey));
-            return Some(PeginSender::P2shP2wpkh {
+            return Ok(Some(PeginSender::P2shP2wpkh {
                 pubkey: pubkey.to_vec(),
                 p2sh_hash: pubkey_hash160(&redeem),
-            });
+            }));
         }
     }
 
     // P2SH-MULTISIG: scriptSig [.., sigs.., redeem] with a multisig redeem;
     // P2SH hash = hash160(redeem).
-    if chunks.len() >= 3 {
+    //
+    // The predicate lives in `rskj_sender_compat` rather than here: it is a
+    // faithful port of bitcoinj's parser dispatch, kept apart so that it can be
+    // switched off and deleted when the RSKIP retiring this path activates.
+    if super::rskj_sender_compat::enabled() && chunks.len() >= 3 {
         if let Some(Chunk::Data(redeem)) = chunks.last() {
-            if is_sent_to_multisig(redeem) {
-                return Some(PeginSender::P2shMultisig { p2sh_hash: pubkey_hash160(redeem) });
+            match super::rskj_sender_compat::is_sent_to_multisig(redeem) {
+                super::rskj_sender_compat::Verdict::Multisig => {
+                    return Ok(Some(PeginSender::P2shMultisig {
+                        p2sh_hash: pubkey_hash160(redeem),
+                    }));
+                }
+                super::rskj_sender_compat::Verdict::RskjThrows(why) => return Err(why),
+                super::rskj_sender_compat::Verdict::NotMultisig => {}
             }
         }
     }
 
     // P2SH-P2WSH: single-chunk scriptSig, witness [.., sigs.., redeem] with
     // a multisig redeem; P2SH hash = hash160(0x0020 || sha256(redeem)).
-    if chunks.len() == 1 && witness.len() >= 3 {
+    if super::rskj_sender_compat::enabled() && chunks.len() == 1 && witness.len() >= 3 {
         let redeem = witness[witness.len() - 1];
-        if is_sent_to_multisig(redeem) {
-            use sha2::Digest;
-            let mut merged = vec![0x00, 0x20];
-            merged.extend_from_slice(&sha2::Sha256::digest(redeem));
-            return Some(PeginSender::P2shP2wsh { p2sh_hash: pubkey_hash160(&merged) });
+        match super::rskj_sender_compat::is_sent_to_multisig(redeem) {
+            super::rskj_sender_compat::Verdict::Multisig => {
+                use sha2::Digest;
+                let mut merged = vec![0x00, 0x20];
+                merged.extend_from_slice(&sha2::Sha256::digest(redeem));
+                return Ok(Some(PeginSender::P2shP2wsh { p2sh_hash: pubkey_hash160(&merged) }));
+            }
+            super::rskj_sender_compat::Verdict::RskjThrows(why) => return Err(why),
+            super::rskj_sender_compat::Verdict::NotMultisig => {}
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Base58Check address string for the peg-in sender (rskj
@@ -5930,7 +5974,7 @@ mod tests {
             }],
             output: vec![],
         };
-        match classify_pegin_sender(&tx) {
+        match classify_pegin_sender(&tx).unwrap() {
             Some(PeginSender::P2pkh { pubkey: parsed }) => assert_eq!(parsed, pubkey),
             other => panic!("expected P2PKH sender, got {}", other.is_some()),
         }
@@ -6174,24 +6218,60 @@ mod tests {
         );
     }
 
+    /// The segregation is real: with the emulation off, the two shapes it
+    /// exists to recognise stop being classified, and nothing else changes.
+    /// This is the test that makes "flip a switch to remove it" a fact rather
+    /// than an intention.
+    #[test]
+    fn the_switch_removes_exactly_the_two_multisig_shapes() {
+        use super::super::rskj_sender_compat as compat;
+
+        // Guard: this flips process-wide state, so restore it.
+        let was = compat::enabled();
+        compat::set_enabled(false);
+
+        assert!(
+            matches!(classify_pegin_sender(&p2pkh_tx()).unwrap(), Some(PeginSender::P2pkh { .. })),
+            "P2PKH is unaffected -- it is credited, not refunded"
+        );
+        assert!(
+            matches!(classify_pegin_sender(&p2sh_p2wpkh_tx()).unwrap(), Some(PeginSender::P2shP2wpkh { .. })),
+            "P2SH-P2WPKH is unaffected for the same reason"
+        );
+        assert!(
+            classify_pegin_sender(&p2sh_multisig_tx()).unwrap().is_none(),
+            "P2SH-multisig is no longer classified"
+        );
+        assert!(
+            classify_pegin_sender(&p2sh_p2wsh_tx()).unwrap().is_none(),
+            "P2SH-P2WSH is no longer classified"
+        );
+
+        compat::set_enabled(was);
+        assert!(
+            matches!(classify_pegin_sender(&p2sh_multisig_tx()).unwrap(), Some(PeginSender::P2shMultisig { .. })),
+            "and switching back restores it"
+        );
+    }
+
     /// rskj: the `gets_*_btc_lock_sender_from_raw_transaction` case in each of
     /// the four classes, and every `rejects_*` case in all four, as one matrix.
     #[test]
     fn classify_pegin_sender_maps_each_shape_to_exactly_one_variant() {
         assert!(
-            matches!(classify_pegin_sender(&p2pkh_tx()), Some(PeginSender::P2pkh { .. })),
+            matches!(classify_pegin_sender(&p2pkh_tx()).unwrap(), Some(PeginSender::P2pkh { .. })),
             "P2PKH scriptSig [sig, pubkey] must classify as P2PKH"
         );
         assert!(
-            matches!(classify_pegin_sender(&p2sh_p2wpkh_tx()), Some(PeginSender::P2shP2wpkh { .. })),
+            matches!(classify_pegin_sender(&p2sh_p2wpkh_tx()).unwrap(), Some(PeginSender::P2shP2wpkh { .. })),
             "single-chunk scriptSig with a 2-item witness must classify as P2SH-P2WPKH"
         );
         assert!(
-            matches!(classify_pegin_sender(&p2sh_multisig_tx()), Some(PeginSender::P2shMultisig { .. })),
+            matches!(classify_pegin_sender(&p2sh_multisig_tx()).unwrap(), Some(PeginSender::P2shMultisig { .. })),
             "scriptSig ending in a multisig redeem must classify as P2SH-multisig"
         );
         assert!(
-            matches!(classify_pegin_sender(&p2sh_p2wsh_tx()), Some(PeginSender::P2shP2wsh { .. })),
+            matches!(classify_pegin_sender(&p2sh_p2wsh_tx()).unwrap(), Some(PeginSender::P2shP2wsh { .. })),
             "single-chunk scriptSig with a >=3-item witness ending in a multisig \
              redeem must classify as P2SH-P2WSH"
         );
@@ -6214,31 +6294,31 @@ mod tests {
             input: vec![],
             output: vec![],
         };
-        assert!(classify_pegin_sender(&no_inputs).is_none(), "no inputs");
+        assert!(classify_pegin_sender(&no_inputs).unwrap().is_none(), "no inputs");
 
         assert!(
-            classify_pegin_sender(&tx_with(vec![], vec![])).is_none(),
+            classify_pegin_sender(&tx_with(vec![], vec![])).unwrap().is_none(),
             "empty scriptSig and no witness"
         );
 
         // Single-chunk scriptSig but a one-item witness: neither the P2WPKH
         // shape (needs 2) nor the P2WSH shape (needs >= 3).
         assert!(
-            classify_pegin_sender(&tx_with(vec![2, 0x00, 0x14], vec![vec![0x30; 71]])).is_none(),
+            classify_pegin_sender(&tx_with(vec![2, 0x00, 0x14], vec![vec![0x30; 71]])).unwrap().is_none(),
             "witness with a single push matches no shape"
         );
 
         // Witness has two pushes but the second is not a valid compressed key.
         assert!(
             classify_pegin_sender(&tx_with(vec![2, 0x00, 0x14],
-                vec![vec![0x30; 71], vec![0xFFu8; 33]])).is_none(),
+                vec![vec![0x30; 71], vec![0xFFu8; 33]])).unwrap().is_none(),
             "P2SH-P2WPKH requires the witness key to be a curve point"
         );
 
         // Three witness items but the last is not a multisig redeem.
         assert!(
             classify_pegin_sender(&tx_with(vec![2, 0x00, 0x20],
-                vec![vec![], vec![0x30; 71], vec![0x01, 0x02, 0x03]])).is_none(),
+                vec![vec![], vec![0x30; 71], vec![0x01, 0x02, 0x03]])).unwrap().is_none(),
             "P2SH-P2WSH requires a multisig redeem as the last witness item"
         );
     }
@@ -6255,7 +6335,7 @@ mod tests {
         script.push(33);
         script.extend_from_slice(&[0xFFu8; 33]); // not on the curve
         assert!(
-            classify_pegin_sender(&tx_with(script, vec![])).is_none(),
+            classify_pegin_sender(&tx_with(script, vec![])).unwrap().is_none(),
             "a non-curve 33-byte push must not classify as P2PKH"
         );
     }
@@ -6293,7 +6373,7 @@ mod tests {
             }],
             output: vec![],
         };
-        match classify_pegin_sender(&tx) {
+        match classify_pegin_sender(&tx).unwrap() {
             Some(PeginSender::P2shMultisig { p2sh_hash }) => {
                 assert_eq!(p2sh_hash, pubkey_hash160(&redeem));
             }
