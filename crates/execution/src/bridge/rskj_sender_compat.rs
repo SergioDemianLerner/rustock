@@ -43,6 +43,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // --- opcodes, named as bitcoinj names them ---------------------------------
 
+// Named for the reader even though only the tests mention it: `OP_0` being
+// push data rather than an opcode is the fact that makes rskj throw, and the
+// constant is where that is written down.
+#[allow(dead_code)]
 const OP_0: u8 = 0x00;
 const OP_PUSHDATA1: u8 = 0x4c;
 const OP_PUSHDATA2: u8 = 0x4d;
