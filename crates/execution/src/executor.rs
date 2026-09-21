@@ -189,6 +189,7 @@ impl RskExecutor {
             self.hardfork_cfg.has_rskip140(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
+            self.hardfork_cfg.has_basefee(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
             &extcodesize_max_precompiles,
@@ -319,6 +320,7 @@ impl RskExecutor {
             self.hardfork_cfg.has_rskip140(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
+            self.hardfork_cfg.has_basefee(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
             &extcodesize_max_precompiles,
@@ -3527,6 +3529,100 @@ mod tests {
 
         assert!(!run(6_223_699), "PUSH0 invalid pre-arrowhead600 (call fails)");
         assert!(run(6_223_700), "PUSH0 valid at arrowhead600 (call succeeds)");
+    }
+
+    /// Audit finding FRCR-679 / FRCR-879.
+    ///
+    /// RSKIP412 (arrowhead600) makes BASEFEE (0x48) valid: rskj's
+    /// `VM.java` OP_BASEFEE throws `invalidOpCode` only while RSKIP412 is
+    /// inactive (`reference.conf`: `rskip412 = arrowhead600`), and
+    /// `VM.doBASEFEE` pushes `program.getMinimumGasPrice()` for 2 gas.
+    ///
+    /// revm bundles BASEFEE into LONDON. rustock maps arrowhead600 to ISTANBUL
+    /// (for the RSKIP400 calldata pricing) and only reaches SHANGHAI at
+    /// lovell700 — so across the whole arrowhead600..lovell700 window, about
+    /// 1.1M mainnet blocks, revm's stock BASEFEE halted `NotActivated` and
+    /// consumed the frame's entire gas where rskj pushed a value and continued.
+    ///
+    /// Same shape as `test_push0_activates_at_arrowhead600`; this one also
+    /// checks the value pushed, because installing the opcode is only half of
+    /// matching rskj — it has to push the block's minimum gas price.
+    #[test]
+    fn test_basefee_activates_at_arrowhead600() {
+        // Runtime: BASEFEE; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+        let runtime: Vec<u8> = vec![0x48, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        // Init: CODECOPY the 9-byte runtime and RETURN it.
+        let mut init = vec![
+            0x60, 0x09, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x09, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        const MIN_GAS_PRICE: u64 = 59_240_000;
+
+        // `None` = the call failed (invalid opcode); `Some(v)` = BASEFEE pushed v.
+        let run = |number: u64| -> Option<U256> {
+            let header = Header {
+                minimum_gas_price: U256::from(MIN_GAS_PRICE),
+                ..dummy_header(number)
+            };
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0x48);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let deploy = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(MIN_GAS_PRICE),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::new(),
+                value: U256::ZERO,
+                input: Bytes::from(init.clone()),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r1 = executor
+                .execute_block(&header, &[(deploy, sender)], &root, store.clone())
+                .expect("deploy block");
+            assert!(r1.tx_results[0].success, "deploy (no BASEFEE in init) always succeeds");
+            let deployed = sender.create(0);
+            let root2 = crate::state::apply_state_changes(
+                &root, store.as_ref(), &r1.state_changes, &r1.markers,
+            );
+            let call = rustock_core::Transaction {
+                nonce: 1,
+                gas_price: U256::from(MIN_GAS_PRICE),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(deployed.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::new(),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r2 = executor
+                .execute_block(&header, &[(call, sender)], &root2, store)
+                .expect("call block");
+            let res = &r2.tx_results[0];
+            if !res.success {
+                return None;
+            }
+            assert_eq!(res.output.len(), 32, "BASEFEE returns one word");
+            Some(U256::from_be_slice(&res.output))
+        };
+
+        // fingerroot500 (PETERSBURG): rskj throws invalidOpCode, so must fail.
+        assert_eq!(run(6_223_699), None, "BASEFEE invalid pre-arrowhead600");
+        // arrowhead600 (ISTANBUL in rustock): the window the audit found.
+        assert_eq!(
+            run(6_223_700),
+            Some(U256::from(MIN_GAS_PRICE)),
+            "RSKIP412 active at arrowhead600: pushes minimumGasPrice"
+        );
+        // arrowhead631, still ISTANBUL.
+        assert_eq!(run(6_549_300), Some(U256::from(MIN_GAS_PRICE)));
+        // lovell700 (SHANGHAI >= LONDON): revm's own BASEFEE already worked
+        // here, so this pins that the explicit install did not change it.
+        assert_eq!(run(7_338_024), Some(U256::from(MIN_GAS_PRICE)));
     }
 
     /// Ported from rskj InitcodeCostCalculatorTest.

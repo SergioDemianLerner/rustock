@@ -179,6 +179,15 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
     }
 
+    /// Whether the BASEFEE opcode (0x48) is available (RSKIP412, Arrowhead600).
+    /// rskj gates it on RSKIP412 (`reference.conf`: `rskip412 = arrowhead600`)
+    /// and pushes `program.getMinimumGasPrice()` (`VM.doBASEFEE`). revm bundles
+    /// BASEFEE into LONDON, and arrowhead600..lovell700 maps to ISTANBUL, so it
+    /// must be installed explicitly (see `rsk_instructions::install`).
+    pub fn has_basefee(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
+    }
+
     /// Whether initcode metering is active (RSKIP438, Lovell700).
     pub fn has_initcode_metering(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
