@@ -3706,6 +3706,208 @@ mod tests {
         );
     }
 
+    /// Audit findings FRCR-75 and FRCR-76.
+    ///
+    /// rskj `BridgeSupport.getBtcTransactionConfirmations` (BridgeSupport.java
+    /// :2194-2235) runs four checks in a fixed order, each with its own code
+    /// (BridgeSupport.java:90-94):
+    ///
+    /// ```text
+    ///   block == null                      -> -1  INEXISTENT_BLOCK_HASH
+    ///   blockDepth > 4320                  -> -4  BLOCK_TOO_OLD
+    ///   not the main-chain block at height -> -2  BLOCK_NOT_IN_BEST_CHAIN
+    ///                     (BlockStoreException) -> -3  INCONSISTENT_BLOCK
+    ///   merkle branch does not reduce      -> -5  INVALID_MERKLE_BRANCH
+    ///   otherwise      bestChainHeight - block.getHeight() + 1
+    /// ```
+    ///
+    /// rustock had -1, then jumped straight to the merkle check and reported
+    /// **-2** for a bad branch. It had no depth check and, more seriously, no
+    /// best-chain check at all: a block on an orphaned BTC fork is still in
+    /// Bridge storage, so rustock would confirm a transaction that exists only
+    /// on that fork — reporting a positive confirmation count where rskj
+    /// returns -2. Everything downstream of this method trusts that number.
+    ///
+    /// Driven end to end on regtest: build a 3-block chain plus a sibling that
+    /// forks at height 1, then query each case through the Bridge precompile.
+    #[test]
+    fn test_btc_transaction_confirmations_codes_and_best_chain_check() {
+        use bitcoin::block::Version;
+        use bitcoin::consensus::serialize as btc_serialize;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+        use crate::bridge::btc_chain::{b256_to_bitcoin_hash, bitcoin_hash_to_b256};
+
+        const BLOCK: u64 = 7_000_000; // every relevant RSKIP active
+        // Regtest difficulty: any nonce is a valid proof of work.
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let hdr = |prev: BlockHash, merkle_seed: u8, nonce: u32| bitcoin::block::Header {
+            version: Version::from_consensus(1),
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::from_byte_array([merkle_seed; 32]),
+            time: 1_700_000_000,
+            bits,
+            nonce,
+        };
+
+        // Regtest's target is ~2^255, so roughly every other nonce works;
+        // search for one rather than assuming.
+        let mine = |prev: BlockHash, merkle_seed: u8| -> bitcoin::block::Header {
+            (0u32..10_000)
+                .map(|nonce| hdr(prev, merkle_seed, nonce))
+                .find(crate::bridge::btc_store::check_proof_of_work)
+                .expect("regtest PoW is trivial")
+        };
+
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+            .header
+            .block_hash();
+        let h1 = mine(genesis, 0x11);
+        let h2 = mine(h1.block_hash(), 0x22);
+        let h3 = mine(h2.block_hash(), 0x33);
+        // Forks at height 1 with the same work as h1, so it never becomes the
+        // head — but it IS stored, which is the whole point.
+        let fork1 = mine(genesis, 0xF1);
+        assert_ne!(fork1.block_hash(), h1.block_hash());
+
+        let receive_header_tx = |nonce: u64, header: &bitcoin::block::Header| {
+            let raw = btc_serialize(header);
+            assert_eq!(raw.len(), 80);
+            let mut input = crate::bridge::compute_selector("receiveHeader(bytes)").to_vec();
+            let mut off = [0u8; 32];
+            off[31] = 0x20;
+            input.extend_from_slice(&off);
+            let mut l = [0u8; 32];
+            l[31] = 80;
+            input.extend_from_slice(&l);
+            let mut payload = raw.clone();
+            payload.resize(96, 0);
+            input.extend_from_slice(&payload);
+            rustock_core::Transaction {
+                nonce,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(input),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            }
+        };
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xC0);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::regtest());
+
+        let txs: Vec<_> = [&h1, &h2, &h3, &fork1]
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (receive_header_tx(i as u64, h), sender))
+            .collect();
+        let built = executor
+            .execute_block(&dummy_header(BLOCK), &txs, &root, store.clone())
+            .expect("header block");
+        for (i, r) in built.tx_results.iter().enumerate() {
+            assert!(r.success, "receiveHeader #{i} call succeeded");
+            assert_eq!(
+                alloy_primitives::I256::from_be_bytes::<32>(r.output[..32].try_into().unwrap()),
+                alloy_primitives::I256::ZERO,
+                "receiveHeader #{i} returned SUCCESS(0)"
+            );
+        }
+        let root = crate::state::apply_state_changes(
+            &root, store.as_ref(), &built.state_changes, &built.markers,
+        );
+
+        // getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])
+        // with an EMPTY merkle branch: the branch reduces to btcTxHash itself,
+        // so a single-transaction block's merkle root is the tx hash.
+        let confirmations = |nonce: u64, tx_hash_display: [u8; 32], block: &bitcoin::block::Header| {
+            let mut input =
+                crate::bridge::compute_selector("getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])")
+                    .to_vec();
+            input.extend_from_slice(&tx_hash_display);
+            input.extend_from_slice(bitcoin_hash_to_b256(&block.block_hash()).as_slice());
+            input.extend_from_slice(&[0u8; 32]); // merkleBranchPath = 0
+            let mut off = [0u8; 32];
+            off[31] = 0x80;
+            input.extend_from_slice(&off); // offset of the hashes array
+            input.extend_from_slice(&[0u8; 32]); // hashes.length = 0
+            let tx = rustock_core::Transaction {
+                nonce,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(2_000_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(input),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r = executor
+                .execute_block(&dummy_header(BLOCK), &[(tx, sender)], &root, store.clone())
+                .expect("query block");
+            let res = &r.tx_results[0];
+            assert!(res.success, "getBtcTransactionConfirmations must not throw");
+            alloy_primitives::I256::from_be_bytes::<32>(res.output[..32].try_into().unwrap())
+        };
+
+        // The merkle root in DISPLAY order is what an ABI caller passes as
+        // btcTxHash for a one-transaction block.
+        let tx_hash_of = |h: &bitcoin::block::Header| -> [u8; 32] {
+            let mut b = h.merkle_root.to_raw_hash().to_byte_array();
+            b.reverse();
+            b
+        };
+        let code = |n: i64| alloy_primitives::I256::try_from(n).unwrap();
+
+        // Happy path: h1 is at height 1, the head is h3 at height 3.
+        assert_eq!(
+            confirmations(4, tx_hash_of(&h1), &h1),
+            code(3),
+            "bestChainHeight - height + 1"
+        );
+        assert_eq!(confirmations(4, tx_hash_of(&h3), &h3), code(1), "the head itself");
+
+        // -1: the block hash is not stored at all.
+        let unknown = hdr(genesis, 0xEE, 999_999);
+        assert_eq!(
+            confirmations(4, tx_hash_of(&unknown), &unknown),
+            code(-1),
+            "INEXISTENT_BLOCK_HASH"
+        );
+
+        // -5: stored, in the best chain, but the branch does not reduce to the
+        // merkle root. rustock used to report -2 here.
+        assert_eq!(
+            confirmations(4, [0xAB; 32], &h1),
+            code(-5),
+            "INVALID_MERKLE_BRANCH"
+        );
+
+        // -2: stored, but on an orphaned fork. rustock used to report 3 — a
+        // confirmed transaction that is not on the BTC main chain.
+        assert_eq!(
+            confirmations(4, tx_hash_of(&fork1), &fork1),
+            code(-2),
+            "BLOCK_NOT_IN_BEST_CHAIN"
+        );
+
+        // Ordering: the best-chain check runs BEFORE the merkle check, so a
+        // fork block with a bad branch still reports -2, not -5.
+        assert_eq!(
+            confirmations(4, [0xAB; 32], &fork1),
+            code(-2),
+            "best-chain check precedes the merkle check"
+        );
+
+        // Sanity: the fork block really is stored, so -2 came from the
+        // best-chain check and not from the block being missing.
+        let _ = b256_to_bitcoin_hash;
+    }
+
     /// Ported from rskj InitcodeCostCalculatorTest.
     /// Validates that contract creation includes initcode word cost at Shanghai.
     #[test]

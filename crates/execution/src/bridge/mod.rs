@@ -918,7 +918,9 @@ fn execute_method<CTX: crate::RskContextTr>(
         // Phase 3: BTC transaction verification
         "registerBtcCoinbaseTransaction" => tx::register_btc_coinbase_transaction(ctx, args, gas_cost),
         "hasBtcBlockCoinbaseTransactionInformation" => tx::has_btc_block_coinbase_info(ctx, args, gas_cost),
-        "getBtcTransactionConfirmations" => tx::get_btc_transaction_confirmations(ctx, args, gas_cost),
+        "getBtcTransactionConfirmations" => {
+            tx::get_btc_transaction_confirmations(ctx, args, gas_cost, config, use_v2, hardfork_cfg)
+        }
 
         // Phase 4: Peg-in
         "registerBtcTransaction" => peg::register_btc_transaction(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),

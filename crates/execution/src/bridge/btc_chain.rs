@@ -324,27 +324,91 @@ pub(crate) fn stored_block_at_main_chain_height<CTX: crate::RskContextTr>(
     height: u32,
     rskip199: bool,
 ) -> Option<StoredBlock> {
-    let head = load_chain_head(ctx)?;
+    match main_chain_block_at_height(ctx, height, rskip199, None) {
+        MainChainLookup::Found(b) => Some(b),
+        MainChainLookup::Absent | MainChainLookup::StoreError => None,
+    }
+}
+
+/// The three outcomes rskj's `getStoredBlockAtMainChainHeight` can produce.
+///
+/// Java distinguishes them by *how* it returns: a `StoredBlock`, `null`, or a
+/// thrown `BlockStoreException`. Callers that only care whether a block was
+/// found can collapse `Absent` and `StoredError` (see
+/// `stored_block_at_main_chain_height`), but `getBtcTransactionConfirmations`
+/// maps them to two different error codes (-2 and -3), so the distinction has
+/// to survive.
+pub(crate) enum MainChainLookup {
+    Found(StoredBlock),
+    /// Java returned `null`: the walk ran off the end of what is stored.
+    Absent,
+    /// Java threw `BlockStoreException`: the height is above the chain head,
+    /// below the RSKIP199 search limit, or the walk landed on a block whose
+    /// recorded height disagrees with its depth.
+    StoreError,
+}
+
+/// rskj `RepositoryBtcBlockStoreWithCache.getStoredBlockAtMainChainHeight`
+/// (l.198-244), preserving the null-vs-exception distinction.
+///
+/// `config` enables the RSKIP199 search-depth limit (l.213-233); pass `None`
+/// to skip it, which is what the pre-existing callers did.
+pub(crate) fn main_chain_block_at_height<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    height: u32,
+    rskip199: bool,
+    config: Option<&BridgeConstants>,
+) -> MainChainLookup {
+    let Some(head) = load_chain_head(ctx) else {
+        return MainChainLookup::StoreError;
+    };
     if height > head.height {
-        return None; // depth < 0: above the chain head
+        // `depth < 0` -> BlockStoreException (l.203-211).
+        return MainChainLookup::StoreError;
     }
     let depth = head.height - height;
 
-    // From RSKIP199, the indexed lookup; it may be absent for blocks below the
-    // index activation, in which case rskj falls back to the walk.
+    // l.213-233: below RSKIP199, blocks older than the search limit are not
+    // reachable at all and the lookup throws.
     if rskip199 {
-        if let Some(hash) = super::storage::bridge_load_btc_block_hash_by_height(ctx, height) {
-            return get_stored_block(ctx, &b256_to_bitcoin_hash(&hash));
+        if let Some(config) = config {
+            let index_activation = config.btc_height_when_block_index_activates;
+            let max_depth = config.max_depth_to_search_blocks_below_index_activation;
+            let limit = if head.height.saturating_sub(index_activation) > max_depth {
+                index_activation
+            } else {
+                head.height.saturating_sub(max_depth)
+            };
+            if height < limit {
+                return MainChainLookup::StoreError;
+            }
         }
     }
 
-    // Walk `depth` parents down from the head (getStoredBlockAtMainChainDepth).
+    // `getInMainchain(height)`: the indexed lookup. Absent for blocks below the
+    // index activation, in which case rskj falls back to the walk.
+    if rskip199 {
+        if let Some(hash) = super::storage::bridge_load_btc_block_hash_by_height(ctx, height) {
+            if let Some(block) = get_stored_block(ctx, &b256_to_bitcoin_hash(&hash)) {
+                return MainChainLookup::Found(block);
+            }
+        }
+    }
+
+    // Walk `depth` parents down from the head (getStoredBlockAtMainChainDepth,
+    // l.271-310). A missing block returns null; a height mismatch throws.
     let mut block_hash = head.header.block_hash();
     for _ in 0..depth {
-        block_hash = get_stored_block(ctx, &block_hash)?.header.prev_blockhash;
+        match get_stored_block(ctx, &block_hash) {
+            Some(b) => block_hash = b.header.prev_blockhash,
+            None => return MainChainLookup::Absent,
+        }
     }
-    let block = get_stored_block(ctx, &block_hash)?;
-    (block.height == height).then_some(block)
+    match get_stored_block(ctx, &block_hash) {
+        None => MainChainLookup::Absent,
+        Some(block) if block.height == height => MainChainLookup::Found(block),
+        Some(_) => MainChainLookup::StoreError,
+    }
 }
 
 /// Seed the bridge BTC chain on first use. rskj does this in two steps that

@@ -5151,13 +5151,6 @@ mod tests {
         );
     }
 
-    /// Regression for mainnet #2,448,984: a federator whose key is NOT in an
-    /// input's redeem script (a NEW-federation member signing the migration
-    /// tx that spends the OLD federation's UTXOs) must not have its
-    /// signature applied — rskj's getSigInsertionIndex/findKeyInRedeem
-    /// throws and processSigning returns. The signature itself verifies
-    /// against the federator's own key, so only redeem membership blocks it.
-    #[test]
     /// Mainnet #9,217,796 tx[1]: a federator submits a 71-byte "signature"
     /// beginning 0x9f, not a DER SEQUENCE. rskj's `Bridge.addSignature` runs
     /// every element through `BtcECKey.ECDSASignature.decodeFromDER` and throws
@@ -5214,6 +5207,13 @@ mod tests {
         assert!(!is_der_signature(&[0x30, 0x04, 0x02, 0x00, 0x02, 0x00]), "empty integer");
     }
 
+    /// Regression for mainnet #2,448,984: a federator whose key is NOT in an
+    /// input's redeem script (a NEW-federation member signing the migration
+    /// tx that spends the OLD federation's UTXOs) must not have its
+    /// signature applied — rskj's getSigInsertionIndex/findKeyInRedeem
+    /// throws and processSigning returns. The signature itself verifies
+    /// against the federator's own key, so only redeem membership blocks it.
+    #[test]
     fn add_signature_rejects_key_not_in_redeem_script() {
         use k256::ecdsa::signature::hazmat::PrehashSigner;
         use k256::ecdsa::{Signature, SigningKey};
