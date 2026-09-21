@@ -388,6 +388,30 @@ impl SyncService {
         self.executing.is_some()
     }
 
+    /// Wait until the in-flight execution job can actually be reaped.
+    ///
+    /// The test controller signals completion from *inside* the execution
+    /// closure, so it fires before the closure returns and before the
+    /// JoinHandle is marked finished. `poll_execution` skips a job whose
+    /// handle is not finished yet, so a test that ticks immediately after the
+    /// controller's signal reaps nothing and sees none of the reap's effects.
+    ///
+    /// Production never notices: it ticks on a timer and reaps on whichever
+    /// tick comes after the handle settles. A test that asserts on the reap
+    /// has to wait for it instead of assuming one tick is enough.
+    #[cfg(test)]
+    pub(crate) async fn await_reapable_execution_for_test(&self) {
+        let Some(job) = &self.executing else { return };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !job.handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "execution job never finished: it is blocked, not merely unreaped"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn has_parked_batch_for_test(&self) -> bool {
         self.pending_exec.is_some()

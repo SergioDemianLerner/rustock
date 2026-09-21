@@ -3253,6 +3253,7 @@ async fn test_pipeline_depth_capped_at_one_ahead() {
     // Now let N finish: poll_execution should start N+1 and resume downloading.
     ctrl.release(true);   // releases N
     ctrl.wait_completed(1);
+    service.await_reapable_execution_for_test().await;
     service.on_tick().await; // reaps N, spawns N+1
     ctrl.wait_started(2);
     assert_eq!(ctrl.started(), vec![3, 6], "N+1 executes only after N completes");
@@ -3300,6 +3301,7 @@ async fn test_pipeline_exec_failure_halts() {
     // so we assert the durable halt effects, not the transient Idle state.)
     ctrl.release(false);
     ctrl.wait_completed(1);
+    service.await_reapable_execution_for_test().await;
     service.on_tick().await;
 
     assert!(!service.has_parked_batch_for_test(), "parked batch must be dropped on halt");
