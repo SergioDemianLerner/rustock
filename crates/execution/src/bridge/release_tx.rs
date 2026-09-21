@@ -600,6 +600,34 @@ pub fn parse_chunks(script: &[u8]) -> Option<Vec<Chunk>> {
                 chunks.push(Chunk::Data(script[pos..pos + len].to_vec()));
                 pos += len;
             }
+            // OP_PUSHDATA4: a uint32 little-endian length, then that many
+            // bytes. bitcoinj notes it "should never actually be used" since a
+            // push cannot exceed 520 bytes, but it parses it, and what matters
+            // here is agreeing with the parser rskj runs rather than with what
+            // a well-formed script would contain. Both of bitcoinj's
+            // under-length cases -- fewer than four bytes of length, and a
+            // length beyond the remaining data -- throw, which is this
+            // function's `None`.
+            0x4e => {
+                if pos + 4 > script.len() {
+                    return None;
+                }
+                let len = u32::from_le_bytes([
+                    script[pos],
+                    script[pos + 1],
+                    script[pos + 2],
+                    script[pos + 3],
+                ]) as usize;
+                pos += 4;
+                // Compared this way round rather than as `pos + len`, because a
+                // declared length near u32::MAX would otherwise be an overflow
+                // before it could be a rejection.
+                if len > script.len() - pos {
+                    return None;
+                }
+                chunks.push(Chunk::Data(script[pos..pos + len].to_vec()));
+                pos += len;
+            }
             other => chunks.push(Chunk::Op(other)),
         }
     }
@@ -1808,29 +1836,76 @@ mod tests {
         );
     }
 
-    /// DIVERGENCE, pinned deliberately rather than asserted as correct.
+    /// OP_PUSHDATA4 now matches bitcoinj's `ScriptParser.parseScriptProgram`,
+    /// verified against co.rsk.bitcoinj:bitcoinj-thin:0.14.4-rsk-18 -- the
+    /// exact artifact rskj pins -- rather than against classic bitcoinj.
     ///
-    /// bitcoinj's parser treats 0x4e (OP_PUSHDATA4) as a push with a 4-byte
-    /// little-endian length. rustock falls through to the catch-all arm and
-    /// records it as a plain opcode, so the chunk list after a 0x4e differs
-    /// between the two implementations.
-    ///
-    /// Reachable in principle: a peg-in scriptSig is attacker-supplied, and
-    /// `classify_pegin_sender` decides the refund address from the chunk list.
-    /// Whether it is reachable in practice depends on whether any such script
-    /// can also satisfy the shape checks downstream, which this test does not
-    /// establish.
-    ///
-    /// Left as-is overnight rather than "fixed": changing how scripts parse is
-    /// a consensus change, and getting it wrong is worse than the divergence
-    /// it would close. Raised for review.
+    /// Previously 0x4e fell through to the catch-all arm and became a plain
+    /// opcode, so every chunk after it differed from what rskj sees. The chunk
+    /// list decides how `classify_pegin_sender` reads an attacker-supplied
+    /// scriptSig, and therefore where a rejected peg-in is refunded.
     #[test]
-    fn parse_chunks_treats_pushdata4_as_an_opcode_unlike_bitcoinj() {
+    fn parse_chunks_reads_pushdata4_like_bitcoinj() {
         use Chunk::*;
+
+        // A zero-length PUSHDATA4 is well formed and pushes empty data. This
+        // is the case that made the old behaviour reachable: four zero bytes
+        // became four separate chunks instead of one empty push.
         assert_eq!(
-            parse_chunks(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0xAA]),
-            Some(vec![Op(0x4e), Data(vec![0x00]), OpZero, OpZero, Op(0xAA)]),
-            "documents CURRENT behaviour: 0x4e is not read as a length-prefixed push"
+            parse_chunks(&[0x4e, 0x00, 0x00, 0x00, 0x00]),
+            Some(vec![Data(vec![])]),
+            "a zero-length PUSHDATA4 is one empty push, not five chunks"
+        );
+
+        // A normal push.
+        assert_eq!(
+            parse_chunks(&[0x4e, 0x02, 0x00, 0x00, 0x00, 0xAA, 0xBB]),
+            Some(vec![Data(vec![0xAA, 0xBB])])
+        );
+
+        // The length is little-endian across all four bytes.
+        let mut script = vec![0x4e, 0x00, 0x01, 0x00, 0x00];
+        script.extend_from_slice(&[0xCD; 256]);
+        assert_eq!(
+            parse_chunks(&script),
+            Some(vec![Data(vec![0xCD; 256])]),
+            "0x00000100 little-endian is 256"
+        );
+
+        // bitcoinj throws when fewer than four length bytes remain.
+        for truncated in [
+            &[0x4e][..],
+            &[0x4e, 0x01][..],
+            &[0x4e, 0x01, 0x00][..],
+            &[0x4e, 0x01, 0x00, 0x00][..],
+        ] {
+            assert!(
+                parse_chunks(truncated).is_none(),
+                "PUSHDATA4 with fewer than four length bytes must be refused"
+            );
+        }
+
+        // And when the declared length exceeds what remains.
+        assert!(
+            parse_chunks(&[0x4e, 0x05, 0x00, 0x00, 0x00, 0xAA]).is_none(),
+            "a length beyond the remaining data must be refused"
+        );
+
+        // A length near u32::MAX must be rejected, not overflow the cursor.
+        assert!(
+            parse_chunks(&[0x4e, 0xFF, 0xFF, 0xFF, 0xFF, 0xAA]).is_none(),
+            "4294967295 bytes must be refused without overflowing"
+        );
+        assert!(
+            parse_chunks(&[0x4e, 0xFF, 0xFF, 0xFF, 0x7F]).is_none(),
+            "a huge length with nothing after it must be refused"
+        );
+
+        // Chunks after a PUSHDATA4 are now read in the right places.
+        assert_eq!(
+            parse_chunks(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0xAA, 0xac]),
+            Some(vec![Data(vec![0xAA]), Op(0xac)]),
+            "parsing resumes after the pushed data, not inside it"
         );
     }
 }
