@@ -900,14 +900,22 @@ pub struct BridgeTxContext {
 /// execution continues with a `0` pushed) — `Program.executePrecompiledAndHandleError`
 /// runs `refundGas(msg.gas - requiredGas)` in its `finally` block.
 ///
-/// Only the standard ETH precompiles that revm reports a non-OOG `Err` for can
-/// reach this path at iris: BN128 add/mul/pairing (0x06–0x08, throw on an
+/// Two families reach this path. The standard ETH precompiles that revm reports
+/// a non-OOG `Err` for at iris: BN128 add/mul/pairing (0x06–0x08, throw on an
 /// invalid point post-RSKIP197 — `BN128PrecompiledContract.unsafeExecute`) and
 /// BLAKE2F (0x09, throws on a bad final-block byte or bad input length —
 /// `Blake2F.execute`). For BN128 the non-OOG `Err` is only returned after revm's
 /// internal `gas_used <= gas_limit` check, so `requiredGas <= gas_limit` always
-/// holds, matching rskj. Returns `None` for addresses that never reach the
-/// non-OOG error path (the gas is then irrelevant).
+/// holds, matching rskj.
+///
+/// And, from reed800, the RSK secp256k1 precompiles (RSKIP516), which return a
+/// non-OOG `Err` whenever a point is off-curve or a coordinate is >= p. rskj
+/// charges their fixed cost regardless, because `getGasForData` never looks at
+/// the input.
+///
+/// Returns `None` only for addresses that genuinely never reach the non-OOG
+/// error path; `None` becomes 0 gas at the call site, so an omission here is a
+/// silent undercharge rather than a failure.
 fn rskip197_required_gas_on_error(addr: &Address, input: &[u8]) -> Option<u64> {
     // EIP-1108 / Istanbul pricing, active for BN128 from papyrus200 in rskj
     // (BN128Addition/Multiplication/Pairing.getGasForData).
@@ -927,6 +935,12 @@ fn rskip197_required_gas_on_error(addr: &Address, input: &[u8]) -> Option<u64> {
             input[..4].try_into().expect("len checked == 213"),
         ) as u64),
         BLAKE2F => Some(0),
+        // RSKIP516 (reed800). rskj's Secp256k1Addition/Multiplication return
+        // their fixed cost from getGasForData REGARDLESS of whether the input
+        // parses, so an off-curve point still costs 150 / 3000. Omitting them
+        // here charged 0, because the caller does `.unwrap_or(0)`.
+        SECP256K1_ADD_ADDR => Some(150),
+        SECP256K1_MUL_ADDR => Some(3_000),
         _ => None,
     }
 }
@@ -1631,6 +1645,89 @@ const fn hex_val(b: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // RSKIP197 requiredGas on a non-OOG precompile error
+    // -----------------------------------------------------------------------
+
+    /// Audit FRCR-280. rskj charges a failing precompile CALL exactly
+    /// `getGasForData(input)` post-RSKIP197, and the secp256k1 contracts
+    /// return their flat cost from `getGasForData` without ever looking at the
+    /// input (`Secp256k1Addition.java:27` EC_256_ADDITION_GAS_COST = 150,
+    /// `Secp256k1Multiplication.java:27` = 3000). Before the fix these two
+    /// addresses fell through to `None`, which `.unwrap_or(0)` turned into a
+    /// free failed call — a consensus divergence from reed800 onwards.
+    #[test]
+    fn rskip197_required_gas_covers_secp256k1() {
+        assert_eq!(
+            rskip197_required_gas_on_error(&SECP256K1_ADD_ADDR, &[]),
+            Some(150)
+        );
+        assert_eq!(
+            rskip197_required_gas_on_error(&SECP256K1_MUL_ADDR, &[]),
+            Some(3_000)
+        );
+        // Independent of the input, exactly as getGasForData is.
+        assert_eq!(
+            rskip197_required_gas_on_error(&SECP256K1_ADD_ADDR, &[0xff; 128]),
+            Some(150)
+        );
+        assert_eq!(
+            rskip197_required_gas_on_error(&SECP256K1_MUL_ADDR, &[0xff; 96]),
+            Some(3_000)
+        );
+    }
+
+    /// The failure above is only reachable if an off-curve point really does
+    /// produce a *non-OOG* `Err` — an OOG error takes the other branch and
+    /// consumes everything. This pins the premise, so the table entry above
+    /// cannot be deleted as unreachable.
+    #[test]
+    fn secp256k1_off_curve_point_is_a_non_oog_error() {
+        // x = 1 is not a valid secp256k1 x-coordinate (1 + 7 = 8 is not a QR).
+        let mut input = [0u8; 128];
+        input[31] = 1; // p1.x = 1
+        input[63] = 1; // p1.y = 1  -> not on the curve
+        input[95] = 1; // p2.x = 1
+        input[127] = 1;
+
+        let err = secp256k1_add_run(&input, 1_000_000).expect_err("off-curve must fail");
+        assert!(!err.is_oog(), "must not be OOG, got {err:?}");
+
+        let err = secp256k1_mul_run(&input[..96], 1_000_000).expect_err("off-curve must fail");
+        assert!(!err.is_oog(), "must not be OOG, got {err:?}");
+    }
+
+    /// The other addresses that reach the same path, pinned together so the
+    /// table is read as a whole. rskj: `BN128Addition.getGasForData` = 150,
+    /// `BN128Multiplication` = 6000, `BN128Pairing` = 45000 + 34000*pairs,
+    /// `Blake2F` = the big-endian rounds word (0 when the length is wrong).
+    #[test]
+    fn rskip197_required_gas_bn128_and_blake2f() {
+        let bn128_add = Address::new(hex_addr("0000000000000000000000000000000000000006"));
+        let bn128_mul = Address::new(hex_addr("0000000000000000000000000000000000000007"));
+        let bn128_pair = Address::new(hex_addr("0000000000000000000000000000000000000008"));
+        let blake2f = Address::new(hex_addr("0000000000000000000000000000000000000009"));
+
+        assert_eq!(rskip197_required_gas_on_error(&bn128_add, &[]), Some(150));
+        assert_eq!(rskip197_required_gas_on_error(&bn128_mul, &[]), Some(6_000));
+        assert_eq!(
+            rskip197_required_gas_on_error(&bn128_pair, &[0u8; 384]),
+            Some(45_000 + 2 * 34_000)
+        );
+
+        let mut blake_input = [0u8; 213];
+        blake_input[..4].copy_from_slice(&12u32.to_be_bytes());
+        assert_eq!(
+            rskip197_required_gas_on_error(&blake2f, &blake_input),
+            Some(12)
+        );
+        assert_eq!(rskip197_required_gas_on_error(&blake2f, &[0u8; 100]), Some(0));
+
+        // ecrecover never throws a non-OOG error in rskj; it returns empty.
+        let ecrecover = Address::new(hex_addr("0000000000000000000000000000000000000001"));
+        assert_eq!(rskip197_required_gas_on_error(&ecrecover, &[]), None);
+    }
 
     #[test]
     fn test_remasc_address() {
