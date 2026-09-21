@@ -23,6 +23,12 @@ pub const SUBMIT_BLOCK_ERROR: i64 = -33000;
 /// not have to assemble a real miner -- with a block processor, a trie store
 /// and a chain behind it -- to be tested.
 pub trait MiningService: Send + Sync {
+    /// The address block rewards are paid to, for `eth_coinbase`.
+    ///
+    /// rskj answers `eth_coinbase` from the miner's configured address. A node
+    /// that mines to a real address but reports the zero address here is
+    /// telling mining software its rewards go nowhere.
+    fn coinbase(&self) -> [u8; 20];
     fn get_work(&self) -> Result<MinerWork, SubmitError>;
     fn submit_bitcoin_block(&self, raw_block: &[u8]) -> Result<SubmittedBlockInfo, SubmitError>;
     fn submit_bitcoin_block_transactions(
@@ -41,6 +47,10 @@ pub trait MiningService: Send + Sync {
 }
 
 impl MiningService for rustock_execution::MinerServer {
+    fn coinbase(&self) -> [u8; 20] {
+        self.coinbase_address().into_array()
+    }
+
     fn get_work(&self) -> Result<MinerWork, SubmitError> {
         rustock_execution::MinerServer::get_work(self)
     }

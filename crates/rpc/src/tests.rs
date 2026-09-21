@@ -1358,6 +1358,11 @@ mod mnr_tests {
     }
 
     impl MiningService for FakeMiner {
+        fn coinbase(&self) -> [u8; 20] {
+            [0x5Au8; 20]
+        }
+
+
         fn get_work(&self) -> Result<MinerWork, SubmitError> {
             self.work
                 .clone()
@@ -1611,6 +1616,35 @@ mod mnr_tests {
         let resp = dispatch_for_test(&state, make_request("rpc_modules", json!([]))).await;
         assert_eq!(resp.result.unwrap()["mnr"], json!("1.0"));
     }
+
+    /// eth_coinbase must report the miner's address once mining is on. With
+    /// mining off the zero address is honest; with mining on it is a lie that
+    /// mining software acts on, so both halves are pinned here.
+    ///
+    /// rskj answers this from the miner configuration in EthModule. rustock
+    /// had it hard-coded to zero, which was correct only for a node that
+    /// never mines -- and stopped being correct when mining landed.
+    #[tokio::test]
+    async fn test_eth_coinbase_reports_the_miner_address() {
+        let (state, _tmp) = setup_state();
+        assert!(state.miner.is_none(), "the default node does not mine");
+        let resp = dispatch_for_test(&state, make_request("eth_coinbase", json!([]))).await;
+        assert_eq!(
+            resp.result.unwrap(),
+            json!("0x0000000000000000000000000000000000000000"),
+            "with no miner the zero address is the honest answer"
+        );
+
+        let (mut state, _tmp2) = setup_state();
+        state.miner = Some(std::sync::Arc::new(FakeMiner::default()));
+        let resp = dispatch_for_test(&state, make_request("eth_coinbase", json!([]))).await;
+        assert_eq!(
+            resp.result.unwrap(),
+            json!("0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"),
+            "with a miner the configured coinbase must be reported"
+        );
+    }
+
 }
 
 // --- administrative methods -------------------------------------------------
