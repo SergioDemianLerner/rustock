@@ -1328,6 +1328,78 @@ async fn test_log_dto_fields_match_rskj() {
 // are rskj's and the consumers are existing pool daemons, so a field that
 // looks wrong here is a field that breaks a miner.
 
+
+// --- block-count getters, and the header-only distinction --------------------
+//
+// rskj covers these in Web3ImplTest (getBlockTransactionCountByHash and
+// friends). Both were named in no rustock test. The interesting case is not
+// the happy path but the three-way answer: a count, zero for a block whose
+// body is absent, and null for a block that is not here at all -- a caller
+// cannot tell "no transactions" from "no block" unless those differ.
+
+#[tokio::test]
+async fn test_block_transaction_count_by_hash_distinguishes_absent_from_empty() {
+    let (state, _tmp) = setup_state();
+    let known = test_header(42).hash();
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockTransactionCountByHash", json!([format!("{known:?}")])),
+    )
+    .await;
+    assert_eq!(
+        resp.result.unwrap(),
+        json!("0x0"),
+        "a stored header with no body has zero transactions, not null"
+    );
+
+    let unknown = "0x".to_string() + &"11".repeat(32);
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockTransactionCountByHash", json!([unknown])),
+    )
+    .await;
+    assert_eq!(
+        resp.result.unwrap(),
+        serde_json::Value::Null,
+        "a block that is not stored must answer null, not zero"
+    );
+}
+
+#[tokio::test]
+async fn test_block_count_getters_reject_a_malformed_hash() {
+    let (state, _tmp) = setup_state();
+    for method in [
+        "eth_getBlockTransactionCountByHash",
+        "eth_getUncleCountByBlockHash",
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, json!(["not-a-hash"]))).await;
+        assert!(resp.result.is_none(), "{method} must not answer a bad hash");
+        assert_eq!(
+            resp.error.expect("an error is expected").code,
+            -32602,
+            "{method} must report INVALID_PARAMS"
+        );
+
+        let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+        assert_eq!(
+            resp.error.expect("an error is expected").code,
+            -32602,
+            "{method} must report INVALID_PARAMS when the hash is missing"
+        );
+    }
+}
+
+/// eth_hashrate is a fixed zero: rustock does not hash, it hands work to
+/// merged-mining software that does. Pinned so it is not "improved" into
+/// reporting a number the node cannot know.
+#[tokio::test]
+async fn test_eth_hashrate_is_zero() {
+    let (state, _tmp) = setup_state();
+    let resp = dispatch_for_test(&state, make_request("eth_hashrate", json!([]))).await;
+    assert_eq!(resp.result.unwrap(), json!("0x0"));
+}
+
 mod mnr_tests {
     use super::*;
     use crate::mnr::{MiningService, SUBMIT_BLOCK_ERROR};
