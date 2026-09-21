@@ -1612,3 +1612,69 @@ mod mnr_tests {
         assert_eq!(resp.result.unwrap()["mnr"], json!("1.0"));
     }
 }
+
+// --- administrative methods -------------------------------------------------
+//
+// rskj gates its equivalents behind the `rsk` module being enabled in config
+// and tests that in Web3ImplTest / ModuleDescriptionTest. rustock gates on
+// --rpc-admin. These two methods were named in no test at all, which the
+// coverage document calls the most uncomfortable gap in the RPC surface:
+// rsk_collectTrie DELETES trie epochs.
+
+/// Without --rpc-admin both admin methods must report as unknown, not as
+/// forbidden. The distinction is deliberate: a node that never had them and a
+/// node that has them switched off should be indistinguishable from outside,
+/// so that probing cannot enumerate which nodes are worth attacking.
+#[tokio::test]
+async fn test_admin_methods_are_unknown_without_the_flag() {
+    let (state, _tmp) = setup_state();
+    assert!(!state.admin_enabled, "the default must be off");
+
+    for method in ["rsk_collectTrie", "rsk_collectTrieStatus"] {
+        let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+        assert!(resp.result.is_none(), "{method} must not answer when admin is off");
+        let err = resp.error.expect("an error is expected");
+        assert_eq!(err.code, -32601, "{method} must report METHOD_NOT_FOUND");
+        assert_eq!(
+            err.message, "Method not found",
+            "{method} must not disclose that it exists but is disabled"
+        );
+    }
+}
+
+/// The gate is on the method name, not on the arguments: a request carrying
+/// plausible parameters must be refused exactly the same way. Worth pinning
+/// because rsk_collectTrie with a block number is the shape that deletes
+/// something, and a gate that only covered the no-argument form would look
+/// correct in every other test.
+#[tokio::test]
+async fn test_admin_gate_ignores_the_parameters() {
+    let (state, _tmp) = setup_state();
+    let resp = dispatch_for_test(
+        &state,
+        make_request("rsk_collectTrie", json!(["0x2a"])),
+    )
+    .await;
+    assert!(resp.result.is_none(), "parameters must not open the gate");
+    assert_eq!(resp.error.unwrap().code, -32601);
+}
+
+/// With admin on, the methods must actually dispatch -- otherwise the gate
+/// test above would pass against a node where they were removed entirely, and
+/// prove nothing. This node has no epoch store, so the call reaches the
+/// handler and reports that rather than being refused by the gate.
+#[tokio::test]
+async fn test_admin_methods_dispatch_when_enabled() {
+    let (mut state, _tmp) = setup_state();
+    state.admin_enabled = true;
+
+    let resp = dispatch_for_test(&state, make_request("rsk_collectTrieStatus", json!([]))).await;
+    let refused_by_gate = resp
+        .error
+        .as_ref()
+        .is_some_and(|e| e.code == -32601 && e.message == "Method not found");
+    assert!(
+        !refused_by_gate,
+        "with admin enabled the method must reach its handler, not the gate"
+    );
+}
