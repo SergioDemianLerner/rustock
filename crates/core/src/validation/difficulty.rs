@@ -26,6 +26,26 @@ impl ParentHeaderValidator for DifficultyRule {
 }
 
 impl DifficultyRule {
+    /// The difficulty a child of `parent` must carry, given the fields a miner
+    /// chooses: its height, timestamp and uncle count.
+    ///
+    /// Validation answers the same question from a header that already exists;
+    /// a miner needs it before one does, so the calculation is shared rather
+    /// than duplicated -- the two must not be allowed to drift.
+    pub fn difficulty_for_child(
+        &self,
+        parent: &Header,
+        number: u64,
+        timestamp: u64,
+        uncle_count: u64,
+    ) -> U256 {
+        let mut probe = parent.clone();
+        probe.number = number;
+        probe.timestamp = timestamp;
+        probe.uncle_count = uncle_count;
+        self.calculate_expected_difficulty(&probe, parent)
+    }
+
     fn calculate_expected_difficulty(&self, header: &Header, parent: &Header) -> U256 {
         let activations = &self.config.activation_heights;
 

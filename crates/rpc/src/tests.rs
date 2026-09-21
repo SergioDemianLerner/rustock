@@ -53,6 +53,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         epoch_store: None,
+        miner: None,
         admin_enabled: false,
         gc_burial: 4000,
     };
@@ -561,6 +562,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         epoch_store: None,
+        miner: None,
         admin_enabled: false,
         gc_burial: 4000,
     };
@@ -603,6 +605,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         epoch_store: None,
+        miner: None,
         admin_enabled: false,
         gc_burial: 4000,
     };
@@ -669,6 +672,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         epoch_store: None,
+        miner: None,
         admin_enabled: false,
         gc_burial: 4000,
     };
@@ -796,6 +800,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         epoch_store: None,
+        miner: None,
         admin_enabled: false,
         gc_burial: 4000,
     };
@@ -888,6 +893,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         epoch_store: None,
+        miner: None,
         admin_enabled: false,
         gc_burial: 4000,
     };
@@ -1055,6 +1061,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         epoch_store: None,
+        miner: None,
         admin_enabled: false,
         gc_burial: 4000,
     };
@@ -1276,6 +1283,7 @@ async fn test_receipt_dto_failed_status() {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         epoch_store: None,
+        miner: None,
         admin_enabled: false,
         gc_burial: 4000,
     };
@@ -1312,4 +1320,295 @@ async fn test_log_dto_fields_match_rskj() {
     assert!(log["address"].as_str().unwrap().starts_with("0x"));
     assert!(log["blockNumber"].as_str().unwrap().starts_with("0x"));
     assert_eq!(log["logIndex"], json!("0x0"));
+}
+
+// ── mnr: merged mining ────────────────────────────────────────────────
+//
+// These check the wire contract rather than the mining itself: the JSON shapes
+// are rskj's and the consumers are existing pool daemons, so a field that
+// looks wrong here is a field that breaks a miner.
+
+mod mnr_tests {
+    use super::*;
+    use crate::mnr::{MiningService, SUBMIT_BLOCK_ERROR};
+    use rustock_execution::mining::{ImportResult, MinerWork, SubmitError, SubmittedBlockInfo};
+    use std::sync::Mutex;
+
+    /// A miner that answers from a script, so the RPC layer can be checked
+    /// without a block processor, a trie and a chain behind it.
+    #[derive(Default)]
+    struct FakeMiner {
+        work: Option<MinerWork>,
+        /// The arguments the last submit call arrived with.
+        last_call: Mutex<Option<(Vec<u8>, Vec<u8>, String, u32)>>,
+        fail_with: Option<String>,
+    }
+
+    impl FakeMiner {
+        fn ok(&self) -> Result<SubmittedBlockInfo, SubmitError> {
+            if let Some(message) = &self.fail_with {
+                return Err(SubmitError::Storage(message.clone()));
+            }
+            Ok(SubmittedBlockInfo {
+                block_imported_result: ImportResult::ImportedBest,
+                block_hash: B256::repeat_byte(0xAB),
+                block_included_height: 0x2a,
+            })
+        }
+    }
+
+    impl MiningService for FakeMiner {
+        fn get_work(&self) -> Result<MinerWork, SubmitError> {
+            self.work
+                .clone()
+                .ok_or_else(|| SubmitError::Storage("no work".into()))
+        }
+
+        fn submit_bitcoin_block(&self, raw: &[u8]) -> Result<SubmittedBlockInfo, SubmitError> {
+            *self.last_call.lock().unwrap() = Some((raw.to_vec(), Vec::new(), String::new(), 0));
+            self.ok()
+        }
+
+        fn submit_bitcoin_block_transactions(
+            &self,
+            header: &[u8],
+            coinbase: &[u8],
+            hashes: &str,
+        ) -> Result<SubmittedBlockInfo, SubmitError> {
+            *self.last_call.lock().unwrap() =
+                Some((header.to_vec(), coinbase.to_vec(), hashes.to_string(), 0));
+            self.ok()
+        }
+
+        fn submit_bitcoin_block_partial_merkle(
+            &self,
+            header: &[u8],
+            coinbase: &[u8],
+            hashes: &str,
+            count: u32,
+        ) -> Result<SubmittedBlockInfo, SubmitError> {
+            *self.last_call.lock().unwrap() =
+                Some((header.to_vec(), coinbase.to_vec(), hashes.to_string(), count));
+            self.ok()
+        }
+    }
+
+    fn sample_work() -> MinerWork {
+        MinerWork {
+            block_hash_for_merged_mining: B256::repeat_byte(0x11),
+            // A target well under 32 bytes, to prove it is zero-padded rather
+            // than sent as a quantity.
+            target: U256::from(0x1234u64),
+            fees_paid_to_miner: U256::from(123_456_789_u64),
+            notify: true,
+            parent_block_hash: B256::repeat_byte(0x22),
+        }
+    }
+
+    fn state_with(miner: FakeMiner) -> (RpcState, tempfile::TempDir, Arc<FakeMiner>) {
+        let (mut state, tmp) = setup_state();
+        let miner = Arc::new(miner);
+        state.miner = Some(miner.clone() as Arc<dyn MiningService>);
+        (state, tmp, miner)
+    }
+
+    #[tokio::test]
+    async fn get_work_returns_rskj_field_shapes() {
+        let (state, _tmp, _miner) =
+            state_with(FakeMiner { work: Some(sample_work()), ..Default::default() });
+
+        let resp = dispatch_for_test(&state, make_request("mnr_getWork", json!([]))).await;
+        let result = resp.result.expect("getWork must answer");
+
+        assert_eq!(
+            result["blockHashForMergedMining"],
+            json!("0x1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        // Padded to 32 bytes: this is a threshold a hash is compared against,
+        // not a quantity, and trimming it would change its meaning.
+        assert_eq!(
+            result["target"],
+            json!("0x0000000000000000000000000000000000000000000000000000000000001234")
+        );
+        // Decimal, not hex: rskj sends `String.valueOf(Coin)` here and pools
+        // parse it as a number.
+        assert_eq!(result["feesPaidToMiner"], json!("123456789"));
+        assert_eq!(result["notify"], json!(true));
+        assert_eq!(
+            result["parentBlockHash"],
+            json!("0x2222222222222222222222222222222222222222222222222222222222222222")
+        );
+    }
+
+    /// `blockImportedResult` is the hex encoding of an ASCII status word --
+    /// `HexUtils.toJsonHex(stringToByteArray(importResult.toString()))` in
+    /// rskj. Sending the word itself would be more sensible and would break
+    /// every client.
+    #[tokio::test]
+    async fn submit_returns_an_rskj_submitted_block_info() {
+        let (state, _tmp, _miner) = state_with(FakeMiner::default());
+
+        let resp = dispatch_for_test(
+            &state,
+            make_request("mnr_submitBitcoinBlock", json!(["0xdeadbeef"])),
+        )
+        .await;
+        let result = resp.result.expect("submit must answer");
+
+        assert_eq!(
+            result["blockImportedResult"],
+            json!(format!("0x{}", hex::encode("IMPORTED_BEST")))
+        );
+        assert_eq!(
+            result["blockHash"],
+            json!("0xabababababababababababababababababababababababababababababababab")
+        );
+        assert_eq!(result["blockIncludedHeight"], json!("0x2a"));
+    }
+
+    #[tokio::test]
+    async fn submit_passes_the_raw_block_through() {
+        let (state, _tmp, miner) = state_with(FakeMiner::default());
+
+        dispatch_for_test(
+            &state,
+            make_request("mnr_submitBitcoinBlock", json!(["0x0102ff"])),
+        )
+        .await;
+
+        let call = miner.last_call.lock().unwrap().clone().expect("submit reached the miner");
+        assert_eq!(call.0, vec![0x01, 0x02, 0xff]);
+    }
+
+    /// rskj takes a block hash as the first argument of the two-part submits
+    /// and ignores it -- the hash is recomputed from the header. The
+    /// positional shape still has to match, or every argument lands one place
+    /// out.
+    #[tokio::test]
+    async fn submit_transactions_reads_arguments_by_rskj_position() {
+        let (state, _tmp, miner) = state_with(FakeMiner::default());
+
+        dispatch_for_test(
+            &state,
+            make_request(
+                "mnr_submitBitcoinBlockTransactions",
+                json!(["0xdead", "0xaabb", "0xccdd", "hash1 hash2"]),
+            ),
+        )
+        .await;
+
+        let call = miner.last_call.lock().unwrap().clone().expect("submit reached the miner");
+        assert_eq!(call.0, vec![0xaa, 0xbb], "header");
+        assert_eq!(call.1, vec![0xcc, 0xdd], "coinbase");
+        assert_eq!(call.2, "hash1 hash2");
+    }
+
+    #[tokio::test]
+    async fn submit_partial_merkle_reads_arguments_by_rskj_position() {
+        let (state, _tmp, miner) = state_with(FakeMiner::default());
+
+        dispatch_for_test(
+            &state,
+            make_request(
+                "mnr_submitBitcoinBlockPartialMerkle",
+                json!(["0xdead", "0xaabb", "0xccdd", "hash1 hash2", "10"]),
+            ),
+        )
+        .await;
+
+        let call = miner.last_call.lock().unwrap().clone().expect("submit reached the miner");
+        assert_eq!(call.0, vec![0xaa, 0xbb], "header");
+        assert_eq!(call.1, vec![0xcc, 0xdd], "coinbase");
+        assert_eq!(call.2, "hash1 hash2");
+        // The transaction count arrives as hex without a prefix.
+        assert_eq!(call.3, 16);
+    }
+
+    #[tokio::test]
+    async fn submit_partial_merkle_rejects_an_empty_hash_list() {
+        let (state, _tmp, _miner) = state_with(FakeMiner::default());
+
+        let resp = dispatch_for_test(
+            &state,
+            make_request(
+                "mnr_submitBitcoinBlockPartialMerkle",
+                json!(["0xdead", "0xaabb", "0xccdd", "", "10"]),
+            ),
+        )
+        .await;
+
+        let error = resp.error.expect("an empty branch cannot be a proof");
+        assert_eq!(error.code, SUBMIT_BLOCK_ERROR);
+    }
+
+    /// A refused submission carries rskj's application-defined code, so a
+    /// miner can tell a rejected block from a malformed request.
+    #[tokio::test]
+    async fn a_refused_submission_uses_rskj_error_code() {
+        let (state, _tmp, _miner) = state_with(FakeMiner {
+            fail_with: Some("the chain moved on".into()),
+            ..Default::default()
+        });
+
+        let resp = dispatch_for_test(
+            &state,
+            make_request("mnr_submitBitcoinBlock", json!(["0xdeadbeef"])),
+        )
+        .await;
+
+        let error = resp.error.expect("the submission was refused");
+        assert_eq!(error.code, SUBMIT_BLOCK_ERROR);
+        assert!(error.message.contains("the chain moved on"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn malformed_parameters_are_rejected_before_the_miner_is_reached() {
+        let (state, _tmp, miner) = state_with(FakeMiner::default());
+
+        for params in [json!([]), json!(["not hex"]), json!([42])] {
+            let resp =
+                dispatch_for_test(&state, make_request("mnr_submitBitcoinBlock", params.clone()))
+                    .await;
+            assert_eq!(
+                resp.error.expect("bad params must be refused").code,
+                INVALID_PARAMS,
+                "{params}"
+            );
+        }
+        assert!(miner.last_call.lock().unwrap().is_none());
+    }
+
+    /// Without a miner the namespace must look absent rather than refused: a
+    /// node that is not mining should be indistinguishable from one built
+    /// without the feature.
+    #[tokio::test]
+    async fn the_namespace_is_absent_when_mining_is_off() {
+        let (state, _tmp) = setup_state();
+
+        for method in [
+            "mnr_getWork",
+            "mnr_submitBitcoinBlock",
+            "mnr_submitBitcoinBlockTransactions",
+            "mnr_submitBitcoinBlockPartialMerkle",
+        ] {
+            let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+            assert_eq!(
+                resp.error.unwrap_or_else(|| panic!("{method} must not answer")).code,
+                METHOD_NOT_FOUND,
+                "{method}"
+            );
+        }
+
+        let resp = dispatch_for_test(&state, make_request("rpc_modules", json!([]))).await;
+        assert!(resp.result.unwrap().get("mnr").is_none());
+    }
+
+    #[tokio::test]
+    async fn rpc_modules_advertises_mnr_when_mining_is_on() {
+        let (state, _tmp, _miner) =
+            state_with(FakeMiner { work: Some(sample_work()), ..Default::default() });
+
+        let resp = dispatch_for_test(&state, make_request("rpc_modules", json!([]))).await;
+        assert_eq!(resp.result.unwrap()["mnr"], json!("1.0"));
+    }
 }

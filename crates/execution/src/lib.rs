@@ -3,6 +3,7 @@ pub mod database;
 pub mod env;
 pub mod executor;
 pub mod hardfork;
+pub mod mining;
 pub mod precompiles;
 pub mod processor;
 pub mod raw_storage;
@@ -27,6 +28,7 @@ pub use precompiles::{
     rsk_precompiles, is_rsk_precompile,
     BRIDGE_ADDR, REMASC_ADDR,
 };
+pub use mining::{BlockTemplate, BlockTemplateBuilder, MinerServer, MinerWork, MiningConfig};
 pub use processor::{BlockProcessor, ProcessError, ProcessedBlock};
 pub use remasc::RemascConfig;
 pub mod supply;

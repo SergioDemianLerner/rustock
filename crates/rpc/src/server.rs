@@ -17,7 +17,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::types::*;
-use crate::{admin, call, eth, logs, net, rsk, state, tx, web3};
+use crate::{admin, call, eth, logs, mnr, net, rsk, state, tx, web3};
 
 /// Trait for submitting raw transactions, allowing the RPC layer to use
 /// the P2P relay without depending on the sync crate directly.
@@ -46,6 +46,9 @@ pub struct RpcState {
     pub tx_pool: Option<Arc<dyn TxPoolReader>>,
     /// Present only when the node runs the epoch trie backend.
     pub epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>>,
+    /// The miner, present only when the node was started with mining enabled.
+    /// Absent, the `mnr_*` namespace answers as it always did.
+    pub miner: Option<Arc<dyn mnr::MiningService>>,
     /// Administrative methods are refused unless the operator enabled them.
     pub admin_enabled: bool,
     /// Burial depth used when an admin collection request names no block.
@@ -150,11 +153,33 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
 
         // -- rpc --
         "rpc_modules" => {
-            JsonRpcResponse::success(
-                id,
-                json!({"eth": "1.0", "net": "1.0", "web3": "1.0", "rpc": "1.0", "rsk": "1.0"}),
-            )
+            let mut modules = serde_json::Map::new();
+            for name in ["eth", "net", "web3", "rpc", "rsk"] {
+                modules.insert(name.to_string(), json!("1.0"));
+            }
+            if state.miner.is_some() {
+                modules.insert("mnr".to_string(), json!("1.0"));
+            }
+            JsonRpcResponse::success(id, Value::Object(modules))
         }
+
+        // -- mnr: merged mining --
+        "mnr_getWork" | "mnr_submitBitcoinBlock" | "mnr_submitBitcoinBlockTransactions"
+        | "mnr_submitBitcoinBlockPartialMerkle"
+            if state.miner.is_none() =>
+        {
+            mining_not_enabled(id, &req.method)
+        }
+        "mnr_getWork" => mnr::mnr_get_work(id, state.miner.as_ref().expect("miner present")),
+        "mnr_submitBitcoinBlock" => {
+            mnr::mnr_submit_bitcoin_block(id, params, state.miner.as_ref().expect("miner present"))
+        }
+        "mnr_submitBitcoinBlockTransactions" => mnr::mnr_submit_bitcoin_block_transactions(
+            id, params, state.miner.as_ref().expect("miner present"),
+        ),
+        "mnr_submitBitcoinBlockPartialMerkle" => mnr::mnr_submit_bitcoin_block_partial_merkle(
+            id, params, state.miner.as_ref().expect("miner present"),
+        ),
 
         // -- rsk --
         "rsk_protocolVersion" => rsk::rsk_protocol_version(id),
@@ -225,7 +250,6 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
             || m.starts_with("personal_")
             || m.starts_with("evm_")
             || m.starts_with("txpool_")
-            || m.starts_with("mnr_")
             || m.starts_with("db_")
             || m.starts_with("sco_") => {
             execution_not_available(id, m)
@@ -233,6 +257,16 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
 
         _ => JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found"),
     }
+}
+
+/// Reported as a missing method rather than a refusal: a node built without a
+/// miner should look the same to a pool as one that never had the namespace.
+fn mining_not_enabled(id: Value, method: &str) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        METHOD_NOT_FOUND,
+        format!("Method {} requires mining, which is not enabled on this node", method),
+    )
 }
 
 fn execution_not_available(id: Value, method: &str) -> JsonRpcResponse {

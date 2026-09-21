@@ -67,27 +67,41 @@ fn java_signed_bytes(value: &U256) -> Vec<u8> {
 }
 
 impl Header {
+    /// The sixteen fields every RSK header carries, in wire order, encoded the
+    /// way rskj encodes them.
+    ///
+    /// Both the block hash and the merged-mining hash are taken over a prefix
+    /// of this same sequence, so it exists once: when the two disagreed on how
+    /// to encode a single field, headers this node *built* hashed differently
+    /// from the way every other node would hash them, while headers it
+    /// *decoded* were unaffected (they hash from the original bytes). That is
+    /// invisible until something builds a header -- which is to say, until
+    /// mining.
+    fn encode_base_fields(&self, list: &mut Vec<u8>) {
+        self.parent_hash.encode(list);
+        self.ommers_hash.encode(list);
+        self.beneficiary.encode(list);
+        self.state_root.encode(list);
+        self.transactions_root.encode(list);
+        self.receipts_root.encode(list);
+        self.logs_bloom.encode(list);
+        java_signed_bytes(&self.difficulty).as_slice().encode(list);
+        self.number.encode(list);
+        java_signed_bytes(&self.gas_limit).as_slice().encode(list);
+        self.gas_used.encode(list);
+        self.timestamp.encode(list);
+        self.extra_data.encode(list);
+        self.paid_fees.encode(list);
+        java_signed_bytes(&self.minimum_gas_price).as_slice().encode(list);
+        self.uncle_count.encode(list);
+    }
+
     /// rskj BlockHeader.getEncoded(true, with_merkle_proof_and_coinbase):
     /// list payload of all header fields; the merkle proof and coinbase tx
     /// are excluded from RSKIP92 block hashes but kept on the wire.
     fn encode_payload(&self, with_merkle_proof_and_coinbase: bool) -> Vec<u8> {
         let mut list = Vec::new();
-        self.parent_hash.encode(&mut list);
-        self.ommers_hash.encode(&mut list);
-        self.beneficiary.encode(&mut list);
-        self.state_root.encode(&mut list);
-        self.transactions_root.encode(&mut list);
-        self.receipts_root.encode(&mut list);
-        self.logs_bloom.encode(&mut list);
-        java_signed_bytes(&self.difficulty).as_slice().encode(&mut list);
-        self.number.encode(&mut list);
-        java_signed_bytes(&self.gas_limit).as_slice().encode(&mut list);
-        self.gas_used.encode(&mut list);
-        self.timestamp.encode(&mut list);
-        self.extra_data.encode(&mut list);
-        self.paid_fees.encode(&mut list);
-        java_signed_bytes(&self.minimum_gas_price).as_slice().encode(&mut list);
-        self.uncle_count.encode(&mut list);
+        self.encode_base_fields(&mut list);
 
         if let Some(umm) = &self.umm_root {
             umm.encode(&mut list);
@@ -367,42 +381,21 @@ impl Header {
             return h;
         }
 
-        let has_umm_root = self.umm_root.is_some();
         let is_umm_block = self.umm_root.as_ref().is_some_and(|u| !u.is_empty());
 
-        let mut list_fields: Vec<Vec<u8>> = vec![
-            alloy_rlp::encode(self.parent_hash),
-            alloy_rlp::encode(self.ommers_hash),
-            alloy_rlp::encode(self.beneficiary),
-            alloy_rlp::encode(self.state_root),
-            alloy_rlp::encode(self.transactions_root),
-            alloy_rlp::encode(self.receipts_root),
-            alloy_rlp::encode(self.logs_bloom),
-            alloy_rlp::encode(self.difficulty),
-            alloy_rlp::encode(self.number),
-            alloy_rlp::encode(self.gas_limit),
-            alloy_rlp::encode(self.gas_used),
-            alloy_rlp::encode(self.timestamp),
-            alloy_rlp::encode(self.extra_data.as_ref()),
-            alloy_rlp::encode(self.paid_fees),
-            alloy_rlp::encode(self.minimum_gas_price),
-            alloy_rlp::encode(self.uncle_count),
-        ];
-
-        if has_umm_root {
-            list_fields.push(alloy_rlp::encode(self.umm_root.as_ref().unwrap().as_ref()));
+        // The same encoder the block hash uses. Encoding difficulty, gas limit
+        // and minimum gas price any other way produces a hash no other node
+        // agrees with -- and since only a header this node built ever reaches
+        // this path, nothing that merely replays the chain would notice.
+        let mut payload = Vec::new();
+        self.encode_base_fields(&mut payload);
+        if let Some(umm) = &self.umm_root {
+            umm.encode(&mut payload);
         }
 
         let mut out = Vec::new();
-        let payload_len = list_fields.iter().map(|f| f.len()).sum::<usize>();
-        let rlp_header = alloy_rlp::Header {
-            list: true,
-            payload_length: payload_len,
-        };
-        rlp_header.encode(&mut out);
-        for field in list_fields {
-            out.extend_from_slice(&field);
-        }
+        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut out);
+        out.extend_from_slice(&payload);
 
         let base_hash = alloy_primitives::keccak256(&out);
 
@@ -533,6 +526,77 @@ mod tests {
             keccak256(&bytes),
             b256!("241f1473b749f420fc1dc1d9d398e478fba883c8b2b615ca4591cd3b2b352a8d")
         );
+    }
+
+    /// RSK mainnet block #9,257,552, fetched from public-node.rsk.co.
+    ///
+    /// The strongest single check on header encoding there is, because every
+    /// field is real and three independent things have to agree: the block
+    /// hash, the merged-mining hash (whose first 20 bytes the miner committed
+    /// to in the coinbase, so mainnet's own hash rate attests to it), and the
+    /// presence of `ummRoot`.
+    ///
+    /// `ummRoot` is the trap. From papyrus200 rskj writes it as the *empty*
+    /// byte array -- never non-empty, since the UMM contracts were never
+    /// deployed -- and nothing in the JSON-RPC representation of a block shows
+    /// that the field is there at all. Omitting it changes both hashes, so a
+    /// miner that left it out would produce blocks no peer accepts.
+    #[test]
+    fn mainnet_block_9257552_hashes_and_merged_mining_commitment() {
+        let header = Header {
+            parent_hash: b256!("8b46403b2df22f81f450bd631db76cb47fe104ed48ab9b94a441f64be823c292"),
+            ommers_hash: b256!("e4d62e0f38c8a425952f64f56c6897c8fd4d9fdd09faeaddb904ec3a8362ae3b"),
+            beneficiary: address!("4e5dabc28e4a0f5e5b19fcb56b28c5a1989352c1"),
+            state_root: b256!("1f0d9418721c8a28c019e21a8af2af203ba43f68bfb8fa3b884642a55b5eedaf"),
+            transactions_root: b256!("2af4a2f53589d9f78b09adfefe9dd8e34f22143743dd0d3b584af8f6ac4d21ad"),
+            receipts_root: b256!("fa059fb22aad8c60ca36bc9d9820ae3c4310dc3d9363bcd2b2624eccb88ed1a6"),
+            logs_bloom: Bloom::from_slice(&hex::decode("00000000000000000000301800100020000100000010000000000200000000100000000000010000000000000000000000000000000000000000800000000000000000000004000000000000400040000000000000000000200200000000000000000000000000000040000000000100000000020000000000000000000000000000400000000001000000000004000000000000000000000000000020000000000000000200000000000000000000000080400000000180000000000000000000000000000800000000040000008000000000000000000000000000000000000000000000000000002000000000000000000400000000000000200000000000").unwrap()),
+            extension_data: None,
+            difficulty: U256::from(0x175cf1ea6738d50d56au128),
+            number: 9_257_552,
+            gas_limit: U256::from(0x989680),
+            gas_used: 0x22f96,
+            timestamp: 0x6ab06c78,
+            extra_data: Bytes::from(hex::decode("d30191564554495645522d643430323166636532").unwrap()),
+            paid_fees: U256::from(0x3656c63bb76u64),
+            minimum_gas_price: U256::from(0x1699280),
+            uncle_count: 2,
+            // Present and empty: papyrus200 activated at #2,392,700.
+            umm_root: Some(Bytes::new()),
+            bitcoin_merged_mining_header: Some(Bytes::from(hex::decode("00e0f327307a19d17c1e20f51c1190b40d9fc53e7f056272a91d02000000000000000000cd81b87bdc182ac40f11daa46886c0b93b7e6497ca0e541ab5775f9c8fdd3d98936cb06ac51e02172a5c3c6e").unwrap())),
+            bitcoin_merged_mining_merkle_proof: Some(Bytes::from(hex::decode("c91bd5fe20d82da439eba4770fb50b6792cc06f083eb88b6795f0c89fc8ca427df7cc40dc64602e3fb3cf5c267664be19d148552f01cc28b6d3907d472008d15ba45ca54695cb6cbceac33003f9582450081de9ac6de608f0d49a78f2cae66c5c65cc0e8ac0674edfad8b00027c9d26b64ebe2476b5e91a95800b6786d91df004aa35390a8e996bf2cf9cc57555a12fcb76abcc376b20ebb5a441b1f94839653472ac163740f33c5e88a33003c73726de57da577d9e57d305937269421c1b0be94af8aa6a13a431fb5425ad871e9675edff825e8b49dc016ab6903bf63d376386dbb6c55d84d449f6147763855259dc20a09f72adfb25195c692bd8da719d1d8e9b227b874cbec4f58fb88dc6b21d810e995b4531346f37b0a3a7e54b3327d79450fa01b5a3420bd772f4f0605c829facdb88bc9f2945aa897aef9e6585c80fa62d683e84d1b8bd228f8c985a8269e312e7d0b135cf5aeb50132e1f2592a112db15c3e521d92fb7184af28a0adc8008fa3eb839d1b6d9e5d5c802160ffa7522649c18aa20502e09c50804448465889141227a0a82c85a0ce6876163ae60cc3ac").unwrap())),
+            bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from(hex::decode("000000000000014013a11ba36836286d0115b1c5c58a42ad692d3aeeaedae25686175928146d440f8931d770ea29b3d5f1dd2eabaf3724518831d656f447230000000000000000002b6a2952534b424c4f434b3afe829f5c494b038c03268d18d0e338bb162f06b69ebc2a5e8f871a1d008d425000000000").unwrap())),
+            cached_hash: None,
+            cached_hash_for_merged_mining: None,
+        };
+
+        assert_eq!(
+            header.hash(),
+            b256!("0e7f9744b001ec59e68f0d60e8bde08ae6e9b9b57113e9a372b2058cc144c9fa"),
+            "block hash"
+        );
+
+        // What the miner actually committed to, read back out of the coinbase
+        // this block carries: `RSKBLOCK:` then 20 bytes of merged-mining hash
+        // and 12 of RSKIP110 fork-detection data.
+        let coinbase = header.bitcoin_merged_mining_coinbase_transaction.clone().unwrap();
+        let tag = b"RSKBLOCK:";
+        let position = coinbase.windows(tag.len()).rposition(|w| w == tag).unwrap();
+        let committed = &coinbase[position + tag.len()..position + tag.len() + 32];
+
+        assert_eq!(
+            &header.hash_for_merged_mining()[..20],
+            &committed[..20],
+            "merged-mining hash prefix"
+        );
+        // The remaining 12 bytes are not hash at all: seven bytes of
+        // commit-to-parents vector, one uncle count, then the height.
+        assert_eq!(&committed[28..32], &9_257_552u32.to_be_bytes(), "height in fork-detection data");
+
+        // Omitting ummRoot is the mistake worth failing loudly on.
+        let without_umm = Header { umm_root: None, ..header.clone() };
+        assert_ne!(without_umm.hash(), header.hash());
+        assert_ne!(without_umm.hash_for_merged_mining(), header.hash_for_merged_mining());
     }
 
     #[test]

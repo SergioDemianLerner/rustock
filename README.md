@@ -195,7 +195,7 @@ crates/
 
 Rustock executes blocks and maintains full state, but it is not yet feature-complete relative to rskj. Notable gaps:
 
-- **No mining or block production.** Rustock validates and replays blocks produced by other nodes; it does not propose blocks, perform merged mining, or expose the mining JSON-RPC namespace.
+- **Mining is single-node only.** Rustock builds blocks, serves the `mnr_*` merged-mining namespace and imports solutions (`--mine`, see [docs/merged-mining.md](docs/merged-mining.md)), but it selects no uncles and has no outbound block announcement, so a mined block reaches peers only when they ask for it.
 - **No archive mode.** The trie store keeps every node it writes (so historical state is queryable as long as the underlying nodes have not been pruned), but there is no explicit archive-vs-pruning policy and no snap/state-sync support — initial sync executes every block from genesis.
 - **Local-only Bridge methods are partial.** The 32 transaction-callable Bridge methods are implemented for consensus; many of the 37 local-only getters used by `eth_call` against the Bridge precompile are still being filled in.
 - **No tracing or debug RPCs.** `debug_*` and `trace_*` are not implemented.
