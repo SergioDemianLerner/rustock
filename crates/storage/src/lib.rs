@@ -35,8 +35,29 @@ const CF_TRIE_NODES: &str = "trie_nodes";
 /// what answering "when did peg-ins happen" needs. Without it the only way to
 /// find one is to walk every receipt in the chain.
 const CF_BRIDGE_EVENTS: &str = "bridge_events";
+/// Every block hash at a height, canonical or not.
+///
+/// Key: `number (8 BE) || hash (32)`, value empty. `block_numbers` answers
+/// "which block is canonical at height N"; this answers "which blocks exist at
+/// height N", which is a different question and the one uncle selection asks --
+/// a miner needs the siblings that lost, and those are exactly the ones the
+/// canonical pointer does not name.
+///
+/// Composite key rather than `number -> [hashes]` so that adding a hash is a
+/// blind put: no read-modify-write, no lost update when two writers race, and
+/// re-indexing the same block is idempotent.
+const CF_HEIGHT_INDEX: &str = "block_hashes_by_number";
 const KEY_HEAD: &[u8] = b"head";
 const KEY_EXEC_HEAD: &[u8] = b"exec_head";
+
+/// `number (8 BE) || hash (32)`: sorts by height, then groups every block at
+/// that height together, so "all blocks at N" is a prefix scan.
+fn height_index_key(number: u64, hash: B256) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[..8].copy_from_slice(&number.to_be_bytes());
+    key[8..].copy_from_slice(hash.as_slice());
+    key
+}
 
 /// Safety limit: refuse to reorg deeper than this many blocks.
 const MAX_REORG_DEPTH: u64 = 1000;
@@ -185,8 +206,19 @@ impl BlockStore {
             "trie_nodes",
         ];
         // `false`: do not fail when the writer's WAL files are present.
-        let db = DB::open_cf_for_read_only(&opts, path, cfs, false)
-            .context("Failed to open RocksDB read-only")?;
+        //
+        // A read-only open must name every column family it wants and fails if
+        // one is absent, so a database written before the height index existed
+        // would stop opening read-only the moment this build shipped. Try with
+        // it, fall back without: the reader then simply has no height index,
+        // which is what an un-upgraded database has anyway.
+        let mut with_index = cfs.clone();
+        with_index.push(CF_HEIGHT_INDEX);
+        let db = match DB::open_cf_for_read_only(&opts, path.as_ref(), with_index, false) {
+            Ok(db) => db,
+            Err(_) => DB::open_cf_for_read_only(&opts, path, cfs, false)
+                .context("Failed to open RocksDB read-only")?,
+        };
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -220,6 +252,7 @@ impl BlockStore {
             ColumnFamilyDescriptor::new(CF_RECEIPTS, cf_opts()),
             ColumnFamilyDescriptor::new(CF_TX_INDEX, cf_opts()),
             ColumnFamilyDescriptor::new(CF_BRIDGE_EVENTS, cf_opts()),
+            ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, cf_opts()),
             ColumnFamilyDescriptor::new("trie_nodes", cf_opts()),
         ];
 
@@ -284,7 +317,116 @@ impl BlockStore {
     pub fn put_header_with_hash(&self, hash: B256, header: &Header) -> Result<()> {
         let buf = encode_header(header);
         self.db.put_cf(self.cf(CF_HEADERS)?, hash.as_slice(), &buf)
-            .context("Failed to write header")
+            .context("Failed to write header")?;
+        self.index_block_height(header.number, hash)
+    }
+
+    /// Record that `hash` exists at `number`, whether or not it is canonical.
+    ///
+    /// Written wherever a header is, because a block that is an orphan today
+    /// may be the uncle a miner includes tomorrow -- and once the header is
+    /// stored without an index entry, nothing later goes looking for it.
+    pub fn index_block_height(&self, number: u64, hash: B256) -> Result<()> {
+        self.db
+            .put_cf(self.cf(CF_HEIGHT_INDEX)?, height_index_key(number, hash), [])
+            .context("Failed to write height index entry")
+    }
+
+    /// Every block hash stored at `number`, canonical or not.
+    ///
+    /// rskj `BlockStore.getChainBlocksByNumber`. Returns an empty vector on a
+    /// database written before this index existed; see `build_height_index`.
+    pub fn hashes_at_height(&self, number: u64) -> Result<Vec<B256>> {
+        let cf = self.cf(CF_HEIGHT_INDEX)?;
+        let prefix = number.to_be_bytes();
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (key, _) = item.context("Failed to scan height index")?;
+            if key.len() != 40 || key[..8] != prefix {
+                break;
+            }
+            out.push(B256::from_slice(&key[8..]));
+        }
+        Ok(out)
+    }
+
+    /// True when the height index holds nothing at all.
+    ///
+    /// Distinguishes "this database predates the index" from "this height has
+    /// no blocks", which otherwise look identical and would have uncle
+    /// selection quietly return nothing forever.
+    pub fn height_index_is_empty(&self) -> Result<bool> {
+        let cf = self.cf(CF_HEIGHT_INDEX)?;
+        Ok(self
+            .db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .next()
+            .is_none())
+    }
+
+    /// Build the height index from the headers already stored.
+    ///
+    /// For a database synced before the index existed. Every header is read and
+    /// its number decoded, so this is a full scan of the headers column family
+    /// -- minutes on a full node, but it reads headers and writes small keys,
+    /// and it never touches state. Safe to interrupt and re-run: each entry is
+    /// a blind put under a key derived from the header itself, so a partial run
+    /// leaves a partial index and a second run completes it.
+    ///
+    /// `progress` is called every `report_every` headers with the count so far.
+    pub fn build_height_index<F: FnMut(u64)>(
+        &self,
+        report_every: u64,
+        mut progress: F,
+    ) -> Result<u64> {
+        let cf_headers = self.cf(CF_HEADERS)?;
+        let cf_index = self.cf(CF_HEIGHT_INDEX)?;
+
+        let mut indexed = 0u64;
+        let mut batch = WriteBatch::default();
+        let iter = self.db.iterator_cf(cf_headers, rocksdb::IteratorMode::Start);
+
+        for item in iter {
+            let (key, value) = item.context("Failed to scan headers")?;
+            if key.len() != 32 {
+                continue;
+            }
+            let hash = B256::from_slice(&key);
+            // The header is keyed by the hash the node computed for it, which
+            // for genesis and for Java-encoded headers is not the hash of a
+            // re-encoding. Index under the stored key, never a recomputed one.
+            let number = match Header::decode(&mut value.as_ref()) {
+                Ok(h) => h.number,
+                Err(e) => {
+                    warn!(
+                        target: "rustock::storage",
+                        "Skipping undecodable header {hash:?} while building the height index: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            batch.put_cf(cf_index, height_index_key(number, hash), []);
+            indexed += 1;
+
+            if indexed % 10_000 == 0 {
+                self.db
+                    .write(std::mem::take(&mut batch))
+                    .context("Failed to write height index batch")?;
+            }
+            if report_every > 0 && indexed % report_every == 0 {
+                progress(indexed);
+            }
+        }
+
+        self.db
+            .write(batch)
+            .context("Failed to write final height index batch")?;
+        Ok(indexed)
     }
 
     /// Column family handles, for callers that build their own write batches
@@ -443,6 +585,7 @@ impl BlockStore {
 
         let cf_headers = self.cf(CF_HEADERS)?;
         let cf_td = self.cf(CF_TD)?;
+        let cf_index = self.cf(CF_HEIGHT_INDEX)?;
 
         let mut batch = WriteBatch::default();
         let mut best_hash = current_head_hash;
@@ -456,6 +599,9 @@ impl BlockStore {
             batch.put_cf(cf_headers, hash.as_slice(), &header_buf);
 
             batch.put_cf(cf_td, hash.as_slice(), encode_td(td));
+            // Fork headers arrive through here too, and they are precisely the
+            // ones uncle selection is looking for.
+            batch.put_cf(cf_index, height_index_key(header.number, hash), []);
 
             if td > best_td {
                 best_td = td;
@@ -2074,5 +2220,185 @@ mod tests {
         let (found_block, found_idx) = store.tx_location(tx_hash).unwrap().unwrap();
         assert_eq!(found_block, block_b);
         assert_eq!(found_idx, 3);
+    }
+
+    // ── the block-height index ────────────────────────────────────────
+
+    /// The point of the index: `block_numbers` names the one canonical block
+    /// at a height, this names them all. Uncle selection needs the ones that
+    /// lost, which the canonical pointer by definition does not mention.
+    #[test]
+    fn height_index_returns_every_block_at_a_height_not_just_the_canonical_one() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let mut winner = dummy_header(7);
+        winner.extra_data = Bytes::from_static(b"winner");
+        let mut loser = dummy_header(7);
+        loser.extra_data = Bytes::from_static(b"loser");
+        assert_ne!(winner.hash(), loser.hash());
+
+        store.put_header(&winner).unwrap();
+        store.put_header(&loser).unwrap();
+        store.put_canonical_hash(7, winner.hash()).unwrap();
+
+        assert_eq!(store.canonical_hash(7).unwrap(), Some(winner.hash()));
+
+        let mut at_seven = store.hashes_at_height(7).unwrap();
+        at_seven.sort();
+        let mut expected = vec![winner.hash(), loser.hash()];
+        expected.sort();
+        assert_eq!(at_seven, expected, "both blocks at #7 must be findable");
+    }
+
+    #[test]
+    fn height_index_does_not_bleed_between_heights() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        for number in [8u64, 9, 10] {
+            store.put_header(&dummy_header(number)).unwrap();
+        }
+
+        assert_eq!(store.hashes_at_height(9).unwrap().len(), 1);
+        assert_eq!(store.hashes_at_height(9).unwrap()[0], dummy_header(9).hash());
+        assert!(store.hashes_at_height(11).unwrap().is_empty());
+    }
+
+    /// Indexing the same block twice must not duplicate it: the key is derived
+    /// from the block, so a re-run of the backfill overwrites rather than
+    /// appends. This is what makes an interrupted upgrade safe to repeat.
+    #[test]
+    fn height_index_entries_are_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let header = dummy_header(3);
+        store.put_header(&header).unwrap();
+        store.put_header(&header).unwrap();
+        store.index_block_height(3, header.hash()).unwrap();
+
+        assert_eq!(store.hashes_at_height(3).unwrap().len(), 1);
+    }
+
+    /// Fork headers arrive through the batch path during sync, and they are
+    /// exactly the blocks uncle selection is looking for.
+    #[test]
+    fn header_batches_are_indexed_by_height() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let mut a = dummy_header(4);
+        a.extra_data = Bytes::from_static(b"a");
+        let mut b = dummy_header(4);
+        b.extra_data = Bytes::from_static(b"b");
+
+        store
+            .store_headers_batch(&[(&a, U256::from(10)), (&b, U256::from(5))], None, U256::ZERO)
+            .unwrap();
+
+        assert_eq!(store.hashes_at_height(4).unwrap().len(), 2);
+    }
+
+    /// The upgrade path for a database synced before the index existed:
+    /// headers are already there, the index is not, and building it must find
+    /// every one of them.
+    #[test]
+    fn the_index_can_be_built_from_headers_alone() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Write headers the way a pre-index build would have: straight into
+        // the headers column family, with no index entry.
+        let headers: Vec<Header> = (1..=5).map(dummy_header).collect();
+        for header in &headers {
+            let buf = encode_header(header);
+            store
+                .db
+                .put_cf(store.cf(CF_HEADERS).unwrap(), header.hash().as_slice(), &buf)
+                .unwrap();
+        }
+
+        assert!(store.height_index_is_empty().unwrap(), "no index yet");
+        assert!(store.hashes_at_height(3).unwrap().is_empty());
+
+        let indexed = store.build_height_index(0, |_| {}).unwrap();
+        assert_eq!(indexed, 5);
+        assert!(!store.height_index_is_empty().unwrap());
+
+        for header in &headers {
+            assert_eq!(
+                store.hashes_at_height(header.number).unwrap(),
+                vec![header.hash()],
+                "#{} must be indexed",
+                header.number
+            );
+        }
+    }
+
+    /// A read-only open must name every column family it wants and fails if
+    /// one is absent, so a database written before the height index existed
+    /// would have stopped opening read-only the moment this shipped -- taking
+    /// every diagnostic that reads a running node's blocks with it.
+    #[test]
+    fn a_database_without_the_index_still_opens_read_only() {
+        let dir = tempdir().unwrap();
+
+        // A database as it was before the index: the old column families only.
+        {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let legacy = vec![
+                ColumnFamilyDescriptor::new(CF_HEADERS, Options::default()),
+                ColumnFamilyDescriptor::new(CF_NUMBERS, Options::default()),
+                ColumnFamilyDescriptor::new(CF_TD, Options::default()),
+                ColumnFamilyDescriptor::new(CF_BODIES, Options::default()),
+                ColumnFamilyDescriptor::new(CF_RECEIPTS, Options::default()),
+                ColumnFamilyDescriptor::new(CF_TX_INDEX, Options::default()),
+                ColumnFamilyDescriptor::new(CF_BRIDGE_EVENTS, Options::default()),
+                ColumnFamilyDescriptor::new("trie_nodes", Options::default()),
+            ];
+            let db = DB::open_cf_descriptors(&opts, dir.path(), legacy).unwrap();
+            let header = dummy_header(1);
+            db.put_cf(
+                db.cf_handle(CF_HEADERS).unwrap(),
+                header.hash().as_slice(),
+                encode_header(&header),
+            )
+            .unwrap();
+        }
+
+        let store = BlockStore::open_read_only(dir.path())
+            .expect("a database without the height index must still open read-only");
+        assert!(store.header(dummy_header(1).hash()).unwrap().is_some());
+
+        // Opening it read-write adds the column family, and the backfill then
+        // has something to do.
+        drop(store);
+        let store = BlockStore::open(dir.path()).unwrap();
+        assert!(store.height_index_is_empty().unwrap());
+        assert_eq!(store.build_height_index(0, |_| {}).unwrap(), 1);
+        assert_eq!(store.hashes_at_height(1).unwrap(), vec![dummy_header(1).hash()]);
+    }
+
+    /// An interrupted upgrade leaves a partial index; running it again must
+    /// complete it rather than double-count or corrupt what is there.
+    #[test]
+    fn building_the_index_twice_is_safe() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        for number in 1..=4 {
+            store.put_header(&dummy_header(number)).unwrap();
+        }
+
+        let first = store.build_height_index(0, |_| {}).unwrap();
+        let second = store.build_height_index(0, |_| {}).unwrap();
+        assert_eq!(first, second);
+
+        for number in 1..=4 {
+            assert_eq!(store.hashes_at_height(number).unwrap().len(), 1);
+        }
     }
 }

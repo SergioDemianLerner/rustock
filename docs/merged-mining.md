@@ -127,44 +127,76 @@ added by it.
 
 ---
 
-## 5. Deliberate omissions
+## 5. Uncles, and the index they needed
 
-**Uncles.** Templates are built with an empty ommer list. A block with no
-uncles is always valid, so this costs only the extra reward REMASC pays for
-including them -- but calling it a scope decision would be too kind, because
-the node could not select uncles today even if it wanted to.
+An uncle is a block that lost: mined on the same parent as one of the recent
+ancestors, but not the one the chain kept. Including it pays both its miner and
+the includer, and `uncle_count` feeds the difficulty calculation and the uncle
+byte of the fork-detection data -- so a wrong list is a consensus fault, not a
+missed reward.
 
-Uncle candidates are the sibling blocks at recent heights that nobody has
-included yet. rskj finds them in `FamilyUtils.getFamily`, which walks back
-through the ancestors and at each height calls
-`BlockStore.getChainBlocksByNumber(n)` -- *every* block at that height,
-canonical or not -- keeping those whose parent is the right ancestor. Rustock
-has no such index: `CF_NUMBERS` maps a number to the one **canonical** hash
-(`crates/storage/src/lib.rs`), so a fork block the node already holds cannot be
-found by height at all. The blocks themselves are not thrown away --
-`store_headers_batch` stores every header by hash and only moves the canonical
-pointer for the winner -- they are simply unenumerable.
+Selection is ported from rskj `FamilyUtils`: take the ancestors within
+`UNCLE_GENERATION_LIMIT` (7), take every block at those heights whose parent is
+the right ancestor, drop the ancestors themselves and anything an ancestor
+already included, sort by height then hash, and cap at `UNCLE_LIST_LIMIT` (10).
 
-There is a second, quieter problem behind that one: sync downloads the best
-chain through the skeleton, so sibling blocks largely never arrive. rskj learns
-of them from gossip. Even with the index, a freshly synced node would often
-have nothing to select from.
+**Candidates are filtered by parentage, not by height.** A block sitting at a
+covered height is not thereby an uncle: it is one only if it is a *direct child
+of a block on the chain being mined*. This is what keeps an orphaned fork from
+poisoning the list. A fork that diverged at #7 and ran on to #8, #9 and #10
+contributes exactly one uncle -- #8, whose parent #7 is on our chain. #9 hangs
+off #8 and #10 off #9, so neither is family, and including them would produce a
+block every peer rejects (rskj checks the same thing independently in
+`validateUncleParent`). A fork that diverged below the window contributes
+nothing at all, however many of its blocks sit at covered heights.
 
-So uncle support is a storage change -- a `number -> [hashes]` column family,
-written wherever a header is stored, plus a backfill for existing databases --
-followed by a port of `getFamily`/`getUncles`/`getUsedUncles`. It carries
-consensus weight, too: uncles set `uncle_count`, which feeds both the
-difficulty calculation and the uncle byte of the fork-detection data.
+The ancestor walk follows `parent_hash` back from the parent being mined on,
+not the store's canonical pointers. That is deliberate, and matches rskj:
+uncles are then selected relative to the chain actually being extended, which
+stays correct mid-reorg when the canonical pointers and the mining parent
+disagree.
+The sort matters: the index returns hashes in whatever order they sit in the
+column family, and two nodes building the same block have to agree on the
+ommer hash.
 
-**Pre-RSKIP92 merkle proofs.** Only the flat RSKIP92 format is produced. The
-older partial-merkle-tree serialization is not, and the verifier in this node
-does not accept it either (it requires a length that is a multiple of 32), so
-nothing is lost: a miner only ever mines at the tip.
+Anything unresolvable yields no uncles rather than a guess. If an ancestor's
+header says it carried uncles but its body cannot be read, the node cannot tell
+whether a candidate was already used, so it mines without uncles and logs why.
 
-**Announcing mined blocks to peers.** The block is executed, stored and made
-the head, but the node has no outbound `NewBlock`/`NewBlockHashes` path — that
-is a gap in the wire protocol implementation, not in mining. Peers learn of the
-block when they ask.
+### 5.1 The height index, and upgrading an existing database
+
+Candidates are by definition the blocks the canonical pointer does *not* name,
+and `block_numbers` maps a height to the one canonical hash. So they were
+unfindable: stored by hash, never thrown away, and impossible to enumerate.
+
+`block_hashes_by_number` fixes that. The key is `number (8 BE) || hash (32)`
+with an empty value, so every block at a height is a prefix scan, adding one is
+a blind put -- no read-modify-write, no lost update if two writers race, and
+re-indexing a block is idempotent. It is written wherever a header is:
+`put_header_with_hash` and the batch path sync uses, which is where fork
+headers actually arrive.
+
+A database synced before the index existed has none of it, and selection would
+silently find nothing forever -- so the miner checks and says so once, and the
+index can be built without resyncing:
+
+```
+rustock-cli --data-dir <dir> --build-height-index
+```
+
+It reads every stored header, decodes its number and writes one small key per
+block. It does not touch state, blocks or receipts. Interrupting it is safe:
+every entry is derived from the header it indexes, so a partial run resumes
+rather than corrupts, and re-running it over a complete index is a no-op. The
+node must be stopped, because RocksDB allows a single writer.
+
+One thing the upgrade cannot fix: sync downloads the best chain through the
+skeleton, so sibling blocks largely never arrived in the first place. Indexing
+an existing database makes the forks it *does* hold findable, but a node that
+has only ever followed the tip will have few. Uncles accumulate from that point
+on.
+
+## 6. Deliberate omissions
 
 **Not writing speculative state.** Executing a template writes its trie nodes
 through to the store, because that is what `execute_block` does and mining does
@@ -181,7 +213,7 @@ most solutions. Mine on a node that has caught up.
 
 ---
 
-## 6. What the tests do and do not cover
+## 7. What the tests do and do not cover
 
 The round trip is real as far as it goes: a genuine Bitcoin block is built with
 a tagged coinbase, a nonce is actually searched for until the block hash clears
@@ -216,9 +248,11 @@ Not covered, in rough order of how much it matters:
    field and are pinned by tests, but no pool daemon has parsed them.
 3. **No real difficulty**, so nothing exercises a long search or template
    refresh under load.
-4. **No uncles**, by design (§5).
+4. **Uncle selection is tested against a synthetic chain only.** The tests
+   build forks directly in the store; no test mines on a chain whose forks
+   arrived over the wire, because sync does not deliver them (§5.1).
 
-## 7. Where the code is
+## 8. Where the code is
 
 | Path | What |
 |---|---|
@@ -226,6 +260,7 @@ Not covered, in rough order of how much it matters:
 | `crates/execution/src/mining/template.rs` | block template builder, transaction selection, the REMASC transaction |
 | `crates/execution/src/mining/server.rs` | work cache, the three submit paths, import |
 | `crates/execution/src/mining/fork_detection.rs` | RSKIP110 fork-detection data |
+| `crates/execution/src/mining/uncles.rs` | uncle selection (rskj `FamilyUtils`) |
 | `crates/execution/src/mining/merkle.rs` | RSKIP92 merkle proofs |
 | `crates/execution/src/mining/coinbase.rs` | building the Bitcoin side, for regtest and tests |
 | `crates/rpc/src/mnr.rs` | the four JSON-RPC methods |
