@@ -942,3 +942,190 @@ fn a_solution_is_imported_with_umm_root_present() {
         .validate(&stored.header)
         .expect("a header carrying ummRoot must still verify");
 }
+
+// ── uncle selection ───────────────────────────────────────────────────
+
+mod uncle_tests {
+    use super::*;
+    use crate::mining::uncles::{UNCLE_LIST_LIMIT, select_uncles};
+
+    /// Build a chain of `height` canonical blocks and return the store.
+    fn chain(height: u64) -> (Arc<BlockStore>, Vec<Header>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let mut headers = Vec::new();
+        let mut parent_hash = B256::ZERO;
+        for number in 0..=height {
+            let header = header_at(number, parent_hash, B256::ZERO);
+            let hash = header.hash();
+            store.put_header_with_hash(hash, &header).unwrap();
+            store.put_body(hash, &[], &[]).unwrap();
+            store.put_canonical_hash(number, hash).unwrap();
+            parent_hash = hash;
+            headers.push(header);
+        }
+        (store, headers, dir)
+    }
+
+    /// A block that lost at `number`, sharing the canonical parent. `tag`
+    /// makes it differ from the winner.
+    fn sibling_of(parent: &Header, number: u64, tag: u8) -> Header {
+        let mut header = header_at(number, parent.hash(), B256::ZERO);
+        header.beneficiary = Address::repeat_byte(tag);
+        header
+    }
+
+    fn store_orphan(store: &BlockStore, header: &Header) -> B256 {
+        let hash = header.hash();
+        store.put_header_with_hash(hash, header).unwrap();
+        store.put_body(hash, &[], &[]).unwrap();
+        hash
+    }
+
+    /// The whole point: a block that lost is not named by the canonical
+    /// pointer, and before the height index there was no way to find it.
+    #[test]
+    fn a_losing_sibling_is_selected_as_an_uncle() {
+        let (store, headers, _dir) = chain(10);
+        let orphan = sibling_of(&headers[9], 10, 0xAA);
+        let orphan_hash = store_orphan(&store, &orphan);
+
+        // It is not canonical...
+        assert_ne!(store.canonical_hash(10).unwrap(), Some(orphan_hash));
+        // ...but it is findable by height, which is what makes this possible.
+        assert_eq!(store.hashes_at_height(10).unwrap().len(), 2);
+
+        let uncles = select_uncles(&store, 11, headers[10].hash());
+        assert_eq!(uncles.len(), 1, "the losing sibling must be offered");
+        assert_eq!(uncles[0].hash(), orphan_hash);
+    }
+
+    /// Ancestors are not uncles of their own descendant, however findable
+    /// they are.
+    #[test]
+    fn ancestors_are_never_selected() {
+        let (store, headers, _dir) = chain(10);
+        let uncles = select_uncles(&store, 11, headers[10].hash());
+        assert!(uncles.is_empty(), "a chain with no forks has no uncles");
+    }
+
+    /// A block older than the generation limit cannot be included: the
+    /// validator rejects `uncle.number - 1 < blockNumber - 7`.
+    #[test]
+    fn uncles_older_than_the_generation_limit_are_not_selected() {
+        let (store, headers, _dir) = chain(20);
+
+        // Mining #21. The oldest includable uncle is #15 (21 - 7 + 1).
+        let just_inside = sibling_of(&headers[14], 15, 0xAA);
+        let too_old = sibling_of(&headers[13], 14, 0xBB);
+        let inside_hash = store_orphan(&store, &just_inside);
+        store_orphan(&store, &too_old);
+
+        let uncles = select_uncles(&store, 21, headers[20].hash());
+        let selected: Vec<B256> = uncles.iter().map(|u| u.hash()).collect();
+
+        assert!(selected.contains(&inside_hash), "#15 is inside the window");
+        assert_eq!(selected.len(), 1, "#14 is one generation too old: {selected:?}");
+    }
+
+    /// An uncle an ancestor already included may not be included again.
+    #[test]
+    fn already_used_uncles_are_not_offered_twice() {
+        let (store, headers, _dir) = chain(10);
+        let orphan = sibling_of(&headers[8], 9, 0xAA);
+        let orphan_hash = store_orphan(&store, &orphan);
+
+        // Without anyone having used it, it is a candidate.
+        assert_eq!(select_uncles(&store, 11, headers[10].hash()).len(), 1);
+
+        // Now let #10 have included it: rewrite #10's body with the uncle.
+        store.put_body(headers[10].hash(), &[], &[orphan.clone()]).unwrap();
+
+        let uncles = select_uncles(&store, 11, headers[10].hash());
+        assert!(
+            uncles.iter().all(|u| u.hash() != orphan_hash),
+            "an uncle #10 already used must not be offered again"
+        );
+    }
+
+    /// A block at the right height on a different fork is not family: its
+    /// parent is not one of our ancestors.
+    #[test]
+    fn a_block_from_an_unrelated_fork_is_not_an_uncle() {
+        let (store, headers, _dir) = chain(10);
+
+        let mut stranger = header_at(10, B256::repeat_byte(0xEE), B256::ZERO);
+        stranger.beneficiary = Address::repeat_byte(0xCC);
+        store_orphan(&store, &stranger);
+
+        let uncles = select_uncles(&store, 11, headers[10].hash());
+        assert!(uncles.is_empty(), "a block whose parent is not an ancestor is not family");
+    }
+
+    /// The list is capped: a longer one is rejected outright rather than
+    /// trimmed by the validator.
+    #[test]
+    fn the_uncle_list_is_capped() {
+        let (store, headers, _dir) = chain(10);
+        for tag in 0..(UNCLE_LIST_LIMIT as u8 + 5) {
+            store_orphan(&store, &sibling_of(&headers[9], 10, tag));
+        }
+
+        let uncles = select_uncles(&store, 11, headers[10].hash());
+        assert_eq!(uncles.len(), UNCLE_LIST_LIMIT);
+    }
+
+    /// Two nodes building the same block must choose the same uncles in the
+    /// same order, or they compute different ommer hashes for what should be
+    /// the same block. The index returns hashes in column-family order, which
+    /// is not an ordering anyone should rely on.
+    #[test]
+    fn selection_is_deterministic() {
+        let (store, headers, _dir) = chain(10);
+        for tag in 0..5u8 {
+            store_orphan(&store, &sibling_of(&headers[9], 10, tag));
+        }
+
+        let first: Vec<B256> = select_uncles(&store, 11, headers[10].hash())
+            .iter()
+            .map(|u| u.hash())
+            .collect();
+        for _ in 0..5 {
+            let again: Vec<B256> = select_uncles(&store, 11, headers[10].hash())
+                .iter()
+                .map(|u| u.hash())
+                .collect();
+            assert_eq!(first, again);
+        }
+        // Sorted by height then hash, so the order is a property of the set
+        // rather than of how it was stored.
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted);
+    }
+
+    /// A database without the index must yield nothing rather than fail --
+    /// and the miner warns, so an operator is not left wondering why their
+    /// blocks never carry uncles.
+    #[test]
+    fn selection_finds_nothing_without_the_index() {
+        let (store, headers, _dir) = chain(10);
+        let orphan = sibling_of(&headers[9], 10, 0xAA);
+        // Store the header the way a pre-index build did: no index entry.
+        let mut buf = Vec::new();
+        alloy_rlp::Encodable::encode(&orphan, &mut buf);
+        store
+            .db()
+            .put_cf(store.cf_headers().unwrap(), orphan.hash().as_slice(), &buf)
+            .unwrap();
+
+        assert!(
+            select_uncles(&store, 11, headers[10].hash()).is_empty(),
+            "an unindexed orphan cannot be found by height"
+        );
+
+        // After the upgrade it can.
+        store.build_height_index(0, |_| {}).unwrap();
+        assert_eq!(select_uncles(&store, 11, headers[10].hash()).len(), 1);
+    }
+}

@@ -128,6 +128,21 @@ struct Args {
     #[arg(long, default_value_t = false)]
     build_bridge_index: bool,
 
+    /// Add the block-height index to an existing database and exit.
+    ///
+    /// Maps every height to every block hash at it, canonical or not. Uncle
+    /// selection needs the blocks that lost, and the canonical pointer names
+    /// only the one that won, so a database synced before this index existed
+    /// cannot mine with uncles until it is built.
+    ///
+    /// Reads every stored header and writes one small key per block. It does
+    /// not touch state, blocks or receipts, and it can be interrupted and
+    /// re-run: each entry is derived from the header it indexes, so a partial
+    /// run simply resumes. The node must be stopped -- RocksDB allows a single
+    /// writer.
+    #[arg(long, default_value_t = false)]
+    build_height_index: bool,
+
     /// Import rskj's receipts from an extracted snapshot directory and exit.
     ///
     /// rustock only writes receipts for blocks it EXECUTES, so a node that
@@ -560,6 +575,13 @@ async fn main() -> Result<()> {
         let store = Arc::new(BlockStore::open(&args.data_dir)?);
         rustock_storage::rskj_import::install_signal_handlers();
         run_build_bridge_index(&store, args.receipts_from, args.receipts_to)?;
+        return Ok(());
+    }
+
+    if args.build_height_index {
+        let store = Arc::new(BlockStore::open(&args.data_dir)?);
+        rustock_storage::rskj_import::install_signal_handlers();
+        run_build_height_index(&store)?;
         return Ok(());
     }
 
@@ -1715,6 +1737,32 @@ fn run_import_receipts(
              those blocks were left without receipts rather than written partially"
         );
     }
+    Ok(())
+}
+
+/// Build the block-height index over an existing database.
+fn run_build_height_index(store: &Arc<BlockStore>) -> anyhow::Result<()> {
+    let already = !store.height_index_is_empty()?;
+    if already {
+        info!(
+            "A height index is already present; re-running to cover anything added since. \
+             This is safe: entries are derived from the headers they index."
+        );
+    }
+
+    let started = std::time::Instant::now();
+    info!("Building the block-height index. This reads every stored header.");
+
+    let indexed = store.build_height_index(250_000, |count| {
+        info!("  indexed {count} blocks");
+    })?;
+
+    let elapsed = started.elapsed();
+    info!(
+        "Height index built: {indexed} blocks in {:.1}s. Uncle selection can now find \
+         the blocks that lost at each height.",
+        elapsed.as_secs_f64()
+    );
     Ok(())
 }
 

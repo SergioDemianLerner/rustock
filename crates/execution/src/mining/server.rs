@@ -107,6 +107,8 @@ pub trait ChainAccess: Send + Sync {
     fn mainchain(&self, limit: usize) -> Result<Vec<Header>, String>;
     /// Hash of the block whose state the trie store currently holds.
     fn executed_head(&self) -> Result<Option<B256>, String>;
+    /// Uncles to include in a block mined on `parent_hash`.
+    fn select_uncles(&self, block_number: u64, parent_hash: B256) -> Result<Vec<Header>, String>;
     /// Store a fully executed block and make it the head if it wins.
     fn commit_mined_block(&self, block: &Block, state_root: B256) -> Result<ImportResult, String>;
 }
@@ -156,6 +158,22 @@ impl ChainAccess for StoreChainAccess {
             Some((hash, _)) => Ok(Some(hash)),
             None => self.store.head().map_err(|e| e.to_string()),
         }
+    }
+
+    fn select_uncles(&self, block_number: u64, parent_hash: B256) -> Result<Vec<Header>, String> {
+        // An un-upgraded database has no height index, so the family of a
+        // block cannot be enumerated and selection would silently return
+        // nothing forever. Say so once rather than quietly mine uncleless
+        // blocks and leave the operator wondering why.
+        if self.store.height_index_is_empty().map_err(|e| e.to_string())? {
+            warn!(
+                target: "rustock::mining",
+                "No block-height index in this database, so no uncle can be found. \
+                 Run the node once with --build-height-index to add it."
+            );
+            return Ok(Vec::new());
+        }
+        Ok(crate::mining::uncles::select_uncles(&self.store, block_number, parent_hash))
     }
 
     fn commit_mined_block(&self, block: &Block, state_root: B256) -> Result<ImportResult, String> {
@@ -262,10 +280,21 @@ impl MinerServer {
             .mainchain(crate::mining::fork_detection::REQUIRED_MAINCHAIN_BLOCKS)
             .map_err(SubmitError::Storage)?;
 
-        // Uncles are left out: a block with none is valid, and selecting them
-        // wrongly is a consensus fault rather than lost reward. See
-        // docs/merged-mining.md.
-        let template = self.builder.build(&mainchain, Vec::new(), self.pending.as_ref())?;
+        let parent = &mainchain[0];
+        let uncles = self
+            .chain
+            .select_uncles(parent.number + 1, parent.hash())
+            .map_err(SubmitError::Storage)?;
+        if !uncles.is_empty() {
+            info!(
+                target: "rustock::mining",
+                "Including {} uncle(s) in the block being mined at #{}",
+                uncles.len(),
+                parent.number + 1
+            );
+        }
+
+        let template = self.builder.build(&mainchain, uncles, self.pending.as_ref())?;
 
         let mut state = self.state.lock().expect("miner state lock");
         let parent_hash = template.parent_hash();
