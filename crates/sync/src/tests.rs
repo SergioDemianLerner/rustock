@@ -2030,6 +2030,73 @@ async fn test_reconcile_recovers_when_the_fork_has_no_canonical_pointer() {
 }
 
 #[tokio::test]
+async fn test_reconcile_when_the_forks_parent_was_never_downloaded() {
+    // The mainnet stall of 2026-09-21, which is NOT the shape of the test
+    // above. There the winning sibling was in our store. Here the network's
+    // block at our own height was never downloaded: we hold only its child.
+    //
+    //   #1  b1              common
+    //   #2  a2 canonical, executed      x2 (the network's) NOT IN STORE
+    //   #3  c3 stored, parent = x2      -- so the lineage walk cannot reach
+    //                                      the fork point
+    //
+    // Adopting c3's lineage sets a pointer at #3 whose parent is not the
+    // canonical #2, which is an inconsistent chain. What must happen instead
+    // is that execution retreats to a block the network can extend.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.update_head(&b1, U256::from(2)).unwrap();
+
+    let mut a2 = dummy_header(2, b1_hash, U256::from(1));
+    a2.extra_data = vec![0xAA].into();
+    let a2_hash = a2.hash();
+    store.update_head(&a2, U256::from(3)).unwrap();
+
+    // x2 is the network's #2. Deliberately NOT stored -- only its hash exists,
+    // as the parent field of a child we did download.
+    let mut x2 = dummy_header(2, b1_hash, U256::from(9));
+    x2.extra_data = vec![0xCC].into();
+    let x2_hash = x2.hash();
+
+    let c3 = dummy_header(3, x2_hash, U256::from(9));
+    store.put_header(&c3).unwrap();
+
+    assert!(store.header(x2_hash).unwrap().is_none(), "the fork's #2 is absent");
+    assert_eq!(store.canonical_hash(3).unwrap(), None);
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(b1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    store.set_exec_head(a2_hash, a2.state_root).unwrap();
+
+    // Drive several rounds, as the live node would.
+    for _ in 0..4 {
+        service.reconcile_exec_head_with_canonical().await;
+    }
+
+    let (head, _) = store.exec_head().unwrap().unwrap();
+    assert_eq!(head, b1_hash,
+        "execution must retreat to b1, the last block the network's chain also \
+         builds on, so sync can re-request #2 and receive x2; got {head:?}");
+}
+
+#[tokio::test]
 async fn test_reconcile_leaves_a_genuine_tip_alone() {
     // The same code path must not fire at the tip. Nothing is stored above our
     // head, so there is no evidence of a fork and nothing to reconcile --
