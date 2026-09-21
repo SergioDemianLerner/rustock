@@ -130,9 +130,31 @@ added by it.
 ## 5. Deliberate omissions
 
 **Uncles.** Templates are built with an empty ommer list. A block with no
-uncles is always valid; selecting them wrongly is a consensus fault, while
-omitting them only forgoes the extra reward REMASC pays for including them. A
-production miner wants them, and `remasc.rs` has the sibling logic to read.
+uncles is always valid, so this costs only the extra reward REMASC pays for
+including them -- but calling it a scope decision would be too kind, because
+the node could not select uncles today even if it wanted to.
+
+Uncle candidates are the sibling blocks at recent heights that nobody has
+included yet. rskj finds them in `FamilyUtils.getFamily`, which walks back
+through the ancestors and at each height calls
+`BlockStore.getChainBlocksByNumber(n)` -- *every* block at that height,
+canonical or not -- keeping those whose parent is the right ancestor. Rustock
+has no such index: `CF_NUMBERS` maps a number to the one **canonical** hash
+(`crates/storage/src/lib.rs`), so a fork block the node already holds cannot be
+found by height at all. The blocks themselves are not thrown away --
+`store_headers_batch` stores every header by hash and only moves the canonical
+pointer for the winner -- they are simply unenumerable.
+
+There is a second, quieter problem behind that one: sync downloads the best
+chain through the skeleton, so sibling blocks largely never arrive. rskj learns
+of them from gossip. Even with the index, a freshly synced node would often
+have nothing to select from.
+
+So uncle support is a storage change -- a `number -> [hashes]` column family,
+written wherever a header is stored, plus a backfill for existing databases --
+followed by a port of `getFamily`/`getUncles`/`getUsedUncles`. It carries
+consensus weight, too: uncles set `uncle_count`, which feeds both the
+difficulty calculation and the uncle byte of the fork-detection data.
 
 **Pre-RSKIP92 merkle proofs.** Only the flat RSKIP92 format is produced. The
 older partial-merkle-tree serialization is not, and the verifier in this node
