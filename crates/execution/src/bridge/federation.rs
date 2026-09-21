@@ -366,6 +366,54 @@ mod tests {
         assert_eq!(fed.get_public_key(0, FederationKeyType::MST).unwrap(), &mst);
         assert!(fed.get_public_key(1, FederationKeyType::BTC).is_none());
     }
+
+    /// rskj `FederationMember.getRskPublicKey` -> `new RskAddress(key)`: the
+    /// RSK address of a federator is keccak256 of the UNCOMPRESSED public key
+    /// with the 0x04 prefix dropped, last 20 bytes. One ground-truth test
+    /// exists (mainnet #6,223,704); these pin the properties around it.
+    ///
+    /// This address is the authorisation check for addSignature -- it decides
+    /// whose signature the Bridge accepts on a peg-out. A key that fails to
+    /// parse must yield None rather than a zero or truncated address, because
+    /// an address derived from garbage is still an address, and would belong
+    /// to nobody.
+    #[test]
+    fn rsk_address_from_public_key_rejects_anything_that_is_not_a_key() {
+        assert!(rsk_address_from_public_key(&[]).is_none(), "empty");
+        assert!(rsk_address_from_public_key(&[0x02]).is_none(), "prefix only");
+        let mut not_on_curve = vec![0x02u8];
+        not_on_curve.extend_from_slice(&[0xFFu8; 32]);
+        assert!(
+            rsk_address_from_public_key(&not_on_curve).is_none(),
+            "33 bytes that do not decode to a curve point must be refused"
+        );
+        let mut bad_prefix = vec![0x01u8];
+        bad_prefix.extend_from_slice(&[0x11u8; 64]);
+        assert!(rsk_address_from_public_key(&bad_prefix).is_none(), "bad prefix");
+        let mut short = vec![0x04u8];
+        short.extend_from_slice(&[0x11u8; 32]);
+        assert!(rsk_address_from_public_key(&short).is_none(), "truncated");
+    }
+
+    /// The compressed and uncompressed encodings of one point are the same
+    /// federator and must derive the same address. rskj stores the compressed
+    /// form and derives from the decoded point, so a rustock that hashed the
+    /// encoding it was handed rather than the decoded point would agree on
+    /// compressed keys and diverge on uncompressed ones.
+    #[test]
+    fn rsk_address_is_the_same_for_both_encodings_of_one_key() {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        let compressed: [u8; 33] = [
+            0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62,
+            0x95, 0xCE, 0x87, 0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28,
+            0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98,
+        ];
+        let point = k256::PublicKey::from_sec1_bytes(&compressed).expect("valid key");
+        let uncompressed = point.to_encoded_point(false);
+        let a = rsk_address_from_public_key(&compressed).expect("compressed derives");
+        let b = rsk_address_from_public_key(uncompressed.as_bytes()).expect("uncompressed derives");
+        assert_eq!(a, b, "one key, one federator, one address");
+    }
 }
 
 /// A federation member as stored in bridge state: compressed BTC, RSK and
