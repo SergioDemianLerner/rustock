@@ -890,3 +890,55 @@ fn a_losing_block_is_stored_but_not_made_canonical() {
     );
     assert_eq!(fx.store.head().unwrap(), Some(rival_hash), "the head must not move");
 }
+
+/// The round trip again, but deep enough that REMASC actually pays out.
+///
+/// Everywhere else these tests mine block #21, and REMASC's
+/// `process_miners_fees` returns immediately there: the executor is built with
+/// `RemascConfig::mainnet()`, whose maturity is 4,000, so a chain that short
+/// has no matured block to distribute. That leaves the interesting half of
+/// REMASC -- fetching the matured header, collecting siblings, paying the
+/// miner -- unexercised, while the test still passes and looks like it covers
+/// block production.
+///
+/// Mining above both the maturity window and the synthetic span runs it for
+/// real. Kept separate because seeding four thousand headers costs a second.
+#[test]
+fn a_solution_is_imported_on_a_chain_deep_enough_for_remasc_to_pay() {
+    // maturity 4,000 + synthetic span 10, so the matured block is #11.
+    let fx = fixture(4_010);
+    let work = fx.server.get_work().unwrap();
+
+    let raw = bitcoin::consensus::serialize(&solve(&work));
+    let info = fx
+        .server
+        .submit_bitcoin_block(&raw)
+        .expect("a solution must be accepted on a chain deep enough for REMASC to pay out");
+
+    assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+    assert_eq!(info.block_included_height, 4_011);
+
+    let stored = fx.store.block(info.block_hash).unwrap().unwrap();
+    MergedMiningRule { config: fx.chain_config.clone() }
+        .validate(&stored.header)
+        .expect("the completed header must satisfy the rule this node applies to peers");
+}
+
+/// And the round trip with `ummRoot` present, which is what mainnet actually
+/// carries. Elsewhere these tests keep papyrus200 out of reach so they can
+/// work at low block numbers, which means the field every real header has is
+/// absent from the block they mine.
+#[test]
+fn a_solution_is_imported_with_umm_root_present() {
+    let fx = fixture_with_papyrus_at(0, 20);
+    let work = fx.server.get_work().unwrap();
+
+    let raw = bitcoin::consensus::serialize(&solve(&work));
+    let info = fx.server.submit_bitcoin_block(&raw).expect("solution accepted");
+
+    let stored = fx.store.block(info.block_hash).unwrap().unwrap();
+    assert_eq!(stored.header.umm_root, Some(Bytes::new()));
+    MergedMiningRule { config: fx.chain_config.clone() }
+        .validate(&stored.header)
+        .expect("a header carrying ummRoot must still verify");
+}

@@ -159,7 +159,44 @@ most solutions. Mine on a node that has caught up.
 
 ---
 
-## 6. Where the code is
+## 6. What the tests do and do not cover
+
+The round trip is real as far as it goes: a genuine Bitcoin block is built with
+a tagged coinbase, a nonce is actually searched for until the block hash clears
+RSK's target, the coinbase is really compressed, the proof really built, and
+acceptance is decided by running `MergedMiningRule` -- the same validator that
+runs on blocks arriving from peers. The search is not decorative: before it
+existed the tests used a fixed nonce, cleared the target only by luck, and that
+is how the `get_work` notify bug surfaced.
+
+The difficulty is 2, so the target is `2^255 - 1` and a nonce is found in a few
+tries. Two heights are used deliberately:
+
+- Most tests mine #21, which is fast but **does not exercise REMASC**:
+  `RskExecutor::new` hardcodes `RemascConfig::mainnet()` whatever the chain id,
+  so at that height `process_miners_fees` returns immediately -- there is no
+  matured block 4,000 back. The REMASC *transaction* is still in the block and
+  still moves the transactions root, which is what §5.1 is about, but nothing
+  is distributed.
+- `a_solution_is_imported_on_a_chain_deep_enough_for_remasc_to_pay` seeds 4,010
+  headers and mines #4,011, clearing both the maturity window and the synthetic
+  span, so the matured-header fetch, sibling collection and payout all run.
+
+Not covered, in rough order of how much it matters:
+
+1. **No interop.** Nothing verifies that an rskj node accepts a block this
+   miner produces. The evidence that it would is indirect: the header encoding,
+   fork-detection data and REMASC transaction are pinned against real mainnet
+   block #9,257,552, which says the formats are right but is not interop
+   testing. Running a regtest rskj against this node is the test that would
+   settle it.
+2. **No real mining software.** The `mnr_*` JSON shapes match rskj field for
+   field and are pinned by tests, but no pool daemon has parsed them.
+3. **No real difficulty**, so nothing exercises a long search or template
+   refresh under load.
+4. **No uncles**, by design (§5).
+
+## 7. Where the code is
 
 | Path | What |
 |---|---|
