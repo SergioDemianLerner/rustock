@@ -631,8 +631,71 @@ impl SyncService {
                             header.number + 1, head_number
                         );
                         self.repair_canonical_gap(head_number, header.number);
+                        return;
                     }
                     _ => {}
+                }
+
+                // Neither signal above can describe a fork this node never
+                // adopted. Both read the canonical index, and a branch we did
+                // not follow never got a pointer -- so `canonical_hash(N+1)`
+                // is None *and* the head never rose above N+1, because the head
+                // tracks the canonical chain too. That is not an edge case: it
+                // wedged mainnet for three days at #9,251,058, with the network
+                // 7,000 blocks ahead on a sibling branch whose headers this
+                // node had already downloaded.
+                //
+                // The height index does describe it -- that is what it is for.
+                // If blocks are stored at N+1 and *none* of them builds on our
+                // executed head, then nothing extends us and we are on a branch
+                // the network left behind. Adopting the stored lineage gives
+                // N+1 a canonical pointer, and the ordinary orphan path above
+                // then rolls execution back one block per round until it
+                // reaches the fork point.
+                let stored_next = store.hashes_at_height(header.number + 1).unwrap_or_default();
+                if stored_next.is_empty() {
+                    return; // genuinely at the tip: nothing to reconcile
+                }
+                let extends_us = stored_next.iter().any(|h| {
+                    store
+                        .header(*h)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|c| c.parent_hash == exec_hash)
+                });
+                if extends_us {
+                    return; // a successor builds on us; the index just lacks a pointer
+                }
+                // Prefer a successor that is itself extended: with several
+                // siblings the one carrying descendants is the branch that kept
+                // going. Ties break on the hash so two nodes reach the same
+                // answer. Picking wrong is survivable -- the next round
+                // re-evaluates -- but picking arbitrarily is not reproducible.
+                let mut candidates = stored_next.clone();
+                candidates.sort();
+                let successor = candidates
+                    .iter()
+                    .find(|h| {
+                        store
+                            .header(**h)
+                            .ok()
+                            .flatten()
+                            .and_then(|c| store.hashes_at_height(c.number + 1).ok())
+                            .is_some_and(|next| !next.is_empty())
+                    })
+                    .copied()
+                    .unwrap_or(candidates[0]);
+                warn!(
+                    target: "rustock::sync",
+                    "Executed head #{} ({:?}) has no descendant among the {} block(s) stored \
+                     at #{}; treating it as orphaned and adopting {:?}",
+                    header.number, exec_hash, stored_next.len(), header.number + 1, successor
+                );
+                if let Err(e) = store.ensure_canonical_lineage(successor) {
+                    warn!(
+                        target: "rustock::sync",
+                        "Orphan recovery: canonical lineage repair failed: {:?}", e
+                    );
                 }
                 return;
             }
