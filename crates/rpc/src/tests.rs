@@ -1678,3 +1678,62 @@ async fn test_admin_methods_dispatch_when_enabled() {
         "with admin enabled the method must reach its handler, not the gate"
     );
 }
+
+// --- key custody ------------------------------------------------------------
+//
+// rskj covers the signing surface in Web3ImplTest and the personal module
+// tests, where the node DOES hold keys and unlocking is part of the contract.
+// rustock holds none, and these tests pin that posture rather than the
+// behaviour of a wallet it does not have. The property is worth a test because
+// it is the kind that regresses quietly: someone implements eth_sign for a
+// local tool, and a node that never had custody suddenly has it.
+
+/// No key-holding method may answer. A node with no wallet must refuse to
+/// sign rather than sign with something it happens to have -- the node
+/// identity key, a miner key -- which would be a signature the operator never
+/// authorised.
+#[tokio::test]
+async fn test_the_node_holds_no_keys_and_refuses_to_sign() {
+    let (state, _tmp) = setup_state();
+
+    for (method, params) in [
+        ("eth_sign", json!(["0x0000000000000000000000000000000000000001", "0xdeadbeef"])),
+        ("eth_signTransaction", json!([{"from": "0x0000000000000000000000000000000000000001"}])),
+        ("eth_sendTransaction", json!([{"from": "0x0000000000000000000000000000000000000001"}])),
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, params)).await;
+        assert!(resp.result.is_none(), "{method} must not return a result");
+        assert_eq!(
+            resp.error.expect("an error is expected").code,
+            -32601,
+            "{method} must be refused"
+        );
+    }
+}
+
+/// eth_accounts must be empty, and consistently so: a caller that trusts a
+/// non-empty list would go on to call eth_sign, which cannot work. rskj
+/// returns the wallet's accounts here; rustock has no wallet.
+#[tokio::test]
+async fn test_eth_accounts_is_empty_because_there_is_no_wallet() {
+    let (state, _tmp) = setup_state();
+    let resp = dispatch_for_test(&state, make_request("eth_accounts", json!([]))).await;
+    assert_eq!(
+        resp.result.unwrap(),
+        json!([]),
+        "a node with no wallet must report no accounts"
+    );
+}
+
+/// The Solidity compiler methods are refused rather than answered with an
+/// empty list. rskj removed these upstream; answering "no compilers" would
+/// invite a caller to treat compilation as supported-but-unavailable.
+#[tokio::test]
+async fn test_compiler_methods_are_refused() {
+    let (state, _tmp) = setup_state();
+    for method in ["eth_getCompilers", "eth_compileSolidity"] {
+        let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+        assert!(resp.result.is_none(), "{method} must not answer");
+        assert_eq!(resp.error.unwrap().code, -32601);
+    }
+}
