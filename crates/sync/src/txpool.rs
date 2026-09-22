@@ -132,6 +132,32 @@ pub struct TransactionPool {
     /// before the pool lock is acquired, so a slow quota refresh never holds up
     /// readers of the pool.
     quota: RwLock<crate::quota::QuotaChecker>,
+    /// Rejections since the last summary, per sender.
+    ///
+    /// Not part of the rskj port -- rskj keeps no such counter. It exists
+    /// because a rate limiter that refuses silently is indistinguishable from
+    /// one that is broken, and the rejection itself logs at `debug`, which the
+    /// node does not run at.
+    quota_rejections: RwLock<HashMap<Address, u64>>,
+}
+
+/// What the limiter refused since the last time anyone asked.
+///
+/// `distinct_senders` against `total` is the discriminator that matters: one
+/// sender refused many times is the limiter working; many senders refused once
+/// each is the limiter misfiring on ordinary traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QuotaRejectionSummary {
+    pub total: u64,
+    pub distinct_senders: usize,
+    /// The sender refused most often, and how often.
+    pub worst: Option<(Address, u64)>,
+}
+
+impl QuotaRejectionSummary {
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
 }
 
 impl TransactionPool {
@@ -149,7 +175,28 @@ impl TransactionPool {
             store,
             trie_store,
             quota: RwLock::new(quota),
+            quota_rejections: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Rejections since the previous call, clearing the counters.
+    ///
+    /// Intended for a periodic reporter: the limiter is meant to be invisible,
+    /// so the only way to tell "nothing is being refused" from "the counter is
+    /// broken" is to report it on a schedule and say nothing when it is zero.
+    pub fn take_quota_rejections(&self) -> QuotaRejectionSummary {
+        let mut counts = self.quota_rejections.write().unwrap();
+        if counts.is_empty() {
+            return QuotaRejectionSummary::default();
+        }
+        let total = counts.values().sum();
+        let distinct_senders = counts.len();
+        let worst = counts
+            .iter()
+            .max_by_key(|(_, n)| **n)
+            .map(|(addr, n)| (*addr, *n));
+        counts.clear();
+        QuotaRejectionSummary { total, distinct_senders, worst }
     }
 
     /// rskj `TransactionPoolImpl`'s `TxQuotaCleanerTimer`, which it schedules at
@@ -302,6 +349,7 @@ impl TransactionPool {
                     tx_hash = %hash, sender = %sender, nonce = tx.nonce,
                     "Transaction refused: account exceeds virtual gas quota"
                 );
+                *self.quota_rejections.write().unwrap().entry(sender).or_insert(0) += 1;
                 return Err(PoolError::AccountExceedsQuota);
             }
         }
@@ -975,6 +1023,47 @@ mod tests {
         let dropped = pool.clean_quotas();
         assert_eq!(dropped, 1, "an account at the ceiling carries no information");
         assert!(pool.quota_of(&addr).is_none());
+    }
+
+    /// The rejection counter is what makes a misfiring limiter visible. The
+    /// summary must distinguish one abusive sender from many ordinary ones,
+    /// because that is the difference between "working" and "broken".
+    #[test]
+    fn test_quota_rejections_are_counted_and_reported() {
+        let balance = U256::from(10u64).pow(U256::from(60));
+        let (pool, key, addr) = setup_pool_with_account(balance, 5);
+
+        // Nothing refused yet: the report must be empty, not absent.
+        assert!(pool.take_quota_rejections().is_empty());
+
+        let mut gas_price = U256::from(59_240_000u64);
+        let mut refusals = 0u64;
+        for _ in 0..500 {
+            let mut tx = make_tx(5, 0);
+            tx.gas_price = gas_price;
+            tx.gas_limit = U256::from(6_800_000u64);
+            sign_tx(&mut tx, &key, 33);
+            if matches!(
+                pool.add_transaction(&encode_tx(&tx)),
+                Err(PoolError::AccountExceedsQuota)
+            ) {
+                refusals += 1;
+                if refusals == 3 {
+                    break;
+                }
+                continue;
+            }
+            gas_price = gas_price * U256::from(140) / U256::from(100);
+        }
+        assert_eq!(refusals, 3, "the flood must be refused at some point");
+
+        let summary = pool.take_quota_rejections();
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.distinct_senders, 1, "one abusive sender, not many");
+        assert_eq!(summary.worst, Some((addr, 3)));
+
+        // Taking the summary clears it, so each report covers one window.
+        assert!(pool.take_quota_rejections().is_empty());
     }
 
     // ========== Intrinsic gas ==========

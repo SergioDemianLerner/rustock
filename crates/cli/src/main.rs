@@ -1001,6 +1001,41 @@ async fn main() -> Result<()> {
         trie_store_for_pool.clone(),
     ));
 
+    // A rate limiter that refuses silently is indistinguishable from a broken
+    // one, and the per-transaction rejection logs at `debug`, which this node
+    // does not run at. Report on a schedule instead, and say nothing when there
+    // is nothing to say.
+    if args.account_tx_rate_limit {
+        let pool_for_report = pool.clone();
+        tokio::spawn(async move {
+            const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+            let mut ticker = tokio::time::interval(REPORT_EVERY);
+            ticker.tick().await; // the first tick fires immediately
+            loop {
+                ticker.tick().await;
+                let summary = pool_for_report.take_quota_rejections();
+                if summary.is_empty() {
+                    continue;
+                }
+                // One sender refused many times is the limiter working; many
+                // senders refused once each is the limiter misfiring on
+                // ordinary traffic. Report both so the difference is visible.
+                let worst = summary
+                    .worst
+                    .map(|(a, n)| format!("{a} ({n})"))
+                    .unwrap_or_else(|| "-".to_string());
+                tracing::info!(
+                    target: "rustock::txpool",
+                    "Rate limiter refused {} transaction(s) from {} sender(s) in the last {}m; \
+                     most refused: {worst}",
+                    summary.total,
+                    summary.distinct_senders,
+                    REPORT_EVERY.as_secs() / 60,
+                );
+            }
+        });
+    }
+
     // rskj runs the equivalent sweep on a `TxQuotaCleanerTimer`.
     if let Some(period) = pool.quota_cleaner_period() {
         let pool_for_cleaner = pool.clone();
