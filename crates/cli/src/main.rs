@@ -1,4 +1,6 @@
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
+
+mod config_file;
 use rustock_core::config::ChainConfig;
 use rustock_core::validation::HeaderVerifier;
 use rustock_storage::BlockStore;
@@ -93,6 +95,19 @@ impl rustock_execution::mining::PendingTransactionSource for PoolTxSource {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Read settings from a TOML file.
+    ///
+    /// Anything given on the command line wins over the file, and the file
+    /// wins over the built-in default -- so an operator can override a file
+    /// setting with a flag without editing the file. Unknown keys are an
+    /// error rather than being ignored.
+    ///
+    /// One-shot operations (--import-*, --repair, --trie-tool-*, --probe-*)
+    /// are command-line only: a node that re-ran an import on every start
+    /// would be a trap.
+    #[arg(long, value_name = "PATH")]
+    config: Option<String>,
+
     /// Port to listen for P2P connections
     #[arg(short, long, default_value_t = 30303)]
     port: u16,
@@ -565,9 +580,95 @@ struct Args {
     trie_node: Option<String>,
 }
 
+/// Apply the file underneath the command line, one setting per line so the
+/// mapping from key to flag is readable at a glance.
+///
+/// `apply` is a no-op for anything the operator typed, which is what makes the
+/// precedence `command line > file > default`.
+fn apply_file_config(
+    matches: &clap::ArgMatches,
+    f: &config_file::FileConfig,
+    a: &mut Args,
+) {
+    use config_file::{apply, apply_opt};
+
+    apply(matches, "port", f.node.port.as_ref(), &mut a.port);
+    apply(matches, "data_dir", f.node.data_dir.as_ref(), &mut a.data_dir);
+    apply(matches, "network_id", f.node.network_id.as_ref(), &mut a.network_id);
+    apply_opt(matches, "secret_key", f.node.secret_key.as_ref(), &mut a.secret_key);
+    apply_opt(matches, "external_ip", f.node.external_ip.as_ref(), &mut a.external_ip);
+    apply(matches, "supply_check", f.node.supply_check.as_ref(), &mut a.supply_check);
+    apply(matches, "rskj_multisig_senders", f.node.rskj_multisig_senders.as_ref(),
+        &mut a.rskj_multisig_senders);
+
+    apply(matches, "rpc_host", f.rpc.host.as_ref(), &mut a.rpc_host);
+    apply(matches, "rpc_port", f.rpc.port.as_ref(), &mut a.rpc_port);
+    apply(matches, "rpc_admin", f.rpc.admin.as_ref(), &mut a.rpc_admin);
+    apply(matches, "no_rpc", f.rpc.disabled.as_ref(), &mut a.no_rpc);
+
+    apply(matches, "max_peers", f.peers.max_peers.as_ref(), &mut a.max_peers);
+    apply(matches, "max_inbound_peers", f.peers.max_inbound_peers.as_ref(),
+        &mut a.max_inbound_peers);
+    apply(matches, "max_inbound_per_ip", f.peers.max_inbound_per_ip.as_ref(),
+        &mut a.max_inbound_per_ip);
+    apply(matches, "max_inbound_per_cidr", f.peers.max_inbound_per_cidr.as_ref(),
+        &mut a.max_inbound_per_cidr);
+    apply(matches, "inbound_cidr_prefix", f.peers.inbound_cidr_prefix.as_ref(),
+        &mut a.inbound_cidr_prefix);
+
+    apply(matches, "trie_backend", f.trie.backend.as_ref(), &mut a.trie_backend);
+    apply_opt(matches, "trie_dir", f.trie.dir.as_ref(), &mut a.trie_dir);
+    apply_opt(matches, "trie_node", f.trie.node.as_ref(), &mut a.trie_node);
+
+    apply(matches, "gc_epochs", f.gc.epochs.as_ref(), &mut a.gc_epochs);
+    apply(matches, "gc_rotate_mb", f.gc.rotate_mb.as_ref(), &mut a.gc_rotate_mb);
+    apply(matches, "gc_burial", f.gc.burial.as_ref(), &mut a.gc_burial);
+    apply(matches, "gc_check_secs", f.gc.check_secs.as_ref(), &mut a.gc_check_secs);
+
+    apply(matches, "prune_keep_depth", f.prune.keep_depth.as_ref(), &mut a.prune_keep_depth);
+    apply(matches, "prune_max_batch", f.prune.max_batch.as_ref(), &mut a.prune_max_batch);
+
+    apply(matches, "mine", f.mining.enabled.as_ref(), &mut a.mine);
+    apply_opt(matches, "mining_coinbase", f.mining.coinbase.as_ref(), &mut a.mining_coinbase);
+    apply(matches, "mining_extra_data", f.mining.extra_data.as_ref(), &mut a.mining_extra_data);
+    apply(matches, "mining_refresh_secs", f.mining.refresh_secs.as_ref(),
+        &mut a.mining_refresh_secs);
+
+    apply(matches, "account_tx_rate_limit", f.account_tx_rate_limit.enabled.as_ref(),
+        &mut a.account_tx_rate_limit);
+    apply(matches, "account_tx_rate_limit_cleaner_period",
+        f.account_tx_rate_limit.cleaner_period.as_ref(),
+        &mut a.account_tx_rate_limit_cleaner_period);
+    apply(matches, "account_tx_rate_limit_max_accounts",
+        f.account_tx_rate_limit.max_accounts.as_ref(),
+        &mut a.account_tx_rate_limit_max_accounts);
+    apply(matches, "account_tx_rate_limit_quota_multiplier",
+        f.account_tx_rate_limit.quota_multiplier.as_ref(),
+        &mut a.account_tx_rate_limit_quota_multiplier);
+    apply(matches, "account_tx_rate_limit_gas_per_second_percent",
+        f.account_tx_rate_limit.gas_per_second_percent.as_ref(),
+        &mut a.account_tx_rate_limit_gas_per_second_percent);
+
+    apply(matches, "log_level", f.log.level.as_ref(), &mut a.log_level);
+    apply(matches, "log_to_stdout", f.log.to_stdout.as_ref(), &mut a.log_to_stdout);
+
+    apply_opt(matches, "pegout_alerts_config", f.alerts.pegout_alerts_config.as_ref(),
+        &mut a.pegout_alerts_config);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    // Parse once, keeping the matches so the merge below can ask clap which
+    // values the operator actually typed -- with the derive API a flag that was
+    // never passed still arrives carrying its default.
+    let matches = Args::command().get_matches();
+    let mut args = Args::from_arg_matches(&matches)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(path) = args.config.clone() {
+        let file = config_file::FileConfig::load(&path)?;
+        apply_file_config(&matches, &file, &mut args);
+    }
+    let args = args;
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&args.log_level));

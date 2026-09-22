@@ -1,0 +1,82 @@
+# rustock node configuration.
+#
+#   rustock --config /etc/rustock/node.toml
+#
+# Precedence: command line  >  this file  >  built-in default.
+# Anything given on the command line wins, so a setting here can always be
+# overridden for one run without editing the file.
+#
+# Every key is optional; omitting one leaves the built-in default shown below.
+# Unknown keys are an ERROR rather than being ignored, so a typo is reported
+# instead of silently leaving a setting at its default.
+#
+# One-shot operations (--import-*, --repair, --trie-tool-*, --probe-*,
+# --build-*, --metadata-*) are command-line only. They run and then exit, so a
+# node that re-ran an import on every start would be a trap, not a convenience.
+
+[node]
+port = 30303                       # P2P listen port
+data_dir = "./rustock-data"        # database and node key
+network_id = 30                    # 30 mainnet, 31 testnet
+# secret_key = "…"                 # hex node key; generated and stored if unset
+# external_ip = "203.0.113.1"      # advertised address; 127.0.0.1 if unset
+supply_check = "per-block"         # off | per-block | per-transaction
+rskj_multisig_senders = "on"       # on | off — emulate rskj multisig peg-in senders
+
+[rpc]
+host = "127.0.0.1"
+port = 4444
+admin = false                      # enables rsk_collectTrie, rsk_pruneBlocks, …
+disabled = false                   # true is the same as --no-rpc
+
+[peers]
+max_peers = 25
+max_inbound_peers = 10
+max_inbound_per_ip = 2
+max_inbound_per_cidr = 4
+inbound_cidr_prefix = 24
+
+[trie]
+backend = "epoch"                  # epoch | single
+# dir = "/var/lib/rustock/trie-epochs"
+# node = "…"                       # diagnostic: start from this state root
+
+# Trie garbage collection. `burial` must exceed the deepest reorg worth
+# surviving: collecting against a root that is later reorganised away discards
+# state the chain needs to rebuild.
+[gc]
+epochs = 4
+rotate_mb = 1024
+burial = 4000
+check_secs = 60
+
+# Block-history pruning. Nothing is deleted unless rsk_pruneBlocks is called,
+# which needs rpc.admin; these only set the boundary it uses. `keep_depth` is
+# clamped up to 8000 whatever is given — 4000 for reorg tolerance plus 4000 for
+# the block-info precompiles, which a re-executed block may itself reach through.
+[prune]
+keep_depth = 100000
+max_batch = 50000
+
+[mining]
+enabled = false                    # serve the mnr_* namespace
+# coinbase = "0x…"                 # REQUIRED when enabled
+extra_data = ""                    # at most 32 bytes
+refresh_secs = 60
+
+# Per-account virtual gas quota (rskj TxQuotaChecker). An account accumulates
+# quota while idle and spends it when broadcasting, so one that floods the
+# mempool is refused here and not relayed onward. Ordinary use never reaches it.
+[account_tx_rate_limit]
+enabled = true
+cleaner_period = 30                # minutes; 0 or negative disables the sweep
+max_accounts = 400000
+quota_multiplier = 2000            # seconds of idleness an account may bank
+gas_per_second_percent = 0.9       # of the block gas limit, accrued per second
+
+[log]
+level = "info"
+to_stdout = false                  # true when run under systemd (journald)
+
+[alerts]
+# pegout_alerts_config = "/etc/rustock/pegout-alerts.toml"
