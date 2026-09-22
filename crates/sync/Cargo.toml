@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+libc = { workspace = true }
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-storage = { version = "0.1.0", path = "../storage" }
 rustock-networking = { version = "0.1.0", path = "../networking" }
