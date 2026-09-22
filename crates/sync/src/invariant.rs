@@ -19,6 +19,7 @@
 //! | 4 -- orphaned head | I5 |
 //! | 5 -- canonical pointer to a block we never downloaded | I2, I3 |
 //! | 6 -- canonical entry stranded above the head | **I6** |
+//! | 7 -- head naming a block that is not canonical | **I8** |
 //!
 //! Stall 6 is the one this was written after: `ensure_canonical_lineage`
 //! wrote a canonical entry at #9,262,402 while `KEY_HEAD` stayed at
@@ -101,6 +102,9 @@ pub enum Violation {
     #[error("I7: the state root {root} recorded at executed head #{at} is not in the trie store")]
     StateRootMissing { at: u64, root: B256 },
 
+    #[error("I8: the head is {hash} at #{at} but the canonical block at that height is {canonical:?}")]
+    HeadNotCanonical { at: u64, hash: B256, canonical: Option<B256> },
+
     #[error("the store could not be read while checking coherence: {0}")]
     StoreUnreadable(String),
 }
@@ -116,6 +120,7 @@ impl Violation {
             Violation::ExecutedOffChain { .. } => "I5",
             Violation::CanonicalAboveHead { .. } => "I6",
             Violation::StateRootMissing { .. } => "I7",
+            Violation::HeadNotCanonical { .. } => "I8",
             Violation::StoreUnreadable(_) => "??",
         }
     }
@@ -128,7 +133,8 @@ impl Violation {
             | Violation::ParentMismatch { at, .. }
             | Violation::ExecutedOffChain { at, .. }
             | Violation::CanonicalAboveHead { at, .. }
-            | Violation::StateRootMissing { at, .. } => Some(at),
+            | Violation::StateRootMissing { at, .. }
+            | Violation::HeadNotCanonical { at, .. } => Some(at),
             Violation::ExecutedAboveHead { executed, .. } => Some(executed),
             Violation::StoreUnreadable(_) => None,
         }
@@ -262,6 +268,25 @@ pub fn check_with_cursor(
     // never reach, because every path that looks for work reads the head.
     if let Some(hash) = store.canonical_hash(head + 1).map_err(read)? {
         return Err(Violation::CanonicalAboveHead { at: head + 1, hash, head });
+    }
+
+    // I8 -- the head is itself on the canonical chain.
+    //
+    // Added after the first deployment of this module: `KEY_HEAD` named a block
+    // at #9,262,401 that was not the canonical block at that height, while the
+    // canonical index below and above it was perfectly consistent. I5 asks this
+    // of the *executed* head and nothing asked it of the head, so the
+    // disagreement had no relation to break -- which is exactly the failure this
+    // module exists to stop. Seven notions of position, six relations.
+    if head >= floor {
+        let canonical = store.canonical_hash(head).map_err(read)?;
+        if canonical != Some(cursor.validated_head.hash) {
+            return Err(Violation::HeadNotCanonical {
+                at: head,
+                hash: cursor.validated_head.hash,
+                canonical,
+            });
+        }
     }
 
     // I7 -- the state we would continue from actually exists
@@ -477,5 +502,33 @@ mod tests {
         assert_eq!(check(&store, None, Scope::Full).unwrap_err().relation(), "I1");
         // … the delta window above it does not.
         assert_eq!(check(&store, None, Scope::Delta { from: 8, to: 9 }), Ok(()));
+    }
+
+    /// The seventh disagreement, found by deploying this module: `KEY_HEAD`
+    /// named a block at #9,262,401 that was not the canonical block at that
+    /// height, while the canonical index below *and* above it was perfectly
+    /// consistent. I5 asks this of the executed head; nothing asked it of the
+    /// head itself, so the disagreement had no relation to break.
+    #[test]
+    fn i8_catches_a_head_that_is_not_the_canonical_block_at_its_height() {
+        let (store, _dir, hashes) = chain(10);
+
+        // A sibling at #9: held, but not canonical. Point KEY_HEAD at it.
+        let mut sibling = header(9, hashes[8]);
+        sibling.timestamp += 1;
+        store.put_header_with_hash(sibling.hash(), &sibling).unwrap();
+        store.set_head(sibling.hash()).unwrap();
+        store.set_exec_head(sibling.hash(), B256::ZERO).unwrap();
+
+        let err = check(&store, None, Scope::Full).unwrap_err();
+        // I5 fires first here (the executed head is off-chain too), so check
+        // the head relation on its own with execution left canonical.
+        assert!(matches!(err.relation(), "I5" | "I8"));
+
+        store.set_exec_head(hashes[9], B256::ZERO).unwrap();
+        store.set_head(sibling.hash()).unwrap();
+        let err = check(&store, None, Scope::Full).unwrap_err();
+        assert_eq!(err.relation(), "I8");
+        assert_eq!(err.at(), Some(9));
     }
 }

@@ -1080,6 +1080,8 @@ impl SyncService {
         let (outstanding, oldest) = self.outstanding_requests();
         let phi = Phi::new(metadata.best_number, executed, outstanding, oldest);
         let now = Instant::now();
+        // Read before `observe`, which opens a new window when it escalates.
+        let stalled_for = self.watchdog.stalled_for(now);
         let Some(escalation) = self.watchdog.observe(phi, now) else {
             return;
         };
@@ -1088,7 +1090,7 @@ impl SyncService {
             target: "rustock::sync",
             "No progress for {}s: Φ = (behind {}, outstanding {}, oldest {}s), \
              best this window {:?}, escalation {} -> {:?}",
-            self.watchdog.stalled_for(now).as_secs(),
+            stalled_for.as_secs(),
             phi.behind,
             phi.outstanding,
             -phi.neg_age_secs,
@@ -1137,6 +1139,29 @@ impl SyncService {
         let Ok(Some(head_hash)) = store.head() else { return };
         let Ok(Some(head)) = store.header(head_hash) else { return };
 
+        // Anchor the walk to the canonical chain, not to whatever KEY_HEAD
+        // happens to name.
+        //
+        // The first deployment of this watchdog retreated when it should have
+        // walked up, because KEY_HEAD named a non-canonical block at its height
+        // and so nothing above it appeared to link back. Starting from the
+        // canonical hash makes the walk follow the chain the rest of the node
+        // agrees on, and re-seating the head onto it is itself the repair.
+        let mut head_hash = head_hash;
+        if let Ok(Some(canonical)) = store.canonical_hash(head.number) {
+            if canonical != head_hash {
+                warn!(
+                    target: "rustock::sync",
+                    "Head re-verification: the head named {:?} at #{} but the canonical block \
+                     there is {:?}; re-seating the head onto the canonical chain",
+                    head_hash, head.number, canonical
+                );
+                if store.set_head(canonical).is_ok() {
+                    head_hash = canonical;
+                }
+            }
+        }
+
         // Walk up while the index keeps naming blocks we hold that link back.
         //
         // Bounded: a damaged index must not turn recovery into a full-chain
@@ -1173,6 +1198,28 @@ impl SyncService {
             return;
         }
 
+        // Never retreat below what we have executed: that breaks I4 by
+        // construction, which the first deployment did within fifteen seconds
+        // of its first escalation. A head below the executed block is not a
+        // recovery, it is a second incoherence on top of the first.
+        let executed = store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| store.header(hash).ok().flatten())
+            .map(|h| h.number)
+            .unwrap_or(0);
+        let floor = head.number.min(executed);
+        let retreat = retreat.min(head.number.saturating_sub(floor));
+        if retreat == 0 {
+            debug!(
+                target: "rustock::sync",
+                "Head re-verification: nothing above the head and nothing to retreat to \
+                 (head #{}, executed #{})", head.number, executed
+            );
+            return;
+        }
+
         // Nothing above us, so the head itself is where progress is failing.
         // Drop back and let the height be fetched again.
         let target = head.number.saturating_sub(retreat);
@@ -1196,6 +1243,22 @@ impl SyncService {
         if let Err(e) = store.set_head(cursor) {
             error!(target: "rustock::sync", "Head re-verification: set_head failed: {:?}", e);
             return;
+        }
+        // Drop the canonical entries the retreat just orphaned.
+        //
+        // Without this the retreat leaves exactly the shape stall 6 was made
+        // of -- canonical entries above the head -- so the watchdog's own
+        // recovery would trip the invariant it is supposed to serve. Two
+        // mechanisms disagreeing about position is the thing this whole
+        // exercise exists to stop, and it would be poor form to add a seventh
+        // instance of it here.
+        for n in (target + 1)..=head.number {
+            if let Err(e) = store.delete_canonical_hash(n) {
+                warn!(
+                    target: "rustock::sync",
+                    "Head re-verification: could not drop the canonical entry at #{n}: {:?}", e
+                );
+            }
         }
         self.last_body_height = self.last_body_height.min(target);
     }
