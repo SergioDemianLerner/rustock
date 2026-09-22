@@ -3362,6 +3362,7 @@ dependencies = [
  "anyhow",
  "futures",
  "k256",
+ "libc",
  "lru",
  "rand 0.8.6",
  "rustock-core",
