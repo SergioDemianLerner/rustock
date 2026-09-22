@@ -3572,3 +3572,184 @@ fn exec_head_number(store: &BlockStore) -> u64 {
         .map(|h| h.number)
         .unwrap_or(0)
 }
+
+// -- Stage 1/2: the coherence invariant and the Φ watchdog ----------------
+
+/// Build a store holding a linked chain 0..=`len`, with `KEY_HEAD` and the
+/// executed head both at the top.
+fn linked_chain(len: u64) -> (Arc<BlockStore>, tempfile::TempDir, Vec<Header>) {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let mut headers = Vec::new();
+    let mut parent = B256::ZERO;
+    for n in 0..=len {
+        let h = dummy_header(n, parent, U256::from(1));
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        parent = h.hash();
+        headers.push(h);
+    }
+    let top = headers.last().unwrap();
+    store.set_exec_head(top.hash(), top.state_root).unwrap();
+    (store, dir, headers)
+}
+
+fn service_over(store: Arc<BlockStore>) -> SyncService {
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    SyncService::new(manager, peer_store, event_rx)
+}
+
+/// Stall 6, end to end.
+///
+/// `ensure_canonical_lineage` writes a canonical entry above `KEY_HEAD`. Every
+/// path that looks for work reads `KEY_HEAD`, so the block is held, linked,
+/// valid and unreachable — on mainnet, for three hours with no error logged.
+/// Head re-verification walks the index up and makes it reachable again.
+#[tokio::test]
+async fn head_reverification_recovers_a_block_stranded_above_the_head() {
+    let (store, _dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+
+    // The stranded block: stored, canonical, linked — but KEY_HEAD stays at #10.
+    let stranded = dummy_header(11, top.hash(), U256::from(1));
+    store.put_header_with_hash(stranded.hash(), &stranded).unwrap();
+    store.put_canonical_hash(11, stranded.hash()).unwrap();
+    assert_eq!(store.head().unwrap(), Some(top.hash()), "precondition: head is behind");
+
+    // The invariant sees it immediately.
+    let violation = crate::invariant::check(&store, None, crate::Scope::Full).unwrap_err();
+    assert_eq!(violation.relation(), "I6");
+
+    let mut service = service_over(store.clone());
+    service.last_body_height = 10;
+    service.reverify_head_lineage(1);
+
+    assert_eq!(store.head().unwrap(), Some(stranded.hash()), "head did not advance");
+    assert_eq!(
+        crate::invariant::check(&store, None, crate::Scope::Full),
+        Ok(()),
+        "the store is still incoherent after re-verification"
+    );
+    assert!(
+        service.last_body_height <= 10,
+        "the body cursor must not sit above the block we just made reachable"
+    );
+}
+
+/// The walk up must stop at the first link that does not hold, or it would
+/// adopt a chain the node cannot actually follow.
+#[tokio::test]
+async fn head_reverification_stops_at_a_broken_link() {
+    let (store, _dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+
+    let good = dummy_header(11, top.hash(), U256::from(1));
+    store.put_header_with_hash(good.hash(), &good).unwrap();
+    store.put_canonical_hash(11, good.hash()).unwrap();
+
+    // #12 is canonical and held, but builds on something else entirely.
+    let detached = dummy_header(12, B256::repeat_byte(0x77), U256::from(1));
+    store.put_header_with_hash(detached.hash(), &detached).unwrap();
+    store.put_canonical_hash(12, detached.hash()).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.reverify_head_lineage(0);
+
+    assert_eq!(store.head().unwrap(), Some(good.hash()), "walked past a broken link");
+}
+
+/// A canonical pointer naming a block we never downloaded (stall 5) must not
+/// be walked onto.
+#[tokio::test]
+async fn head_reverification_does_not_adopt_a_block_we_do_not_hold() {
+    let (store, _dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+    store.put_canonical_hash(11, B256::repeat_byte(0xaa)).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.reverify_head_lineage(0);
+
+    assert_eq!(store.head().unwrap(), Some(top.hash()), "adopted a block we do not hold");
+}
+
+/// With nothing above the head, the escalation retreats instead, so the range
+/// is downloaded again.
+#[tokio::test]
+async fn head_reverification_retreats_when_there_is_nothing_above() {
+    let (store, _dir, headers) = linked_chain(10);
+    let mut service = service_over(store.clone());
+    service.last_body_height = 10;
+
+    service.reverify_head_lineage(3);
+
+    assert_eq!(store.head().unwrap(), Some(headers[7].hash()), "did not retreat three blocks");
+    assert!(service.last_body_height <= 7);
+}
+
+/// A coherent, caught-up node must not be disturbed by either mechanism.
+#[tokio::test]
+async fn a_healthy_node_is_left_alone() {
+    let (store, _dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+
+    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
+
+    let mut service = service_over(store.clone());
+    service.verify_coherence();
+    service.reverify_head_lineage(0);
+    // No peers, so the watchdog has no target and must not accumulate a stall.
+    service.check_phi_progress().await;
+
+    assert_eq!(store.head().unwrap(), Some(top.hash()));
+    assert_eq!(service.watchdog.level(), 0);
+}
+
+/// The second rung of the ladder has to be a different action from the first,
+/// or the escalation is decorative.
+#[tokio::test]
+async fn the_second_escalation_forces_a_connection_point_search() {
+    let (store, _dir, _headers) = linked_chain(10);
+    let mut service = service_over(store);
+    assert!(!service.force_connection_search);
+
+    // Drive the watchdog to its second rung with a gap that never improves.
+    let t0 = std::time::Instant::now();
+    let window = std::time::Duration::from_secs(1);
+    service.watchdog = ProgressWatchdog::new(window);
+    let phi = Phi::new(500, 10, 0, None);
+    service.watchdog.observe(phi, t0);
+    let first = service.watchdog.observe(phi, t0 + std::time::Duration::from_secs(2));
+    let second = service.watchdog.observe(phi, t0 + std::time::Duration::from_secs(4));
+
+    assert!(matches!(first, Some(Escalation::RetreatAndReverify { .. })));
+    assert!(matches!(second, Some(Escalation::ResearchConnectionPoint)));
+}
+
+/// The upward walk must be bounded, so a damaged index cannot turn every
+/// escalation into a full-chain sweep.
+#[tokio::test]
+async fn head_reverification_bounds_the_upward_walk() {
+    let (store, _dir, headers) = linked_chain(10);
+    let mut parent = headers.last().unwrap().clone();
+
+    // A linked, canonical, held run far longer than the walk limit.
+    for n in 11..=(11 + 5_000u64) {
+        let h = dummy_header(n, parent.hash(), U256::from(1));
+        store.put_header_with_hash(h.hash(), &h).unwrap();
+        store.put_canonical_hash(n, h.hash()).unwrap();
+        parent = h;
+    }
+
+    let mut service = service_over(store.clone());
+    service.reverify_head_lineage(0);
+
+    let head = store.header(store.head().unwrap().unwrap()).unwrap().unwrap();
+    assert!(head.number > 10, "the walk made no progress at all");
+    assert!(
+        head.number <= 10 + 4_096,
+        "the walk was not bounded: reached #{}",
+        head.number
+    );
+}

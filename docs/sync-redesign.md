@@ -724,9 +724,17 @@ fifteen minutes:
 **"Round complete" while Φ is unchanged is precisely the bug signature** —
 and the node logged it 450 times without treating it as anything at all.
 
-So: track Φ across rounds. If *k* consecutive completed rounds leave Φ
-unchanged, the node is not syncing, whatever it believes about itself.
-Escalate:
+So: track Φ. If Φ fails to reach a strictly better value within a bounded
+window, the node is not syncing, whatever it believes about itself. Escalate:
+
+> **Corrected 2026-09-22, after stall 6.** This said *"if k consecutive rounds
+> leave Φ **unchanged**"*, which contradicts the progress obligation three
+> paragraphs above — that obligation is *strict decrease*. Stall 6 fell exactly
+> into the gap between the two: the executed head was frozen while `peer_best`
+> kept rising, so Φ's first component **grew** (354, 355, … 364) and a test for
+> "unchanged" would have stayed quiet through all 106 rounds of it. Growing is
+> not progress. The implemented test is *failed to improve*, and
+> `a_growing_gap_escalates_even_though_phi_is_never_unchanged` pins it.
 
 ```
    k rounds, Φ unchanged
@@ -749,6 +757,7 @@ without understanding the cause.
 | 3 | 20 hours | Yes — 2,332 tips arrived, executed head never moved |
 | 4 | 3 days | Yes — sync reset in a loop, Φ unchanged |
 | 5 | 15 minutes | Yes — 450 rounds, Φ unchanged |
+| 6 | 3 hours | Yes — 106 rounds, Φ *growing* (see the correction in §14) |
 
 ## 15. The whole design, on one page
 
@@ -1072,7 +1081,7 @@ protects the live node while the structural work proceeds.
 
 ```
   ┌────────────────────────────────────────────────────────────────────────┐
-  │ STAGE 1   Φ watchdog                          ~30 lines    ~half a day │
+  │ STAGE 1   Φ watchdog                  DONE    ~30 lines    ~half a day │
   │           Detects any stall of this family. No design change.          │
   │           ▸ ships alone, immediately                                   │
   └────────────────────────────────────────────────────────────────────────┘
@@ -1128,7 +1137,7 @@ we have not seen", that settles it.
 
 | Stage | Lines | Time | Risk | Value if stopped here |
 |---|---:|---:|---|---|
-| 1 Φ watchdog | ~30 | ½ day | none — observes only | **Every stall in this document self-heals** |
+| 1 Φ watchdog | ~30 | ½ day | none — observes only | **Every stall in this document self-heals** — *shipped 2026-09-22, `crates/sync/src/watchdog.rs`* |
 | 2 invariant() | ~150 | 2 days | none — observes only | Silent incoherence becomes loud and located |
 | 3 Cursor | ~300 | 3 days | medium — changes write paths | Stalls 1, 3, 5 become unrepresentable |
 | 4 Validated | ~100 | 1 day | low — mechanical | Unverified heads become a compile error |
@@ -1178,6 +1187,14 @@ so the second and third components have to carry the progress signal there.
 This needs to be got right; it is the sort of detail that produces stall
 number six.
 
+> It did. Stall 6 arrived on 2026-09-22, before either stage was implemented,
+> and through a different door than this paragraph anticipated — not a false
+> positive during a header phase, but a false *negative* from the watchdog's
+> wording. Both are now covered by tests:
+> `a_working_header_round_banks_progress_through_outstanding_requests` for the
+> case feared here, and `a_churning_round_does_not_bank_progress_forever` for
+> its mirror image.
+
 **What this does not address.** Peer selection and reputation, bandwidth
 scheduling, and snap/state sync are all out of scope. This document is about
 one thing: the node's own picture of where it is.
@@ -1195,6 +1212,13 @@ one thing: the node's own picture of where it is.
 | 5 | 2026-09-22 | 15 min | canonical pointer | what we hold | A | PR #50 |
 
 ## Appendix B — the invariant, in full
+
+> **Implemented 2026-09-22** as `crates/sync/src/invariant.rs`, checked on every
+> tick with `Scope::Delta` over the window between the executed head and the
+> validated head. One test per relation, each named for the stall it would have
+> caught. `derive_cursor` reads the three position keys directly rather than
+> deriving a coherent cursor — that is stage 3, and the point of stage 2 is to
+> check the representation the node actually has today.
 
 ```rust
 /// Relations that must hold over the node's picture of the chain.

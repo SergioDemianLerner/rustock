@@ -2,7 +2,9 @@ use crate::events::SyncEvent;
 use crate::manager::{SyncManager, MAX_SKELETON_CHUNKS};
 use crate::progress::SyncProgress;
 use crate::state::{InFlightBody, SyncState};
+use crate::invariant::{self, Scope, Violation};
 use crate::tracker::PeerChunkTracker;
+use crate::watchdog::{Escalation, Phi, ProgressWatchdog};
 use rustock_core::types::header::Header;
 use rustock_core::types::transaction::Transaction;
 use rustock_core::Block;
@@ -251,6 +253,23 @@ pub struct SyncService {
     /// watched execution itself, so it could stop and no mechanism would notice.
     pub(crate) last_exec_height: u64,
     pub(crate) last_exec_progress: std::time::Instant,
+    /// Generic liveness net: tracks Φ and escalates when it fails to improve.
+    ///
+    /// Every watchdog that existed before this one measured the *downloaded*
+    /// head, which is the frontier that sits at the tip whether or not the node
+    /// is making progress. This one is anchored to the executed head, which is
+    /// the only frontier that cannot lie about progress.
+    pub(crate) watchdog: ProgressWatchdog,
+    /// Set by the watchdog's second escalation: distrust the cheap
+    /// connection-point shortcut and binary-search for it instead.
+    ///
+    /// Without this, the second rung of the ladder would do exactly what the
+    /// first one did -- which is the kind of escalation that looks like it
+    /// works because it never runs alone.
+    pub(crate) force_connection_search: bool,
+    /// When a coherence violation was last logged, so a persistent one reports
+    /// steadily rather than once per tick.
+    pub(crate) last_violation_log: Option<std::time::Instant>,
     /// When the follow buffer was first seen blocked behind a missing block.
     ///
     /// A block arriving before its predecessor is normal -- a gap-pull fires
@@ -310,6 +329,9 @@ impl SyncService {
             last_body_height: 0,
             last_exec_height: 0,
             last_exec_progress: Instant::now(),
+            watchdog: ProgressWatchdog::default(),
+            force_connection_search: false,
+            last_violation_log: None,
             follow_gap_since: None,
             pending_follow_bodies: HashMap::new(),
             follow_buffer: BTreeMap::new(),
@@ -488,6 +510,8 @@ impl SyncService {
 
         self.expire_stale_follow_bodies();
         self.check_execution_progress();
+        self.verify_coherence();
+        self.check_phi_progress().await;
 
         match &self.state {
             SyncState::Idle => {
@@ -946,6 +970,245 @@ impl SyncService {
         self.last_exec_progress = Instant::now();
     }
 
+    /// Check the coherence invariant over the heights this node just touched.
+    ///
+    /// Cheap: a handful of point reads. It runs on every tick rather than only
+    /// after a commit because a violation can also be written by the storage
+    /// layer's own fork choice, which sync does not drive.
+    ///
+    /// A violation does not halt the node. It is reported loudly, with the
+    /// relation and the height, and left to the watchdog to act on -- halting a
+    /// live node on a relation that has never been checked before would turn a
+    /// diagnostic into an outage. The point of stage 2 is that the node stops
+    /// being silent, not that it stops.
+    pub(crate) fn verify_coherence(&mut self) {
+        let store = &self.manager.store;
+        let cursor = match invariant::derive_cursor(store) {
+            Ok(Some(c)) => c,
+            Ok(None) => return,
+            Err(v) => {
+                self.report_violation(&v);
+                return;
+            }
+        };
+
+        // Delta scope: the window between what we have executed and what we
+        // consider downloaded, which is where every disagreement so far has
+        // lived. The I4..I7 relations are checked whatever the scope.
+        let scope = Scope::Delta {
+            from: cursor.executed.number,
+            to: cursor.validated_head.number,
+        };
+        let trie = self.trie_store.as_deref();
+        if let Err(v) = invariant::check_with_cursor(store, trie, scope, &cursor) {
+            self.report_violation(&v);
+        }
+    }
+
+    /// Report a broken relation, at most once every thirty seconds so a
+    /// persistent violation is visible without flooding the log.
+    fn report_violation(&mut self, v: &Violation) {
+        let now = Instant::now();
+        let due = self
+            .last_violation_log
+            .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(30));
+        if !due {
+            return;
+        }
+        self.last_violation_log = Some(now);
+        warn!(
+            target: "rustock::sync",
+            "Coherence violation {}: {}", v.relation(), v
+        );
+    }
+
+    /// Outstanding network requests and the age of the oldest, across whichever
+    /// phase the node is in. The second and third components of Φ.
+    fn outstanding_requests(&self) -> (usize, Option<Duration>) {
+        let now = Instant::now();
+        let mut count = 0usize;
+        let mut oldest: Option<Duration> = None;
+        let mut note = |since: Instant| {
+            let age = now.saturating_duration_since(since);
+            oldest = Some(oldest.map_or(age, |o: Duration| o.max(age)));
+        };
+
+        match &self.state {
+            SyncState::DownloadingHeaders { tracker, .. } => {
+                count += tracker.in_flight.values().map(|q| q.len()).sum::<usize>();
+                for since in tracker.waiting_since.values() {
+                    note(*since);
+                }
+            }
+            SyncState::DownloadingBodies { in_flight, .. } => {
+                count += in_flight.len();
+                for body in in_flight.values() {
+                    note(body.sent);
+                }
+            }
+            _ => {}
+        }
+
+        // Follow-mode body requests are outstanding work in any state.
+        count += self.pending_follow_bodies.len();
+        for (_, _, sent) in self.pending_follow_bodies.values() {
+            note(*sent);
+        }
+
+        (count, oldest)
+    }
+
+    /// The Φ watchdog. Runs every tick; escalates when Φ has failed to improve.
+    pub(crate) async fn check_phi_progress(&mut self) {
+        let Some((_, metadata)) = self.peer_store.best_peer().await else {
+            // With no peer there is no target, so there is nothing to be
+            // behind. Do not accumulate a stall against a disconnected node.
+            self.watchdog.reset(Instant::now());
+            return;
+        };
+
+        let executed = self
+            .manager
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| self.manager.store.header(hash).ok().flatten())
+            .map(|h| h.number)
+            .unwrap_or(0);
+
+        let (outstanding, oldest) = self.outstanding_requests();
+        let phi = Phi::new(metadata.best_number, executed, outstanding, oldest);
+        let now = Instant::now();
+        let Some(escalation) = self.watchdog.observe(phi, now) else {
+            return;
+        };
+
+        warn!(
+            target: "rustock::sync",
+            "No progress for {}s: Φ = (behind {}, outstanding {}, oldest {}s), \
+             best this window {:?}, escalation {} -> {:?}",
+            self.watchdog.stalled_for(now).as_secs(),
+            phi.behind,
+            phi.outstanding,
+            -phi.neg_age_secs,
+            self.watchdog.best(),
+            self.watchdog.level(),
+            escalation,
+        );
+
+        match escalation {
+            Escalation::RetreatAndReverify { blocks }
+            | Escalation::WidenRetreat { blocks } => {
+                self.reverify_head_lineage(blocks);
+                self.restart_round();
+            }
+            Escalation::ResearchConnectionPoint => {
+                // Drop the assumption about where we join the peer's chain and
+                // make `try_start_sync` search for it again from scratch.
+                self.force_connection_search = true;
+                self.reverify_head_lineage(0);
+                self.restart_round();
+            }
+            Escalation::Exhausted { blocks } => {
+                error!(
+                    target: "rustock::sync",
+                    "Retreating {blocks} blocks has not restored progress. This is not a \
+                     stall the watchdog can clear; the node needs attention."
+                );
+            }
+        }
+    }
+
+    /// Re-establish that the head is the top of the contiguous canonical chain
+    /// we actually hold, walking up first and retreating only if it is broken.
+    ///
+    /// Walking *up* is what clears stall 6: `ensure_canonical_lineage` can write
+    /// canonical entries above `KEY_HEAD`, and because every path that looks for
+    /// work reads `KEY_HEAD`, those blocks become unreachable -- held, linked,
+    /// valid, and invisible. Re-deriving the head from the index makes them
+    /// reachable again.
+    ///
+    /// Retreating is what clears stalls 2 and 5: when the canonical entry at the
+    /// head names a block we do not hold, or does not link to the one below,
+    /// dropping back makes the height be downloaded again.
+    pub(crate) fn reverify_head_lineage(&mut self, retreat: u64) {
+        let store = &self.manager.store;
+        let Ok(Some(head_hash)) = store.head() else { return };
+        let Ok(Some(head)) = store.header(head_hash) else { return };
+
+        // Walk up while the index keeps naming blocks we hold that link back.
+        //
+        // Bounded: a damaged index must not turn recovery into a full-chain
+        // sweep on every escalation. A gap wider than this is not something to
+        // walk out of anyway -- it wants a sync round.
+        const MAX_WALK_UP: u64 = 4_096;
+        let mut top = (head.number, head_hash);
+        for _ in 0..MAX_WALK_UP {
+            let next = top.0 + 1;
+            let Ok(Some(hash)) = store.canonical_hash(next) else { break };
+            let Ok(Some(hdr)) = store.header(hash) else { break };
+            if hdr.parent_hash != top.1 {
+                break;
+            }
+            top = (next, hash);
+        }
+
+        if top.0 > head.number {
+            warn!(
+                target: "rustock::sync",
+                "Head re-verification: canonical chain is held up to #{} but the head said #{}; \
+                 advancing the head by {} block(s)",
+                top.0, head.number, top.0 - head.number
+            );
+            if let Err(e) = store.set_head(top.1) {
+                error!(target: "rustock::sync", "Head re-verification: set_head failed: {:?}", e);
+                return;
+            }
+            self.last_body_height = self.last_body_height.min(head.number);
+            return;
+        }
+
+        if retreat == 0 {
+            return;
+        }
+
+        // Nothing above us, so the head itself is where progress is failing.
+        // Drop back and let the height be fetched again.
+        let target = head.number.saturating_sub(retreat);
+        let mut cursor = head_hash;
+        for _ in 0..retreat {
+            let Ok(Some(hdr)) = store.header(cursor) else { break };
+            if hdr.number == 0 {
+                break;
+            }
+            cursor = hdr.parent_hash;
+        }
+        if cursor == head_hash {
+            return;
+        }
+        warn!(
+            target: "rustock::sync",
+            "Head re-verification: retreating the head from #{} to #{} so the range is \
+             downloaded again",
+            head.number, target
+        );
+        if let Err(e) = store.set_head(cursor) {
+            error!(target: "rustock::sync", "Head re-verification: set_head failed: {:?}", e);
+            return;
+        }
+        self.last_body_height = self.last_body_height.min(target);
+    }
+
+    /// Abandon whatever round is in flight so the next tick starts a fresh one.
+    fn restart_round(&mut self) {
+        self.follow_buffer.clear();
+        self.follow_gap_since = None;
+        self.pending_exec = None;
+        self.state = SyncState::Idle;
+        self.last_progress = Instant::now();
+    }
+
     /// Rebuild the canonical pointers from the best downloaded head down past
     /// `exec_number`, so execution has a contiguous chain to follow again.
     ///
@@ -1074,8 +1337,8 @@ impl SyncService {
 
         // If the peer's best hash matches our chain, use our head as connection point.
         // Otherwise, use binary search to find where our chain diverges from the peer.
-        let peer_hash_known = self.manager.store.has_block(metadata.best_hash)
-            .unwrap_or(false);
+        let peer_hash_known = !std::mem::take(&mut self.force_connection_search)
+            && self.manager.store.has_block(metadata.best_hash).unwrap_or(false);
 
         if peer_hash_known || head.number == 0 {
             let cp = head.number;
