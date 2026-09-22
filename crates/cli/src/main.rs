@@ -507,6 +507,41 @@ struct Args {
     #[arg(long, default_value_t = 50_000)]
     prune_max_batch: u64,
 
+    /// Rate-limit accounts that broadcast transactions consuming large amounts
+    /// of shared resources (rskj `transaction.accountTxRateLimit.enabled`).
+    ///
+    /// On by default, as in rskj. Each account accumulates "virtual gas" while
+    /// idle and spends it when it broadcasts; an account that floods the
+    /// mempool runs out and its transactions are refused entry here, so they
+    /// are not relayed onward. Ordinary use never reaches the limit.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    account_tx_rate_limit: bool,
+
+    /// Minutes between sweeps that drop accounts which have accumulated the
+    /// full quota (rskj `transaction.accountTxRateLimit.cleanerPeriod`).
+    ///
+    /// An account at the ceiling is indistinguishable from one never seen, so
+    /// keeping it costs memory and says nothing. Zero or negative disables the
+    /// sweep, matching rskj.
+    #[arg(long, default_value_t = 30)]
+    account_tx_rate_limit_cleaner_period: i64,
+
+    /// Most accounts tracked at once (rskj `MAX_QUOTAS_SIZE`). The map evicts
+    /// the least recently accessed entry, so a flood of distinct addresses
+    /// cannot grow it without bound.
+    #[arg(long, default_value_t = 400_000)]
+    account_tx_rate_limit_max_accounts: usize,
+
+    /// How many seconds of idleness an account may bank, as a multiple of the
+    /// per-second accrual (rskj `MAX_QUOTA_GAS_MULTIPLIER`).
+    #[arg(long, default_value_t = 2_000)]
+    account_tx_rate_limit_quota_multiplier: u64,
+
+    /// Fraction of the block gas limit an account accrues per second of
+    /// idleness (rskj `MAX_GAS_PER_SECOND_PERCENT`).
+    #[arg(long, default_value_t = 0.9)]
+    account_tx_rate_limit_gas_per_second_percent: f64,
+
     /// Enable administrative JSON-RPC methods.
     ///
     /// Off by default. These act on the node rather than answering questions
@@ -949,12 +984,77 @@ async fn main() -> Result<()> {
         Some(t) => t.clone(),
         None => Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone())),
     };
+    let pool_config = rustock_sync::txpool::PoolConfig {
+        quota: rustock_sync::quota::QuotaConfig {
+            enabled: args.account_tx_rate_limit,
+            cleaner_period_minutes: args.account_tx_rate_limit_cleaner_period,
+            max_quotas_size: args.account_tx_rate_limit_max_accounts,
+            max_quota_gas_multiplier: args.account_tx_rate_limit_quota_multiplier,
+            max_gas_per_second_percent: args.account_tx_rate_limit_gas_per_second_percent,
+        },
+        ..Default::default()
+    };
     let pool = Arc::new(rustock_sync::TransactionPool::new(
-        rustock_sync::txpool::PoolConfig::default(),
+        pool_config,
         config.chain_id.into(),
         store.clone(),
         trie_store_for_pool.clone(),
     ));
+
+    // A rate limiter that refuses silently is indistinguishable from a broken
+    // one, and the per-transaction rejection logs at `debug`, which this node
+    // does not run at. Report on a schedule instead, and say nothing when there
+    // is nothing to say.
+    if args.account_tx_rate_limit {
+        let pool_for_report = pool.clone();
+        tokio::spawn(async move {
+            const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+            let mut ticker = tokio::time::interval(REPORT_EVERY);
+            ticker.tick().await; // the first tick fires immediately
+            loop {
+                ticker.tick().await;
+                let summary = pool_for_report.take_quota_rejections();
+                if summary.is_empty() {
+                    continue;
+                }
+                // One sender refused many times is the limiter working; many
+                // senders refused once each is the limiter misfiring on
+                // ordinary traffic. Report both so the difference is visible.
+                let worst = summary
+                    .worst
+                    .map(|(a, n)| format!("{a} ({n})"))
+                    .unwrap_or_else(|| "-".to_string());
+                tracing::info!(
+                    target: "rustock::txpool",
+                    "Rate limiter refused {} transaction(s) from {} sender(s) in the last {}m; \
+                     most refused: {worst}",
+                    summary.total,
+                    summary.distinct_senders,
+                    REPORT_EVERY.as_secs() / 60,
+                );
+            }
+        });
+    }
+
+    // rskj runs the equivalent sweep on a `TxQuotaCleanerTimer`.
+    if let Some(period) = pool.quota_cleaner_period() {
+        let pool_for_cleaner = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            ticker.tick().await; // the first tick fires immediately
+            loop {
+                ticker.tick().await;
+                let dropped = pool_for_cleaner.clean_quotas();
+                tracing::debug!(target: "rustock::txpool", "Quota sweep dropped {dropped} accounts");
+            }
+        });
+        tracing::info!(
+            "Account tx rate limiting on; quota sweep every {} min",
+            period.as_secs() / 60
+        );
+    } else if !args.account_tx_rate_limit {
+        tracing::info!("Account tx rate limiting disabled");
+    }
 
     let hardfork_cfg = rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
     let block_processor = rustock_execution::BlockProcessor::new(

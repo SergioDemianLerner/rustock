@@ -5,6 +5,7 @@ mod progress;
 mod service;
 mod state;
 mod tracker;
+pub mod quota;
 pub mod tx_relay;
 pub mod txpool;
 
