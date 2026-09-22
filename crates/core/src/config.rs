@@ -28,6 +28,11 @@ pub struct ActivationHeights {
     pub wasabi100: u64,
     /// Papyrus200 hardfork – enables RSKIP156 (difficulty divisor 50 -> 400).
     pub papyrus200: u64,
+    /// Iris300 hardfork – enables RSKIP180 (960-byte merged-mining merkle
+    /// proof cap).
+    pub iris300: u64,
+    /// Fingerroot500 hardfork – enables RSKIP252 (transaction gas price cap).
+    pub fingerroot500: u64,
 }
 
 /// Process-wide activation heights, consulted by block-hash computation
@@ -52,14 +57,20 @@ impl ActivationHeights {
             orchid: 729_000,
             wasabi100: 1_591_000,
             papyrus200: 2_392_700,
+            iris300: 3_614_800,
+            fingerroot500: 5_468_000,
         }
     }
 
     pub fn testnet() -> Self {
+        // rskj config/testnet.conf. Testnet starts on wasabi100, but papyrus200
+        // is a real height there (863,000), not genesis.
         Self {
             orchid: 0,
             wasabi100: 0,
-            papyrus200: 0,
+            papyrus200: 863_000,
+            iris300: 2_060_500,
+            fingerroot500: 4_015_800,
         }
     }
 
@@ -68,6 +79,8 @@ impl ActivationHeights {
             orchid: 0,
             wasabi100: 0,
             papyrus200: u64::MAX,
+            iris300: 0,
+            fingerroot500: 0,
         }
     }
 }
@@ -314,14 +327,24 @@ mod tests {
         assert_eq!(heights.orchid, 729_000);
         assert_eq!(heights.wasabi100, 1_591_000);
         assert_eq!(heights.papyrus200, 2_392_700);
+        assert_eq!(heights.iris300, 3_614_800);
+        assert_eq!(heights.fingerroot500, 5_468_000);
     }
 
+    /// rskj `rskj-core/src/main/resources/config/testnet.conf`. Testnet begins
+    /// already on wasabi100 (bahamas, orchid, orchid060 and wasabi100 are all
+    /// height 0 there), but papyrus200 and everything after it are real
+    /// heights. This previously asserted `papyrus200 == 0`, which made RSKIP156
+    /// -- the difficulty divisor moving from 50 to 400 -- active from testnet
+    /// genesis instead of from #863,000.
     #[test]
     fn test_testnet_activation_heights() {
         let heights = ActivationHeights::testnet();
         assert_eq!(heights.orchid, 0);
         assert_eq!(heights.wasabi100, 0);
-        assert_eq!(heights.papyrus200, 0);
+        assert_eq!(heights.papyrus200, 863_000);
+        assert_eq!(heights.iris300, 2_060_500);
+        assert_eq!(heights.fingerroot500, 4_015_800);
     }
 
     #[test]

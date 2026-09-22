@@ -12,6 +12,7 @@ use tracing::debug;
 use crate::executor::RskExecutor;
 use crate::hardfork::RskHardforkConfig;
 use crate::state::apply_state_changes;
+use rustock_core::validation::ValidationError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
@@ -33,6 +34,8 @@ pub enum ProcessError {
     TransactionsRootMismatch { header: B256, computed: B256 },
     #[error("ommers hash mismatch: header={header}, computed={computed}")]
     OmmersHashMismatch { header: B256, computed: B256 },
+    #[error("block validation failed: {0}")]
+    Validation(#[from] ValidationError),
     #[error("logs bloom mismatch")]
     LogsBloomMismatch,
     /// The block's balance changes do not conserve the native supply: more
@@ -76,6 +79,46 @@ pub struct BlockProcessor {
     executor: RskExecutor,
     hardfork_cfg: RskHardforkConfig,
     block_store: Arc<BlockStore>,
+    /// RSKIP110 fork-detection validation reads 449 ancestor headers per
+    /// block. Correct, but costly during a bulk replay, so it is opt-in.
+    validate_fork_detection_data: bool,
+}
+
+/// Ancestry lookups backed by the block store, for the uncle and
+/// fork-detection rules.
+struct StoreAncestry<'a> {
+    store: &'a BlockStore,
+}
+
+impl rustock_core::validation::uncles::AncestorSource for StoreAncestry<'_> {
+    fn header(&self, hash: B256) -> Option<rustock_core::Header> {
+        self.store.header(hash).ok().flatten()
+    }
+
+    fn uncles_of(&self, hash: B256) -> Vec<rustock_core::Header> {
+        self.store
+            .body(hash)
+            .ok()
+            .flatten()
+            .map(|(_, ommers)| ommers)
+            .unwrap_or_default()
+    }
+}
+
+impl rustock_core::validation::fork_detection::MainchainView for StoreAncestry<'_> {
+    fn headers_from(&self, from: B256, count: u64) -> Vec<rustock_core::Header> {
+        let mut out = Vec::with_capacity(count as usize);
+        let mut cursor = Some(from);
+        while out.len() < count as usize {
+            let Some(hash) = cursor else { break };
+            let Some(header) = self.store.header(hash).ok().flatten() else { break };
+            let parent = header.parent_hash;
+            let is_genesis = header.number == 0;
+            out.push(header);
+            cursor = if is_genesis { None } else { Some(parent) };
+        }
+        out
+    }
 }
 
 impl BlockProcessor {
@@ -84,7 +127,19 @@ impl BlockProcessor {
         block_store: Arc<BlockStore>,
     ) -> Self {
         let executor = RskExecutor::new(hardfork_cfg.clone(), block_store.clone());
-        Self { executor, hardfork_cfg, block_store }
+        Self {
+            executor,
+            hardfork_cfg,
+            block_store,
+            validate_fork_detection_data: false,
+        }
+    }
+
+    /// Enable the RSKIP110 fork-detection check (off by default: it costs 449
+    /// ancestor header reads per block).
+    pub fn with_fork_detection_validation(mut self, enabled: bool) -> Self {
+        self.validate_fork_detection_data = enabled;
+        self
     }
 
     /// Execute all transactions in a block without validating results against the header.
@@ -193,6 +248,119 @@ impl BlockProcessor {
             receipts_root,
             logs_bloom: block_bloom,
         })
+    }
+
+    /// `AncestorSource` / `MainchainView` over the block store, so the uncle
+    /// and fork-detection rules can walk ancestry.
+    ///
+    /// Both walk parents one header at a time. rskj keeps a cached
+    /// `ConsensusValidationMainchainView` for the fork-detection case because
+    /// it needs 449 headers per block; this is the straightforward version.
+    fn ancestry(&self) -> StoreAncestry<'_> {
+        StoreAncestry { store: &self.block_store }
+    }
+
+    /// The consensus rules that need the block body, run before execution.
+    ///
+    /// rskj composes these in `RskContext.getBlockValidationRule`. They all
+    /// *reject* a block; none of them changes what a valid block executes to,
+    /// which is why whole-chain replay can never exercise them — mainnet has
+    /// no invalid block to reject.
+    pub fn validate_block_rules(
+        &self,
+        block: &Block,
+        parent: Option<&rustock_core::Header>,
+    ) -> Result<(), ValidationError> {
+        use rustock_core::validation::block_rules::{
+            BlockTxsMaxGasPriceRule, ExtraDataRule, PrevMinGasPriceRule, RemascValidationRule,
+            TxsMinGasPriceRule,
+        };
+        use rustock_core::validation::{BlockValidator, HeaderValidator, ParentHeaderValidator};
+
+        let number = block.header.number;
+
+        // rskj `BlockValidatorImpl.isValid` refuses genesis outright: it is
+        // loaded from the genesis file, never validated. Genesis carries no
+        // REMASC transaction, so running these rules on it would reject the
+        // chain's first block.
+        if number == 0 {
+            return Ok(());
+        }
+
+        // rskj TxsMinGasPriceRule -- unconditional.
+        TxsMinGasPriceRule.validate_block(block)?;
+        // rskj BlockTxsMaxGasPriceRule -- RSKIP252 (fingerroot500).
+        BlockTxsMaxGasPriceRule {
+            rskip252_height: self.rskip252_height(),
+        }
+        .validate_block(block)?;
+        // rskj RemascValidationRule -- unconditional.
+        RemascValidationRule.validate_block(block)?;
+        // rskj ExtraDataRule -- unconditional, 32 bytes.
+        ExtraDataRule::default().validate(&block.header)?;
+
+        if let Some(parent) = parent {
+            // rskj PrevMinGasPriceRule -- unconditional.
+            PrevMinGasPriceRule.validate_with_parent(&block.header, parent)?;
+        }
+
+        // rskj BlockUnclesValidationRule. The ommers HASH is checked in
+        // process_block; this decides whether the uncles are admissible.
+        let ancestry = self.ancestry();
+        let header_rules: Vec<Box<dyn HeaderValidator>> = Vec::new();
+        let parent_rules: Vec<Box<dyn ParentHeaderValidator>> = Vec::new();
+        rustock_core::validation::uncles::UnclesValidationRule {
+            store: &ancestry,
+            uncle_list_limit: rustock_core::validation::uncles::UNCLE_LIST_LIMIT,
+            uncle_generation_limit: rustock_core::validation::uncles::UNCLE_GENERATION_LIMIT,
+            header_rules: &header_rules,
+            parent_rules: &parent_rules,
+        }
+        .validate(block)?;
+
+        // rskj ForkDetectionDataRule -- RSKIP110 (wasabi100).
+        if self.validate_fork_detection_data {
+            let actual =
+                rustock_core::validation::merged_mining::extract_fork_detection_data(&block.header);
+            rustock_core::validation::fork_detection::validate(
+                &block.header,
+                actual,
+                &ancestry,
+                self.rskip110_height(),
+            )?;
+        }
+        let _ = number;
+        Ok(())
+    }
+
+    /// `validate_block_rules` with the parent resolved from the block store —
+    /// the shape the sync path wants, mirroring rskj `BlockValidatorImpl`,
+    /// which looks the parent up the same way and returns invalid when it is
+    /// missing for a non-genesis block.
+    pub fn validate_block(&self, block: &Block) -> Result<(), ValidationError> {
+        let parent = self
+            .block_store
+            .header(block.header.parent_hash)
+            .ok()
+            .flatten();
+        self.validate_block_rules(block, parent.as_ref())
+    }
+
+    /// RSKIP252 (`fingerroot500`) for this chain.
+    fn rskip252_height(&self) -> u64 {
+        match self.hardfork_cfg.chain_id {
+            crate::hardfork::RSK_MAINNET_CHAIN_ID => 5_468_000,
+            crate::hardfork::RSK_TESTNET_CHAIN_ID => 4_015_800,
+            _ => 0,
+        }
+    }
+
+    /// RSKIP110 (`wasabi100`) for this chain.
+    fn rskip110_height(&self) -> u64 {
+        match self.hardfork_cfg.chain_id {
+            crate::hardfork::RSK_MAINNET_CHAIN_ID => 1_591_000,
+            _ => 0,
+        }
     }
 
     /// Execute all transactions in a block and validate results against the header.

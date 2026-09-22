@@ -40,6 +40,8 @@ fn test_chain_config() -> Arc<ChainConfig> {
             orchid: 0,
             wasabi100: 0,
             papyrus200: u64::MAX,
+            iris300: 0,
+            fingerroot500: 0,
         },
     })
 }
