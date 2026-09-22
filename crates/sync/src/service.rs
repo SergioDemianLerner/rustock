@@ -712,8 +712,39 @@ impl SyncService {
         // truncated by a late-arriving header can leave that pointer stale
         // (still naming our orphan); repair the lineage so the next round
         // downloads and executes the true canonical block at this height.
-        if let Err(e) = store.ensure_canonical_lineage(child.parent_hash) {
-            warn!(target: "rustock::sync", "Reorg: canonical lineage repair failed: {:?}", e);
+        //
+        // That repair only works if we HOLD the true canonical block.
+        // `ensure_canonical_lineage` walks down from the hash it is given and
+        // stops at the first header the store does not have -- so when the
+        // replacement block was never downloaded, it writes nothing at all and
+        // returns success. The canonical pointer keeps naming the orphan, and
+        // because `our_head_number()` reads that pointer, every subsequent
+        // skeleton round asks from a hash that is no longer on the chain,
+        // stores the same dangling headers above it, and completes without
+        // advancing. Mainnet #9,258,222 sat in that loop for 15 minutes.
+        //
+        // When the block is absent there is nothing to repair the lineage TO,
+        // so retreat instead: drop the canonical entry at this height and move
+        // the head pointer down to the orphan's parent, which both branches
+        // agree on. The connection-point search then re-runs from a block that
+        // really is on the chain, and this height is downloaded again.
+        if store.header(child.parent_hash).ok().flatten().is_some() {
+            if let Err(e) = store.ensure_canonical_lineage(child.parent_hash) {
+                warn!(target: "rustock::sync", "Reorg: canonical lineage repair failed: {:?}", e);
+            }
+        } else {
+            warn!(
+                target: "rustock::sync",
+                "Reorg: canonical block {:?} at #{} is not held; retreating head to #{} \
+                 so the height is downloaded again",
+                child.parent_hash, header.number, header.number - 1
+            );
+            if let Err(e) = store.delete_canonical_hash(header.number) {
+                warn!(target: "rustock::sync", "Reorg: dropping canonical #{} failed: {:?}", header.number, e);
+            }
+            if let Err(e) = store.set_head(header.parent_hash) {
+                warn!(target: "rustock::sync", "Reorg: retreating head failed: {:?}", e);
+            }
         }
         // Orphaned: roll back to the executed head's parent.
         let parent_hash = header.parent_hash;

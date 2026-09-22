@@ -2094,6 +2094,20 @@ async fn test_reconcile_when_the_forks_parent_was_never_downloaded() {
     assert_eq!(head, b1_hash,
         "execution must retreat to b1, the last block the network's chain also \
          builds on, so sync can re-request #2 and receive x2; got {head:?}");
+
+    // Rolling execution back is only half of it, and asserting only that is why
+    // this wedge survived a test written for its own shape. `our_head_number()`
+    // -- which chooses where the next skeleton is requested from -- reads
+    // `store.head()`, not the exec head. While that still names a2, every round
+    // asks peers for headers after a block their chain abandoned, stores the
+    // dangling children again, and completes without advancing. Mainnet
+    // #9,258,222 looped there for 15 minutes with peers answering in 1s.
+    assert_eq!(store.head().unwrap(), Some(b1_hash),
+        "the head pointer must retreat too, or the next skeleton is requested \
+         from the orphan and the node re-downloads the same dangling headers");
+    assert_ne!(store.canonical_hash(2).unwrap(), Some(a2_hash),
+        "the canonical pointer must stop naming the orphan at #2, so the height \
+         is downloaded again");
 }
 
 #[tokio::test]
