@@ -100,14 +100,7 @@ impl SyncProgress {
         let pct = (current as f64 / peer_best as f64 * 100.0).min(100.0);
         let eta = format_eta(peer_best.saturating_sub(frontier), avg_speed);
 
-        let state_label = match state {
-            SyncState::FindingConnectionPoint { .. } => "finding connection point",
-            SyncState::DownloadingSkeleton { .. } => "downloading skeleton",
-            SyncState::DownloadingHeaders { .. } => "downloading headers",
-            SyncState::DownloadingBodies { .. } => "downloading bodies",
-            SyncState::Idle => "idle",
-            SyncState::Following => "following",
-        };
+        let state_label = describe_state(state);
 
         info!(
             target: "rustock::sync",
@@ -120,6 +113,64 @@ impl SyncProgress {
         self.last_report_at = now;
         self.last_report_block = current;
         self.last_report_downloaded = downloaded;
+    }
+}
+
+/// A phase label that says what the phase is *doing*, not merely which phase it
+/// is in.
+///
+/// The bare label was actively misleading during a stall: `downloading headers`
+/// reads identically whether chunks are arriving or every peer is refusing, and
+/// the surrounding counters (`exec`, `dl`, `peer`) are all static in both cases.
+/// The numbers below come from the state the sync machine already holds, so
+/// this costs nothing but says which chunk is awaited, how many requests are
+/// outstanding and with how many peers, and how far the current skeleton
+/// reaches.
+fn describe_state(state: &SyncState) -> String {
+    match state {
+        SyncState::FindingConnectionPoint { peer_best, start, end, .. } => format!(
+            "finding connection point: bisecting #{start}..#{end} ({} to halve), peer best #{peer_best}",
+            end.saturating_sub(*start)
+        ),
+        SyncState::DownloadingSkeleton { peer_best, connection_point, .. } => format!(
+            "downloading skeleton: from #{connection_point}, {} behind peer best #{peer_best}",
+            peer_best.saturating_sub(*connection_point)
+        ),
+        SyncState::DownloadingHeaders {
+            peer_best, skeleton, connection_point, tracker, ..
+        } => {
+            let in_flight: usize = tracker.in_flight.values().map(|q| q.len()).sum();
+            let busy_peers = tracker.in_flight.values().filter(|q| !q.is_empty()).count();
+            // The skeleton's last entry is the highest header this round will
+            // reach; what is left after it is the next round's work.
+            let span_end = skeleton.last().map(|b| b.number).unwrap_or(*connection_point);
+            let waiting = tracker
+                .waiting_since
+                .values()
+                .map(|t| t.elapsed().as_secs())
+                .max()
+                .unwrap_or(0);
+            format!(
+                "downloading headers: chunk {}/{} ({} assigned, {in_flight} in flight across \
+                 {busy_peers} peers, {} buffered), skeleton #{connection_point}..#{span_end}, \
+                 {} beyond it to peer best #{peer_best}, longest wait {waiting}s",
+                tracker.next_to_process,
+                tracker.total_chunks,
+                tracker.next_to_assign.saturating_sub(1),
+                tracker.buffered.len(),
+                peer_best.saturating_sub(span_end),
+            )
+        }
+        SyncState::DownloadingBodies {
+            peer_best, pending_headers, next_request, in_flight, ..
+        } => format!(
+            "downloading bodies: {}/{} requested, {} in flight, peer best #{peer_best}",
+            next_request,
+            pending_headers.len(),
+            in_flight.len()
+        ),
+        SyncState::Idle => "idle".to_string(),
+        SyncState::Following => "following".to_string(),
     }
 }
 
@@ -183,6 +234,69 @@ fn format_duration(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The stall that prompted this: `downloading headers` with static
+    /// `exec`/`dl`/`peer` counters is the same line whether chunks are arriving
+    /// or every peer is refusing. The label must name the awaited chunk, the
+    /// outstanding requests and how long the longest one has been waiting, so a
+    /// reader can tell those two apart from the log alone.
+    #[test]
+    fn downloading_headers_label_reports_chunk_and_request_progress() {
+        use crate::tracker::PeerChunkTracker;
+        use alloy_primitives::B512;
+        use rustock_networking::protocol::rsk::BlockIdentifier;
+
+        let mut tracker = PeerChunkTracker::new(22);
+        tracker.next_to_process = 3;
+        tracker.next_to_assign = 9;
+        tracker.buffered.insert(5, Vec::new());
+        tracker.buffered.insert(6, Vec::new());
+        let peer = B512::repeat_byte(0x11);
+        tracker.in_flight.entry(peer).or_default().extend([3usize, 4]);
+
+        let skeleton = vec![
+            BlockIdentifier { hash: Default::default(), number: 9_258_222 },
+            BlockIdentifier { hash: Default::default(), number: 9_260_000 },
+        ];
+        let label = describe_state(&SyncState::DownloadingHeaders {
+            peer_best: 9_260_892,
+            skeleton,
+            connection_point: 9_258_222,
+            tracker,
+            pending_next_skeleton: None,
+        });
+
+        assert!(label.contains("chunk 3/22"), "{label}");
+        assert!(label.contains("8 assigned"), "{label}");
+        assert!(label.contains("2 in flight across 1 peers"), "{label}");
+        assert!(label.contains("2 buffered"), "{label}");
+        assert!(label.contains("#9258222..#9260000"), "{label}");
+        assert!(label.contains("892 beyond it"), "{label}");
+    }
+
+    /// The other phases carry their own useful numbers; none should be a bare
+    /// noun any more.
+    #[test]
+    fn every_active_phase_label_carries_numbers() {
+        let finding = describe_state(&SyncState::FindingConnectionPoint {
+            peer: Default::default(),
+            peer_best: 9_260_892,
+            start: 9_000_000,
+            end: 9_260_892,
+        });
+        assert!(finding.contains("#9000000..#9260892"), "{finding}");
+
+        let skeleton = describe_state(&SyncState::DownloadingSkeleton {
+            peer: Default::default(),
+            peer_best: 9_260_892,
+            connection_point: 9_258_222,
+        });
+        assert!(skeleton.contains("from #9258222"), "{skeleton}");
+        assert!(skeleton.contains("2670 behind"), "{skeleton}");
+
+        assert_eq!(describe_state(&SyncState::Idle), "idle");
+        assert_eq!(describe_state(&SyncState::Following), "following");
+    }
     use super::*;
 
     /// Download phase: execution is flat but the download frontier is climbing.
