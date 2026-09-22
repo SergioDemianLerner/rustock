@@ -79,6 +79,7 @@ pub fn install<WIRE, HOST>(
     istanbul_opcodes_enabled: bool,
     push0_enabled: bool,
     basefee_enabled: bool,
+    staticcall_enabled: bool,
     transient_storage_enabled: bool,
     mcopy_enabled: bool,
     extcodesize_max_precompiles: &[Address],
@@ -248,9 +249,19 @@ pub fn install<WIRE, HOST>(
         opcode::DELEGATECALL,
         Instruction::new(rsk_delegate_call::<WIRE, HOST>, CALL_STATIC_GAS),
     );
+    // RSKIP91 (orchid, mainnet #729,000) introduced STATICCALL. rskj's
+    // `VM.java` OP_STATICCALL throws `invalidOpCode` (consuming the frame's
+    // gas) while RSKIP91 is inactive; rustock maps Genesis to BYZANTIUM, where
+    // revm already provides the opcode, so before orchid it must be replaced
+    // with the invalid-opcode handler -- same pattern as EXTCODEHASH before
+    // papyrus.
     instructions.insert_instruction(
         opcode::STATICCALL,
-        Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS),
+        if staticcall_enabled {
+            Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS)
+        } else {
+            Instruction::new(invalid_opcode::<WIRE, HOST>, 0)
+        },
     );
     instructions.insert_instruction(
         opcode::SELFDESTRUCT,
@@ -275,6 +286,7 @@ pub fn install<WIRE, HOST>(
         ISTANBUL_OPCODES_ENABLED.with(|f| f.set(istanbul_opcodes_enabled));
         PUSH0_ENABLED.with(|f| f.set(push0_enabled));
         BASEFEE_ENABLED.with(|f| f.set(basefee_enabled));
+        STATICCALL_ENABLED.with(|f| f.set(staticcall_enabled));
         let default_table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
             WIRE,
             HOST,
@@ -283,7 +295,9 @@ pub fn install<WIRE, HOST>(
             let op = op as u8;
             let static_gas = match op {
                 opcode::EXTCODESIZE | opcode::CALL | opcode::CALLCODE
-                | opcode::DELEGATECALL | opcode::STATICCALL => CALL_STATIC_GAS,
+                | opcode::DELEGATECALL => CALL_STATIC_GAS,
+                opcode::STATICCALL if staticcall_enabled => CALL_STATIC_GAS,
+                opcode::STATICCALL => 0,
                 opcode::EXTCODEHASH if !extcodehash_enabled => 0,
                 opcode::CHAINID if istanbul_opcodes_enabled => 2,
                 opcode::SELFBALANCE if istanbul_opcodes_enabled => 5,
@@ -574,6 +588,8 @@ thread_local! {
     static PUSH0_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// RSKIP412 flag for the all-ops tracer's BASEFEE dispatch.
     static BASEFEE_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// RSKIP91 flag for the all-ops tracer's STATICCALL dispatch.
+    static STATICCALL_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
 }
 
 /// All-ops tracer: log pc/opcode/gas (post-static-charge), then dispatch to
@@ -604,7 +620,13 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
         opcode::CALL => rsk_call(context),
         opcode::CALLCODE => rsk_call_code(context),
         opcode::DELEGATECALL => rsk_delegate_call(context),
-        opcode::STATICCALL => rsk_static_call(context),
+        opcode::STATICCALL => {
+            if STATICCALL_ENABLED.with(|f| f.get()) {
+                rsk_static_call(context)
+            } else {
+                invalid_opcode(context)
+            }
+        }
         opcode::SELFDESTRUCT => rsk_selfdestruct(context),
         opcode::EXTCODEHASH if !EXTCODEHASH_ENABLED.with(|f| f.get()) => {
             invalid_opcode(context)
