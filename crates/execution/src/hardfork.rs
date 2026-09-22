@@ -386,6 +386,13 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
     }
 
+    /// RSKIP385 (fingerroot500): `getEstimatedFeesForNextPegOutEvent` stops
+    /// short-circuiting to zero when the peg-out queue is empty
+    /// (`BridgeSupport.shouldReturnZeroEstimatedFees`).
+    pub fn has_rskip385(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
+    }
+
     /// RSKIP305: committed federations become P2SH-P2WSH-ERP federations
     /// instead of P2SH-ERP (mainnet reed800 = 8,052,200; testnet 6,835,700;
     /// regtest 0).

@@ -3910,6 +3910,111 @@ mod tests {
         let _ = b256_to_bitcoin_hash;
     }
 
+    /// Audit findings FRCR-78 and FRCR-678.
+    ///
+    /// `getEstimatedFeesForNextPegOutEvent` is **transaction-callable** — rskj
+    /// `BridgeMethods` gives it `fixedPermission(false)` — so a contract can
+    /// CALL it and branch on the answer, which makes the value consensus.
+    /// rustock returned a hardcoded `0`.
+    ///
+    /// rskj `BridgeSupport.getEstimatedFeesForNextPegOutEvent`:
+    ///
+    /// ```text
+    ///   shouldReturnZeroEstimatedFees()  -> 0
+    ///   !RSKIP305                        -> feePerKB * simulatePegoutTxSize(2 in, queued+2 out) / 1000
+    ///   otherwise                        -> inputSum - outputSum of a simulated batched peg-out,
+    ///                                       falling back to the line above on failure
+    /// ```
+    ///
+    /// Driven through the Bridge precompile: `releaseBtc` transactions build a
+    /// real release queue, then the getter is called and its int256 read back.
+    #[test]
+    fn test_estimated_fees_for_next_pegout_is_not_hardcoded_zero() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        // Run `pegouts` releaseBtc transactions, then query the estimate.
+        let query = |number: u64, pegouts: u64| -> U256 {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0xE5);
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc * U256::from(50));
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let header = dummy_header(number);
+
+            let mut root = root;
+            for nonce in 0..pegouts {
+                let tx = rustock_core::Transaction {
+                    nonce,
+                    gas_price: U256::from(0),
+                    gas_limit: U256::from(200_000),
+                    to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                    value: one_rbtc, // 1 RBTC, well above the peg-out minimum
+                    input: Bytes::new(), // empty input = releaseBtc
+                    v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+                };
+                let r = executor
+                    .execute_block(&header, &[(tx, sender)], &root, store.clone())
+                    .expect("releaseBtc block");
+                assert!(r.tx_results[0].success, "releaseBtc must succeed");
+                root = crate::state::apply_state_changes(
+                    &root, store.as_ref(), &r.state_changes, &r.markers,
+                );
+            }
+
+            let call = rustock_core::Transaction {
+                nonce: pegouts,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(500_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(
+                    crate::bridge::compute_selector("getEstimatedFeesForNextPegOutEvent()").to_vec(),
+                ),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r = executor
+                .execute_block(&header, &[(call, sender)], &root, store)
+                .expect("query block");
+            let res = &r.tx_results[0];
+            assert!(res.success, "getEstimatedFeesForNextPegOutEvent must not throw");
+            assert_eq!(res.output.len(), 32);
+            U256::from_be_slice(&res.output)
+        };
+
+        // hop400 (#4,598,500) .. fingerroot500 (#5,468,000): RSKIP271 active,
+        // RSKIP385 not — shouldReturnZeroEstimatedFees is true for an EMPTY
+        // queue only.
+        assert_eq!(query(5_000_000, 0), U256::ZERO, "empty queue pre-RSKIP385 -> 0");
+        let pre385_one = query(5_000_000, 1);
+        assert!(!pre385_one.is_zero(), "a queued peg-out pre-RSKIP385 must cost something");
+
+        // fingerroot500 onward RSKIP385 is active, so the zero short-circuit is
+        // gone: even an empty queue reports the 2-input / 2-output estimate.
+        let f500_empty = query(6_000_000, 0);
+        assert!(!f500_empty.is_zero(), "RSKIP385 removes the empty-queue zero");
+
+        // reed800 (#8,052,200): RSKIP305 switches to the simulation. With no
+        // federation UTXOs the builder cannot fund the peg-out, which is rskj's
+        // BridgeIllegalArgumentException path -> fall back to the size estimate.
+        let reed_empty = query(8_500_000, 0);
+        assert!(!reed_empty.is_zero(), "reed800 fallback must still produce a fee");
+
+        // vetiver900 (#8,804,200) activates RSKIP540, which only changes the
+        // hypothetical amount; with the fallback in play the answer is stable.
+        let vetiver_empty = query(9_000_000, 0);
+        assert!(!vetiver_empty.is_zero());
+
+        // More queued peg-outs mean more outputs, hence a bigger transaction
+        // and a strictly bigger fee. This is what a hardcoded 0 could never do.
+        let f500_three = query(6_000_000, 3);
+        assert!(
+            f500_three > f500_empty,
+            "3 queued peg-outs must cost more than 0: {f500_three} vs {f500_empty}"
+        );
+    }
+
     /// Ported from rskj InitcodeCostCalculatorTest.
     /// Validates that contract creation includes initcode word cost at Shanghai.
     #[test]
