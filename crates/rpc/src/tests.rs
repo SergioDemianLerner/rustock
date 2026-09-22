@@ -906,6 +906,8 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         miner: None,
         admin_enabled: false,
         gc_burial: 4000,
+        prune_keep_depth: 100_000,
+        prune_max_batch: 50_000,
     };
 
     // Ask the node for the block, take the hash it reports...
