@@ -78,6 +78,8 @@ pub fn install<WIRE, HOST>(
     extcodehash_enabled: bool,
     istanbul_opcodes_enabled: bool,
     push0_enabled: bool,
+    basefee_enabled: bool,
+    staticcall_enabled: bool,
     transient_storage_enabled: bool,
     mcopy_enabled: bool,
     extcodesize_max_precompiles: &[Address],
@@ -116,6 +118,24 @@ pub fn install<WIRE, HOST>(
         instructions.insert_instruction(
             opcode::PUSH0,
             Instruction::new(rsk_push0::<WIRE, HOST>, 2),
+        );
+    }
+    // RSKIP412 (arrowhead600): BASEFEE (0x48, rskj `OpCode.BASEFEE` BASE_TIER =
+    // 2 gas) pushes the block's minimum gas price. rskj gates it on RSKIP412
+    // (`VM.java` OP_BASEFEE -> invalidOpCode when inactive), which activates at
+    // arrowhead600 — but revm bundles BASEFEE into LONDON, and arrowhead600..
+    // lovell700 maps to ISTANBUL, so revm's stock BASEFEE halts NotActivated
+    // across that whole window. Install an unchecked version, same as PUSH0.
+    //
+    // It is only needed for that window: every pre-arrowhead upgrade maps to
+    // BYZANTIUM or PETERSBURG (no BASEFEE, matching rskj), and lovell700+ maps
+    // to SHANGHAI >= LONDON where revm's own BASEFEE is already correct. The
+    // unchecked instruction is installed for both, so the behaviour no longer
+    // depends on which side of the spec boundary a block falls.
+    if basefee_enabled {
+        instructions.insert_instruction(
+            opcode::BASEFEE,
+            Instruction::new(rsk_basefee::<WIRE, HOST>, 2),
         );
     }
     if !extcodehash_enabled {
@@ -229,9 +249,19 @@ pub fn install<WIRE, HOST>(
         opcode::DELEGATECALL,
         Instruction::new(rsk_delegate_call::<WIRE, HOST>, CALL_STATIC_GAS),
     );
+    // RSKIP91 (orchid, mainnet #729,000) introduced STATICCALL. rskj's
+    // `VM.java` OP_STATICCALL throws `invalidOpCode` (consuming the frame's
+    // gas) while RSKIP91 is inactive; rustock maps Genesis to BYZANTIUM, where
+    // revm already provides the opcode, so before orchid it must be replaced
+    // with the invalid-opcode handler -- same pattern as EXTCODEHASH before
+    // papyrus.
     instructions.insert_instruction(
         opcode::STATICCALL,
-        Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS),
+        if staticcall_enabled {
+            Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS)
+        } else {
+            Instruction::new(invalid_opcode::<WIRE, HOST>, 0)
+        },
     );
     instructions.insert_instruction(
         opcode::SELFDESTRUCT,
@@ -255,6 +285,8 @@ pub fn install<WIRE, HOST>(
         EXTCODEHASH_ENABLED.with(|f| f.set(extcodehash_enabled));
         ISTANBUL_OPCODES_ENABLED.with(|f| f.set(istanbul_opcodes_enabled));
         PUSH0_ENABLED.with(|f| f.set(push0_enabled));
+        BASEFEE_ENABLED.with(|f| f.set(basefee_enabled));
+        STATICCALL_ENABLED.with(|f| f.set(staticcall_enabled));
         let default_table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
             WIRE,
             HOST,
@@ -263,11 +295,14 @@ pub fn install<WIRE, HOST>(
             let op = op as u8;
             let static_gas = match op {
                 opcode::EXTCODESIZE | opcode::CALL | opcode::CALLCODE
-                | opcode::DELEGATECALL | opcode::STATICCALL => CALL_STATIC_GAS,
+                | opcode::DELEGATECALL => CALL_STATIC_GAS,
+                opcode::STATICCALL if staticcall_enabled => CALL_STATIC_GAS,
+                opcode::STATICCALL => 0,
                 opcode::EXTCODEHASH if !extcodehash_enabled => 0,
                 opcode::CHAINID if istanbul_opcodes_enabled => 2,
                 opcode::SELFBALANCE if istanbul_opcodes_enabled => 5,
                 opcode::PUSH0 if push0_enabled => 2,
+                opcode::BASEFEE if basefee_enabled => 2,
                 _ => default_table[op as usize].static_gas(),
             };
             instructions.insert_instruction(
@@ -378,6 +413,19 @@ fn rsk_push0<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
     if !context.interpreter.stack.push(U256::ZERO) {
+        context.interpreter.halt_overflow();
+    }
+}
+
+/// BASEFEE (RSKIP412, arrowhead600) without revm's LONDON spec check: pushes
+/// the block's base fee, which in rustock carries RSK's `minimumGasPrice`
+/// (`env.rs`: `basefee: header.minimum_gas_price`). rskj `VM.doBASEFEE` pushes
+/// `program.getMinimumGasPrice()` verbatim. Static gas (2, BASE_TIER) comes
+/// from the instruction table entry installed in `install`.
+fn rsk_basefee<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    if !context.interpreter.stack.push(U256::from(context.host.basefee())) {
         context.interpreter.halt_overflow();
     }
 }
@@ -538,6 +586,10 @@ thread_local! {
     static ISTANBUL_OPCODES_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
     /// RSKIP398 flag for the all-ops tracer's PUSH0 dispatch.
     static PUSH0_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// RSKIP412 flag for the all-ops tracer's BASEFEE dispatch.
+    static BASEFEE_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// RSKIP91 flag for the all-ops tracer's STATICCALL dispatch.
+    static STATICCALL_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
 }
 
 /// All-ops tracer: log pc/opcode/gas (post-static-charge), then dispatch to
@@ -568,7 +620,13 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
         opcode::CALL => rsk_call(context),
         opcode::CALLCODE => rsk_call_code(context),
         opcode::DELEGATECALL => rsk_delegate_call(context),
-        opcode::STATICCALL => rsk_static_call(context),
+        opcode::STATICCALL => {
+            if STATICCALL_ENABLED.with(|f| f.get()) {
+                rsk_static_call(context)
+            } else {
+                invalid_opcode(context)
+            }
+        }
         opcode::SELFDESTRUCT => rsk_selfdestruct(context),
         opcode::EXTCODEHASH if !EXTCODEHASH_ENABLED.with(|f| f.get()) => {
             invalid_opcode(context)
@@ -591,6 +649,13 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
         opcode::PUSH0 => {
             if PUSH0_ENABLED.with(|f| f.get()) {
                 rsk_push0(context)
+            } else {
+                invalid_opcode(context)
+            }
+        }
+        opcode::BASEFEE => {
+            if BASEFEE_ENABLED.with(|f| f.get()) {
+                rsk_basefee(context)
             } else {
                 invalid_opcode(context)
             }

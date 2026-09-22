@@ -43,7 +43,7 @@ use crate::precompiles::BridgeTxContext;
 // ABI selector helper
 // ---------------------------------------------------------------------------
 
-fn compute_selector(sig: &str) -> [u8; 4] {
+pub(crate) fn compute_selector(sig: &str) -> [u8; 4] {
     let h = Keccak256::digest(sig.as_bytes());
     [h[0], h[1], h[2], h[3]]
 }
@@ -918,7 +918,9 @@ fn execute_method<CTX: crate::RskContextTr>(
         // Phase 3: BTC transaction verification
         "registerBtcCoinbaseTransaction" => tx::register_btc_coinbase_transaction(ctx, args, gas_cost),
         "hasBtcBlockCoinbaseTransactionInformation" => tx::has_btc_block_coinbase_info(ctx, args, gas_cost),
-        "getBtcTransactionConfirmations" => tx::get_btc_transaction_confirmations(ctx, args, gas_cost),
+        "getBtcTransactionConfirmations" => {
+            tx::get_btc_transaction_confirmations(ctx, args, gas_cost, config, use_v2, hardfork_cfg)
+        }
 
         // Phase 4: Peg-in
         "registerBtcTransaction" => peg::register_btc_transaction(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
@@ -948,7 +950,9 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getActiveFederationCreationBlockHeight" => governance::get_active_federation_creation_block_height(ctx, gas_cost),
         "getNextPegoutCreationBlockNumber" => peg::get_next_pegout_creation_block_number(ctx, gas_cost),
         "getQueuedPegoutsCount" => peg::get_queued_pegouts_count(ctx, gas_cost),
-        "getEstimatedFeesForNextPegOutEvent" => peg::get_estimated_fees_for_next_pegout(ctx, gas_cost),
+        "getEstimatedFeesForNextPegOutEvent" => {
+            peg::get_estimated_fees_for_next_pegout(ctx, gas_cost, config, hardfork_cfg)
+        }
         "getEstimatedFeesForPegOutAmount" => peg::get_estimated_fees_for_pegout_amount(ctx, args, gas_cost, config, hardfork_cfg),
 
         // Local-only getters with real storage reads

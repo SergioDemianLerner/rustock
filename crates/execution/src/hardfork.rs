@@ -60,22 +60,23 @@ pub const MAINNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
 ];
 
 /// Testnet activation heights.
+///
+/// Ground truth is rskj `rskj-core/src/main/resources/config/testnet.conf`
+/// (rskj 9.1.0). Testnet starts already on wasabi100: bahamas, orchid,
+/// orchid060 and wasabi100 are all height 0 there, unlike mainnet.
 pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
     (0, RskNetworkUpgrade::Genesis),
     (0, RskNetworkUpgrade::Orchid),
-    (863_000, RskNetworkUpgrade::Wasabi100),
-    // rskj testnet activates twoToThree (504_000) BEFORE wasabi100, which the
-    // linear ladder cannot express; modeling it as wasabi-coincident loses
-    // RSKIP150 only in the testnet 504_000..863_000 window.
-    (863_000, RskNetworkUpgrade::TwoToThree),
-    (1_580_000, RskNetworkUpgrade::Papyrus200),
+    (0, RskNetworkUpgrade::Wasabi100),
+    (504_000, RskNetworkUpgrade::TwoToThree),
+    (863_000, RskNetworkUpgrade::Papyrus200),
     (2_060_500, RskNetworkUpgrade::Iris300),
     (3_103_000, RskNetworkUpgrade::Hop400),
     (4_015_800, RskNetworkUpgrade::Fingerroot500),
     (4_927_100, RskNetworkUpgrade::Arrowhead600),
     // arrowhead631 = -1 on testnet (rskj testnet.conf)
-    (5_735_824, RskNetworkUpgrade::Lovell700),
-    (6_420_700, RskNetworkUpgrade::Reed800),
+    (6_110_487, RskNetworkUpgrade::Lovell700),
+    (6_835_700, RskNetworkUpgrade::Reed800),
     (7_139_600, RskNetworkUpgrade::Reed810),
     (7_604_200, RskNetworkUpgrade::Vetiver900),
 ];
@@ -176,6 +177,24 @@ impl RskHardforkConfig {
     /// lovell700; revm only bundles PUSH0 into SHANGHAI, so arrowhead600..
     /// lovell700 needs it installed explicitly (see rsk_instructions::install).
     pub fn has_push0(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
+    }
+
+    /// RSKIP91 (Orchid, mainnet #729,000): the STATICCALL opcode (0xfa).
+    /// rskj's `VM.java` OP_STATICCALL throws `invalidOpCode` while RSKIP91 is
+    /// inactive (`reference.conf`: `rskip91 = orchid`). rustock maps Genesis to
+    /// `SpecId::BYZANTIUM`, where revm already has STATICCALL, so it must be
+    /// disabled explicitly before Orchid.
+    pub fn has_rskip91(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Orchid
+    }
+
+    /// Whether the BASEFEE opcode (0x48) is available (RSKIP412, Arrowhead600).
+    /// rskj gates it on RSKIP412 (`reference.conf`: `rskip412 = arrowhead600`)
+    /// and pushes `program.getMinimumGasPrice()` (`VM.doBASEFEE`). revm bundles
+    /// BASEFEE into LONDON, and arrowhead600..lovell700 maps to ISTANBUL, so it
+    /// must be installed explicitly (see `rsk_instructions::install`).
+    pub fn has_basefee(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
     }
 
@@ -364,6 +383,13 @@ impl RskHardforkConfig {
     /// RSKIP374: ends the special-case funds-migration window, restoring the
     /// normal `fundsMigrationAgeSinceActivationEnd` (Fingerroot500).
     pub fn has_rskip374(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
+    }
+
+    /// RSKIP385 (fingerroot500): `getEstimatedFeesForNextPegOutEvent` stops
+    /// short-circuiting to zero when the peg-out queue is empty
+    /// (`BridgeSupport.shouldReturnZeroEstimatedFees`).
+    pub fn has_rskip385(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
     }
 
@@ -593,6 +619,91 @@ fn upgrade_to_spec_id(upgrade: RskNetworkUpgrade) -> SpecId {
 
 #[cfg(test)]
 mod tests {
+
+    /// Audit finding FRCR-674.
+    ///
+    /// rskj gates STATICCALL (0xfa) on RSKIP91 — `VM.java` OP_STATICCALL
+    /// throws `invalidOpCode` while it is inactive, and `reference.conf` sets
+    /// `rskip91 = orchid` (mainnet #729,000). rustock maps Genesis to
+    /// `SpecId::BYZANTIUM`, where revm already provides STATICCALL, so before
+    /// this gate rustock executed the opcode for the first 729,000 blocks,
+    /// where rskj aborts the frame and consumes all its gas.
+    #[test]
+    fn test_staticcall_gated_on_orchid_rskip91() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_rskip91(0));
+        assert!(!cfg.has_rskip91(728_999));
+        assert!(cfg.has_rskip91(729_000));
+        assert!(cfg.has_rskip91(9_000_000));
+
+        // rskj testnet.conf: orchid = 0, so STATICCALL is live from genesis.
+        let testnet = RskHardforkConfig::testnet();
+        assert!(testnet.has_rskip91(0));
+    }
+
+    /// rskj `rskj-core/src/main/resources/config/testnet.conf` (rskj 9.1.0),
+    /// transcribed as a block. rustock's testnet ladder had drifted: wasabi100
+    /// was 863,000 (rskj: 0 — that number is rskj's *papyrus200*), papyrus200
+    /// was 1,580,000 (a value that appears nowhere in rskj), twoToThree was
+    /// folded into wasabi, and lovell700/reed800 were both wrong. Mainnet was
+    /// and is exact; this pins both so neither can drift again.
+    #[test]
+    fn activation_heights_match_rskj_config() {
+        let m = RskHardforkConfig::mainnet();
+        // rskj config/main.conf
+        for (height, upgrade) in [
+            (729_000u64, RskNetworkUpgrade::Orchid),
+            (1_591_000, RskNetworkUpgrade::Wasabi100),
+            (2_018_000, RskNetworkUpgrade::TwoToThree),
+            (2_392_700, RskNetworkUpgrade::Papyrus200),
+            (3_614_800, RskNetworkUpgrade::Iris300),
+            (4_598_500, RskNetworkUpgrade::Hop400),
+            (5_468_000, RskNetworkUpgrade::Fingerroot500),
+            (6_223_700, RskNetworkUpgrade::Arrowhead600),
+            (6_549_300, RskNetworkUpgrade::Arrowhead631),
+            (7_338_024, RskNetworkUpgrade::Lovell700),
+            (8_052_200, RskNetworkUpgrade::Reed800),
+            (8_804_200, RskNetworkUpgrade::Vetiver900),
+        ] {
+            assert!(
+                m.active_upgrade(height) >= upgrade,
+                "mainnet {upgrade:?} must be active at {height}"
+            );
+            assert!(
+                m.active_upgrade(height - 1) < upgrade,
+                "mainnet {upgrade:?} must NOT be active at {}",
+                height - 1
+            );
+        }
+
+        let t = RskHardforkConfig::testnet();
+        // rskj config/testnet.conf. bahamas/orchid/orchid060/wasabi100 = 0.
+        assert!(t.active_upgrade(0) >= RskNetworkUpgrade::Wasabi100);
+        for (height, upgrade) in [
+            (504_000u64, RskNetworkUpgrade::TwoToThree),
+            (863_000, RskNetworkUpgrade::Papyrus200),
+            (2_060_500, RskNetworkUpgrade::Iris300),
+            (3_103_000, RskNetworkUpgrade::Hop400),
+            (4_015_800, RskNetworkUpgrade::Fingerroot500),
+            (4_927_100, RskNetworkUpgrade::Arrowhead600),
+            (6_110_487, RskNetworkUpgrade::Lovell700),
+            (6_835_700, RskNetworkUpgrade::Reed800),
+            (7_139_600, RskNetworkUpgrade::Reed810),
+            (7_604_200, RskNetworkUpgrade::Vetiver900),
+        ] {
+            assert!(
+                t.active_upgrade(height) >= upgrade,
+                "testnet {upgrade:?} must be active at {height}"
+            );
+            assert!(
+                t.active_upgrade(height - 1) < upgrade,
+                "testnet {upgrade:?} must NOT be active at {}",
+                height - 1
+            );
+        }
+        // arrowhead631 = -1 on testnet: the ladder must never report it.
+        assert!(t.active_upgrade(u64::MAX) >= RskNetworkUpgrade::Vetiver900);
+    }
     use super::*;
 
     #[test]

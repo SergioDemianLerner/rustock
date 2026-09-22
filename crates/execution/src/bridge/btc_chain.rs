@@ -4,13 +4,15 @@
 //! relayers to submit BTC block headers to the Bridge contract, building
 //! an SPV header chain in contract storage.
 //!
-//! Error codes (matching rskj):
-//! -  1: success
-//! - -1: block already known
-//! - -2: called too soon (rate limiting)
-//! - -3: previous block not found
-//! - -4: too far ahead of chain tip
-//! - -5: invalid proof of work
+//! Error codes (matching rskj `BridgeSupport.java:96-100` and
+//! `Bridge.java:243`):
+//! -   0: success
+//! -  -1: called too soon (RSKIP200 rate limiting)
+//! -  -2: block too old
+//! -  -3: previous block not found
+//! -  -4: block previously saved
+//! - -20: header size mismatch (returned by `Bridge`, not `BridgeSupport`)
+//! - -99: unexpected exception
 
 use alloy_primitives::{Bytes, U256};
 use bitcoin::block::Header as BtcHeader;
@@ -35,6 +37,24 @@ const ERR_BLOCK_TOO_OLD: i64 = -2;
 const ERR_PREV_NOT_FOUND: i64 = -3;
 const ERR_ALREADY_KNOWN: i64 = -4;
 const ERR_UNEXPECTED_EXCEPTION: i64 = -99;
+/// rskj `Bridge.RECEIVE_HEADER_ERROR_SIZE_MISTMATCH` (Bridge.java:243).
+/// Unlike the codes above this one is produced by `Bridge.receiveHeader`
+/// itself, before `BridgeSupport` is reached, and is *returned* — the call
+/// succeeds and the caller sees -20 on the stack.
+const ERR_SIZE_MISMATCH: i64 = -20;
+
+/// rskj `BtcTransactionFormatUtils.isBlockHeaderSize`: exactly 80 bytes once
+/// RSKIP124 is active, otherwise 80..=85 (bitcoinj's `makeBlock` tolerated a
+/// trailing transaction-count varint).
+fn is_block_header_size(size: usize, rskip124: bool) -> bool {
+    const MIN_BLOCK_HEADER_SIZE: usize = 80;
+    const MAX_BLOCK_HEADER_SIZE: usize = 85;
+    if rskip124 {
+        size == MIN_BLOCK_HEADER_SIZE
+    } else {
+        (MIN_BLOCK_HEADER_SIZE..=MAX_BLOCK_HEADER_SIZE).contains(&size)
+    }
+}
 
 /// Process a single BTC header submitted via `receiveHeader(bytes)`.
 ///
@@ -63,8 +83,13 @@ pub fn receive_header<CTX: crate::RskContextTr>(
     // Deserialize BTC header (80 bytes). rskj has already parsed the header
     // (Bridge.receiveHeader takes a BtcBlock) by this point, so the order of
     // checks below mirrors BridgeSupport.receiveHeader (BridgeSupport.java:227).
-    if header_bytes.len() < 80 {
-        return Err(PrecompileError::other("receiveHeader: header too short"));
+    // rskj `Bridge.receiveHeader` size gate (Bridge.java:573-576). A wrong
+    // size is NOT an exception: it returns -20 and the call succeeds. rustock
+    // used to raise a precompile error for anything under 80 bytes and to
+    // silently truncate anything over — both fork from rskj, which rejects
+    // 81 bytes just as firmly as it rejects 79.
+    if !is_block_header_size(header_bytes.len(), hardfork_cfg.has_rskip124(block_number)) {
+        return Ok(encode_int_result(gas_cost, ERR_SIZE_MISMATCH));
     }
 
     let btc_header: BtcHeader = deserialize(&header_bytes[..80])
@@ -299,27 +324,91 @@ pub(crate) fn stored_block_at_main_chain_height<CTX: crate::RskContextTr>(
     height: u32,
     rskip199: bool,
 ) -> Option<StoredBlock> {
-    let head = load_chain_head(ctx)?;
+    match main_chain_block_at_height(ctx, height, rskip199, None) {
+        MainChainLookup::Found(b) => Some(b),
+        MainChainLookup::Absent | MainChainLookup::StoreError => None,
+    }
+}
+
+/// The three outcomes rskj's `getStoredBlockAtMainChainHeight` can produce.
+///
+/// Java distinguishes them by *how* it returns: a `StoredBlock`, `null`, or a
+/// thrown `BlockStoreException`. Callers that only care whether a block was
+/// found can collapse `Absent` and `StoredError` (see
+/// `stored_block_at_main_chain_height`), but `getBtcTransactionConfirmations`
+/// maps them to two different error codes (-2 and -3), so the distinction has
+/// to survive.
+pub(crate) enum MainChainLookup {
+    Found(StoredBlock),
+    /// Java returned `null`: the walk ran off the end of what is stored.
+    Absent,
+    /// Java threw `BlockStoreException`: the height is above the chain head,
+    /// below the RSKIP199 search limit, or the walk landed on a block whose
+    /// recorded height disagrees with its depth.
+    StoreError,
+}
+
+/// rskj `RepositoryBtcBlockStoreWithCache.getStoredBlockAtMainChainHeight`
+/// (l.198-244), preserving the null-vs-exception distinction.
+///
+/// `config` enables the RSKIP199 search-depth limit (l.213-233); pass `None`
+/// to skip it, which is what the pre-existing callers did.
+pub(crate) fn main_chain_block_at_height<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    height: u32,
+    rskip199: bool,
+    config: Option<&BridgeConstants>,
+) -> MainChainLookup {
+    let Some(head) = load_chain_head(ctx) else {
+        return MainChainLookup::StoreError;
+    };
     if height > head.height {
-        return None; // depth < 0: above the chain head
+        // `depth < 0` -> BlockStoreException (l.203-211).
+        return MainChainLookup::StoreError;
     }
     let depth = head.height - height;
 
-    // From RSKIP199, the indexed lookup; it may be absent for blocks below the
-    // index activation, in which case rskj falls back to the walk.
+    // l.213-233: below RSKIP199, blocks older than the search limit are not
+    // reachable at all and the lookup throws.
     if rskip199 {
-        if let Some(hash) = super::storage::bridge_load_btc_block_hash_by_height(ctx, height) {
-            return get_stored_block(ctx, &b256_to_bitcoin_hash(&hash));
+        if let Some(config) = config {
+            let index_activation = config.btc_height_when_block_index_activates;
+            let max_depth = config.max_depth_to_search_blocks_below_index_activation;
+            let limit = if head.height.saturating_sub(index_activation) > max_depth {
+                index_activation
+            } else {
+                head.height.saturating_sub(max_depth)
+            };
+            if height < limit {
+                return MainChainLookup::StoreError;
+            }
         }
     }
 
-    // Walk `depth` parents down from the head (getStoredBlockAtMainChainDepth).
+    // `getInMainchain(height)`: the indexed lookup. Absent for blocks below the
+    // index activation, in which case rskj falls back to the walk.
+    if rskip199 {
+        if let Some(hash) = super::storage::bridge_load_btc_block_hash_by_height(ctx, height) {
+            if let Some(block) = get_stored_block(ctx, &b256_to_bitcoin_hash(&hash)) {
+                return MainChainLookup::Found(block);
+            }
+        }
+    }
+
+    // Walk `depth` parents down from the head (getStoredBlockAtMainChainDepth,
+    // l.271-310). A missing block returns null; a height mismatch throws.
     let mut block_hash = head.header.block_hash();
     for _ in 0..depth {
-        block_hash = get_stored_block(ctx, &block_hash)?.header.prev_blockhash;
+        match get_stored_block(ctx, &block_hash) {
+            Some(b) => block_hash = b.header.prev_blockhash,
+            None => return MainChainLookup::Absent,
+        }
     }
-    let block = get_stored_block(ctx, &block_hash)?;
-    (block.height == height).then_some(block)
+    match get_stored_block(ctx, &block_hash) {
+        None => MainChainLookup::Absent,
+        Some(block) if block.height == height => MainChainLookup::Found(block),
+        Some(_) => MainChainLookup::StoreError,
+    }
 }
 
 /// Seed the bridge BTC chain on first use. rskj does this in two steps that
@@ -884,5 +973,29 @@ mod tests {
         assert_eq!(ERR_PREV_NOT_FOUND, -3); // RECEIVE_HEADER_CANT_FOUND_PREVIOUS_BLOCK
         assert_eq!(ERR_ALREADY_KNOWN, -4); // RECEIVE_HEADER_BLOCK_PREVIOUSLY_SAVED
         assert_eq!(ERR_UNEXPECTED_EXCEPTION, -99); // RECEIVE_HEADER_UNEXPECTED_EXCEPTION
+    }
+
+    /// Ground truth: rskj `BtcTransactionFormatUtils.isBlockHeaderSize`.
+    /// Exactly 80 bytes once RSKIP124 is active; 80..=85 before it, because
+    /// bitcoinj's `makeBlock` tolerated a trailing transaction-count varint.
+    /// Anything else makes `Bridge.receiveHeader` return -20 (Bridge.java:575).
+    #[test]
+    fn receive_header_size_rule_matches_rskj() {
+        // RSKIP124 active (wasabi100 onward — every block that can reach
+        // receiveHeader, which needs RSKIP200).
+        assert!(is_block_header_size(80, true));
+        for bad in [0usize, 1, 79, 81, 85, 86, 160] {
+            assert!(!is_block_header_size(bad, true), "size {bad} must be rejected");
+        }
+
+        // Pre-RSKIP124: the MIN..=MAX window.
+        for ok in 80usize..=85 {
+            assert!(is_block_header_size(ok, false), "size {ok} accepted pre-RSKIP124");
+        }
+        for bad in [0usize, 79, 86] {
+            assert!(!is_block_header_size(bad, false), "size {bad} rejected pre-RSKIP124");
+        }
+
+        assert_eq!(ERR_SIZE_MISMATCH, -20); // Bridge.RECEIVE_HEADER_ERROR_SIZE_MISTMATCH
     }
 }

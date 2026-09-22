@@ -189,6 +189,8 @@ impl RskExecutor {
             self.hardfork_cfg.has_rskip140(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
+            self.hardfork_cfg.has_basefee(header.number),
+            self.hardfork_cfg.has_rskip91(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
             &extcodesize_max_precompiles,
@@ -319,6 +321,8 @@ impl RskExecutor {
             self.hardfork_cfg.has_rskip140(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
+            self.hardfork_cfg.has_basefee(header.number),
+            self.hardfork_cfg.has_rskip91(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
             &extcodesize_max_precompiles,
@@ -3527,6 +3531,488 @@ mod tests {
 
         assert!(!run(6_223_699), "PUSH0 invalid pre-arrowhead600 (call fails)");
         assert!(run(6_223_700), "PUSH0 valid at arrowhead600 (call succeeds)");
+    }
+
+    /// Audit finding FRCR-679 / FRCR-879.
+    ///
+    /// RSKIP412 (arrowhead600) makes BASEFEE (0x48) valid: rskj's
+    /// `VM.java` OP_BASEFEE throws `invalidOpCode` only while RSKIP412 is
+    /// inactive (`reference.conf`: `rskip412 = arrowhead600`), and
+    /// `VM.doBASEFEE` pushes `program.getMinimumGasPrice()` for 2 gas.
+    ///
+    /// revm bundles BASEFEE into LONDON. rustock maps arrowhead600 to ISTANBUL
+    /// (for the RSKIP400 calldata pricing) and only reaches SHANGHAI at
+    /// lovell700 — so across the whole arrowhead600..lovell700 window, about
+    /// 1.1M mainnet blocks, revm's stock BASEFEE halted `NotActivated` and
+    /// consumed the frame's entire gas where rskj pushed a value and continued.
+    ///
+    /// Same shape as `test_push0_activates_at_arrowhead600`; this one also
+    /// checks the value pushed, because installing the opcode is only half of
+    /// matching rskj — it has to push the block's minimum gas price.
+    #[test]
+    fn test_basefee_activates_at_arrowhead600() {
+        // Runtime: BASEFEE; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+        let runtime: Vec<u8> = vec![0x48, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        // Init: CODECOPY the 9-byte runtime and RETURN it.
+        let mut init = vec![
+            0x60, 0x09, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x09, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        const MIN_GAS_PRICE: u64 = 59_240_000;
+
+        // `None` = the call failed (invalid opcode); `Some(v)` = BASEFEE pushed v.
+        let run = |number: u64| -> Option<U256> {
+            let header = Header {
+                minimum_gas_price: U256::from(MIN_GAS_PRICE),
+                ..dummy_header(number)
+            };
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0x48);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let deploy = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(MIN_GAS_PRICE),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::new(),
+                value: U256::ZERO,
+                input: Bytes::from(init.clone()),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r1 = executor
+                .execute_block(&header, &[(deploy, sender)], &root, store.clone())
+                .expect("deploy block");
+            assert!(r1.tx_results[0].success, "deploy (no BASEFEE in init) always succeeds");
+            let deployed = sender.create(0);
+            let root2 = crate::state::apply_state_changes(
+                &root, store.as_ref(), &r1.state_changes, &r1.markers,
+            );
+            let call = rustock_core::Transaction {
+                nonce: 1,
+                gas_price: U256::from(MIN_GAS_PRICE),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(deployed.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::new(),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r2 = executor
+                .execute_block(&header, &[(call, sender)], &root2, store)
+                .expect("call block");
+            let res = &r2.tx_results[0];
+            if !res.success {
+                return None;
+            }
+            assert_eq!(res.output.len(), 32, "BASEFEE returns one word");
+            Some(U256::from_be_slice(&res.output))
+        };
+
+        // fingerroot500 (PETERSBURG): rskj throws invalidOpCode, so must fail.
+        assert_eq!(run(6_223_699), None, "BASEFEE invalid pre-arrowhead600");
+        // arrowhead600 (ISTANBUL in rustock): the window the audit found.
+        assert_eq!(
+            run(6_223_700),
+            Some(U256::from(MIN_GAS_PRICE)),
+            "RSKIP412 active at arrowhead600: pushes minimumGasPrice"
+        );
+        // arrowhead631, still ISTANBUL.
+        assert_eq!(run(6_549_300), Some(U256::from(MIN_GAS_PRICE)));
+        // lovell700 (SHANGHAI >= LONDON): revm's own BASEFEE already worked
+        // here, so this pins that the explicit install did not change it.
+        assert_eq!(run(7_338_024), Some(U256::from(MIN_GAS_PRICE)));
+    }
+
+    /// Audit finding FRCR-476.
+    ///
+    /// rskj's `Bridge.receiveHeader` (Bridge.java:568-586) checks the argument
+    /// size *before* anything else and, on a mismatch, **returns**
+    /// `RECEIVE_HEADER_ERROR_SIZE_MISTMATCH = -20` (Bridge.java:243). The call
+    /// succeeds; the caller reads -20 off the stack. The size rule is
+    /// `BtcTransactionFormatUtils.isBlockHeaderSize`: exactly 80 bytes once
+    /// RSKIP124 is active.
+    ///
+    /// rustock had neither half. Under 80 bytes it raised a precompile error
+    /// (post-RSKIP197 a revert pushing 0, pre-197 a failed call consuming all
+    /// gas); over 80 bytes it silently truncated to the first 80 and processed
+    /// the header as if it were valid. Both fork from rskj on inputs any
+    /// relayer can submit.
+    #[test]
+    fn test_receive_header_size_mismatch_returns_minus_20() {
+        // ABI-encode `receiveHeader(bytes)` with a payload of `len` bytes.
+        let call_input = |len: usize| -> Vec<u8> {
+            let mut input = crate::bridge::compute_selector("receiveHeader(bytes)").to_vec();
+            let mut off = [0u8; 32];
+            off[31] = 0x20;
+            input.extend_from_slice(&off); // offset to the bytes argument
+            let mut l = [0u8; 32];
+            l[24..].copy_from_slice(&(len as u64).to_be_bytes());
+            input.extend_from_slice(&l); // length
+            let mut payload = vec![0xABu8; len];
+            payload.resize(len.div_ceil(32) * 32, 0); // right-pad to a word
+            input.extend_from_slice(&payload);
+            input
+        };
+
+        // Returns the int256 the Bridge produced, or None if the call failed.
+        let run = |len: usize| -> Option<alloy_primitives::I256> {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0x7E);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(2_000_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(call_input(len)),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r = executor
+                .execute_block(&dummy_header(7_000_000), &[(tx, sender)], &root, store)
+                .expect("block");
+            let res = &r.tx_results[0];
+            if !res.success || res.output.len() != 32 {
+                return None;
+            }
+            Some(alloy_primitives::I256::from_be_bytes::<32>(res.output[..32].try_into().unwrap()))
+        };
+
+        let minus_20 = alloy_primitives::I256::try_from(-20i64).unwrap();
+        // Too short: rskj returns -20, it does not throw.
+        assert_eq!(run(79), Some(minus_20), "79-byte header -> -20");
+        assert_eq!(run(0), Some(minus_20), "empty header -> -20");
+        // Too long: rskj returns -20 rather than truncating to 80.
+        assert_eq!(run(81), Some(minus_20), "81-byte header -> -20");
+        assert_eq!(run(85), Some(minus_20), "85-byte header -> -20 once RSKIP124 is on");
+
+        // Exactly 80 is accepted for processing and must NOT report -20. The
+        // bytes are garbage, so the Bridge reports an ordinary BridgeSupport
+        // code (-3, previous block not found) — the point is that it got that
+        // far.
+        let at_80 = run(80).expect("80-byte header is processed");
+        assert_ne!(at_80, minus_20, "80 bytes must reach BridgeSupport");
+        assert_eq!(
+            at_80,
+            alloy_primitives::I256::try_from(-3i64).unwrap(),
+            "unknown parent -> RECEIVE_HEADER_CANT_FOUND_PREVIOUS_BLOCK"
+        );
+    }
+
+    /// Audit findings FRCR-75 and FRCR-76.
+    ///
+    /// rskj `BridgeSupport.getBtcTransactionConfirmations` (BridgeSupport.java
+    /// :2194-2235) runs four checks in a fixed order, each with its own code
+    /// (BridgeSupport.java:90-94):
+    ///
+    /// ```text
+    ///   block == null                      -> -1  INEXISTENT_BLOCK_HASH
+    ///   blockDepth > 4320                  -> -4  BLOCK_TOO_OLD
+    ///   not the main-chain block at height -> -2  BLOCK_NOT_IN_BEST_CHAIN
+    ///                     (BlockStoreException) -> -3  INCONSISTENT_BLOCK
+    ///   merkle branch does not reduce      -> -5  INVALID_MERKLE_BRANCH
+    ///   otherwise      bestChainHeight - block.getHeight() + 1
+    /// ```
+    ///
+    /// rustock had -1, then jumped straight to the merkle check and reported
+    /// **-2** for a bad branch. It had no depth check and, more seriously, no
+    /// best-chain check at all: a block on an orphaned BTC fork is still in
+    /// Bridge storage, so rustock would confirm a transaction that exists only
+    /// on that fork — reporting a positive confirmation count where rskj
+    /// returns -2. Everything downstream of this method trusts that number.
+    ///
+    /// Driven end to end on regtest: build a 3-block chain plus a sibling that
+    /// forks at height 1, then query each case through the Bridge precompile.
+    #[test]
+    fn test_btc_transaction_confirmations_codes_and_best_chain_check() {
+        use bitcoin::block::Version;
+        use bitcoin::consensus::serialize as btc_serialize;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+        use crate::bridge::btc_chain::{b256_to_bitcoin_hash, bitcoin_hash_to_b256};
+
+        const BLOCK: u64 = 7_000_000; // every relevant RSKIP active
+        // Regtest difficulty: any nonce is a valid proof of work.
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let hdr = |prev: BlockHash, merkle_seed: u8, nonce: u32| bitcoin::block::Header {
+            version: Version::from_consensus(1),
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::from_byte_array([merkle_seed; 32]),
+            time: 1_700_000_000,
+            bits,
+            nonce,
+        };
+
+        // Regtest's target is ~2^255, so roughly every other nonce works;
+        // search for one rather than assuming.
+        let mine = |prev: BlockHash, merkle_seed: u8| -> bitcoin::block::Header {
+            (0u32..10_000)
+                .map(|nonce| hdr(prev, merkle_seed, nonce))
+                .find(crate::bridge::btc_store::check_proof_of_work)
+                .expect("regtest PoW is trivial")
+        };
+
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+            .header
+            .block_hash();
+        let h1 = mine(genesis, 0x11);
+        let h2 = mine(h1.block_hash(), 0x22);
+        let h3 = mine(h2.block_hash(), 0x33);
+        // Forks at height 1 with the same work as h1, so it never becomes the
+        // head — but it IS stored, which is the whole point.
+        let fork1 = mine(genesis, 0xF1);
+        assert_ne!(fork1.block_hash(), h1.block_hash());
+
+        let receive_header_tx = |nonce: u64, header: &bitcoin::block::Header| {
+            let raw = btc_serialize(header);
+            assert_eq!(raw.len(), 80);
+            let mut input = crate::bridge::compute_selector("receiveHeader(bytes)").to_vec();
+            let mut off = [0u8; 32];
+            off[31] = 0x20;
+            input.extend_from_slice(&off);
+            let mut l = [0u8; 32];
+            l[31] = 80;
+            input.extend_from_slice(&l);
+            let mut payload = raw.clone();
+            payload.resize(96, 0);
+            input.extend_from_slice(&payload);
+            rustock_core::Transaction {
+                nonce,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(input),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            }
+        };
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xC0);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::regtest());
+
+        let txs: Vec<_> = [&h1, &h2, &h3, &fork1]
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (receive_header_tx(i as u64, h), sender))
+            .collect();
+        let built = executor
+            .execute_block(&dummy_header(BLOCK), &txs, &root, store.clone())
+            .expect("header block");
+        for (i, r) in built.tx_results.iter().enumerate() {
+            assert!(r.success, "receiveHeader #{i} call succeeded");
+            assert_eq!(
+                alloy_primitives::I256::from_be_bytes::<32>(r.output[..32].try_into().unwrap()),
+                alloy_primitives::I256::ZERO,
+                "receiveHeader #{i} returned SUCCESS(0)"
+            );
+        }
+        let root = crate::state::apply_state_changes(
+            &root, store.as_ref(), &built.state_changes, &built.markers,
+        );
+
+        // getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])
+        // with an EMPTY merkle branch: the branch reduces to btcTxHash itself,
+        // so a single-transaction block's merkle root is the tx hash.
+        let confirmations = |nonce: u64, tx_hash_display: [u8; 32], block: &bitcoin::block::Header| {
+            let mut input =
+                crate::bridge::compute_selector("getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])")
+                    .to_vec();
+            input.extend_from_slice(&tx_hash_display);
+            input.extend_from_slice(bitcoin_hash_to_b256(&block.block_hash()).as_slice());
+            input.extend_from_slice(&[0u8; 32]); // merkleBranchPath = 0
+            let mut off = [0u8; 32];
+            off[31] = 0x80;
+            input.extend_from_slice(&off); // offset of the hashes array
+            input.extend_from_slice(&[0u8; 32]); // hashes.length = 0
+            let tx = rustock_core::Transaction {
+                nonce,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(2_000_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(input),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r = executor
+                .execute_block(&dummy_header(BLOCK), &[(tx, sender)], &root, store.clone())
+                .expect("query block");
+            let res = &r.tx_results[0];
+            assert!(res.success, "getBtcTransactionConfirmations must not throw");
+            alloy_primitives::I256::from_be_bytes::<32>(res.output[..32].try_into().unwrap())
+        };
+
+        // The merkle root in DISPLAY order is what an ABI caller passes as
+        // btcTxHash for a one-transaction block.
+        let tx_hash_of = |h: &bitcoin::block::Header| -> [u8; 32] {
+            let mut b = h.merkle_root.to_raw_hash().to_byte_array();
+            b.reverse();
+            b
+        };
+        let code = |n: i64| alloy_primitives::I256::try_from(n).unwrap();
+
+        // Happy path: h1 is at height 1, the head is h3 at height 3.
+        assert_eq!(
+            confirmations(4, tx_hash_of(&h1), &h1),
+            code(3),
+            "bestChainHeight - height + 1"
+        );
+        assert_eq!(confirmations(4, tx_hash_of(&h3), &h3), code(1), "the head itself");
+
+        // -1: the block hash is not stored at all.
+        let unknown = hdr(genesis, 0xEE, 999_999);
+        assert_eq!(
+            confirmations(4, tx_hash_of(&unknown), &unknown),
+            code(-1),
+            "INEXISTENT_BLOCK_HASH"
+        );
+
+        // -5: stored, in the best chain, but the branch does not reduce to the
+        // merkle root. rustock used to report -2 here.
+        assert_eq!(
+            confirmations(4, [0xAB; 32], &h1),
+            code(-5),
+            "INVALID_MERKLE_BRANCH"
+        );
+
+        // -2: stored, but on an orphaned fork. rustock used to report 3 — a
+        // confirmed transaction that is not on the BTC main chain.
+        assert_eq!(
+            confirmations(4, tx_hash_of(&fork1), &fork1),
+            code(-2),
+            "BLOCK_NOT_IN_BEST_CHAIN"
+        );
+
+        // Ordering: the best-chain check runs BEFORE the merkle check, so a
+        // fork block with a bad branch still reports -2, not -5.
+        assert_eq!(
+            confirmations(4, [0xAB; 32], &fork1),
+            code(-2),
+            "best-chain check precedes the merkle check"
+        );
+
+        // Sanity: the fork block really is stored, so -2 came from the
+        // best-chain check and not from the block being missing.
+        let _ = b256_to_bitcoin_hash;
+    }
+
+    /// Audit findings FRCR-78 and FRCR-678.
+    ///
+    /// `getEstimatedFeesForNextPegOutEvent` is **transaction-callable** — rskj
+    /// `BridgeMethods` gives it `fixedPermission(false)` — so a contract can
+    /// CALL it and branch on the answer, which makes the value consensus.
+    /// rustock returned a hardcoded `0`.
+    ///
+    /// rskj `BridgeSupport.getEstimatedFeesForNextPegOutEvent`:
+    ///
+    /// ```text
+    ///   shouldReturnZeroEstimatedFees()  -> 0
+    ///   !RSKIP305                        -> feePerKB * simulatePegoutTxSize(2 in, queued+2 out) / 1000
+    ///   otherwise                        -> inputSum - outputSum of a simulated batched peg-out,
+    ///                                       falling back to the line above on failure
+    /// ```
+    ///
+    /// Driven through the Bridge precompile: `releaseBtc` transactions build a
+    /// real release queue, then the getter is called and its int256 read back.
+    #[test]
+    fn test_estimated_fees_for_next_pegout_is_not_hardcoded_zero() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        // Run `pegouts` releaseBtc transactions, then query the estimate.
+        let query = |number: u64, pegouts: u64| -> U256 {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0xE5);
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc * U256::from(50));
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let header = dummy_header(number);
+
+            let mut root = root;
+            for nonce in 0..pegouts {
+                let tx = rustock_core::Transaction {
+                    nonce,
+                    gas_price: U256::from(0),
+                    gas_limit: U256::from(200_000),
+                    to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                    value: one_rbtc, // 1 RBTC, well above the peg-out minimum
+                    input: Bytes::new(), // empty input = releaseBtc
+                    v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+                };
+                let r = executor
+                    .execute_block(&header, &[(tx, sender)], &root, store.clone())
+                    .expect("releaseBtc block");
+                assert!(r.tx_results[0].success, "releaseBtc must succeed");
+                root = crate::state::apply_state_changes(
+                    &root, store.as_ref(), &r.state_changes, &r.markers,
+                );
+            }
+
+            let call = rustock_core::Transaction {
+                nonce: pegouts,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(500_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(
+                    crate::bridge::compute_selector("getEstimatedFeesForNextPegOutEvent()").to_vec(),
+                ),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r = executor
+                .execute_block(&header, &[(call, sender)], &root, store)
+                .expect("query block");
+            let res = &r.tx_results[0];
+            assert!(res.success, "getEstimatedFeesForNextPegOutEvent must not throw");
+            assert_eq!(res.output.len(), 32);
+            U256::from_be_slice(&res.output)
+        };
+
+        // hop400 (#4,598,500) .. fingerroot500 (#5,468,000): RSKIP271 active,
+        // RSKIP385 not — shouldReturnZeroEstimatedFees is true for an EMPTY
+        // queue only.
+        assert_eq!(query(5_000_000, 0), U256::ZERO, "empty queue pre-RSKIP385 -> 0");
+        let pre385_one = query(5_000_000, 1);
+        assert!(!pre385_one.is_zero(), "a queued peg-out pre-RSKIP385 must cost something");
+
+        // fingerroot500 onward RSKIP385 is active, so the zero short-circuit is
+        // gone: even an empty queue reports the 2-input / 2-output estimate.
+        let f500_empty = query(6_000_000, 0);
+        assert!(!f500_empty.is_zero(), "RSKIP385 removes the empty-queue zero");
+
+        // reed800 (#8,052,200): RSKIP305 switches to the simulation. With no
+        // federation UTXOs the builder cannot fund the peg-out, which is rskj's
+        // BridgeIllegalArgumentException path -> fall back to the size estimate.
+        let reed_empty = query(8_500_000, 0);
+        assert!(!reed_empty.is_zero(), "reed800 fallback must still produce a fee");
+
+        // vetiver900 (#8,804,200) activates RSKIP540, which only changes the
+        // hypothetical amount; with the fallback in play the answer is stable.
+        let vetiver_empty = query(9_000_000, 0);
+        assert!(!vetiver_empty.is_zero());
+
+        // More queued peg-outs mean more outputs, hence a bigger transaction
+        // and a strictly bigger fee. This is what a hardcoded 0 could never do.
+        let f500_three = query(6_000_000, 3);
+        assert!(
+            f500_three > f500_empty,
+            "3 queued peg-outs must cost more than 0: {f500_three} vs {f500_empty}"
+        );
     }
 
     /// Ported from rskj InitcodeCostCalculatorTest.

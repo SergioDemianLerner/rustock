@@ -4960,14 +4960,203 @@ pub fn get_queued_pegouts_count<CTX: crate::RskContextTr>(
     Ok(PrecompileOutput::new(gas_cost, count.to_be_bytes::<32>().to_vec().into()))
 }
 
-/// `getEstimatedFeesForNextPegOutEvent()` → uint256
+/// rskj `BridgeStorageProvider.getReleaseRequestQueue` (l.168-193): the legacy
+/// `releaseRequestQueue` entries FIRST, then — once RSKIP146 is active — the
+/// `releaseRequestQueueWithTxHash` entries appended. Both lists, concatenated,
+/// not one or the other.
+fn load_release_request_queue<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    rskip146: bool,
+) -> Vec<ReleaseRequest> {
+    let legacy = bridge_load_bytes(ctx, bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY));
+    let mut entries = deserialize_release_queue_legacy(&legacy);
+    if rskip146 {
+        let with_hash =
+            bridge_load_bytes(ctx, bridge_storage_key(RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY));
+        entries.extend(deserialize_release_queue_with_hash(&with_hash));
+    }
+    entries
+}
+
+/// The deterministic recipient rskj uses for the hypothetical extra peg-out in
+/// `getEstimatedFeesFromPegoutTransactionSimulation`:
+/// `BtcECKey.fromPublicOnly(<this pubkey>).toAddress(params)` — a P2PKH of its
+/// hash160. The key exists only to make the simulated output deterministic.
+const SIMULATION_RECIPIENT_PUBKEY: [u8; 33] = [
+    0x03, 0x29, 0xf5, 0x19, 0xf8, 0xd1, 0x3a, 0x7e, 0x3d, 0xd3, 0x5f, 0xa5, 0xc2, 0x48, 0x0c, 0x6b,
+    0xf6, 0xc0, 0x48, 0x9d, 0xa4, 0x00, 0x81, 0xe8, 0x31, 0x1a, 0x91, 0x81, 0x34, 0x92, 0x08, 0x39,
+    0x53,
+];
+
+/// rskj `BridgeSupport.getEstimatedFeesForNextPegOutEvent` (BridgeSupport.java
+/// l.2632-2644), in satoshis.
+///
+/// ```text
+///   shouldReturnZeroEstimatedFees()        -> 0
+///   !RSKIP305                              -> getEstimatedFeesFromInputsAndOutputsCount()
+///   otherwise                              -> getEstimatedFeesFromPegoutTransactionSimulation()
+///                                             (falling back to the former on failure)
+/// ```
+fn estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> u64 {
+    let queue = load_release_request_queue(ctx, hardfork_cfg.has_rskip146(block_number));
+
+    // shouldReturnZeroEstimatedFees (l.2646-2651).
+    if !hardfork_cfg.has_rskip385(block_number)
+        && (!hardfork_cfg.has_rskip271(block_number) || queue.is_empty())
+    {
+        return 0;
+    }
+
+    if !hardfork_cfg.has_rskip305(block_number) {
+        return estimated_fees_from_inputs_and_outputs_count(
+            ctx, config, hardfork_cfg, block_number, queue.len(),
+        );
+    }
+
+    // getEstimatedFeesFromPegoutTransactionSimulation (l.2677-2692): the
+    // hypothetical next peg-out is worth the minimum peg-out value from
+    // RSKIP540, and 1 BTC (`Coin.valueOf(1, 0)`) before it.
+    let estimated_next_amount = if hardfork_cfg.has_rskip540(block_number) {
+        config.minimum_pegout_tx_value
+    } else {
+        100_000_000
+    };
+
+    simulate_pegout_fee(ctx, config, hardfork_cfg, block_number, &queue, estimated_next_amount)
+        .unwrap_or_else(|| {
+            // BridgeIllegalArgumentException -> "fallback to old logic".
+            estimated_fees_from_inputs_and_outputs_count(
+                ctx, config, hardfork_cfg, block_number, queue.len(),
+            )
+        })
+}
+
+/// rskj `BridgeSupport.getEstimatedFeesFromInputsAndOutputsCount`
+/// (l.2664-2675): size a peg-out with 2 inputs and `queued + 2` outputs, then
+/// `feePerKB * size / 1000`.
+fn estimated_fees_from_inputs_and_outputs_count<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+    queued_pegouts: usize,
+) -> u64 {
+    let (keys, redeem_script) =
+        active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
+    if keys.is_empty() {
+        return 0;
+    }
+    let format = active_federation_format(ctx, config, hardfork_cfg, block_number);
+    let fed_script = p2sh_output_script(&federation_output_hash160(&redeem_script, format));
+    let threshold = super::release_tx::redeem_script_threshold(&redeem_script);
+
+    let outputs_count = queued_pegouts + 2;
+    let inputs_count = 2;
+
+    // rskj BridgeUtils.simulatePegoutTxSize: RSKIP378 (cardamom1000) is -1 on
+    // both mainnet and testnet, so the pre-cardamom branch is the live one —
+    // and it picks the sizer by federation format, not by activation.
+    let size = if format >= 4000 {
+        pegout_tx_size_segwit(&redeem_script, &fed_script, threshold, inputs_count, outputs_count)
+    } else {
+        pegout_tx_size_legacy(&redeem_script, &fed_script, threshold, inputs_count, outputs_count)
+    };
+
+    let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+    fee_per_kb.saturating_mul(size as u64) / 1000
+}
+
+/// rskj `BridgeSupport.getEstimatedFeesFromPegoutTransactionSimulation(Coin)`
+/// (l.2694-2732): append one hypothetical request to a COPY of the release
+/// queue, run the ordinary batched-peg-out builder over the active
+/// federation's real UTXO set, and report `inputSum - outputSum`.
+///
+/// `None` mirrors the `BridgeIllegalArgumentException` rskj throws when the
+/// builder does not return SUCCESS; the caller then falls back.
+fn simulate_pegout_fee<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+    queue: &[ReleaseRequest],
+    estimated_next_amount: u64,
+) -> Option<u64> {
+    let (keys, redeem_script) =
+        active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
+    if keys.is_empty() {
+        return None;
+    }
+    let format = active_federation_format(ctx, config, hardfork_cfg, block_number);
+    let is_segwit = format >= 4000;
+    let change_script = p2sh_output_script(&federation_output_hash160(&redeem_script, format));
+    let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+    let tx_version = if hardfork_cfg.has_rskip201(block_number) { 2 } else { 1 };
+
+    let utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, block_number);
+    let available = load_utxos_at(ctx, utxo_key);
+
+    // Same FlyoverCompatibleBtcWallet resolution updateCollections uses.
+    let mut candidate_fed_redeems = vec![redeem_script.clone()];
+    if let Some((_, retiring_redeem)) =
+        retiring_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number)
+    {
+        candidate_fed_redeems.push(retiring_redeem);
+    }
+    let flyover_overrides = resolve_flyover_input_redeems(ctx, &available, &candidate_fed_redeems);
+    let redeem_for = |u: &BridgeUtxo| -> &[u8] {
+        flyover_overrides
+            .get(&(u.tx_hash, u.vout))
+            .map(|r| r.as_slice())
+            .unwrap_or(redeem_script.as_slice())
+    };
+
+    let mut outputs: Vec<super::release_tx::PegoutOutput> = queue
+        .iter()
+        .map(|r| super::release_tx::PegoutOutput {
+            script: p2pkh_output_script(&r.btc_dest_hash160),
+            amount_satoshis: r.amount_satoshis,
+        })
+        .collect();
+    outputs.push(super::release_tx::PegoutOutput {
+        script: p2pkh_output_script(&redeem_script_hash160(&SIMULATION_RECIPIENT_PUBKEY)),
+        amount_satoshis: estimated_next_amount,
+    });
+
+    let built = super::release_tx::complete_pegout_tx(
+        &available,
+        &outputs,
+        &change_script,
+        redeem_for,
+        fee_per_kb,
+        tx_version,
+        is_segwit,
+    )?;
+
+    let input_sum: u64 = built.used_utxos.iter().map(|u| u.value_satoshis).sum();
+    let output_sum: u64 = built.tx.output.iter().map(|o| o.value.to_sat()).sum();
+    Some(input_sum.saturating_sub(output_sum))
+}
+
+/// `getEstimatedFeesForNextPegOutEvent()` → uint256 (satoshis)
+///
+/// Transaction-callable (rskj `BridgeMethods` `fixedPermission(false)`), so the
+/// value it returns is consensus-visible: a contract can CALL it and branch on
+/// the answer. It used to return a hardcoded 0.
 pub fn get_estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
-    _ctx: &mut CTX,
+    ctx: &mut CTX,
     gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // Return 0 for now
-    let output = [0u8; 32];
-    Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()))
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let fee = estimated_fees_for_next_pegout(ctx, config, hardfork_cfg, block_number);
+    let out = U256::from(fee).to_be_bytes::<32>();
+    Ok(PrecompileOutput::new(gas_cost, out.to_vec().into()))
 }
 
 /// `getEstimatedFeesForPegOutAmount(uint256 pegoutAmountInWeis)` → uint256
@@ -5004,8 +5193,22 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
         ));
     }
 
-    let output = [0u8; 32];
-    Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()))
+    // rskj getEstimatedFeesForPegOutAmount: the same peg-out simulation as
+    // getEstimatedFeesForNextPegOutEvent, with the caller's amount as the
+    // hypothetical extra request. rskj does NOT fall back here -- a builder
+    // failure propagates as BridgeIllegalArgumentException.
+    // A BTC Coin is a signed 64-bit satoshi count; anything larger cannot be
+    // built into a transaction at all, so it takes the same failure path.
+    let amount: u64 = satoshis.try_into().map_err(|_| {
+        PrecompileError::other("getEstimatedFeesForPegOutAmount: cannot simulate peg-out")
+    })?;
+    let queue = load_release_request_queue(ctx, hardfork_cfg.has_rskip146(block_number));
+    let fee = simulate_pegout_fee(ctx, config, hardfork_cfg, block_number, &queue, amount)
+        .ok_or_else(|| {
+            PrecompileError::other("getEstimatedFeesForPegOutAmount: cannot simulate peg-out")
+        })?;
+    let out = U256::from(fee).to_be_bytes::<32>();
+    Ok(PrecompileOutput::new(gas_cost, out.to_vec().into()))
 }
 
 // ---------------------------------------------------------------------------
@@ -5151,13 +5354,6 @@ mod tests {
         );
     }
 
-    /// Regression for mainnet #2,448,984: a federator whose key is NOT in an
-    /// input's redeem script (a NEW-federation member signing the migration
-    /// tx that spends the OLD federation's UTXOs) must not have its
-    /// signature applied — rskj's getSigInsertionIndex/findKeyInRedeem
-    /// throws and processSigning returns. The signature itself verifies
-    /// against the federator's own key, so only redeem membership blocks it.
-    #[test]
     /// Mainnet #9,217,796 tx[1]: a federator submits a 71-byte "signature"
     /// beginning 0x9f, not a DER SEQUENCE. rskj's `Bridge.addSignature` runs
     /// every element through `BtcECKey.ECDSASignature.decodeFromDER` and throws
@@ -5214,6 +5410,13 @@ mod tests {
         assert!(!is_der_signature(&[0x30, 0x04, 0x02, 0x00, 0x02, 0x00]), "empty integer");
     }
 
+    /// Regression for mainnet #2,448,984: a federator whose key is NOT in an
+    /// input's redeem script (a NEW-federation member signing the migration
+    /// tx that spends the OLD federation's UTXOs) must not have its
+    /// signature applied — rskj's getSigInsertionIndex/findKeyInRedeem
+    /// throws and processSigning returns. The signature itself verifies
+    /// against the federator's own key, so only redeem membership blocks it.
+    #[test]
     fn add_signature_rejects_key_not_in_redeem_script() {
         use k256::ecdsa::signature::hazmat::PrehashSigner;
         use k256::ecdsa::{Signature, SigningKey};

@@ -313,66 +313,119 @@ pub fn has_btc_block_coinbase_info<CTX: crate::RskContextTr>(
 // getBtcTransactionConfirmations
 // ---------------------------------------------------------------------------
 
-const CONFIRMATION_ERR_BLOCK_NOT_FOUND: i64 = -1;
-const CONFIRMATION_ERR_INVALID_BRANCH: i64 = -2;
-const _CONFIRMATION_ERR_BLOCK_TOO_OLD: i64 = -3;
-const CONFIRMATION_ERR_BTC_NOT_READY: i64 = -4;
+// getBtcTransactionConfirmations result codes. Ground truth is rskj
+// `BridgeSupport.java:90-94` — the calling contract branches on these
+// integers, so a client that invents its own values forks.
+const CONFIRMATION_ERR_INEXISTENT_BLOCK_HASH: i64 = -1;
+const CONFIRMATION_ERR_BLOCK_NOT_IN_BEST_CHAIN: i64 = -2;
+const CONFIRMATION_ERR_INCONSISTENT_BLOCK: i64 = -3;
+const CONFIRMATION_ERR_BLOCK_TOO_OLD: i64 = -4;
+const CONFIRMATION_ERR_INVALID_MERKLE_BRANCH: i64 = -5;
 
 /// `getBtcTransactionConfirmations(bytes32 btcTxHash, bytes32 btcBlockHash, uint256 merkleBranchPath, bytes32[] merkleBranchHashes)` → int256
+///
+/// Mirrors rskj `BridgeSupport.getBtcTransactionConfirmations`
+/// (BridgeSupport.java:2194-2235). The ORDER of the checks is consensus: each
+/// one returns a distinct code, so performing them in a different sequence
+/// reports a different error for an input that fails more than one.
 pub fn get_btc_transaction_confirmations<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    use_v2: bool,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let (branch, tx_hash, block_hash_bytes) =
         MerkleBranch::from_abi_args(args).ok_or_else(|| {
             PrecompileError::other("getBtcTransactionConfirmations: invalid args")
         })?;
 
-    // Get chain head
-    let chain_head = match load_chain_head(ctx) {
-        Some(h) => h,
-        None => return Ok(encode_int_output(gas_cost, CONFIRMATION_ERR_BTC_NOT_READY)),
-    };
+    // rskj `this.ensureBtcBlockChain()` — the chain head always exists by the
+    // time the checks below run.
+    let block_number =
+        revm::context_interface::Block::number(revm::context_interface::ContextTr::block(ctx))
+            .to::<u64>();
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
 
-    // Get the block
+    // 1. Block must exist. (rskj `getBlockKeepingTestnetConsensus`; the
+    //    hardcoded testnet block it special-cases is not a mainnet concern.)
     let block_hash =
         b256_to_bitcoin_hash(&alloy_primitives::B256::from(block_hash_bytes));
     let block = match get_stored_block(ctx, &block_hash) {
         Some(b) => b,
-        None => return Ok(encode_int_output(gas_cost, CONFIRMATION_ERR_BLOCK_NOT_FOUND)),
+        None => {
+            return Ok(encode_int_output(gas_cost, CONFIRMATION_ERR_INEXISTENT_BLOCK_HASH))
+        }
     };
 
-    // Compute merkle root from branch
-    let computed_root = branch.reduce_from(&tx_hash);
+    let best_chain_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
 
-    // Check if it matches the block's merkle root
+    // 2. Too deep. `Math.max(0, bestChainHeight - block.getHeight())`, so a
+    //    block ABOVE the head has depth 0 and passes here — it is rejected by
+    //    the best-chain check below, with a different code.
+    let block_depth = best_chain_height.saturating_sub(block.height);
+    // rskj `BridgeSupport.BTC_TRANSACTION_CONFIRMATION_MAX_DEPTH` = 4320,
+    // held in BridgeConstants here so the gas estimate
+    // (`btc_tx_confirmations_cost`) and the result cannot drift apart.
+    if block_depth > config.btc_transaction_confirmation_max_depth {
+        return Ok(encode_int_output(gas_cost, CONFIRMATION_ERR_BLOCK_TOO_OLD));
+    }
+
+    // 3. The block must be the one the main chain holds at its height — a
+    //    block on an orphaned fork is stored, and confirming a transaction
+    //    from it would be exactly the double-spend this check prevents.
+    //    rskj's null return maps to -2, its BlockStoreException to -3.
+    match super::btc_chain::main_chain_block_at_height(ctx, block.height, rskip199, Some(config)) {
+        super::btc_chain::MainChainLookup::Found(main) => {
+            // bitcoinj `StoredBlock.equals`: header, chainWork and height.
+            let same = main.header.block_hash() == block.header.block_hash()
+                && main.height == block.height
+                && main.chain_work == block.chain_work;
+            if !same {
+                return Ok(encode_int_output(
+                    gas_cost,
+                    CONFIRMATION_ERR_BLOCK_NOT_IN_BEST_CHAIN,
+                ));
+            }
+        }
+        super::btc_chain::MainChainLookup::Absent => {
+            return Ok(encode_int_output(
+                gas_cost,
+                CONFIRMATION_ERR_BLOCK_NOT_IN_BEST_CHAIN,
+            ))
+        }
+        super::btc_chain::MainChainLookup::StoreError => {
+            return Ok(encode_int_output(gas_cost, CONFIRMATION_ERR_INCONSISTENT_BLOCK))
+        }
+    }
+
+    // 4. Merkle branch must reduce to the block's merkle root (or, from
+    //    RSKIP143, to the registered witness merkle root).
+    let computed_root = branch.reduce_from(&tx_hash);
     let block_merkle_root = {
         let raw = block.header.merkle_root.to_raw_hash();
         *raw.as_byte_array()
     };
-
     let root_valid = if computed_root == block_merkle_root {
         true
     } else {
-        // Post-RSKIP143: also accept witness merkle root
         match get_coinbase_information(ctx, &block_hash_bytes) {
             Some(witness_root) => computed_root == witness_root,
             None => false,
         }
     };
-
     if !root_valid {
-        return Ok(encode_int_output(gas_cost, CONFIRMATION_ERR_INVALID_BRANCH));
+        return Ok(encode_int_output(
+            gas_cost,
+            CONFIRMATION_ERR_INVALID_MERKLE_BRANCH,
+        ));
     }
 
-    // Compute confirmations
-    let confirmations = chain_head.height as i64 - block.height as i64 + 1;
-    if confirmations < 0 {
-        return Ok(encode_int_output(gas_cost, CONFIRMATION_ERR_BLOCK_NOT_FOUND));
-    }
-
-    Ok(encode_int_output(gas_cost, confirmations))
+    // `bestChainHeight - block.getHeight() + 1`. Step 3 guarantees the block
+    // is at or below the head, so this is >= 1.
+    Ok(encode_int_output(gas_cost, block_depth as i64 + 1))
 }
 
 // ---------------------------------------------------------------------------
@@ -671,5 +724,30 @@ mod tests {
             ],
         };
         assert_eq!(find_witness_commitment(&tx), Some(commitment_b));
+    }
+
+    /// Ground truth: rskj `BridgeSupport.java:90-94`. These integers are the
+    /// method's public contract — every caller branches on them — so a client
+    /// that renumbers them forks even when its logic is right. rustock used to
+    /// return -2 for a bad merkle branch (rskj: -5), reserved -3 for "too old"
+    /// (rskj: -4) and invented -4 for "BTC chain not ready", which rskj has no
+    /// code for because `ensureBtcBlockChain` guarantees a chain head.
+    #[test]
+    fn btc_transaction_confirmation_codes_match_rskj() {
+        assert_eq!(CONFIRMATION_ERR_INEXISTENT_BLOCK_HASH, -1);
+        assert_eq!(CONFIRMATION_ERR_BLOCK_NOT_IN_BEST_CHAIN, -2);
+        assert_eq!(CONFIRMATION_ERR_INCONSISTENT_BLOCK, -3);
+        assert_eq!(CONFIRMATION_ERR_BLOCK_TOO_OLD, -4);
+        assert_eq!(CONFIRMATION_ERR_INVALID_MERKLE_BRANCH, -5);
+
+        // BridgeSupport.java:104. The gas estimate and the result must use the
+        // same bound, or a call can be priced as shallow and answered as deep.
+        for c in [
+            super::super::constants::BridgeConstants::mainnet(),
+            super::super::constants::BridgeConstants::testnet(),
+            super::super::constants::BridgeConstants::regtest(),
+        ] {
+            assert_eq!(c.btc_transaction_confirmation_max_depth, 4320);
+        }
     }
 }
