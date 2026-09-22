@@ -1001,11 +1001,13 @@ async fn main() -> Result<()> {
         trie_store_for_pool.clone(),
     ));
 
-    // A rate limiter that refuses silently is indistinguishable from a broken
-    // one, and the per-transaction rejection logs at `debug`, which this node
-    // does not run at. Report on a schedule instead, and say nothing when there
-    // is nothing to say.
-    if args.account_tx_rate_limit {
+    // Every line in the transaction path logs at `debug` or `trace` and this
+    // node runs at `info`, so the pool is otherwise entirely unobservable: an
+    // empty `txpool_status` is equally consistent with healthy traffic that has
+    // already been mined and with no transaction ever arriving. Report on a
+    // schedule, and stay silent when nothing happened so a line always means
+    // something did.
+    {
         let pool_for_report = pool.clone();
         tokio::spawn(async move {
             const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
@@ -1013,25 +1015,45 @@ async fn main() -> Result<()> {
             ticker.tick().await; // the first tick fires immediately
             loop {
                 ticker.tick().await;
-                let summary = pool_for_report.take_quota_rejections();
-                if summary.is_empty() {
+                let a = pool_for_report.take_activity();
+                if a.is_empty() {
                     continue;
                 }
-                // One sender refused many times is the limiter working; many
-                // senders refused once each is the limiter misfiring on
-                // ordinary traffic. Report both so the difference is visible.
-                let worst = summary
-                    .worst
-                    .map(|(a, n)| format!("{a} ({n})"))
-                    .unwrap_or_else(|| "-".to_string());
+                let rejected = a.rejected();
+                // Reasons, most common first, so a change in the mix is visible
+                // without turning on debug logging.
+                let reasons = if a.rejections.is_empty() {
+                    "-".to_string()
+                } else {
+                    a.rejections
+                        .iter()
+                        .map(|(reason, n)| format!("{reason}={n}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
                 tracing::info!(
                     target: "rustock::txpool",
-                    "Rate limiter refused {} transaction(s) from {} sender(s) in the last {}m; \
-                     most refused: {worst}",
-                    summary.total,
-                    summary.distinct_senders,
+                    "Mempool in the last {}m: {} offered, {} accepted, {rejected} rejected, \
+                     {} mined | {reasons}",
                     REPORT_EVERY.as_secs() / 60,
+                    a.offered,
+                    a.accepted,
+                    a.mined,
                 );
+                // One sender refused many times is the rate limiter working as
+                // designed; many senders refused once each is it misfiring on
+                // ordinary traffic. Only say so when it actually refused something.
+                if a.quota_senders > 0 {
+                    let worst = a
+                        .quota_worst
+                        .map(|(addr, n)| format!("{addr} ({n})"))
+                        .unwrap_or_else(|| "-".to_string());
+                    tracing::info!(
+                        target: "rustock::txpool",
+                        "Rate limiter refused {} sender(s); most refused: {worst}",
+                        a.quota_senders,
+                    );
+                }
             }
         });
     }

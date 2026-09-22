@@ -96,6 +96,31 @@ impl fmt::Display for PoolError {
 
 impl std::error::Error for PoolError {}
 
+impl PoolError {
+    /// A short, stable label for the activity summary. Deliberately a
+    /// `&'static str` so the counters cannot grow without bound.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::AlreadyKnown => "already-known",
+            Self::NonceTooLow => "nonce-too-low",
+            Self::NonceTooHigh => "nonce-too-high",
+            Self::InsufficientFunds => "insufficient-funds",
+            Self::GasLimitExceeded => "gas-limit-exceeded",
+            Self::GasPriceTooLow => "gas-price-too-low",
+            Self::IntrinsicGasTooHigh => "intrinsic-gas-too-high",
+            Self::ReplacementGasPriceTooLow => "replacement-underpriced",
+            Self::TxTooLarge => "too-large",
+            Self::PoolFull => "pool-full",
+            Self::InvalidSignature(_) => "invalid-signature",
+            Self::InsufficientFundsForPendingAndNew => "insufficient-funds-pending",
+            Self::IsRemascTransaction => "remasc",
+            Self::AccountExceedsQuota => "quota",
+            Self::RlpDecode(_) => "rlp-decode",
+            Self::StoreError(_) => "store-error",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PooledTx {
     pub tx: Transaction,
@@ -132,32 +157,58 @@ pub struct TransactionPool {
     /// before the pool lock is acquired, so a slow quota refresh never holds up
     /// readers of the pool.
     quota: RwLock<crate::quota::QuotaChecker>,
-    /// Rejections since the last summary, per sender.
+    /// Activity since the last summary.
     ///
     /// Not part of the rskj port -- rskj keeps no such counter. It exists
-    /// because a rate limiter that refuses silently is indistinguishable from
-    /// one that is broken, and the rejection itself logs at `debug`, which the
-    /// node does not run at.
-    quota_rejections: RwLock<HashMap<Address, u64>>,
+    /// because every line in the transaction path logs at `debug` and the node
+    /// runs at `info`, so the pool is otherwise entirely unobservable.
+    stats: RwLock<PoolStats>,
 }
 
-/// What the limiter refused since the last time anyone asked.
+/// What passed through the pool since the last time anyone asked.
 ///
-/// `distinct_senders` against `total` is the discriminator that matters: one
-/// sender refused many times is the limiter working; many senders refused once
-/// each is the limiter misfiring on ordinary traffic.
+/// The pool is otherwise silent at `info`: every line in the transaction path
+/// logs at `debug` or `trace`, so without this there is no way to tell "the
+/// rate limiter never fires because traffic is healthy" from "it never fires
+/// because no transaction ever arrives". Those need very different responses.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct QuotaRejectionSummary {
-    pub total: u64,
-    pub distinct_senders: usize,
-    /// The sender refused most often, and how often.
-    pub worst: Option<(Address, u64)>,
+pub struct PoolActivity {
+    /// Transactions offered to the pool, from peers and over RPC.
+    pub offered: u64,
+    /// Offered and accepted.
+    pub accepted: u64,
+    /// Removed because a block contained them.
+    pub mined: u64,
+    /// Rejections by reason, most common first.
+    pub rejections: Vec<(&'static str, u64)>,
+    /// Distinct senders the rate limiter refused.
+    ///
+    /// Read against the `quota` entry in `rejections`: one sender refused many
+    /// times is the limiter working; many senders refused once each is the
+    /// limiter misfiring on ordinary traffic.
+    pub quota_senders: usize,
+    /// The sender the limiter refused most often, and how often.
+    pub quota_worst: Option<(Address, u64)>,
 }
 
-impl QuotaRejectionSummary {
+impl PoolActivity {
+    /// True when nothing at all happened, so the reporter can stay quiet.
     pub fn is_empty(&self) -> bool {
-        self.total == 0
+        self.offered == 0 && self.mined == 0
     }
+
+    pub fn rejected(&self) -> u64 {
+        self.rejections.iter().map(|(_, n)| n).sum()
+    }
+}
+
+#[derive(Default)]
+struct PoolStats {
+    offered: u64,
+    accepted: u64,
+    mined: u64,
+    rejections: HashMap<&'static str, u64>,
+    quota_by_sender: HashMap<Address, u64>,
 }
 
 impl TransactionPool {
@@ -175,28 +226,35 @@ impl TransactionPool {
             store,
             trie_store,
             quota: RwLock::new(quota),
-            quota_rejections: RwLock::new(HashMap::new()),
+            stats: RwLock::new(PoolStats::default()),
         }
     }
 
-    /// Rejections since the previous call, clearing the counters.
+    /// Activity since the previous call, clearing the counters.
     ///
-    /// Intended for a periodic reporter: the limiter is meant to be invisible,
-    /// so the only way to tell "nothing is being refused" from "the counter is
-    /// broken" is to report it on a schedule and say nothing when it is zero.
-    pub fn take_quota_rejections(&self) -> QuotaRejectionSummary {
-        let mut counts = self.quota_rejections.write().unwrap();
-        if counts.is_empty() {
-            return QuotaRejectionSummary::default();
-        }
-        let total = counts.values().sum();
-        let distinct_senders = counts.len();
-        let worst = counts
+    /// Intended for a periodic reporter that stays silent when nothing
+    /// happened, so a line in the log always means something did.
+    pub fn take_activity(&self) -> PoolActivity {
+        let mut stats = self.stats.write().unwrap();
+        let mut rejections: Vec<(&'static str, u64)> =
+            stats.rejections.iter().map(|(k, v)| (*k, *v)).collect();
+        rejections.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let quota_senders = stats.quota_by_sender.len();
+        let quota_worst = stats
+            .quota_by_sender
             .iter()
             .max_by_key(|(_, n)| **n)
             .map(|(addr, n)| (*addr, *n));
-        counts.clear();
-        QuotaRejectionSummary { total, distinct_senders, worst }
+        let activity = PoolActivity {
+            offered: stats.offered,
+            accepted: stats.accepted,
+            mined: stats.mined,
+            rejections,
+            quota_senders,
+            quota_worst,
+        };
+        *stats = PoolStats::default();
+        activity
     }
 
     /// rskj `TransactionPoolImpl`'s `TxQuotaCleanerTimer`, which it schedules at
@@ -218,7 +276,21 @@ impl TransactionPool {
     }
 
     /// Add a raw RLP-encoded transaction to the pool.
+    /// Add a raw RLP-encoded transaction to the pool, recording the outcome.
     pub fn add_transaction(&self, raw: &[u8]) -> Result<B256, PoolError> {
+        let result = self.add_transaction_inner(raw);
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.offered += 1;
+            match &result {
+                Ok(_) => stats.accepted += 1,
+                Err(e) => *stats.rejections.entry(e.reason()).or_insert(0) += 1,
+            }
+        }
+        result
+    }
+
+    fn add_transaction_inner(&self, raw: &[u8]) -> Result<B256, PoolError> {
         let tx = Transaction::decode(&mut &raw[..])
             .map_err(|e| PoolError::RlpDecode(format!("{e}")))?;
 
@@ -349,7 +421,7 @@ impl TransactionPool {
                     tx_hash = %hash, sender = %sender, nonce = tx.nonce,
                     "Transaction refused: account exceeds virtual gas quota"
                 );
-                *self.quota_rejections.write().unwrap().entry(sender).or_insert(0) += 1;
+                *self.stats.write().unwrap().quota_by_sender.entry(sender).or_insert(0) += 1;
                 return Err(PoolError::AccountExceedsQuota);
             }
         }
@@ -457,12 +529,14 @@ impl TransactionPool {
     }
 
     pub fn remove_mined(&self, transactions: &[Transaction]) {
+        let mut removed = 0u64;
         let mut inner = self.inner.write().unwrap();
         for tx in transactions {
             let mut buf = Vec::new();
             tx.encode(&mut buf);
             let hash = tx_hash(&buf);
             if let Some(sender) = inner.by_hash.remove(&hash) {
+                removed += 1;
                 if let Some(map) = inner.pending.get_mut(&sender) {
                     map.remove(&tx.nonce);
                     if map.is_empty() {
@@ -476,6 +550,10 @@ impl TransactionPool {
                     }
                 }
             }
+        }
+        drop(inner);
+        if removed > 0 {
+            self.stats.write().unwrap().mined += removed;
         }
     }
 
@@ -1033,8 +1111,8 @@ mod tests {
         let balance = U256::from(10u64).pow(U256::from(60));
         let (pool, key, addr) = setup_pool_with_account(balance, 5);
 
-        // Nothing refused yet: the report must be empty, not absent.
-        assert!(pool.take_quota_rejections().is_empty());
+        // Nothing has happened yet: the report must be empty, not absent.
+        assert!(pool.take_activity().is_empty());
 
         let mut gas_price = U256::from(59_240_000u64);
         let mut refusals = 0u64;
@@ -1057,13 +1135,79 @@ mod tests {
         }
         assert_eq!(refusals, 3, "the flood must be refused at some point");
 
-        let summary = pool.take_quota_rejections();
-        assert_eq!(summary.total, 3);
-        assert_eq!(summary.distinct_senders, 1, "one abusive sender, not many");
-        assert_eq!(summary.worst, Some((addr, 3)));
+        let a = pool.take_activity();
+        assert_eq!(a.rejections.iter().find(|(r, _)| *r == "quota").map(|(_, n)| *n), Some(3));
+        assert_eq!(a.quota_senders, 1, "one abusive sender, not many");
+        assert_eq!(a.quota_worst, Some((addr, 3)));
 
         // Taking the summary clears it, so each report covers one window.
-        assert!(pool.take_quota_rejections().is_empty());
+        assert!(pool.take_activity().is_empty());
+    }
+
+    /// The summary is what makes the pool observable at all: every line in the
+    /// transaction path logs at `debug` and the node runs at `info`, so without
+    /// this an empty `txpool_status` is equally consistent with healthy traffic
+    /// already mined and with nothing ever arriving.
+    #[test]
+    fn test_pool_activity_is_counted_across_every_outcome() {
+        let balance = U256::from(10u64).pow(U256::from(20));
+        let (pool, key, _addr) = setup_pool_with_account(balance, 0);
+
+        // Silent when nothing has happened.
+        assert!(pool.take_activity().is_empty());
+
+        // One accepted.
+        let mut good = make_tx(0, 59_240_000);
+        sign_tx(&mut good, &key, 33);
+        let raw = encode_tx(&good);
+        pool.add_transaction(&raw).unwrap();
+
+        // The same one again: rejected as already known, which is ordinary --
+        // several peers relay the same transaction.
+        assert!(matches!(pool.add_transaction(&raw), Err(PoolError::AlreadyKnown)));
+
+        // One rejected for an unrelated reason.
+        let mut cheap = make_tx(1, 1);
+        sign_tx(&mut cheap, &key, 33);
+        assert!(matches!(
+            pool.add_transaction(&encode_tx(&cheap)),
+            Err(PoolError::GasPriceTooLow)
+        ));
+
+        // And one mined away.
+        pool.remove_mined(std::slice::from_ref(&good));
+
+        let a = pool.take_activity();
+        assert_eq!(a.offered, 3, "every call counts as offered, accepted or not");
+        assert_eq!(a.accepted, 1);
+        assert_eq!(a.mined, 1);
+        assert_eq!(a.rejected(), 2);
+        assert!(!a.is_empty());
+
+        // Reasons are reported most common first, so a change in the mix shows
+        // up without turning on debug logging.
+        let reasons: Vec<&str> = a.rejections.iter().map(|(r, _)| *r).collect();
+        assert!(reasons.contains(&"already-known"), "{reasons:?}");
+        assert!(reasons.contains(&"gas-price-too-low"), "{reasons:?}");
+
+        // Taking it clears it, so each report covers exactly one window.
+        assert!(pool.take_activity().is_empty());
+    }
+
+    /// A transaction that never reaches the pool -- undecodable bytes -- is
+    /// still "offered". Counting only well-formed transactions would hide a
+    /// peer sending us rubbish.
+    #[test]
+    fn test_undecodable_transactions_still_count_as_offered() {
+        let (pool, _key, _addr) = setup_pool_with_account(U256::from(10u64).pow(U256::from(20)), 0);
+        assert!(matches!(
+            pool.add_transaction(&[0xff, 0xff, 0xff]),
+            Err(PoolError::RlpDecode(_))
+        ));
+        let a = pool.take_activity();
+        assert_eq!(a.offered, 1);
+        assert_eq!(a.accepted, 0);
+        assert_eq!(a.rejections, vec![("rlp-decode", 1)]);
     }
 
     // ========== Intrinsic gas ==========
