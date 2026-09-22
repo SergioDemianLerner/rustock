@@ -180,10 +180,31 @@ This is **not** a local-only getter: `BridgeMethods.java` gives it
 it as `TransactionCallable` too. A contract that calls it gets `0` from rustock
 and a real fee from rskj — divergent execution, divergent state root.
 
-This is the only medium/low finding that can fork the canonical chain today,
-and it is the one that is genuinely expensive to fix (it needs the peg-out
-transaction-size simulation, the active federation redeem script, and
-`feePerKb`). Not fixed here — see below.
+This is the only medium/low finding that can fork the canonical chain today.
+RSKIP385 activates at fingerroot500 (#5,468,000), so from that height rskj
+*never* returns zero, and from reed800 (#8,052,200) it runs the full
+simulation. Mainnet has been past both for millions of blocks, so **every call
+today returns a real fee on rskj and 0 on rustock**.
+
+**Fixed** in `60c200e`. rustock already had every piece — `complete_pegout_tx`
+is the same builder `updateCollections` uses for real batched peg-outs, and
+`pegout_tx_size_segwit` / `pegout_tx_size_legacy` already reproduce rskj's
+pre-cardamom sizers. What was missing was the wiring:
+
+- `load_release_request_queue` mirrors `BridgeStorageProvider
+  .getReleaseRequestQueue` (l.168-193): the legacy queue first, then the
+  with-txhash queue appended once RSKIP146 is active — both, concatenated.
+- `simulate_pegout_fee` appends one hypothetical request (rskj's deterministic
+  P2PKH recipient, worth `minimumPegoutTxValue` from RSKIP540 and 1 BTC before
+  it) to a copy of the queue, runs the builder over the active federation's
+  real UTXO set with the same flyover redeem resolution, and reports
+  `inputSum - outputSum`.
+- A builder failure is rskj's `BridgeIllegalArgumentException`: the
+  next-pegout getter falls back to the size estimate, as rskj does.
+
+`getEstimatedFeesForPegOutAmount` (RSKIP540) was the same stub and now runs the
+same simulation with the caller's amount; rskj does not fall back there, so a
+builder failure returns an error.
 
 ### FRCR-674 (part two) — STATICCALL value semantics before RSKIP103
 
@@ -195,6 +216,7 @@ Described in Group 2. Not fixed here — see below.
 
 | Finding | Fix |
 |---|---|
+| **FRCR-78, -678** | `getEstimatedFeesForNextPegOutEvent` (and `getEstimatedFeesForPegOutAmount`) compute the fee instead of returning a hardcoded 0 — `60c200e`. The only one of the 40 that can fork the canonical chain today. |
 | FRCR-674 (part one) | STATICCALL gated on RSKIP91 (orchid, #729,000); before it, the invalid-opcode handler, matching `VM.java` |
 | FRCR-673, -675, -680, -681 | testnet activation ladder corrected against rskj `config/testnet.conf`, plus a test transcribing **both** networks' tables as a block |
 
@@ -205,7 +227,6 @@ Described in Group 2. Not fixed here — see below.
 | Group 1 (8 rules) | One coherent piece of work on the validator pipeline, not eight patches. Sized and ordered above. No effect on the canonical chain. |
 | FRCR-274, -275 (DUPN/SWAPN/TXINDEX) | Implementable — the semantics are recorded below — but proven unexercised on mainnet and permanently unreachable there. Matters for testnet replay. `doDUPN`/`doSWAPN` also call `program.step()` **twice**, so the PC advances by 2 and the byte after the opcode is skipped; that quirk has to be reproduced, and it is worth doing deliberately rather than in passing. |
 | FRCR-674 (part two) | Needs care: pre-RSKIP103 STATICCALL pops a third stack word and may charge `VT_CALL`, and the downstream static-call write-protection interacts with it. Window is #729,000–#1,052,699, permanently closed, proven unexercised. A wrong "fix" is worse than the documented gap. |
-| FRCR-78 / -678 | Requires the peg-out transaction simulation. Real and current; the largest single item on this list. |
 | FRCR-574 | Mempool policy, not consensus. |
 
 ## No action — the RSKIP text is stale, rustock matches rskj
@@ -233,6 +254,21 @@ Plus FRCR-376, FRCR-378 (RSKIP-107/108 trie format wording), FRCR-80
 ambiguity), which the audit itself files as `spec`-actionable and which the
 whole-chain replay settles empirically: the deployed format is what rustock
 reproduces for 9,230,008 blocks.
+
+## Recorded while implementing: a latent queue-loading divergence
+
+rskj's `getReleaseRequestQueue` concatenates the legacy `releaseRequestQueue`
+with `releaseRequestQueueWithTxHash` once RSKIP146 is active. rustock's
+`updateCollections` and `getQueuedPegoutsCount` each read **one** of the two
+(with-txhash if present, else legacy), never both.
+
+On mainnet the legacy queue was drained before RSKIP146 activated at iris300
+(#3,614,800) and every request since goes to the with-txhash queue, so the two
+readings coincide — which the whole-chain replay confirms. It is a latent
+divergence of the same family as Group 2: correct by circumstance rather than
+by construction. The new fee estimator follows rskj and concatenates, because
+it is a read-only path where matching rskj costs nothing; changing the live
+peg-out processing path was not worth the risk for a case mainnet cannot reach.
 
 ## No consensus effect — local-only getters and prototype gaps
 
@@ -266,6 +302,8 @@ baseline inverts the ranking for us in both directions:
 
 Net: of the 40 medium/low rows, 13 are actionable, and the two with real teeth
 (the missing validator rules, and `getEstimatedFeesForNextPegOutEvent`) are not
-the ones the severity column points at. Reading the reports against rskj rather
+the ones the severity column points at. The peg-out fee getter is the single
+row that can fork the chain as it stands today, and it is filed as MEDIUM
+between two stale-spec rows. Reading the reports against rskj rather
 than against the RSKIP is what separates them — which is the same conclusion the
 high-severity pass reached with FRCR-77.
