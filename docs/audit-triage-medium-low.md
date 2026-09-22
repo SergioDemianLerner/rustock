@@ -77,12 +77,36 @@ is exactly the scenario a validating node exists to prevent.
 It also means replay can never detect any of them: mainnet contains no invalid
 block, so the missing rules are never given anything to reject.
 
-**Recommendation.** Build these as one piece of work, not six. rustock already
-has the `HeaderValidator` / `ParentHeaderValidator` traits and a composition
-point; the rules themselves are small. Suggested order by exposure:
-`TxsMinGasPriceRule`, `BlockTxsMaxGasPriceRule`, `PrevMinGasPriceRule` (cheap,
-purely arithmetic), then uncles and REMASC, then the RSKIP-110/180/351
-merged-mining and header rules.
+**Status: the eight mainnet-active rules are implemented** (`94194c0`). The
+two `reed810` rules (RSKIP144 edges, RSKIP351 header checks) are not, since
+they cannot fire on mainnet.
+
+Placement follows rskj's own split: `BlockValidatorImpl` runs when a block
+arrives, separately from `BlockExecutor`. So the rules hang off
+`BlockProcessor::validate_block` and are called from the sync service's two
+acceptance paths, not from `process_block`, which stays the pure executor.
+
+**How they were verified matters more than the unit tests.** These rules
+*reject* blocks, so their failure mode is the inverse of the usual one: a rule
+that is too strict halts the node on a block the network accepted, and no unit
+test can detect that. `crates/execution/tests/mainnet_block_rules.rs` runs them
+against the local mainnet store — 425 sampled blocks across every era plus
+dense runs either side of each activation, 12,341 uncle-bearing blocks, and 300
+consecutive blocks with fork detection enabled. Zero rejections.
+
+That check paid for itself on the first run: genesis has no REMASC
+transaction. rskj's `BlockValidatorImpl.isValid` returns `false` for genesis —
+it is loaded from the genesis file, never validated — so the pipeline skips
+block 0.
+
+Two implementation notes. The fork-detection rule is opt-in
+(`with_fork_detection_validation`) because it reads 449 ancestor headers per
+block; rskj caches the same view in `ConsensusValidationMainchainView`, and the
+`MainchainView` trait leaves room for that. And `ActivationHeights` gained
+`iris300`/`fingerroot500`, which surfaced a third testnet height error: its
+`papyrus200` was `0` where rskj's `config/testnet.conf` says `863,000`, so
+RSKIP156's difficulty divisor was activating from testnet genesis. Mainnet was
+unaffected.
 
 FRCR-574 (the 80× *propagation* cap) is mempool policy, not consensus — rskj
 applies `TxGasPriceCap.FOR_TRANSACTION` in `TxValidatorMaximumGasPriceValidator`
@@ -231,7 +255,7 @@ Described in Group 2. Not fixed here — see below.
 
 | Finding | Why not |
 |---|---|
-| Group 1 (8 rules) | One coherent piece of work on the validator pipeline, not eight patches. Sized and ordered above. No effect on the canonical chain. |
+| Group 1: RSKIP144 edges, RSKIP351 header checks | Gated on `reed810`, which is `-1` on mainnet. Testnet-only. |
 | FRCR-274, -275 (DUPN/SWAPN/TXINDEX) | Implementable — the semantics are recorded below — but proven unexercised on mainnet and permanently unreachable there. Matters for testnet replay. `doDUPN`/`doSWAPN` also call `program.step()` **twice**, so the PC advances by 2 and the byte after the opcode is skipped; that quirk has to be reproduced, and it is worth doing deliberately rather than in passing. |
 | FRCR-674 (part two) | Needs care: pre-RSKIP103 STATICCALL pops a third stack word and may charge `VT_CALL`, and the downstream static-call write-protection interacts with it. Window is #729,000–#1,052,699, permanently closed, proven unexercised. A wrong "fix" is worse than the documented gap. |
 | FRCR-574 | Mempool policy, not consensus. |
