@@ -5,9 +5,7 @@ JSON-RPC namespace, and completes them from Bitcoin solutions submitted back.
 This describes what was built, what was verified against mainnet while building
 it, and what is deliberately not there.
 
-It supersedes `merged-mining-handover.md`, which surveyed the work before it
-existed. Section numbers below refer to that document where a question it
-raised is now answered.
+It replaces the pre-implementation survey this repository used to carry.
 
 ---
 
@@ -25,6 +23,22 @@ refusing to start.
 
 The template is rebuilt every `--mining-refresh-secs` (60 by default), matching
 rskj. A template goes stale as the chain advances and as transactions arrive.
+Nothing else rebuilds it: the sync service owns the execution loop and does not
+know the miner exists, so without that timer a pool would keep being handed work
+for a parent the chain left behind and every solution would be refused.
+
+The same settings live in the config file:
+
+```toml
+[mining]
+enabled = false                    # serve the mnr_* namespace
+# coinbase = "0x…"                 # REQUIRED when enabled
+extra_data = ""                    # at most 32 bytes
+refresh_secs = 60
+```
+
+`--mining-extra-data` is capped at 32 bytes by the header rules, and the node
+checks at startup rather than letting every block fail validation.
 
 | Method | Sends |
 |---|---|
@@ -77,7 +91,7 @@ Omitting it changes both the block hash and the merged-mining hash. Pinned by
 a real header and reproduces its hash and the 20-byte commitment its coinbase
 carries.
 
-**RSKIP351 extension data is not in use** (handover §5.3, left unverified).
+**RSKIP351 extension data is not in use.**
 `reed810 = -1` in rskj's `main.conf`: the fork never activated on mainnet.
 `extension_data: None` is correct, and the fixture above confirms it from the
 other direction — the header reproduces its real hash with a plain 256-byte
@@ -94,13 +108,14 @@ canonically moves the transactions root, and the resulting failure names a root
 rather than an encoding. Pinned against the real transaction of that same
 block.
 
-Two further handover questions are answered by tests rather than by mainnet:
+Two further questions the survey raised are answered by tests rather than by
+mainnet:
 
-- **`paid_fees` is not self-referential** (§5.4). REMASC reads the *matured*
+- **`paid_fees` is not self-referential.** REMASC reads the *matured*
   block's `paid_fees` from storage, not the block being built, so the zero
   placeholder during execution is harmless and no second pass is needed.
   `filling_paid_fees_does_not_change_what_the_block_executes_to`.
-- **Filling the mining fields does not move the merged-mining hash** (§5.5).
+- **Filling the mining fields does not move the merged-mining hash.**
   RSKIP92 keeps the proof and coinbase out of the hashed prefix precisely so a
   solution can attach to a block already committed to.
 
@@ -196,7 +211,202 @@ an existing database makes the forks it *does* hold findable, but a node that
 has only ever followed the tip will have few. Uncles accumulate from that point
 on.
 
-## 6. Deliberate omissions
+## 6. Building the template
+
+The load-bearing hook is that `BlockProcessor::execute_block` executes
+**without** checking the header's roots, while `process_block` checks them. A
+template is assembled with placeholder roots, executed, and has the real roots
+written back from the result:
+
+```rust
+let mut header = Header { state_root: B256::ZERO, receipts_root: B256::ZERO,
+                          logs_bloom: Bloom::ZERO, /* … */ };
+let executed = self.processor.execute_block(&block, &state_root, trie)?;
+header.state_root    = executed.state_root_hash;
+header.receipts_root = executed.receipts_root;
+header.logs_bloom    = executed.logs_bloom;
+header.gas_used      = executed.gas_used;
+header.paid_fees     = executed.paid_fees;
+```
+
+There is no second execution path for mining, so a block this builds is
+executed by exactly the code that will later re-execute it on the way in.
+
+### Fields the builder computes
+
+- **`timestamp`** — `max(now, parent.timestamp + 1)`. A header not *strictly*
+  after its parent is rejected outright. rskj `MinerClock.calculateTimestampForChild`.
+- **`difficulty`** — `DifficultyRule::difficulty_for_child(parent, number,
+  timestamp, uncle_count)`, shared with validation deliberately: two copies of a
+  consensus calculation will drift.
+- **`gas_limit`** — one step toward an optional target, bounded by
+  `parent / 1024`; `None` inherits the parent's, which is always valid. rskj
+  `GasLimitCalculator`.
+- **`minimum_gas_price`** — one step toward an optional target, bounded by 1% of
+  the parent's, or one wei when 1% rounds to nothing. rskj
+  `MinimumGasPriceCalculator` (RSKIP-09).
+
+Neither target is exposed on the command line, so a running node inherits both
+from the parent and they never drift.
+
+### The REMASC transaction
+
+REMASC is an ordinary entry in the transaction list, recognised by shape — the
+executor does not append it. A template without it executes to a different state
+root, and the failure reads as an execution bug rather than a missing
+transaction (`a_template_without_remasc_would_not_validate`).
+
+Its `cached_rlp` is not an optimisation: the zero fields are not canonical RLP
+(gas price and gas limit are a literal `0x00`, the value `0x80`) and the nonce is
+the parent's height. Re-encoding would move the transactions root. Pinned against
+mainnet by `remasc_transaction_matches_mainnet`.
+
+### Transaction selection
+
+Ported from rskj `PendingState.sortByPriceTakingIntoAccountSenderAndNonce`:
+cluster by sender, order each cluster by nonce, then merge the clusters by
+price, always comparing only each sender's *next* transaction. Ordering purely
+by price would interleave a sender's own transactions out of nonce order and
+strand all but the first.
+
+A candidate is then skipped if it is below `minimum_gas_price`, if its nonce is
+not the one the state expects, or if its gas limit no longer fits — the executor
+charges each transaction its own gas limit against the block's, so there is no
+partial inclusion and a cheaper transaction may still fit after a large one is
+skipped.
+
+Ties break by hash, and the merge order by queue index, because a `HashMap` hands
+senders back in whatever order it likes and two nodes building the same template
+must agree (`transaction_ordering_is_stable_for_equal_prices`). Senders are
+pre-recovered by the pool on admission; otherwise the builder would recover every
+sender again on every rebuild, once a minute per pending transaction.
+
+---
+
+## 7. The merkle proof
+
+RSKIP92. The coinbase is always transaction 0, so it is always the **left**
+operand at every level, and the proof is nothing but the sibling path bottom-up
+— no direction bits, no partial-merkle-tree framing. That is the whole of the
+RSKIP: the older format serialized a full Bitcoin partial merkle tree, whose flag
+bits and transaction count were redundant for a path known to start at index 0.
+
+Every hash is in **display** order, the reverse of Bitcoin's consensus encoding,
+matching bitcoinj's `Sha256Hash`. `parse_wire_hashes` reverses each entry on the
+way in, because rskj takes these fields as one space-separated string and
+reverses every entry (`Utils.reverseBytes`) — so the wire carries consensus order
+and everything past that point is display order.
+
+One builder per submit form (rskj `Rskip92MerkleProofBuilder`):
+
+| From | Function | Note |
+|---|---|---|
+| A whole Bitcoin block | `proof_from_txids` | Walks the tree, duplicating the final hash on odd levels |
+| The block's transaction hashes | `proof_from_tx_hashes` | The same walk |
+| An already-computed branch | `proof_from_merkle_hashes` | **Drops `hashes[0]`** |
+
+That last one is the trap: the first hash of a partial merkle branch is the
+coinbase itself, and the verifier starts from a coinbase hash it computes. Left
+in, it would be folded twice.
+
+Bitcoin's odd-level duplication never affects the coinbase's own sibling — index
+1 always exists while a level has more than one node — but it does affect the
+hashes computed above it, so the walk has to do it.
+
+---
+
+## 8. Work, submission and import
+
+### The cache, and why it is keyed the way it is
+
+A solution arrives minutes after the work it answers, by which time the node has
+usually built several newer templates. Templates are kept in a small cache keyed
+by **the merged-mining hash the coinbase commits to** — not the block hash, since
+that is what a submission can be matched by. rskj keeps 20
+(`MinerServerImpl.CACHE_SIZE`); so does this. Keeping only the newest would make
+a miner that was merely a little slow lose a block it had legitimately found.
+
+`take_template` does **not** remove the entry it finds. Two solutions to the same
+work is not an error, and the second would otherwise be reported as unknown work
+rather than as a duplicate block.
+
+`notify` follows rskj `MinerServerImpl.getNotify`: a new parent always warrants a
+push to miners, otherwise only fees above 110% of the last notified figure
+(`NOTIFY_FEES_PERCENTAGE_INCREASE = 10`), so a pool is not woken for every
+transaction that trickles in. `get_work` clears the flag after it is read once —
+it marks the transition, not the work — and the build-then-return path goes
+through the same clearing code, or the *second* caller would be told to notify
+about work the first already took. That bug is the one the real nonce search
+surfaced (§10).
+
+### The submit path
+
+All three RPC forms converge on `complete_and_import`:
+
+1. **Match** — `extract_merged_mining_hash` finds the **last** `RSKBLOCK:` in the
+   coinbase and reads the 32 bytes after it. rskj
+   `MnrModuleImpl.extractBlockHashForMergedMining`.
+2. **Check the parent still stands** — if the executed head has moved off the
+   template's parent, refuse with `ParentNoLongerHead`.
+3. **Compress the coinbase** — `compress_coinbase`, the same function the
+   verifier's format is defined by.
+4. **Fill the three fields**, with a `debug_assert` that the merged-mining hash
+   did not move.
+5. **Self-check** — run `MergedMiningRule`, the same rule every peer will run.
+   Failing here means the node built something it would itself reject, worth
+   catching before it is stored and announced rather than after.
+6. **Execute and commit** — `process_and_commit` against the parent state root
+   the template recorded, so the submission re-executes from the same point.
+7. **Rebuild work** — the chain moved, so whatever is on offer is stale.
+
+### Importing: why not `put_block`
+
+`commit_mined_block` writes header, body and total difficulty separately rather
+than calling `put_block`:
+
+```rust
+self.store.put_header_with_hash(hash, &block.header)?;
+self.store.put_body(hash, &block.transactions, &block.ommers)?;
+self.store.put_total_difficulty(hash, td)?;
+
+if td > current_td {
+    self.store.update_canonical_chain(hash)?;
+    self.store.set_exec_head(hash, state_root)?;
+    self.trie_store.flush();
+    ImportResult::ImportedBest
+} else {
+    ImportResult::ImportedNotBest
+}
+```
+
+`put_block` writes the canonical `number -> hash` pointer **unconditionally**,
+which would hand the height to a block that then loses the total-difficulty
+comparison two lines below, leaving the canonical chain naming a block that is
+not on it. Header and body are safe to store either way, being keyed by hash.
+Pinned by `a_losing_block_is_stored_but_not_made_canonical`.
+
+The `flush()` on the winning path matters too: the trie nodes the block wrote are
+durable only once flushed, and announcing a head whose state cannot be reloaded
+after a restart would leave the node unable to build on its own block.
+
+Miners are told which of `IMPORTED_BEST`, `IMPORTED_NOT_BEST` or `EXIST`
+happened, so they can tell "my block won" from "my block was valid but somebody
+else's arrived first".
+
+### Error reporting
+
+Every rejected submission becomes one application-defined code, `-33000`
+(rskj `JsonRpcApplicationDefinedErrorCodes.SUBMIT_BLOCK`), so a miner
+distinguishes causes by message rather than by code. `target` is zero-padded to
+the full 32 bytes (`0x{:064x}`) because it is a value to compare a hash against,
+not a quantity. `mnr_submitBitcoinBlockTransactions` and `…PartialMerkle` take
+the block hash as parameter 0 and ignore it, as rskj does — the hash is
+recomputed from the header, and a submission disagreeing with itself about it
+would be caught by the merged-mining check anyway.
+
+---
+
+## 9. Deliberate omissions
 
 **Not writing speculative state.** Executing a template writes its trie nodes
 through to the store, because that is what `execute_block` does and mining does
@@ -213,7 +423,7 @@ most solutions. Mine on a node that has caught up.
 
 ---
 
-## 7. What the tests do and do not cover
+## 10. What the tests do and do not cover
 
 The round trip is real as far as it goes: a genuine Bitcoin block is built with
 a tagged coinbase, a nonce is actually searched for until the block hash clears
@@ -230,7 +440,7 @@ tries. Two heights are used deliberately:
   `RskExecutor::new` hardcodes `RemascConfig::mainnet()` whatever the chain id,
   so at that height `process_miners_fees` returns immediately -- there is no
   matured block 4,000 back. The REMASC *transaction* is still in the block and
-  still moves the transactions root, which is what §5.1 is about, but nothing
+  still moves the transactions root, which is what §6 is about, but nothing
   is distributed.
 - `a_solution_is_imported_on_a_chain_deep_enough_for_remasc_to_pay` seeds 4,010
   headers and mines #4,011, clearing both the maturity window and the synthetic
@@ -252,7 +462,7 @@ Not covered, in rough order of how much it matters:
    build forks directly in the store; no test mines on a chain whose forks
    arrived over the wire, because sync does not deliver them (§5.1).
 
-## 8. Where the code is
+## 11. Where the code is
 
 | Path | What |
 |---|---|
