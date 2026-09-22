@@ -53,11 +53,18 @@ up:
 | `ExtraDataRule` | `extraData` over the maximum size | **missing** |
 | `BlockUnclesValidationRule` | >10 uncles, uncles older than 7 generations, invalid uncle headers | **missing** |
 | `RemascValidationRule` | last transaction is not the REMASC transaction | **missing** |
-| `ValidTxExecutionSublistsEdgesRule` | malformed RSKIP144 parallel-execution edges | **missing** |
-| RSKIP-351 header version / extension hash | malformed compressed header | **missing** (FRCR-479) |
+| `ValidTxExecutionSublistsEdgesRule` | malformed RSKIP144 parallel-execution edges | **missing** — but RSKIP144 is gated on `reed810`, which is `-1` on mainnet, so this is **testnet-only** (from #7,139,600) |
+| RSKIP-351 header version / extension hash | malformed compressed header | **missing** (FRCR-479) — RSKIP351 is also `reed810`, so likewise **testnet-only** |
 | `BlockRootValidationRule` | wrong txs/receipts root | present (`processor.rs`) |
 | `ProofOfWorkRule` | bad merged-mining PoW | present |
 | `BlockDifficultyRule`, `BlockParentGasLimitRule`, `GasLimitRule`, `BlockTimeStampValidationRule`, `BlockParentNumberRule` | — | present |
+
+Eight of the ten are live on mainnet today; the last two are gated on
+`reed810`, which rskj sets to `-1` on mainnet, so they bite only on testnet
+(from #7,139,600). Activation heights for the rest: `TxsMinGasPriceRule`,
+`PrevMinGasPriceRule`, uncles, REMASC and `extraData` are unconditional;
+RSKIP110 from wasabi100 (#1,591,000); RSKIP180 from iris300 (#3,614,800);
+RSKIP252 from fingerroot500 (#5,468,000).
 
 **Why this is a different kind of divergence from the high-severity four.**
 Every one of these is an *accepts-too-much* gap. rustock computes the same
