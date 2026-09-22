@@ -2,7 +2,7 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::{Decodable, Encodable};
 use rustock_core::{Header, Transaction};
 use rustock_storage::BlockStore;
-use rustock_trie::{account_key, AccountState, TrieKeySlice, TrieNode, TrieStore};
+use rustock_trie::{account_key, code_key, AccountState, TrieKeySlice, TrieNode, TrieStore};
 use sha3::{Digest, Keccak256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -31,6 +31,8 @@ pub struct PoolConfig {
     pub max_tx_size: usize,
     /// Maximum transactions held across all accounts, pending and queued.
     pub max_pool_transactions: usize,
+    /// Per-account virtual-gas rate limiting (rskj `TxQuotaChecker`).
+    pub quota: crate::quota::QuotaConfig,
 }
 
 impl Default for PoolConfig {
@@ -42,6 +44,7 @@ impl Default for PoolConfig {
             outdated_timeout_secs: 650,
             max_tx_size: MAX_TX_SIZE,
             max_pool_transactions: MAX_POOL_TRANSACTIONS,
+            quota: crate::quota::QuotaConfig::default(),
         }
     }
 }
@@ -61,6 +64,7 @@ pub enum PoolError {
     InvalidSignature(String),
     InsufficientFundsForPendingAndNew,
     IsRemascTransaction,
+    AccountExceedsQuota,
     RlpDecode(String),
     StoreError(String),
 }
@@ -83,6 +87,7 @@ impl fmt::Display for PoolError {
                 write!(f, "insufficient funds to pay for pending and new transactions")
             }
             Self::IsRemascTransaction => write!(f, "transaction is a remasc transaction"),
+            Self::AccountExceedsQuota => write!(f, "account exceeds quota"),
             Self::RlpDecode(e) => write!(f, "RLP decode error: {e}"),
             Self::StoreError(e) => write!(f, "store error: {e}"),
         }
@@ -123,6 +128,10 @@ pub struct TransactionPool {
     chain_id: u64,
     store: Arc<BlockStore>,
     trie_store: Arc<dyn TrieStore>,
+    /// rskj `TxQuotaChecker`. Behind its own lock: the quota decision is taken
+    /// before the pool lock is acquired, so a slow quota refresh never holds up
+    /// readers of the pool.
+    quota: RwLock<crate::quota::QuotaChecker>,
 }
 
 impl TransactionPool {
@@ -132,13 +141,33 @@ impl TransactionPool {
         store: Arc<BlockStore>,
         trie_store: Arc<dyn TrieStore>,
     ) -> Self {
+        let quota = crate::quota::QuotaChecker::new(config.quota.clone());
         Self {
             inner: RwLock::new(PoolInner::new()),
             config,
             chain_id,
             store,
             trie_store,
+            quota: RwLock::new(quota),
         }
+    }
+
+    /// rskj `TransactionPoolImpl`'s `TxQuotaCleanerTimer`, which it schedules at
+    /// `transaction.accountTxRateLimit.cleanerPeriod` minutes. Exposed rather
+    /// than spawned internally so the caller owns the task; returns how many
+    /// accounts were dropped.
+    pub fn clean_quotas(&self) -> usize {
+        self.quota.write().unwrap().clean_max_quotas(Instant::now())
+    }
+
+    /// The cleaner interval, or `None` when the clean is disabled.
+    pub fn quota_cleaner_period(&self) -> Option<std::time::Duration> {
+        self.quota.read().unwrap().cleaner_period()
+    }
+
+    /// Virtual gas currently available to `address`, for diagnostics and tests.
+    pub fn quota_of(&self, address: &Address) -> Option<f64> {
+        self.quota.read().unwrap().quota_of(address)
     }
 
     /// Add a raw RLP-encoded transaction to the pool.
@@ -205,6 +234,9 @@ impl TransactionPool {
             &inner.queued
         };
         let mut old_hash_to_remove: Option<B256> = None;
+        // The rate limiter prices a replacement by how much it overbids the
+        // transaction it displaces, so it needs the displaced one.
+        let mut replaced_facts: Option<crate::quota::TxFacts> = None;
         if let Some(nonce_map) = target_map.get(&sender) {
             if let Some(existing) = nonce_map.get(&tx.nonce) {
                 if existing.hash == hash {
@@ -217,6 +249,7 @@ impl TransactionPool {
                     return Err(PoolError::ReplacementGasPriceTooLow);
                 }
                 old_hash_to_remove = Some(existing.hash);
+                replaced_facts = Some(tx_facts(&existing.tx, existing.encoded_size));
             }
         }
 
@@ -232,6 +265,44 @@ impl TransactionPool {
             }
             if total_cost > balance {
                 return Err(PoolError::InsufficientFundsForPendingAndNew);
+            }
+        }
+
+        // rskj `TransactionPoolImpl.internalAddTransaction`: the quota check is
+        // the LAST gate, after every cheaper validation and after the
+        // replacement has been resolved. Running it earlier would let an
+        // invalid transaction consume an honest account's virtual gas.
+        {
+            let accounts = TrieAccountView::new(head_header.state_root, &*self.trie_store);
+            let ctx = crate::quota::QuotaContext {
+                block_gas_limit: head_header.gas_limit.try_into().unwrap_or(u64::MAX),
+                block_min_gas_price: head_header
+                    .minimum_gas_price
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                // rustock has no fee-market average yet, so this takes rskj's
+                // own `createSkippingGasPriceFactor` branch -- the one it uses
+                // whenever `GasPriceTracker.isFeeMarketWorking()` is false.
+                // Supplying `Some(avg)` here enables the low-gas-price factor
+                // with no other change.
+                avg_gas_price: None,
+            };
+            let receiver = (tx.to.len() == 20).then(|| Address::from_slice(tx.to.as_ref()));
+            let accepted = self.quota.write().unwrap().accept_tx(
+                sender,
+                receiver,
+                &tx_facts(&tx, encoded_size),
+                replaced_facts.as_ref(),
+                &ctx,
+                &accounts,
+                Instant::now(),
+            );
+            if !accepted {
+                debug!(
+                    tx_hash = %hash, sender = %sender, nonce = tx.nonce,
+                    "Transaction refused: account exceeds virtual gas quota"
+                );
+                return Err(PoolError::AccountExceedsQuota);
             }
         }
 
@@ -498,6 +569,61 @@ impl TransactionPool {
     }
 }
 
+/// `AccountView` over the state trie at a given root — what the rate limiter
+/// needs to ask about an address (rskj's `RepositorySnapshot` and
+/// `PendingState` in one).
+///
+/// The root node is resolved once and reused: `accept_tx` asks about both the
+/// sender and the receiver, and each question is a trie descent.
+struct TrieAccountView<'a> {
+    root: Option<TrieNode>,
+    store: &'a dyn TrieStore,
+}
+
+impl<'a> TrieAccountView<'a> {
+    fn new(state_root: B256, store: &'a dyn TrieStore) -> Self {
+        let root = store
+            .get(state_root.as_slice())
+            .map(|d| TrieNode::from_message(&d, store));
+        Self { root, store }
+    }
+
+    fn lookup(&self, key: Vec<u8>) -> Option<Vec<u8>> {
+        let root = self.root.as_ref()?;
+        root.get(&TrieKeySlice::from_key(&key), self.store)
+    }
+}
+
+impl crate::quota::AccountView for TrieAccountView<'_> {
+    fn nonce(&self, address: &Address) -> u64 {
+        self.lookup(account_key(address))
+            .and_then(|d| AccountState::decode(&d).ok())
+            .map(|a| a.nonce.to::<u64>())
+            .unwrap_or(0)
+    }
+
+    /// rskj `isContract`: the account has code associated with it. In the
+    /// unitrie that is a node under the account's code key.
+    fn is_contract(&self, address: &Address) -> bool {
+        self.lookup(code_key(address)).is_some_and(|c| !c.is_empty())
+    }
+
+    /// rskj `isExist`: the account node is present at all.
+    fn exists(&self, address: &Address) -> bool {
+        self.lookup(account_key(address)).is_some()
+    }
+}
+
+/// The facts the rate limiter needs from a transaction.
+fn tx_facts(tx: &Transaction, encoded_size: usize) -> crate::quota::TxFacts {
+    crate::quota::TxFacts {
+        nonce: tx.nonce,
+        gas_limit: tx.gas_limit.try_into().unwrap_or(u64::MAX),
+        gas_price: tx.gas_price,
+        size: encoded_size,
+    }
+}
+
 /// Compute the cost of a transaction: value + gas_price * gas_limit.
 fn tx_cost(tx: &Transaction) -> U256 {
     tx.value + tx.gas_price * tx.gas_limit
@@ -549,6 +675,9 @@ mod tests {
             outdated_timeout_secs: 650,
             max_tx_size: MAX_TX_SIZE,
             max_pool_transactions: MAX_POOL_TRANSACTIONS,
+            // The production default, so the pool's own tests exercise the
+            // configuration the node actually runs.
+            quota: crate::quota::QuotaConfig::default(),
         }
     }
 
@@ -650,6 +779,202 @@ mod tests {
         let mut buf = Vec::new();
         tx.encode(&mut buf);
         buf
+    }
+
+    // ========== Account transaction rate limiting (rskj TxQuotaChecker) ==========
+
+    /// The abuse the limiter exists to stop, end to end through the pool:
+    /// broadcast a large transaction, replace it, repeat. Every node that
+    /// accepts it stores and relays it; nothing is ever paid because nothing is
+    /// ever mined.
+    ///
+    /// Each replacement is priced by how little it overbids (rskj's
+    /// `replacementFactor = 1 + 1/ratio`), so a sender doing this at the
+    /// minimum 40% bump runs out of virtual gas and is refused with
+    /// `AccountExceedsQuota`.
+    #[test]
+    fn test_quota_refuses_an_endless_replacement_flood() {
+        // The 40% bump compounds, so the balance must be absurd for this test
+        // to be about the quota rather than about running out of money. With
+        // 1e22 the sender goes broke after ~51 replacements, before the quota
+        // bites at ~126 -- which is a different test.
+        let balance = U256::from(10u64).pow(U256::from(60));
+        let (pool, key, _addr) = setup_pool_with_account(balance, 5);
+
+        // The price is tracked in U256: 40% compounding overruns u64 after
+        // about 65 replacements, long before the quota bites.
+        let mut gas_price = U256::from(59_240_000u64);
+        let mut accepted = 0usize;
+        let mut refused_for_quota = false;
+
+        for _ in 0..500 {
+            let mut tx = make_tx(5, 0);
+            tx.gas_price = gas_price;
+            // A full-block gas limit is what makes this expensive to relay.
+            tx.gas_limit = U256::from(6_800_000u64);
+            sign_tx(&mut tx, &key, 33);
+            match pool.add_transaction(&encode_tx(&tx)) {
+                Ok(_) => accepted += 1,
+                Err(PoolError::AccountExceedsQuota) => {
+                    refused_for_quota = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected rejection: {e}"),
+            }
+            gas_price = gas_price * U256::from(140) / U256::from(100); // the pool's bump
+        }
+
+        assert!(accepted > 0, "the first replacements must be accepted");
+        assert!(
+            refused_for_quota,
+            "an account replacing a full-block transaction forever must eventually \
+             be refused; {accepted} were accepted"
+        );
+    }
+
+    /// The limiter must not disturb ordinary use. A normal account sending
+    /// normal transactions never notices it.
+    #[test]
+    fn test_quota_does_not_affect_ordinary_transactions() {
+        let balance = U256::from(10u64).pow(U256::from(20));
+        let (pool, key, _addr) = setup_pool_with_account(balance, 0);
+
+        for nonce in 0..16u64 {
+            let mut tx = make_tx(nonce, 59_240_000);
+            sign_tx(&mut tx, &key, 33);
+            pool.add_transaction(&encode_tx(&tx))
+                .unwrap_or_else(|e| panic!("ordinary tx at nonce {nonce} rejected: {e}"));
+        }
+        assert_eq!(pool.status().0, 16);
+    }
+
+    /// With the limiter switched off, the same flood that is refused above is
+    /// accepted — proving the rejection comes from the limiter and not from
+    /// some other pool rule.
+    #[test]
+    fn test_quota_disabled_accepts_what_it_would_otherwise_refuse() {
+        let config = PoolConfig {
+            quota: crate::quota::QuotaConfig { enabled: false, ..Default::default() },
+            ..test_config()
+        };
+        let balance = U256::from(10u64).pow(U256::from(60));
+        let (pool, key, _addr) = setup_pool_with_config(balance, 5, config);
+
+        let mut gas_price = U256::from(59_240_000u64);
+        for i in 0..200 {
+            let mut tx = make_tx(5, 0);
+            tx.gas_price = gas_price;
+            tx.gas_limit = U256::from(6_800_000u64);
+            sign_tx(&mut tx, &key, 33);
+            match pool.add_transaction(&encode_tx(&tx)) {
+                Ok(_) => {}
+                Err(e) => panic!("replacement {i} rejected with the limiter off: {e}"),
+            }
+            gas_price = gas_price * U256::from(140) / U256::from(100);
+        }
+    }
+
+    /// A stricter configuration refuses sooner. This is what makes the tunables
+    /// worth exposing: an operator under pressure can tighten them without a
+    /// rebuild.
+    #[test]
+    fn test_quota_configuration_tightens_the_limit() {
+        let count_accepted = |percent: f64, multiplier: u64| {
+            let config = PoolConfig {
+                quota: crate::quota::QuotaConfig {
+                    max_gas_per_second_percent: percent,
+                    max_quota_gas_multiplier: multiplier,
+                    ..Default::default()
+                },
+                ..test_config()
+            };
+            let balance = U256::from(10u64).pow(U256::from(60));
+            let (pool, key, _addr) = setup_pool_with_config(balance, 5, config);
+            let mut gas_price = U256::from(59_240_000u64);
+            let mut n = 0;
+            for _ in 0..500 {
+                let mut tx = make_tx(5, 0);
+                tx.gas_price = gas_price;
+                tx.gas_limit = U256::from(6_800_000u64);
+                sign_tx(&mut tx, &key, 33);
+                if pool.add_transaction(&encode_tx(&tx)).is_err() {
+                    break;
+                }
+                n += 1;
+                gas_price = gas_price * U256::from(140) / U256::from(100);
+            }
+            n
+        };
+
+        let lenient = count_accepted(0.9, 2_000);
+        let strict = count_accepted(0.9, 10);
+        assert!(
+            strict < lenient,
+            "a smaller quota multiplier must refuse sooner: strict {strict}, lenient {lenient}"
+        );
+    }
+
+    /// The quota check is the LAST gate. An invalid transaction must be
+    /// rejected for its own reason and must not consume the sender's virtual
+    /// gas — otherwise anyone could drain an honest account's quota by
+    /// broadcasting rubbish signed with its key.
+    #[test]
+    fn test_invalid_transactions_do_not_consume_quota() {
+        let balance = U256::from(10u64).pow(U256::from(20));
+        let (pool, key, addr) = setup_pool_with_account(balance, 5);
+
+        // Prime the account so it is tracked, then read its quota.
+        let mut good = make_tx(5, 59_240_000);
+        sign_tx(&mut good, &key, 33);
+        pool.add_transaction(&encode_tx(&good)).unwrap();
+        let after_good = pool.quota_of(&addr).expect("sender is tracked");
+
+        // A transaction below the block's minimum gas price is refused by an
+        // earlier rule.
+        let mut bad = make_tx(6, 1);
+        sign_tx(&mut bad, &key, 33);
+        assert!(matches!(
+            pool.add_transaction(&encode_tx(&bad)),
+            Err(PoolError::GasPriceTooLow)
+        ));
+
+        let after_bad = pool.quota_of(&addr).expect("sender is still tracked");
+        assert_eq!(
+            after_good, after_bad,
+            "a transaction rejected by an earlier rule must not cost virtual gas"
+        );
+    }
+
+    /// The periodic sweep is reachable from the pool, and reports what it did.
+    #[test]
+    fn test_quota_cleaner_is_wired_to_the_pool() {
+        let balance = U256::from(10u64).pow(U256::from(20));
+        let (pool, key, addr) = setup_pool_with_account(balance, 5);
+
+        let mut tx = make_tx(5, 59_240_000);
+        sign_tx(&mut tx, &key, 33);
+        pool.add_transaction(&encode_tx(&tx)).unwrap();
+        assert!(pool.quota_of(&addr).is_some());
+
+        // Default period is rskj's 30 minutes.
+        assert_eq!(
+            pool.quota_cleaner_period(),
+            Some(std::time::Duration::from_secs(30 * 60))
+        );
+
+        // Immediately after spending, the account is BELOW the ceiling, so the
+        // sweep must keep it -- dropping it here would lose the record of what
+        // it just spent.
+        assert_eq!(pool.clean_quotas(), 0, "an account below the ceiling is kept");
+        assert!(pool.quota_of(&addr).is_some());
+
+        // It spent ~35,000 virtual gas out of 12.24 billion, and accrues 6.12
+        // million per second, so it is back at the ceiling within microseconds.
+        // Once there it carries no information and is dropped.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let dropped = pool.clean_quotas();
+        assert_eq!(dropped, 1, "an account at the ceiling carries no information");
+        assert!(pool.quota_of(&addr).is_none());
     }
 
     // ========== Intrinsic gas ==========

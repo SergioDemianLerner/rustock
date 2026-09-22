@@ -507,6 +507,41 @@ struct Args {
     #[arg(long, default_value_t = 50_000)]
     prune_max_batch: u64,
 
+    /// Rate-limit accounts that broadcast transactions consuming large amounts
+    /// of shared resources (rskj `transaction.accountTxRateLimit.enabled`).
+    ///
+    /// On by default, as in rskj. Each account accumulates "virtual gas" while
+    /// idle and spends it when it broadcasts; an account that floods the
+    /// mempool runs out and its transactions are refused entry here, so they
+    /// are not relayed onward. Ordinary use never reaches the limit.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    account_tx_rate_limit: bool,
+
+    /// Minutes between sweeps that drop accounts which have accumulated the
+    /// full quota (rskj `transaction.accountTxRateLimit.cleanerPeriod`).
+    ///
+    /// An account at the ceiling is indistinguishable from one never seen, so
+    /// keeping it costs memory and says nothing. Zero or negative disables the
+    /// sweep, matching rskj.
+    #[arg(long, default_value_t = 30)]
+    account_tx_rate_limit_cleaner_period: i64,
+
+    /// Most accounts tracked at once (rskj `MAX_QUOTAS_SIZE`). The map evicts
+    /// the least recently accessed entry, so a flood of distinct addresses
+    /// cannot grow it without bound.
+    #[arg(long, default_value_t = 400_000)]
+    account_tx_rate_limit_max_accounts: usize,
+
+    /// How many seconds of idleness an account may bank, as a multiple of the
+    /// per-second accrual (rskj `MAX_QUOTA_GAS_MULTIPLIER`).
+    #[arg(long, default_value_t = 2_000)]
+    account_tx_rate_limit_quota_multiplier: u64,
+
+    /// Fraction of the block gas limit an account accrues per second of
+    /// idleness (rskj `MAX_GAS_PER_SECOND_PERCENT`).
+    #[arg(long, default_value_t = 0.9)]
+    account_tx_rate_limit_gas_per_second_percent: f64,
+
     /// Enable administrative JSON-RPC methods.
     ///
     /// Off by default. These act on the node rather than answering questions
@@ -949,12 +984,42 @@ async fn main() -> Result<()> {
         Some(t) => t.clone(),
         None => Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone())),
     };
+    let pool_config = rustock_sync::txpool::PoolConfig {
+        quota: rustock_sync::quota::QuotaConfig {
+            enabled: args.account_tx_rate_limit,
+            cleaner_period_minutes: args.account_tx_rate_limit_cleaner_period,
+            max_quotas_size: args.account_tx_rate_limit_max_accounts,
+            max_quota_gas_multiplier: args.account_tx_rate_limit_quota_multiplier,
+            max_gas_per_second_percent: args.account_tx_rate_limit_gas_per_second_percent,
+        },
+        ..Default::default()
+    };
     let pool = Arc::new(rustock_sync::TransactionPool::new(
-        rustock_sync::txpool::PoolConfig::default(),
+        pool_config,
         config.chain_id.into(),
         store.clone(),
         trie_store_for_pool.clone(),
     ));
+
+    // rskj runs the equivalent sweep on a `TxQuotaCleanerTimer`.
+    if let Some(period) = pool.quota_cleaner_period() {
+        let pool_for_cleaner = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            ticker.tick().await; // the first tick fires immediately
+            loop {
+                ticker.tick().await;
+                let dropped = pool_for_cleaner.clean_quotas();
+                tracing::debug!(target: "rustock::txpool", "Quota sweep dropped {dropped} accounts");
+            }
+        });
+        tracing::info!(
+            "Account tx rate limiting on; quota sweep every {} min",
+            period.as_secs() / 60
+        );
+    } else if !args.account_tx_rate_limit {
+        tracing::info!("Account tx rate limiting disabled");
+    }
 
     let hardfork_cfg = rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
     let block_processor = rustock_execution::BlockProcessor::new(
