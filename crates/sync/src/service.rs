@@ -214,6 +214,10 @@ pub(crate) type ExecFn = Arc<
 /// and overlapping skeleton pre-fetch.
 pub struct SyncService {
     manager: Arc<SyncManager>,
+    /// Per-block counters for the periodic activity report. Shared with the
+    /// reporter task, and written from both execution paths so the window
+    /// covers everything executed however it arrived.
+    chain_activity: Arc<crate::chain_activity::ChainActivity>,
     peer_store: Arc<rustock_networking::peers::PeerStore>,
     event_rx: mpsc::UnboundedReceiver<SyncEvent>,
     pub(crate) state: SyncState,
@@ -290,6 +294,7 @@ impl SyncService {
     ) -> Self {
         Self {
             manager,
+            chain_activity: Arc::new(crate::chain_activity::ChainActivity::new()),
             peer_store,
             event_rx,
             state: SyncState::Idle,
@@ -358,6 +363,7 @@ impl SyncService {
         // are all Send + Sync, so the closure runs safely on a blocking thread.
         let store = self.manager.store.clone();
         let tx_pool = self.tx_pool.clone();
+        let activity = self.chain_activity.clone();
         self.exec_fn = Some(Arc::new(move |state_root, blocks_since_flush, pending| {
             process_downloaded_blocks(
                 &processor,
@@ -367,9 +373,16 @@ impl SyncService {
                 tx_pool.as_deref(),
                 blocks_since_flush,
                 &pending,
+                &activity,
             )
         }));
         self
+    }
+
+    /// The per-block counters, for the periodic activity report. Taken before
+    /// the service is moved into its task.
+    pub fn chain_activity(&self) -> Arc<crate::chain_activity::ChainActivity> {
+        self.chain_activity.clone()
     }
 
     /// Test seam: install a controllable execution step and a starting state
@@ -2257,8 +2270,18 @@ impl SyncService {
             return false;
         }
 
+        let cpu_start = crate::chain_activity::thread_cpu_time();
+        let wall_start = Instant::now();
         match processor.process_and_commit(&block, &state_root, trie_store.clone()) {
             Ok(result) => {
+                self.chain_activity.record_block(
+                    header.number,
+                    block.transactions.len(),
+                    result.gas_used,
+                    header.gas_limit.try_into().unwrap_or(u64::MAX),
+                    crate::chain_activity::thread_cpu_time().saturating_sub(cpu_start),
+                    wall_start.elapsed(),
+                );
                 trie_store.flush();
                 let _ = self.manager.store.set_exec_head(hash, result.state_root_hash);
                 info!(
@@ -2332,6 +2355,7 @@ fn process_downloaded_blocks(
     tx_pool: Option<&crate::TransactionPool>,
     mut blocks_since_flush: u64,
     pending_headers: &[(B256, Header)],
+    activity: &crate::chain_activity::ChainActivity,
 ) -> ExecOutcome {
     let mut current_root = state_root;
     let mut processed = 0u64;
@@ -2405,8 +2429,21 @@ fn process_downloaded_blocks(
             break;
         }
 
+        // Both clocks, because the difference between them is the diagnostic:
+        // CPU time rising is execution getting slower, wall time rising alone
+        // is the node waiting on the trie database rather than working.
+        let cpu_start = crate::chain_activity::thread_cpu_time();
+        let wall_start = Instant::now();
         match processor.process_and_commit(&block, &current_root, trie_store.clone()) {
             Ok(result) => {
+                activity.record_block(
+                    header.number,
+                    block.transactions.len(),
+                    result.gas_used,
+                    header.gas_limit.try_into().unwrap_or(u64::MAX),
+                    crate::chain_activity::thread_cpu_time().saturating_sub(cpu_start),
+                    wall_start.elapsed(),
+                );
                 current_root = result.new_state_root;
                 last_executed = Some((*hash, result.state_root_hash));
                 processed += 1;

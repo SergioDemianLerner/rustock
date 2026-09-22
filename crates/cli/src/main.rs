@@ -1153,6 +1153,54 @@ async fn main() -> Result<()> {
         info!("Sourcing block bodies from rskj LevelDB at {path} (peers only for what it lacks)");
         sync_service = sync_service.with_block_source(Arc::new(source));
     }
+    // `Processed N blocks` says the node is alive but nothing about what it is
+    // processing: a node keeping up with an idle chain and one keeping up with
+    // a saturated one produce the same line. Report what the blocks actually
+    // contained, on the same cadence as the mempool summary, and stay silent
+    // when no block was executed -- at the tip that is roughly one every 30
+    // seconds, so an empty window is itself worth noticing.
+    {
+        let activity = sync_service.chain_activity();
+        tokio::spawn(async move {
+            const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+            let mut ticker = tokio::time::interval(REPORT_EVERY);
+            ticker.tick().await; // the first tick fires immediately
+            loop {
+                ticker.tick().await;
+                let a = activity.take();
+                if a.is_empty() {
+                    continue;
+                }
+                let range = match a.first_block {
+                    Some(first) if first != a.last_block => {
+                        format!("#{first}..#{}", a.last_block)
+                    }
+                    _ => format!("#{}", a.last_block),
+                };
+                // ns/gas is the figure to watch across windows. Gas measures
+                // work, so cost per unit of work should hold steady whatever
+                // the chain is doing; a rising figure means each unit is
+                // costing more than it used to. Blocks vary too much in size
+                // for time-per-block to be comparable the same way.
+                tracing::info!(
+                    target: "rustock::sync",
+                    "Chain in the last {}m: {} block(s) {range}, {:.1} tx/block, \
+                     {:.0} gas/block, {:.1}% full | {:.1} ms/block cpu ({:.1} wall), \
+                     {:.1} ns/gas cpu ({:.1} wall)",
+                    REPORT_EVERY.as_secs() / 60,
+                    a.blocks,
+                    a.avg_transactions(),
+                    a.avg_gas_used(),
+                    a.fullness_percent(),
+                    a.avg_cpu_ms_per_block(),
+                    a.avg_wall_ms_per_block(),
+                    a.cpu_nanos_per_gas(),
+                    a.wall_nanos_per_gas(),
+                );
+            }
+        });
+    }
+
     let tx_relay = Arc::new(TxRelay::with_pool(peer_store.clone(), pool.clone()));
 
     let mut node = Node::with_peer_store(node_config, peer_store.clone());
