@@ -359,7 +359,10 @@ impl RskSubMessage {
             RskSubMessage::Transactions(txs) => {
                 let mut txs_payload = Vec::new();
                 for tx in txs {
-                    RlpHeader { list: false, payload_length: tx.len() }.encode(&mut txs_payload);
+                    // A transaction is already a complete RLP list, so it goes
+                    // in verbatim. Wrapping it in a string header made every
+                    // transaction this node relayed undecodable to its peers,
+                    // the mirror image of the decode bug above.
                     txs_payload.extend_from_slice(tx);
                 }
                 RlpHeader { list: true, payload_length: txs_payload.len() }.encode(out);
@@ -606,10 +609,20 @@ impl Decodable for RskMessage {
                 let mut list_body = &body_params[..list_h.payload_length];
                 let mut txs = Vec::new();
                 while !list_body.is_empty() {
+                    // Each item is a COMPLETE transaction -- itself an RLP list
+                    // -- and must be handed on whole. Decoding the header to
+                    // find the item's length and then keeping only the payload
+                    // strips the list header, and the pool cannot decode what
+                    // is left: `Transaction::decode` needs a complete RLP list.
+                    //
+                    // Mainnet symptom: 19 transactions offered in five minutes,
+                    // all 19 rejected `rlp-decode`.
+                    let before = list_body;
                     let tx_h = RlpHeader::decode(&mut list_body)?;
-                    let tx_data = &list_body[..tx_h.payload_length];
-                    list_body = &list_body[tx_h.payload_length..];
-                    txs.push(Bytes::copy_from_slice(tx_data));
+                    let header_len = before.len() - list_body.len();
+                    let total = header_len + tx_h.payload_length;
+                    txs.push(Bytes::copy_from_slice(&before[..total]));
+                    list_body = &before[total..];
                 }
                 RskSubMessage::Transactions(txs)
             }
@@ -782,11 +795,69 @@ mod tests {
     }
 
     #[test]
+    /// A `Transactions` message as it arrives on the wire: an outer RLP list
+    /// whose items are each a COMPLETE transaction -- itself an RLP list.
+    ///
+    /// The round-trip test below cannot catch a mistake here, because it feeds
+    /// our own encoder's output to our own decoder; if both are wrong in the
+    /// same way it still passes. This one pins the format itself.
+    ///
+    /// Mainnet symptom: 19 transactions offered in five minutes, all 19
+    /// rejected `rlp-decode`, because the decoder handed the pool each
+    /// transaction's payload with its list header stripped off.
+    #[test]
+    fn transactions_decode_keeps_each_transaction_whole() {
+        use alloy_primitives::Bytes;
+
+        // A complete, self-contained RLP list: 0xc4 header + four items.
+        // This stands for one transaction.
+        let tx: Vec<u8> = vec![0xc4, 0x01, 0x02, 0x03, 0x04];
+
+        // The wire message: an outer list containing that item verbatim.
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&tx);
+        let mut wire = Vec::new();
+        RlpHeader { list: true, payload_length: inner.len() }.encode(&mut wire);
+        wire.extend_from_slice(&inner);
+
+        // Frame it exactly as rskj's Message.getEncoded does:
+        //   RLP([ RLP([ type, RLP_String(params) ]) ])
+        let mut msg_rlp = Vec::new();
+        (RskMessageType::Transactions as u8).encode(&mut msg_rlp);
+        RlpHeader { list: false, payload_length: wire.len() }.encode(&mut msg_rlp);
+        msg_rlp.extend_from_slice(&wire);
+
+        let mut wrapped = Vec::new();
+        RlpHeader { list: true, payload_length: msg_rlp.len() }.encode(&mut wrapped);
+        wrapped.extend_from_slice(&msg_rlp);
+
+        let mut framed = Vec::new();
+        RlpHeader { list: true, payload_length: wrapped.len() }.encode(&mut framed);
+        framed.extend_from_slice(&wrapped);
+
+        let mut slice = framed.as_slice();
+        let decoded = RskMessage::decode(&mut slice).expect("decodes");
+        let RskSubMessage::Transactions(txs) = decoded.sub_message else {
+            panic!("expected Transactions");
+        };
+        assert_eq!(txs.len(), 1);
+        assert_eq!(
+            txs[0],
+            Bytes::from(tx.clone()),
+            "each item must survive whole, header included -- the pool decodes \
+             it as a transaction, which is only valid as a complete RLP list"
+        );
+    }
+
     fn test_rsk_message_rlp_transactions() {
         use alloy_primitives::Bytes;
 
-        let tx1 = Bytes::from(vec![0xf8, 0x65, 0x80, 0x01, 0x82, 0x52, 0x08]);
-        let tx2 = Bytes::from(vec![0xf8, 0x66, 0x01, 0x02, 0x83, 0x01, 0x00, 0x00]);
+        // Complete RLP lists, as real transactions are. The previous values
+        // were truncated fragments that only round-tripped because the encoder
+        // wrapped them in a string header and the decoder unwrapped it again --
+        // symmetric, and wrong in both directions.
+        let tx1 = Bytes::from(vec![0xc4, 0x01, 0x02, 0x03, 0x04]);
+        let tx2 = Bytes::from(vec![0xc6, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16]);
         let msg = RskMessage::new(RskSubMessage::Transactions(vec![tx1.clone(), tx2.clone()]));
 
         let mut buf = Vec::new();
