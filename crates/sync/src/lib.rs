@@ -6,9 +6,11 @@ mod service;
 mod state;
 mod tracker;
 pub mod chain_activity;
+pub mod invariant;
 pub mod quota;
 pub mod tx_relay;
 pub mod txpool;
+pub mod watchdog;
 
 // Re-exports for external consumers
 pub use events::SyncEvent;
@@ -16,7 +18,9 @@ pub use handler::SyncHandler;
 pub use manager::SyncManager;
 pub use service::{ExternalBlockSource, SyncService};
 pub use state::{InFlightBody, SyncState};
+pub use invariant::{Scope, Violation};
 pub use tracker::PeerChunkTracker;
+pub use watchdog::{Escalation, Phi, ProgressWatchdog};
 pub use tx_relay::TxRelay;
 pub use txpool::TransactionPool;
 
