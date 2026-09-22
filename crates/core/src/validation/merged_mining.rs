@@ -20,6 +20,11 @@ pub const HASH_FOR_MERGED_MINING_PREFIX_LENGTH: usize = 20;
 /// which bounds how much of the coinbase a verifier has to be handed.
 pub const MAX_RSK_TAG_POSITION_IN_TAIL: usize = 64;
 
+/// rskj `Constants.getMaxBitcoinMergedMiningMerkleProofLength()` = 960 bytes
+/// (30 SHA-256 hashes), enforced by `Rskip92MerkleProofValidator` from
+/// RSKIP180 (iris300).
+pub const MAX_MERGED_MINING_MERKLE_PROOF_LENGTH: usize = 960;
+
 pub struct MergedMiningRule {
     pub config: std::sync::Arc<ChainConfig>,
 }
@@ -106,6 +111,19 @@ impl HeaderValidator for MergedMiningRule {
         let merkle_proof_bytes = header.bitcoin_merged_mining_merkle_proof.as_ref()
             .ok_or(ValidationError::BitcoinMerkleProofDecodeError)?;
 
+        // RSKIP180 (iris300): rskj `Rskip92MerkleProofValidator` rejects a
+        // merged-mining merkle proof longer than
+        // `Constants.getMaxBitcoinMergedMiningMerkleProofLength()` (960 bytes,
+        // i.e. 30 hashes) before the format check.
+        if header.number >= self.config.activation_heights.iris300
+            && merkle_proof_bytes.len() > MAX_MERGED_MINING_MERKLE_PROOF_LENGTH
+        {
+            return Err(ValidationError::MerkleProofTooLarge {
+                max: MAX_MERGED_MINING_MERKLE_PROOF_LENGTH,
+                got: merkle_proof_bytes.len(),
+            });
+        }
+
         if merkle_proof_bytes.len() % 32 != 0 {
             return Err(ValidationError::BitcoinMerkleProofDecodeError);
         }
@@ -125,6 +143,39 @@ impl HeaderValidator for MergedMiningRule {
         Ok(())
     }
 }
+
+/// The 12 fork-detection bytes a header commits to, read out of its
+/// merged-mining coinbase.
+///
+/// rskj `BlockHeader.getMiningForkDetectionData`: locate
+/// `RSK_TAG || hashForMergedMining[0..20]` in the coinbase and take the 12
+/// bytes that follow. Returns `None` when the tag is absent or the coinbase is
+/// too short — rskj throws `IllegalStateException` in both cases.
+pub fn extract_fork_detection_data(header: &Header) -> Option<[u8; 12]> {
+    let compressed = header.bitcoin_merged_mining_coinbase_transaction.as_ref()?;
+    if compressed.len() < MIDSTATE_SIZE_TRIMMED + 1 {
+        return None;
+    }
+    let tail = &compressed[MIDSTATE_SIZE_TRIMMED..];
+    let rsk_hash = header.hash_for_merged_mining();
+    let prefix: Vec<u8> = [
+        RSK_TAG,
+        &rsk_hash.as_slice()[..HASH_FOR_MERGED_MINING_PREFIX_LENGTH],
+    ]
+    .concat();
+    let position = find_last_subsequence(tail, &prefix)?;
+    let from = position + prefix.len();
+    let to = from + FORK_DETECTION_DATA_LENGTH;
+    if tail.len() < to {
+        return None;
+    }
+    let mut out = [0u8; FORK_DETECTION_DATA_LENGTH];
+    out.copy_from_slice(&tail[from..to]);
+    Some(out)
+}
+
+/// rskj `BlockHeader.FORK_DETECTION_DATA_LENGTH`.
+pub const FORK_DETECTION_DATA_LENGTH: usize = 12;
 
 pub fn find_last_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.len() > haystack.len() {

@@ -2211,6 +2211,21 @@ impl SyncService {
             ommers,
         };
 
+        // rskj validates a block's body against the consensus rules when it
+        // arrives (`BlockValidatorImpl`), separately from executing it
+        // (`BlockExecutor`). These are the rules that REJECT a block --
+        // transaction gas-price bounds, the REMASC transaction, uncles,
+        // extraData, fork-detection data -- none of which changes what a valid
+        // block executes to.
+        if let Err(e) = processor.validate_block(&block) {
+            warn!(
+                target: "rustock::sync",
+                "Block #{} ({:?}) failed consensus validation: {e}",
+                block.header.number, hash
+            );
+            return false;
+        }
+
         match processor.process_and_commit(&block, &state_root, trie_store.clone()) {
             Ok(result) => {
                 trie_store.flush();
@@ -2348,6 +2363,16 @@ fn process_downloaded_blocks(
             transactions,
             ommers,
         };
+
+        // Same consensus gate as the single-block path above.
+        if let Err(e) = processor.validate_block(&block) {
+            warn!(
+                target: "rustock::sync",
+                "Block #{} ({:?}) failed consensus validation: {e}",
+                block.header.number, hash
+            );
+            break;
+        }
 
         match processor.process_and_commit(&block, &current_root, trie_store.clone()) {
             Ok(result) => {

@@ -54,6 +54,51 @@ pub enum ValidationError {
 
     #[error("Bitcoin coinbase tag missing or invalid")]
     BitcoinCoinbaseTagInvalid,
+
+    #[error("Merged-mining merkle proof is {got} bytes, over the {max}-byte limit")]
+    MerkleProofTooLarge { max: usize, got: usize },
+
+    #[error("Tx gas price {tx_gas_price} is below the block minimum {block_minimum}")]
+    TxGasPriceBelowMinimum { tx_gas_price: U256, block_minimum: U256 },
+
+    #[error("Tx gas price {tx_gas_price} is above the cap {cap}")]
+    TxGasPriceAboveCap { tx_gas_price: U256, cap: U256 },
+
+    #[error("Block's last transaction is not the REMASC transaction")]
+    RemascTxMissing,
+
+    #[error("Extra data is {got} bytes, over the {max}-byte maximum")]
+    ExtraDataTooLarge { max: usize, got: usize },
+
+    #[error("Minimum gas price {got} outside the allowed range [{lower}, {upper}]")]
+    MinGasPriceOutOfRange { lower: U256, upper: U256, got: U256 },
+
+    #[error("Uncle list has {got} entries, over the limit of {max}")]
+    TooManyUncles { max: usize, got: usize },
+
+    #[error("Uncle {hash} is a direct ancestor of the block")]
+    UncleIsAncestor { hash: B256 },
+
+    #[error("Uncle {hash} was already included by an ancestor")]
+    UncleAlreadyUsed { hash: B256 },
+
+    #[error("Uncle {hash} appears twice in the same block")]
+    UncleRepeated { hash: B256 },
+
+    #[error("Uncle {hash} is a sibling or descendant of the block")]
+    UncleIsSiblingOrDescendant { hash: B256 },
+
+    #[error("Uncle {hash} is older than the {limit}-generation limit")]
+    UncleTooOld { hash: B256, limit: u64 },
+
+    #[error("Uncle {hash} has no parent among the block's ancestors")]
+    UncleHasNoCommonParent { hash: B256 },
+
+    #[error("Fork detection data mismatch: expected {expected:?}, got {got:?}")]
+    ForkDetectionDataMismatch { expected: [u8; 12], got: [u8; 12] },
+
+    #[error("Fork detection data could not be read from the coinbase")]
+    ForkDetectionDataUnreadable,
 }
 
 pub trait HeaderValidator: Send + Sync {
@@ -62,6 +107,55 @@ pub trait HeaderValidator: Send + Sync {
 
 pub trait ParentHeaderValidator: Send + Sync {
     fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError>;
+}
+
+/// A rule that needs the block body — transactions or uncles — and not just
+/// the header. rskj's `BlockValidationRule`.
+pub trait BlockValidator: Send + Sync {
+    fn validate_block(&self, block: &crate::types::block::Block) -> Result<(), ValidationError>;
+}
+
+/// Runs the body-dependent rules. Kept separate from `HeaderVerifier` because
+/// the sync pipeline sees headers before bodies: header rules gate the
+/// download, these gate acceptance.
+pub struct BlockVerifier {
+    rules: Vec<Box<dyn BlockValidator>>,
+}
+
+impl Default for BlockVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlockVerifier {
+    pub fn new() -> Self {
+        Self { rules: Vec::new() }
+    }
+
+    /// The body rules rskj runs on every block, in `RskContext` order.
+    /// Uncle and fork-detection validation need the block store and are wired
+    /// separately by the caller that has it.
+    pub fn default_rsk(config: &crate::config::ChainConfig) -> Self {
+        Self::new()
+            .with_rule(block_rules::TxsMinGasPriceRule)
+            .with_rule(block_rules::BlockTxsMaxGasPriceRule {
+                rskip252_height: config.activation_heights.fingerroot500,
+            })
+            .with_rule(block_rules::RemascValidationRule)
+    }
+
+    pub fn with_rule(mut self, rule: impl BlockValidator + 'static) -> Self {
+        self.rules.push(Box::new(rule));
+        self
+    }
+
+    pub fn verify(&self, block: &crate::types::block::Block) -> Result<(), ValidationError> {
+        for rule in &self.rules {
+            rule.validate_block(block)?;
+        }
+        Ok(())
+    }
 }
 
 /// Orchestrator to run multiple validation rules.
@@ -100,9 +194,11 @@ impl HeaderVerifier {
                 max_gas_limit: config.max_gas_limit 
             })
             .with_static_rule(MergedMiningRule { config: config.clone() })
+            .with_static_rule(block_rules::ExtraDataRule::default())
             .with_parent_rule(BlockNumberRule)
             .with_parent_rule(TimestampRule::new(15)) // 15s drift
             .with_parent_rule(BlockParentGasLimitRule { config: config.clone() })
+            .with_parent_rule(block_rules::PrevMinGasPriceRule)
             .with_parent_rule(DifficultyRule { config })
     }
 
@@ -131,6 +227,9 @@ impl HeaderVerifier {
     }
 }
 
+pub mod block_rules;
+pub mod fork_detection;
+pub mod uncles;
 pub mod header_rules;
 pub mod difficulty;
 pub mod merged_mining;
@@ -138,6 +237,10 @@ pub mod merged_mining;
 pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitBoundsRule, BlockParentGasLimitRule};
 pub use difficulty::DifficultyRule;
 pub use merged_mining::MergedMiningRule;
+pub use block_rules::{
+    BlockTxsMaxGasPriceRule, ExtraDataRule, PrevMinGasPriceRule, RemascValidationRule,
+    TxsMinGasPriceRule,
+};
 
 #[cfg(test)]
 mod tests;
