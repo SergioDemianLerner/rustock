@@ -4120,3 +4120,62 @@ async fn rolling_execution_back_reports_when_no_state_survives() {
 
     assert!(!service.roll_execution_back(1), "claimed success with no state to resume from");
 }
+
+/// Mainnet, 2026-09-23 14:10. The executed head was perfectly canonical — so
+/// nothing considered it orphaned — but its state root was no longer in the
+/// trie store. I7 reported it every 30 seconds and no recovery path responded,
+/// and the node sat in a retry loop failing every block with
+/// `NonceTooHigh { state: 0 }`: an account read back empty, which is what a
+/// missing trie node looks like.
+///
+/// A violation nothing acts on is a slower version of no violation at all.
+#[tokio::test]
+async fn a_missing_state_root_at_the_executed_head_is_repaired_not_just_reported() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let mut chain = vec![genesis.clone()];
+    for n in 1..=4u64 {
+        let mut h = dummy_header(n, chain[(n - 1) as usize].hash(), U256::from(n + 1));
+        h.state_root = B256::repeat_byte(0x40 + n as u8);
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        chain.push(h);
+    }
+
+    // The executed head IS canonical — I5 is satisfied — but its state is gone.
+    store.set_exec_head(chain[4].hash(), chain[4].state_root).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(chain[3].state_root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie.clone(), empty);
+
+    // Precondition: the invariant sees it, and I5 does not.
+    let violation = crate::invariant::check(&store, Some(trie.as_ref()), crate::Scope::Full)
+        .unwrap_err();
+    assert_eq!(violation.relation(), "I7");
+
+    service.verify_coherence();
+
+    let (exec_hash, exec_root) = store.exec_head().unwrap().unwrap();
+    assert_eq!(exec_hash, chain[3].hash(), "execution was not rolled back to usable state");
+    assert_eq!(exec_root, chain[3].state_root);
+    assert_eq!(
+        crate::invariant::check(&store, Some(trie.as_ref()), crate::Scope::Full),
+        Ok(()),
+        "still incoherent after the repair"
+    );
+}

@@ -1086,11 +1086,33 @@ impl SyncService {
                 // is the wrong thing to make progress depend on: it exists for
                 // the failures nothing else understands, and a failure we can
                 // name and repair is not one of them.
-                if matches!(
-                    v,
-                    Violation::CanonicalAboveHead { .. } | Violation::HeadNotCanonical { .. }
-                ) {
-                    self.reverify_head_lineage(0);
+                match v {
+                    Violation::CanonicalAboveHead { .. } | Violation::HeadNotCanonical { .. } => {
+                        self.reverify_head_lineage(0);
+                    }
+                    // I7: the executed head names a state root the trie store
+                    // does not have, so the node cannot execute another block
+                    // from it -- and nothing else notices, because the executed
+                    // head is perfectly canonical.
+                    //
+                    // Mainnet 2026-09-23: a rollback left execution on an
+                    // abandoned branch; by the time that branch became canonical
+                    // again its state had been collected. I5 cleared itself, I7
+                    // did not, and the node sat in a retry loop failing every
+                    // block with `NonceTooHigh { state: 0 }` -- an account read
+                    // back empty, which is what a missing trie node looks like.
+                    //
+                    // Rolling back to a height whose state we still hold costs
+                    // re-executing a few blocks. Not rolling back costs the node.
+                    Violation::StateRootMissing { at, .. } => {
+                        warn!(
+                            target: "rustock::sync",
+                            "Executed head #{at} has no state in the trie store; rolling \
+                             execution back to a height that does"
+                        );
+                        self.roll_execution_back(at);
+                    }
+                    _ => {}
                 }
             }
             Ok(()) => self.clear_violation(),
