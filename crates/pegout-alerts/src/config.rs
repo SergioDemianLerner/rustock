@@ -17,6 +17,7 @@ fn default_poll_secs() -> u64 { 5 }
 fn default_pegout_btc() -> f64 { 100.0 }
 fn default_output_btc() -> f64 { 100.0 }
 fn default_in_transit_btc() -> f64 { 200.0 }
+fn default_in_transit_report_secs() -> u64 { 600 }
 fn default_confirmations() -> u64 { 4_000 }
 fn default_smtp_port() -> u16 { 587 }
 fn default_queue() -> usize { 256 }
@@ -53,6 +54,16 @@ pub struct PegoutAlerts {
     /// this.
     #[serde(default = "default_in_transit_btc")]
     pub in_transit_alert_btc: f64,
+    /// How often to report the total value in transit, in seconds. `0`
+    /// disables the report.
+    ///
+    /// This is a *report*, not an alert: it fires whatever the total is, as
+    /// long as it is non-zero, so an operator can see money moving rather than
+    /// only being told when it exceeds a threshold. Peg-outs take 4,000
+    /// confirmations to clear, so ten minutes is frequent enough to watch one
+    /// progress and rare enough not to fill the log.
+    #[serde(default = "default_in_transit_report_secs")]
+    pub in_transit_report_secs: u64,
     /// Confirmations a peg-out needs before it leaves "in transit". Mainnet
     /// uses 4,000; it is configurable because testnet and regtest do not.
     #[serde(default = "default_confirmations")]
@@ -84,6 +95,7 @@ impl Default for PegoutAlerts {
             pegout_alert_btc: default_pegout_btc(),
             output_alert_btc: default_output_btc(),
             in_transit_alert_btc: default_in_transit_btc(),
+            in_transit_report_secs: default_in_transit_report_secs(),
             confirmations: default_confirmations(),
             max_queued_alerts: default_queue(),
             federation_change_scripts: Vec::new(),
@@ -193,6 +205,7 @@ impl PegoutAlerts {
         f("pegout_alert_btc", self.pegout_alert_btc.to_string(), new.pegout_alert_btc.to_string(), true);
         f("output_alert_btc", self.output_alert_btc.to_string(), new.output_alert_btc.to_string(), true);
         f("in_transit_alert_btc", self.in_transit_alert_btc.to_string(), new.in_transit_alert_btc.to_string(), true);
+        f("in_transit_report_secs", self.in_transit_report_secs.to_string(), new.in_transit_report_secs.to_string(), true);
         f("confirmations", self.confirmations.to_string(), new.confirmations.to_string(), true);
         f("poll_interval_secs", self.poll_interval_secs.to_string(), new.poll_interval_secs.to_string(), true);
         f(

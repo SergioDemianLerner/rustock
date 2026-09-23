@@ -57,6 +57,8 @@ pub struct Watcher {
     /// Modification time of that file as last seen — whether or not it parsed,
     /// so a broken edit is reported once rather than on every poll.
     config_seen_mtime: Option<SystemTime>,
+    /// When the periodic in-transit report last fired.
+    last_in_transit_report: std::time::Instant,
 }
 
 impl Watcher {
@@ -86,6 +88,7 @@ impl Watcher {
             next_block,
             config_path: None,
             config_seen_mtime: None,
+            last_in_transit_report: std::time::Instant::now(),
             inbox: None,
         })
     }
@@ -194,7 +197,90 @@ impl Watcher {
             if let Err(e) = self.sweep() {
                 tracing::warn!(target: "rustock::pegout_alerts", "sweep failed, will retry: {e:#}");
             }
+            self.report_in_transit_if_due();
         }
+    }
+
+    /// Emit the in-transit line.
+    ///
+    /// One function, used by both callers -- the periodic report and the
+    /// moment a peg-out is requested -- so the two cannot drift into saying
+    /// the same thing two different ways.
+    fn log_in_transit(&self, number: u64, total_sats: u64, in_transit: &[(u64, u64)], waiting: usize, why: &str) {
+        let counted = in_transit
+            .iter()
+            .filter(|(created, _)| number.saturating_sub(*created) < self.cfg.confirmations)
+            .count();
+        tracing::info!(
+            target: "rustock::pegout_alerts",
+            "{} BTC in peg-out transit across {} transaction(s) at #{number} \
+             ({} waiting, {} confirmations to clear) [{why}]",
+            crate::config::sats_to_btc_string(total_sats),
+            counted,
+            waiting,
+            self.cfg.confirmations,
+        );
+    }
+
+    /// Report the total value of peg-outs in transit, periodically.
+    ///
+    /// A *report*, not an alert. The existing `InTransitAboveThreshold` alert
+    /// fires only when the total crosses 200 BTC and only on the block that
+    /// pushed it there; between those moments an operator has no way to see
+    /// that money is moving at all. A peg-out needs 4,000 confirmations —
+    /// roughly a day — to clear, so a ten-minute line is frequent enough to
+    /// watch one progress and rare enough not to fill the log.
+    ///
+    /// Silent when nothing is in transit, which is the usual case: a line
+    /// saying "0 BTC" every ten minutes teaches the reader to skip it, and
+    /// then the line that matters gets skipped too.
+    fn report_in_transit_if_due(&mut self) {
+        let every = self.cfg.in_transit_report_secs;
+        if every == 0 || self.last_in_transit_report.elapsed() < Duration::from_secs(every) {
+            return;
+        }
+        // Reset the clock whatever the outcome, so a run of blocks the Bridge
+        // never touched does not cost a trie read every poll.
+        let since_last = self.last_in_transit_report.elapsed();
+        self.last_in_transit_report = std::time::Instant::now();
+
+        let (number, state_root) = match self.head_with_state_root() {
+            Ok(Some(v)) => v,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    target: "rustock::pegout_alerts",
+                    "in-transit report: reading the head: {e:#}"
+                );
+                return;
+            }
+        };
+
+        let (waiting_txs, in_transit) = match self.read_bridge_state(state_root) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "rustock::pegout_alerts",
+                    "in-transit report: reading Bridge state at #{number}: {e:#}"
+                );
+                return;
+            }
+        };
+
+        let (total, _) = watch::check_in_transit(number, &in_transit, &self.cfg);
+        if !watch::in_transit_report_due(total, since_last, every) {
+            return;
+        }
+
+        self.log_in_transit(number, total, &in_transit, waiting_txs.len(), "periodic");
+    }
+
+    /// The executed head's number and state root, for a read that is not
+    /// driven by block processing.
+    fn head_with_state_root(&self) -> anyhow::Result<Option<(u64, alloy_primitives::B256)>> {
+        let Some((hash, _)) = self.store.exec_head()? else { return Ok(None) };
+        let Some(header) = self.store.header(hash)? else { return Ok(None) };
+        Ok(Some((header.number, header.state_root)))
     }
 
     fn head_number(&self) -> anyhow::Result<u64> {
@@ -261,6 +347,11 @@ impl Watcher {
             tracing::info!(
                 target: "rustock::pegout_alerts",
                 block = number,
+                // Both: sats is what the event carries and what a script wants;
+                // BTC is what a person reads. `release_requested`'s data field
+                // is the amount in satoshis, so this is a rendering of the
+                // event, not an interpretation of it.
+                amount_btc = %crate::config::sats_to_btc_string(p.amount_sats),
                 amount_sats = p.amount_sats,
                 rsk_tx = %hex::encode(p.rsk_tx_hash),
                 btc_tx = %hex::encode(p.btc_tx_hash),
@@ -292,6 +383,19 @@ impl Watcher {
                         waiting_txs = waiting_txs.len(), "bridge peg-out state"
                     );
                     if !pegouts.is_empty() {
+                        // A peg-out was requested in this block, which is the
+                        // moment the total goes UP. Report it here rather than
+                        // waiting up to ten minutes for the periodic line: the
+                        // increase is the event worth seeing, and seeing it
+                        // next to the request that caused it is the whole point.
+                        if total > 0 {
+                            self.log_in_transit(
+                                number, total, &in_transit, waiting_txs.len(), "peg-out requested",
+                            );
+                            // The periodic report would otherwise repeat this
+                            // within seconds.
+                            self.last_in_transit_report = std::time::Instant::now();
+                        }
                         alerts.extend(alert);
                     }
                 }
