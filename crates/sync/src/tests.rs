@@ -3674,18 +3674,26 @@ async fn head_reverification_does_not_adopt_a_block_we_do_not_hold() {
     assert_eq!(store.head().unwrap(), Some(top.hash()), "adopted a block we do not hold");
 }
 
-/// With nothing above the head, the escalation retreats instead, so the range
-/// is downloaded again.
+/// With nothing above the head, the escalation retreats — but only into ground
+/// execution has not already covered, so the range is downloaded again without
+/// leaving execution stranded above the head.
 #[tokio::test]
 async fn head_reverification_retreats_when_there_is_nothing_above() {
     let (store, _dir, headers) = linked_chain(10);
+    // Execution is back at #5, so there is room to retreat into.
+    store.set_exec_head(headers[5].hash(), headers[5].state_root).unwrap();
+
     let mut service = service_over(store.clone());
     service.last_body_height = 10;
-
     service.reverify_head_lineage(3);
 
     assert_eq!(store.head().unwrap(), Some(headers[7].hash()), "did not retreat three blocks");
     assert!(service.last_body_height <= 7);
+    assert_eq!(
+        crate::invariant::check(&store, None, crate::Scope::Full),
+        Ok(()),
+        "the retreat left the store incoherent"
+    );
 }
 
 /// A coherent, caught-up node must not be disturbed by either mechanism.
@@ -3752,4 +3760,67 @@ async fn head_reverification_bounds_the_upward_walk() {
         "the walk was not bounded: reached #{}",
         head.number
     );
+}
+
+/// The live failure from the first deployment, 2026-09-22 20:32.
+///
+/// `KEY_HEAD` named a non-canonical block at #9,262,401 while the canonical
+/// index held #9,262,401 and #9,262,402, linked. The walk up compared the
+/// stranded block's parent against `KEY_HEAD`'s hash, saw a mismatch, and
+/// retreated — when everything needed to walk forward was present.
+#[tokio::test]
+async fn head_reverification_reseats_a_head_that_is_not_canonical_then_walks_up() {
+    let (store, _dir, headers) = linked_chain(10);
+    let canonical_top = headers.last().unwrap();
+
+    // A sibling at #10, held but not canonical, wrongly named as the head.
+    let mut sibling = dummy_header(10, headers[9].parent_hash, U256::from(1));
+    sibling.timestamp += 7;
+    store.put_header_with_hash(sibling.hash(), &sibling).unwrap();
+    store.set_head(sibling.hash()).unwrap();
+
+    // And a block above the canonical head: held, canonical, linked.
+    let above = dummy_header(11, canonical_top.hash(), U256::from(1));
+    store.put_header_with_hash(above.hash(), &above).unwrap();
+    store.put_canonical_hash(11, above.hash()).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.reverify_head_lineage(1);
+
+    assert_eq!(
+        store.head().unwrap(),
+        Some(above.hash()),
+        "should have re-seated onto the canonical chain and then walked up"
+    );
+    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
+}
+
+/// Retreating below the executed head breaks I4 by construction — which the
+/// first deployment did within fifteen seconds of its first escalation.
+#[tokio::test]
+async fn head_reverification_never_retreats_below_the_executed_head() {
+    let (store, _dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+    // Executed and head both at #10: there is nowhere to retreat to.
+    store.set_exec_head(top.hash(), top.state_root).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.reverify_head_lineage(5);
+
+    assert_eq!(store.head().unwrap(), Some(top.hash()), "retreated below execution");
+    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
+}
+
+/// With execution further back, a retreat is allowed but stops at it.
+#[tokio::test]
+async fn head_reverification_retreats_only_as_far_as_the_executed_head() {
+    let (store, _dir, headers) = linked_chain(10);
+    store.set_exec_head(headers[8].hash(), headers[8].state_root).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.reverify_head_lineage(5);
+
+    let head = store.header(store.head().unwrap().unwrap()).unwrap().unwrap();
+    assert_eq!(head.number, 8, "should have stopped at the executed head");
+    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
 }
