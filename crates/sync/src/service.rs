@@ -284,7 +284,7 @@ pub struct SyncService {
     progress: SyncProgress,
     block_processor: Option<Arc<BlockProcessor>>,
     trie_store: Option<Arc<dyn TrieStore>>,
-    current_state_root: Option<TrieNode>,
+    pub(crate) current_state_root: Option<TrieNode>,
     /// One-batch-ahead execution pipeline: the batch currently executing on a
     /// blocking thread, if any. While set, downloads may run for the next
     /// batch but no further batch may begin executing — enforcing a strict
@@ -573,6 +573,7 @@ impl SyncService {
 
         self.expire_stale_follow_bodies();
         self.check_execution_progress();
+        self.resync_state_root_with_exec_head();
         self.verify_coherence();
         self.check_phi_progress().await;
 
@@ -1036,6 +1037,55 @@ impl SyncService {
         self.pending_exec = None;
         self.state = SyncState::Idle;
         self.last_exec_progress = Instant::now();
+    }
+
+    /// Keep the in-memory state root equal to the one the executed head
+    /// committed.
+    ///
+    /// These are two representations of the same fact and they can come apart:
+    /// `Transition::Retreat` rolls the *committed* executed head back on its
+    /// own when a reorg moves the ground under it, and the service's in-memory
+    /// root does not hear about it. Follow mode already refused to execute in
+    /// that state -- correctly -- but refusing is not recovering, and the body
+    /// pipeline had no such guard at all, so it executed against the stale root
+    /// and produced `NonceTooLow`: the state one transaction ahead of where the
+    /// marker said it was.
+    ///
+    /// Mainnet 2026-09-23 17:21, and it is the same shape as every other
+    /// failure this subsystem has had -- two notions of one fact, and a code
+    /// path reading the wrong one. The committed root is the authority; this
+    /// reloads from it.
+    pub(crate) fn resync_state_root_with_exec_head(&mut self) {
+        let Some(trie_store) = self.trie_store.clone() else { return };
+        let Ok(Some((_, committed))) = self.manager.store.exec_head() else { return };
+
+        let in_memory = self
+            .current_state_root
+            .as_ref()
+            .map(|r| r.compute_hash(trie_store.as_ref()));
+        if in_memory == Some(committed) {
+            return;
+        }
+
+        match trie_store.get(committed.as_slice()) {
+            Some(data) => {
+                warn!(
+                    target: "rustock::sync",
+                    "In-memory state root {:?} disagrees with the executed head's committed \
+                     root {:?}; reloading from the committed one",
+                    in_memory, committed
+                );
+                self.current_state_root = Some(TrieNode::from_message(&data, trie_store.as_ref()));
+                // Anything queued was queued against the old root.
+                self.follow_buffer.clear();
+                self.pending_exec = None;
+            }
+            None => warn!(
+                target: "rustock::sync",
+                "The executed head's committed state root {:?} is not in the trie store; \
+                 execution cannot resume from it", committed
+            ),
+        }
     }
 
     /// Check the coherence invariant over the heights this node just touched.
