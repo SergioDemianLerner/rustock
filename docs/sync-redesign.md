@@ -1201,7 +1201,7 @@ one thing: the node's own picture of where it is.
 
 ---
 
-## Appendix A — the five stalls, in one table
+## Appendix A — the stalls, in one table
 
 | # | Date | Duration | Fact A | Fact B | Read | Fix |
 |---|---|---|---|---|---|---|
@@ -1210,10 +1210,14 @@ one thing: the node's own picture of where it is.
 | 3 | — | 20 hours | executed head | downloaded head | B | `a8c23f3` |
 | 4 | 2026-09-18 | 3 days | canonical index | height index | A | `e078115` |
 | 5 | 2026-09-22 | 15 min | canonical pointer | what we hold | A | PR #50 |
+| 6 | 2026-09-22 | 3 hours | canonical index | KEY_HEAD | A | PR #69 — not expressible |
+| 7 | 2026-09-23 | sawtooth | KEY_HEAD | canonical index | A | PR #69 — not expressible |
 
 ## Appendix B — the invariant, in full
 
-> **Implemented 2026-09-22** as `crates/sync/src/invariant.rs`, checked on every
+> **Implemented 2026-09-22** as `crates/sync/src/invariant.rs`, with the
+> structural half following on 2026-09-23 as `crates/storage/src/position.rs`
+> (see Appendix C), checked on every
 > tick with `Scope::Delta` over the window between the executed head and the
 > validated head. One test per relation, each named for the stall it would have
 > caught. `derive_cursor` reads the three position keys directly rather than
@@ -1275,3 +1279,52 @@ fn invariant(store: &Store, scope: Scope) -> Result<(), Violation> {
 `Scope::Delta` checks only the heights a batch touched — O(1) per commit, for
 production. `Scope::Full` sweeps `floor..head` — for startup, tests and the
 simulator.
+
+## Appendix C — what the simulator found, 2026-09-23
+
+Stages 3, 4 and 5 were implemented together. The simulator found two holes in
+stages 3 and 4 **on its first run**, both within 34 steps, and neither was in
+any hand-written test.
+
+They are recorded here because they are the argument for stage 5 existing at
+all. Both are in code that had just been written to be correct by construction,
+reviewed, and believed.
+
+### 1. `Adopt` reorged the chain and left execution on the old branch
+
+```
+  execute #1 on branch A
+  adopt a tip on branch B that rewrites #1
+  -> canonical(1) = B,  executed = A   ... I5 broken
+```
+
+This is stall 4's shape arriving straight through the new API. The type system
+guaranteed the head and the canonical index moved together, and said nothing
+about the third key.
+
+**Fix:** `apply()` rolls the executed head back to the fork point in the same
+`WriteBatch`. The target is the height just below the lowest one the transition
+rewrites, clamped to the new head — conservative, and always a block common to
+both branches.
+
+### 2. `Validated` proves lineage, not canonicity
+
+`Transition::Executed` accepted any provable block, and a fork block is
+perfectly provable. Recording one as the executed head breaks I5 immediately,
+and the node then executes forward from a branch it is not on.
+
+**Fix:** `apply()` refuses to record execution of a block that is not the
+canonical block at its height, and refuses one above the head.
+
+### Why this matters more than the fixes
+
+The claim in §12 was that the seven relations would be maintained *by
+construction*. Stages 3 and 4 made six of them structural and left the seventh
+reachable, and no amount of reading the code found it. A property test over
+~245,000 adversarial events found it twice in under a second.
+
+The honest conclusion: **"correct by construction" is a claim that needs the
+same evidence as any other.** The previous two attempts at this subsystem were
+asserted safe on exactly the reasoning that failed here.
+
+---
