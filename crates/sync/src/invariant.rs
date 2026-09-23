@@ -28,16 +28,15 @@
 //! on the first commit.
 
 use alloy_primitives::B256;
-use rustock_storage::BlockStore;
+use rustock_storage::{BlockRef, BlockStore};
 use rustock_trie::TrieStore;
 
-/// A block, by height and hash. Enough to state the relations; the typed
-/// `Validated<BlockRef>` of stage 4 is deliberately not built here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockRef {
-    pub number: u64,
-    pub hash: B256,
-}
+/// A block, by height and hash.
+///
+/// Re-exported from the storage crate rather than defined again here: two
+/// structurally identical `BlockRef` types in one crate is exactly the kind of
+/// near-duplicate that lets a caller pass the wrong one, and this module
+/// predates `rustock_storage::position`.
 
 /// The three notions of position, read together.
 ///
