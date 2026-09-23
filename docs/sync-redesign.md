@@ -1,9 +1,31 @@
 # A sync design in which these stalls cannot happen
 
-**Status:** proposal, for discussion
 **Written:** 2026-09-22, after the fifth mainnet stall of the same family
 **Audience:** anyone who knows what a blockchain is. No familiarity with
 rustock's sync code is assumed; everything it needs is built up in Part I.
+
+**Status:** stages 1–5 implemented and running on mainnet since 2026-09-23.
+Stage 6 not started.
+
+| Stage | State | Where |
+|---|---|---|
+| 1 — Φ watchdog | **done** | `crates/sync/src/watchdog.rs` |
+| 2 — invariant after every commit | **done** | `crates/sync/src/invariant.rs` |
+| 3 — Cursor | **done**, as a read-through rather than a derivation (§10) | `crates/storage/src/position.rs` |
+| 4 — `Validated` | **done** | `crates/storage/src/position.rs` |
+| 5 — simulator | **done, partially** — see §18a for what it does not do | `crates/storage/tests/` |
+| 6 — `step()` | not started | — |
+
+> **Read §18a, §17(c) and §23 before citing this document as evidence.** The
+> design sections describe what was intended; those three describe the gap
+> between that and what exists. In particular **liveness is not established**,
+> and the simulator does not exercise the protocol at all.
+>
+> Two stalls (6 and 7) happened *after* this was written, and one of them was
+> caused by the fix for stall 5. Appendix C records two further defects the
+> simulator found in the implementation of this very document. The corrections
+> are inline, marked as blockquotes, rather than rewritten into the original
+> text — the way the design was wrong is more useful than a clean draft.
 
 ---
 
@@ -13,14 +35,17 @@ The document has four parts. They can be read independently, but they build.
 
 | Part | What it does | Read it if |
 |---|---|---|
-| **I** (§1–§7) | Explains what syncing is, how rustock does it today, and walks through all five stalls with diagrams | You want to understand *why* this keeps happening |
+| **I** (§1–§7) | Explains what syncing is, how rustock does it today, and walks through the first five stalls with diagrams (stalls 6 and 7 are in Appendix A) | You want to understand *why* this keeps happening |
 | **II** (§8–§15) | The proposed design, one principle at a time | You want to evaluate the proposal |
 | **III** (§16–§20) | Replays each historical stall against the new design; defines what "prove" means and how | You want to know whether it actually closes the class |
 | **IV** (§21–§23) | Migration, staged by cost and risk | You want to decide what to do on Monday |
+| **Appendices** | The stall table (A), the invariant in full (B), what the simulator found (C), and how all of it was tested (D) | You want the evidence rather than the argument |
 
-If you read only one section, read **§20** (the watchdog) — it is thirty lines
-of code that would have caught every stall in this document, and it can ship
-without any of the rest.
+If you read only one section, read **§20** — it argues for the Φ watchdog,
+thirty lines of code that would have caught every stall in this document and
+that can ship without any of the rest. If you read two, read **Appendix D**,
+which is the only place that says what the evidence for all of this is
+actually worth.
 
 ---
 
@@ -199,7 +224,7 @@ This is a reasonable design and it is fast when it works. The problem is not
 the algorithm. The problem is what happens to those twelve position facts
 when a reorg lands in the middle of step 3.
 
-## 5. The five stalls
+## 5. The first five stalls
 
 Each of these wedged the node on mainnet. Each was fixed correctly. None of
 the fixes prevented the next one.
@@ -528,25 +553,77 @@ Deriving the cursor is a walk, so it must be bounded and cached — see the
 caveats in §23. The point is not that it is recomputed on every access; it is
 that **there is no second place where it could be wrong**.
 
+> **What was actually built (2026-09-23), and how it differs.**
+>
+> `KEY_HEAD` was **not** deleted. All three keys are still stored, and
+> `BlockStore::cursor()` is a read-through over them rather than a derived
+> value. This principle is therefore only half implemented, and the document
+> should not be read as saying otherwise.
+>
+> The reason is that the atomicity in §11 turned out to do the work this
+> principle was reaching for. Once every write of position goes through one
+> `Transition` applied as one `WriteBatch`, "a second place where it could be
+> wrong" stops being reachable — not because the second place was removed, but
+> because nothing can write to it alone. Deriving the cursor instead would have
+> meant a bounded, cached walk whose cache invalidation is, by §23's own
+> admission, *"the single most dangerous detail in the proposal"*.
+>
+> Trading a dangerous cache for an atomic batch was the better deal. But it
+> means the cursor is a *view*, not a derivation, and if a future change
+> reintroduces a path that writes one key alone, this principle will not stop
+> it. The coherence check is what would catch that.
+
 ## 11. Principle 3 — make the illegal state unrepresentable
 
 Where a rule can be enforced by the type system, enforce it there, so that
 violating it is a compile error rather than a runtime surprise.
 
+The sketch this section originally carried is kept below, because the way it
+was **wrong** is the most instructive thing in this document:
+
 ```rust
-/// A BlockRef whose lineage HAS been verified. The only way to obtain one is
-/// to run the verification.
-pub struct Validated(BlockRef);
-
-/// The sole constructor. Walks from `tip` toward the floor, checking that
-/// every header is present and that each names the previous as its parent.
-pub fn verify_lineage(store: &Store, tip: BlockRef)
-    -> Result<Validated, LineageBreak>;
-
-/// Every function that advances position demands the proof.
+// ORIGINAL SKETCH — do not build this.
 pub fn advance_head(store: &Store, head: Validated, batch: &mut WriteBatch);
 pub fn write_canonical(store: &Store, head: Validated, batch: &mut WriteBatch);
 ```
+
+Two functions. Both demand the proof, so neither can write an unverified head —
+and **both can still be called without the other.** That is stall 6 exactly:
+`ensure_canonical_lineage` wrote the canonical entries and nothing wrote the
+head. A design whose whole purpose was to stop one key moving without the
+others reproduced the defect in its own API sketch, and nobody noticed until
+the simulator did.
+
+What shipped merges them, so the question cannot arise:
+
+```rust
+/// A BlockRef proved to be held and lineage-linked. No `new`, no `From`,
+/// private fields. It also carries the canonical entries adopting it needs,
+/// so indexing and adopting cannot come apart.
+pub struct Validated { tip: BlockRef, lineage: Vec<(u64, B256)> }
+
+/// The sole constructor.
+impl Validated {
+    pub fn prove(store: &BlockStore, hash: B256) -> Result<Self, LineageBreak>;
+}
+
+/// The only way to change position. Each variant names every key that must
+/// move, and `apply` writes them in ONE WriteBatch.
+pub enum Transition {
+    Adopt    { head: Validated },
+    Retreat  { to: Validated },
+    Executed { at: Validated, state_root: B256 },
+}
+
+impl BlockStore {
+    pub fn cursor(&self) -> Result<Option<Cursor>>;
+    pub fn apply(&self, t: &Transition) -> Result<Cursor>;
+}
+```
+
+`crates/storage/src/position.rs`. `ensure_canonical_lineage` — the function
+that wrote `CF_NUMBERS` alone — is now crate-private, so the sketch above is
+not merely discouraged, it is unreachable from outside the storage crate.
 
 There is no `Validated::new`. There is no `From<BlockRef> for Validated`.
 The struct field is private. **Therefore it is not possible to write a head
@@ -566,12 +643,17 @@ The `LineageBreak` error is itself useful — it names *where* the chain is
 broken, which is the diagnostic the node has never had:
 
 ```rust
-enum LineageBreak {
-    MissingHeader { at: u64, expected: B256 },   // stall 5
+pub enum LineageBreak {
+    MissingHeader  { at: u64, hash: B256 },        // stall 5
     ParentMismatch { at: u64, holds: B256, parent_of_child: B256 },  // stall 2
-    NoCanonicalEntry { at: u64 },                 // stall 2
+    BelowFloor     { hash: B256, floor: u64 },     // pruned history
+    Storage(String),
 }
 ```
+
+(`NoCanonicalEntry` from the original sketch turned out to belong to the
+coherence check, not to lineage proof: proving a lineage is about what we
+*hold*, and the canonical index is what we *claim*.)
 
 Compare with today, where the equivalent situation produces `Ok(())`.
 
@@ -594,8 +676,21 @@ fn invariant(store: &Store, scope: Scope) -> Result<(), Violation> {
     // I5  executed is an ancestor of validated_head
     // I6  No canonical entry exists above validated_head
     // I7  The state root recorded at `executed` is present in the trie store
+    // I8  validated_head IS the canonical entry at its own height
 }
 ```
+
+> **I8 was added on 2026-09-23, by the node.** The list above originally
+> stopped at I7, and asked of the *executed* head (I5) a question it never
+> asked of the head itself. On mainnet, `KEY_HEAD` named a block at #9,262,401
+> that was not canonical at that height while the canonical index below **and**
+> above it was perfectly consistent — so no listed relation broke, and the
+> node sawtoothed between the tip and three minutes behind it.
+>
+> Seven notions of position, and the invariant covered six of them. This is
+> worth more than the fix: a list of relations written by hand is exactly as
+> complete as its author's imagination, which is the failure mode this whole
+> document is about.
 
 Run it **after every commit**, not only in tests. A violation means the
 node's picture of the chain is incoherent, and the entire lesson of Part I is
@@ -611,6 +706,8 @@ Here is the payoff, and it is the strongest single argument in this document:
 | 3 — follow-mode gap | I4, I5 | nothing |
 | 4 — orphaned head | I5 | nothing |
 | 5 — pointer to absent block | I2, I3 | nothing |
+| 6 — canonical stranded above head | I6 | nothing |
+| 7 — head not canonical | I8 | nothing (I8 did not exist) |
 
 **Every stall violates a relation in this list at the moment it begins. Not
 one is detectable by any assertion that exists in the code today.** One
@@ -799,7 +896,7 @@ without understanding the cause.
                             escalate / retreat / shout
 ```
 
-Read the diagram against the five stalls:
+Read the diagram against the first five stalls:
 
 - **Stall 2** cannot happen: one `WriteBatch`, all-or-nothing.
 - **Stall 5** cannot happen: no `KEY_HEAD`; canonical entries need `Validated`.
@@ -814,7 +911,7 @@ A design is only worth the migration cost if it *provably* excludes the bugs
 that motivated it. So let us replay all five against it, one at a time, and
 be specific about which mechanism does the work.
 
-## 16. Replaying the five stalls
+## 16. Replaying the first five stalls
 
 ### Stall 1 — cursor skipped unexecuted ranges
 
@@ -954,13 +1051,34 @@ of the system. It is short *because* of the design — under the current code
 the same argument would have to consider every call site of
 `put_canonical_hash`.
 
+> **Held, with one correction.** `BlockStore::apply` is that single function,
+> and `ensure_canonical_lineage` is crate-private. But the one-site argument
+> was made *before* the simulator ran, and it was incomplete in a way reading
+> could not reveal: the argument covered what gets written into the canonical
+> index, and said nothing about the executed head being dragged off the chain
+> by a reorg that index performed. See Appendix C.
+>
+> A one-site argument is only as good as the set of properties it is made
+> about. This one now includes execution because a machine noticed it did not.
+
 ### (c) Liveness (P3) — *exhaustive simulation*
 
-This is the real work, and the part worth building. See §18.
+> **NOT ESTABLISHED.** This is the largest gap between this document and what
+> exists, and it should not be read as done.
+>
+> The simulator that shipped (§18) asserts **coherence**, not liveness. It has
+> no model of peers, so it cannot ask "does the node converge on the true
+> chain?" — only "is the node's picture of the chain self-consistent after
+> every write?". Those are different questions, and only the second is
+> answered.
+>
+> Liveness is what stage 6 buys, because asking it requires a `step()` the
+> simulator can drive against simulated peers. Until then, liveness rests on
+> the Φ watchdog (§14) — a *detector*, not a guarantee.
 
 ## 18. The simulator, in detail
 
-The five stalls are all **scheduling phenomena**: a reorg arriving while a
+The first five stalls are all **scheduling phenomena**: a reorg arriving while a
 chunk is in flight; a header whose parent is replaced between request and
 delivery; a crash between two writes. Unit tests cannot find these reliably,
 because the author must first imagine the interleaving.
@@ -1029,6 +1147,78 @@ These become permanent regression tests expressed in the same framework, so
 "does the new design handle the old bugs?" is answered by running the suite
 rather than by reasoning.
 
+### 18a. What was actually built, 2026-09-23
+
+The design above is the simulator worth having. What shipped is **smaller**, and
+the difference matters enough to state plainly before anyone relies on it.
+
+`crates/storage/tests/position_simulator.rs` — about 420 lines.
+
+```
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  WORLD            every block that exists anywhere              │
+  │                   grows on a seeded schedule; forks at seeded   │
+  │                   depth; no notion of "true" canonical chain    │
+  └────────────────────────────┬────────────────────────────────────┘
+                               │  events, not messages
+  ┌────────────────────────────▼────────────────────────────────────┐
+  │  NODE             a real BlockStore on a tempdir                │
+  │    Mine / Download / Adopt / Execute / Retreat / Restart        │
+  │    each applied through the real Transition API                 │
+  │    assert!(coherent(store))        ← AFTER EVERY EVENT          │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+**What it does.** Seeded xorshift picks one of six events per step. Downloads
+arrive in arbitrary order, including blocks the node will never adopt. Forks
+are mined at random depth, so siblings pile up at every height. Adoption and
+execution are attempted on blocks that may not be provable or canonical, and a
+refusal is a legitimate outcome that must leave the store untouched. After
+every event the **full** coherence sweep runs — every height from the floor to
+the head, plus I4, I5, I6, I8 — and a failure prints the seed, the step, the
+broken relation, and the last twelve events.
+
+**Coverage as it stands:**
+
+| Suite | Seeds | Steps | Events |
+|---|---|---|---|
+| `random_schedules_never_leave_the_store_incoherent` | 400 | 400 | 160,000 |
+| `long_runs_stay_coherent` | 5 | 5,000 | 25,000 |
+| `a_storm_of_reorgs_stays_coherent` | 60 | 600 | 36,000 |
+| | | | **221,000** |
+
+Roughly a minute of CPU. (An earlier note said ~245,000; the arithmetic above
+is the correct figure.)
+
+**What it does NOT do**, each of which §18 above promises:
+
+- **No simulated peers.** No delayed, dropped, reordered, disconnecting,
+  stale-view or lying peers. Events are applied directly to the store, so the
+  *protocol* is not exercised at all — only the position layer underneath it.
+- **No `step()` under test.** There is nothing to drive, because stage 6 has
+  not been done. The node's actual sync loop is not in the simulation.
+- **No liveness assertion.** There is no model of the true canonical chain, so
+  `validated_head == model.head` is not checked and cannot be. See §17(c).
+- **No safety-against-a-model assertion**, for the same reason.
+- **No shrinking.** A failing seed is reproducible but not minimised; the
+  twelve-event tail does the job by hand, which was enough for the two defects
+  found but will not scale.
+- **No run against the old implementation.** §21 says to validate the
+  simulator by reproducing stalls 1–5 against the pre-redesign code. That was
+  not done. Instead the nine replays in `stall_replays.rs` assert the shapes
+  directly — weaker evidence that the simulator *works*, since it never
+  demonstrated it can catch a bug it was not pointed at.
+
+That last one deserves emphasis: the simulator **did** find two real defects it
+was not pointed at (Appendix C), which is the evidence that matters most. But
+it found them in the new code, not by reproducing old bugs, so the
+self-validation §21 asked for has not happened.
+
+**The corpus.** `crates/storage/tests/stall_replays.rs` — nine tests building
+the recorded on-disk shape of each stall at its real heights, each asserting
+the shape is *unreachable through the public API* rather than merely detected.
+This is the part of §18's "corpus" that was delivered.
+
 ## 19. Why the current tests could not have done this
 
 It is worth being clear about this, because the natural objection to the whole
@@ -1087,34 +1277,34 @@ protects the live node while the structural work proceeds.
   └────────────────────────────────────────────────────────────────────────┘
                                    │
   ┌────────────────────────────────▼───────────────────────────────────────┐
-  │ STAGE 2   invariant() after every commit      ~150 lines   ~2 days     │
+  │ STAGE 2   invariant() after every commit  DONE  ~150 lines   ~2 days   │
   │           Run it against the recorded reorg corpus first — EXPECT it   │
   │           to fire on the existing code. That is the point.             │
   │           ▸ ships alone; gate behind a flag defaulting to on           │
   └────────────────────────────────────────────────────────────────────────┘
                                    │
   ┌────────────────────────────────▼───────────────────────────────────────┐
-  │ STAGE 3   Cursor as a derived value           ~300 lines   ~3 days     │
+  │ STAGE 3   Cursor (as a read-through)      DONE  ~300 lines   ~3 days   │
   │           Delete KEY_HEAD. our_head_number() reads the cursor.         │
   │           Canonical entries written only alongside the walk.           │
   │           ▸ invariant() from stage 2 guards this change                │
   └────────────────────────────────────────────────────────────────────────┘
                                    │
   ┌────────────────────────────────▼───────────────────────────────────────┐
-  │ STAGE 4   Validated<BlockRef>                 ~100 lines   ~1 day      │
+  │ STAGE 4   Validated<BlockRef>             DONE  ~100 lines   ~1 day    │
   │           Mechanical once stage 3 lands: make the proof a parameter.   │
   │           Turns "wrote an unverified head" into a compile error.       │
   └────────────────────────────────────────────────────────────────────────┘
                                    │
   ┌────────────────────────────────▼───────────────────────────────────────┐
-  │ STAGE 5   The simulator                       ~600 lines   ~1 week     │
+  │ STAGE 5   The simulator (partial, §18a)   DONE  ~420 lines   ~1 week   │
   │           Build it BEFORE stage 6, and run it against the OLD          │
   │           implementation — it should reproduce stalls 1–5 from seeds.  │
   │           That validates the simulator itself.                         │
   └────────────────────────────────────────────────────────────────────────┘
                                    │
   ┌────────────────────────────────▼───────────────────────────────────────┐
-  │ STAGE 6   Extract step()                      ~1,200 lines ~2 weeks    │
+  │ STAGE 6   Extract step()                  TODO  ~1,200 lines ~2 weeks  │
   │           The largest piece. Move tracker state into store or Inbox.   │
   │           Run old and new side by side under the simulator as a        │
   │           differential oracle during the transition.                   │
@@ -1132,6 +1322,19 @@ corpus, we will know how often the existing code actually violates coherence.
 If the answer is "rarely, and only in the five known shapes", stages 3–6 are a
 judgement call about long-term cost. If the answer is "constantly, in shapes
 we have not seen", that settles it.
+
+> **The decision point resolved itself, 2026-09-22.** `invariant()` was
+> deployed at 20:29:46 and fired 1.5 ms later on a shape nobody had listed, on
+> a node that had been silently wedged for three hours. Within twenty-four
+> hours it had also produced I8 — an eighth relation, found because the node
+> broke a rule the list did not contain.
+>
+> That answered the question in the second form: not "rarely, in known
+> shapes", but "immediately, in shapes we had not seen". Stages 3, 4 and 5
+> followed on 2026-09-23.
+>
+> **Stage 5 did not run against the old implementation**, which §21 asks for
+> and §18a records as an outstanding gap in the evidence.
 
 ## 22. Effort and risk summary
 
@@ -1156,6 +1359,24 @@ confirmed checkpoint, not to genesis — and cached. And the cache must be
 invalidated by the *same batch* that writes blocks, or we have reintroduced
 exactly the problem this document is about, one level up. This is the single
 most dangerous detail in the proposal and deserves its own review.
+
+**Coherence is not liveness.** The simulator answers "is the node's picture of
+the chain self-consistent?" and does not answer "does the node get to the right
+chain?". Nothing in what shipped establishes the second. See §17(c) and §18a.
+
+**The simulator does not exercise the protocol.** There are no simulated peers
+and no `step()`, so every scheduling phenomenon §18 was written to catch — a
+reorg arriving while a chunk is in flight, a header whose parent is replaced
+between request and delivery — is *not* covered. The position layer beneath
+those phenomena is covered thoroughly; the phenomena themselves are not.
+
+**The simulator was never validated against a known bug.** §21 asks that it
+reproduce stalls 1–5 against the pre-redesign code before being trusted to
+certify the new code. It did not. It found two genuine defects it was not
+pointed at, which is good evidence but not the evidence that was asked for.
+
+**Position is stored, not derived.** §10's principle is half implemented. A
+future path that writes one key alone would not be prevented — only detected.
 
 **A property test is not a proof.** §18 gives high confidence over an
 enormous number of schedules; it does not give certainty. It is the strongest
@@ -1201,7 +1422,7 @@ one thing: the node's own picture of where it is.
 
 ---
 
-## Appendix A — the five stalls, in one table
+## Appendix A — the stalls, in one table
 
 | # | Date | Duration | Fact A | Fact B | Read | Fix |
 |---|---|---|---|---|---|---|
@@ -1210,10 +1431,14 @@ one thing: the node's own picture of where it is.
 | 3 | — | 20 hours | executed head | downloaded head | B | `a8c23f3` |
 | 4 | 2026-09-18 | 3 days | canonical index | height index | A | `e078115` |
 | 5 | 2026-09-22 | 15 min | canonical pointer | what we hold | A | PR #50 |
+| 6 | 2026-09-22 | 3 hours | canonical index | KEY_HEAD | A | PR #69 — not expressible |
+| 7 | 2026-09-23 | sawtooth | KEY_HEAD | canonical index | A | PR #69 — not expressible |
 
 ## Appendix B — the invariant, in full
 
-> **Implemented 2026-09-22** as `crates/sync/src/invariant.rs`, checked on every
+> **Implemented 2026-09-22** as `crates/sync/src/invariant.rs`, with the
+> structural half following on 2026-09-23 as `crates/storage/src/position.rs`
+> (see Appendix C), checked on every
 > tick with `Scope::Delta` over the window between the executed head and the
 > validated head. One test per relation, each named for the stall it would have
 > caught. `derive_cursor` reads the three position keys directly rather than
@@ -1263,6 +1488,12 @@ fn invariant(store: &Store, scope: Scope) -> Result<(), Violation> {
         return Err(Violation::CanonicalAboveHead { .. });
     }
 
+    // I8 — the head is itself the canonical block at its height
+    if store.canonical_hash(cursor.validated_head.number)?
+        != Some(cursor.validated_head.hash) {
+        return Err(Violation::HeadNotCanonical { .. });
+    }
+
     // I7 — the state we would continue from actually exists
     if !store.trie_has(cursor.state_root) {
         return Err(Violation::StateRootMissing { .. });
@@ -1275,3 +1506,148 @@ fn invariant(store: &Store, scope: Scope) -> Result<(), Violation> {
 `Scope::Delta` checks only the heights a batch touched — O(1) per commit, for
 production. `Scope::Full` sweeps `floor..head` — for startup, tests and the
 simulator.
+
+## Appendix C — what the simulator found, 2026-09-23
+
+Stages 3, 4 and 5 were implemented together. The simulator found two holes in
+stages 3 and 4 **on its first run**, both within 34 steps, and neither was in
+any hand-written test.
+
+They are recorded here because they are the argument for stage 5 existing at
+all. Both are in code that had just been written to be correct by construction,
+reviewed, and believed.
+
+### 1. `Adopt` reorged the chain and left execution on the old branch
+
+```
+  execute #1 on branch A
+  adopt a tip on branch B that rewrites #1
+  -> canonical(1) = B,  executed = A   ... I5 broken
+```
+
+This is stall 4's shape arriving straight through the new API. The type system
+guaranteed the head and the canonical index moved together, and said nothing
+about the third key.
+
+**Fix:** `apply()` rolls the executed head back to the fork point in the same
+`WriteBatch`. The target is the height just below the lowest one the transition
+rewrites, clamped to the new head — conservative, and always a block common to
+both branches.
+
+### 2. `Validated` proves lineage, not canonicity
+
+`Transition::Executed` accepted any provable block, and a fork block is
+perfectly provable. Recording one as the executed head breaks I5 immediately,
+and the node then executes forward from a branch it is not on.
+
+**Fix:** `apply()` refuses to record execution of a block that is not the
+canonical block at its height, and refuses one above the head.
+
+### Why this matters more than the fixes
+
+The claim in §12 was that the seven relations would be maintained *by
+construction*. Stages 3 and 4 made six of them structural and left the seventh
+reachable, and no amount of reading the code found it. A property test over
+~245,000 adversarial events found it twice in under a second.
+
+The honest conclusion: **"correct by construction" is a claim that needs the
+same evidence as any other.** The previous two attempts at this subsystem were
+asserted safe on exactly the reasoning that failed here.
+
+---
+
+## Appendix D — how this was tested, and what the evidence is worth
+
+Four layers, each answering a different question, and each with a different
+weight. They are listed weakest first, because the order in which they are
+*convincing* is the reverse of the order in which they are usually cited.
+
+### Layer 1 — unit tests (weakest)
+
+`crates/storage/src/position.rs`, 14 tests. One per behaviour of `prove`,
+`Adopt`, `Retreat`, `Executed` and `cursor`.
+
+**Answers:** does each piece do what its author thought?
+**Cannot answer:** anything its author did not think of. Both defects in
+Appendix C passed every unit test in this file, because the author wrote both
+the code and the tests from the same misunderstanding. This is the same
+structural blindness the September audit response describes at length: *a test
+authored alongside the implementation inherits the implementation's
+misreadings.*
+
+### Layer 2 — the recorded corpus
+
+`crates/storage/tests/stall_replays.rs`, 9 tests. Each builds the on-disk shape
+the live node was actually found in, at its real heights, and asserts the shape
+is **unreachable** through the public API rather than merely detected.
+
+**Answers:** would the old bugs still be possible?
+**Cannot answer:** whether new ones are. A regression corpus is a record of
+defeats, not a prediction.
+
+The distinction between *unreachable* and *detected* is the point of these
+tests. A shape that is merely detected is a shape a future caller can still
+create.
+
+### Layer 3 — the property simulator (strongest of the three offline layers)
+
+`crates/storage/tests/position_simulator.rs`. 221,000 seeded adversarial events
+(§18a), full coherence checked after **every** write, failures reproducible
+from a printed seed.
+
+**Answers:** across an enormous number of orderings nobody imagined, does the
+node's picture of the chain stay self-consistent?
+**Cannot answer:** liveness, protocol behaviour, or anything involving peers
+(§18a's omissions; §17(c)).
+
+This is the layer that earned its cost. It found two real defects within 34
+steps of its first run, neither of which was in any hand-written test, both in
+code that had been written to be correct by construction, reviewed, and
+believed. Without it, this document's central claim would have shipped false
+for the third time.
+
+### Layer 4 — production (the only layer that settles anything)
+
+Deployed to the mainnet node at 02:50 on 2026-09-23, replacing a build that
+was visibly sawtoothing.
+
+| | before (per hour) | after (first 30 min) |
+|---|---|---|
+| coherence violations | 13 | **0** |
+| watchdog escalations | 6 | **0** |
+| head re-verifications | 4 | **0** |
+| ERROR lines | 0 | **0** |
+| blocks executed | — | 60, at the tip |
+
+Three tip reorgs occurred in that window — the events that previously wedged
+the node for three minutes each. Each was handled in a single tick:
+
+```
+Orphan recovery: cannot adopt 0xe…c9 (no header stored for 0x1d…2e at #9263608);
+                 retreating to #9263607 so the height is downloaded again
+Orphan recovery: head and execution retreated to #9263607
+```
+
+Head and execution moving together, in one write.
+
+**Answers:** does it work?
+**Cannot answer:** does it keep working? Thirty minutes is thirty minutes.
+Stall 4 took three days to appear and stall 3 ran for twenty hours without a
+single error line. A quiet half-hour is consistent with a correct node and also
+with a node that has not yet met the schedule that breaks it.
+
+### What the four layers do not cover
+
+Stated together, so it is not necessary to reassemble them from four sections:
+
+1. **Liveness.** Nothing here shows the node converges on the correct chain,
+   only that it stays self-consistent while trying. (§17c)
+2. **The protocol.** No simulated peers, no `step()` — so reorg-during-chunk,
+   parent-replaced-in-flight and every other scheduling phenomenon §18 was
+   written for remain untested. (§18a)
+3. **The simulator itself.** It was never run against the old code to prove it
+   can catch a known bug. (§21)
+4. **Duration.** See above.
+
+Items 1 and 2 are what stage 6 buys. Item 3 is a day's work and should be done
+before the simulator is cited as certification rather than as a bug-finder.
