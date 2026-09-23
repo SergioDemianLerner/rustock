@@ -3824,3 +3824,148 @@ async fn head_reverification_retreats_only_as_far_as_the_executed_head() {
     assert_eq!(head.number, 8, "should have stopped at the executed head");
     assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
 }
+
+/// I6 is briefly true on essentially every new tip: a header is canonicalised
+/// as soon as it links, and the head only advances once the body is executed.
+/// Reporting that would put a warning in the log every few seconds and teach
+/// whoever reads it to skip the line — which is the failure this subsystem
+/// already had, where a stall printed 450 times and was treated as nothing.
+#[tokio::test]
+async fn a_transient_violation_is_not_reported() {
+    let (store, _dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+
+    let above = dummy_header(11, top.hash(), U256::from(1));
+    store.put_header_with_hash(above.hash(), &above).unwrap();
+    store.put_canonical_hash(11, above.hash()).unwrap();
+
+    let mut service = service_over(store.clone());
+
+    // Seen, clock started, nothing said.
+    service.verify_coherence();
+    assert!(service.violation_since.is_some(), "the violation was not noticed");
+    assert!(service.last_violation_log.is_none(), "a transient violation was reported");
+
+    // Still inside the grace period.
+    service.verify_coherence();
+    assert!(service.last_violation_log.is_none(), "reported before the grace period elapsed");
+
+    // It clears, as an ordinary tip does.
+    store.set_head(above.hash()).unwrap();
+    service.verify_coherence();
+    assert!(service.violation_since.is_none(), "a cleared violation was not forgotten");
+}
+
+/// A violation that outlives the grace period is exactly what the node was
+/// blind to for three hours, and must be reported.
+///
+/// Uses I1 rather than I6: I6 now repairs itself on the tick that finds it, so
+/// it can no longer persist — which is the point of the fix, and makes it the
+/// wrong relation to test persistence with.
+#[tokio::test]
+async fn a_persistent_violation_is_reported() {
+    let (store, _dir, _headers) = linked_chain(10);
+    // A hole at the head's own height: inside the delta window, and not one of
+    // the relations with an automatic repair.
+    store.delete_canonical_hash(10).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.verify_coherence();
+
+    // Backdate the first sighting past the grace period.
+    let (id, _) = service.violation_since.clone().unwrap();
+    service.violation_since =
+        Some((id, std::time::Instant::now() - std::time::Duration::from_secs(120)));
+
+    service.verify_coherence();
+    assert!(service.last_violation_log.is_some(), "a three-hour-class violation went unreported");
+}
+
+/// A different relation breaking restarts the clock rather than inheriting the
+/// previous one's age — otherwise one long-standing violation would make every
+/// later one look instantly urgent.
+#[tokio::test]
+async fn a_different_violation_starts_its_own_clock() {
+    let (store, _dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+    let above = dummy_header(11, top.hash(), U256::from(1));
+    store.put_header_with_hash(above.hash(), &above).unwrap();
+    store.put_canonical_hash(11, above.hash()).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.verify_coherence();
+    let (first_id, _) = service.violation_since.clone().unwrap();
+
+    // Resolve I6 and break something else inside the checked window. (Height
+    // 5 would be invisible here: the delta scope spans the executed head to
+    // the validated head, which is the whole point of it being cheap.)
+    store.set_head(above.hash()).unwrap();
+    store.delete_canonical_hash(11).unwrap();
+    service.verify_coherence();
+
+    let (second_id, _) = service.violation_since.clone().unwrap();
+    assert_ne!(first_id, second_id, "the new violation inherited the old identity");
+    assert!(service.last_violation_log.is_none(), "reported a freshly-seen violation at once");
+}
+
+/// The root cause of stall 6, fixed at its source.
+///
+/// The orphan-adopt path declares a lineage canonical and, before this, left
+/// KEY_HEAD behind it — so the blocks it had just adopted were held, linked,
+/// valid and unreachable, because every path that looks for work reads
+/// KEY_HEAD.
+#[tokio::test]
+async fn adopting_a_canonical_lineage_moves_the_head_onto_it() {
+    let (store, _dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+
+    let a = dummy_header(11, top.hash(), U256::from(1));
+    let b = dummy_header(12, a.hash(), U256::from(1));
+    for h in [&a, &b] {
+        store.put_header_with_hash(h.hash(), h).unwrap();
+    }
+    // There is no longer an API that writes the lineage without the head:
+    // `ensure_canonical_lineage` is crate-private to the storage crate, and
+    // `Transition::Adopt` is the only public way in. That is the fix — the
+    // state stall 6 lived in is not reachable from here any more.
+    let proved = rustock_storage::Validated::prove(&store, b.hash()).unwrap();
+    assert_eq!(proved.lineage().len(), 2, "both fork blocks should need canonical entries");
+    store.apply(&rustock_storage::Transition::Adopt { head: proved }).unwrap();
+
+    assert_eq!(store.head().unwrap(), Some(b.hash()), "the head did not follow the lineage");
+    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
+    let _ = top;
+}
+
+/// I6 must be repaired the moment it is seen, not three minutes later when the
+/// watchdog gets to it. Waiting made the node sawtooth between the tip and
+/// three minutes behind it, because adopting an orphaned tip is routine.
+#[tokio::test]
+async fn an_i6_violation_is_repaired_on_the_tick_that_finds_it() {
+    let (store, _dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+
+    let above = dummy_header(11, top.hash(), U256::from(1));
+    store.put_header_with_hash(above.hash(), &above).unwrap();
+    store.put_canonical_hash(11, above.hash()).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.verify_coherence();
+
+    assert_eq!(store.head().unwrap(), Some(above.hash()), "I6 was seen but not repaired");
+    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
+}
+
+/// The repair must never invent a chain: a canonical pointer to a block we do
+/// not hold stays unrepaired and reported rather than adopted.
+#[tokio::test]
+async fn the_immediate_repair_never_adopts_a_block_we_do_not_hold() {
+    let (store, _dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+    store.put_canonical_hash(11, B256::repeat_byte(0xaa)).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.verify_coherence();
+
+    assert_eq!(store.head().unwrap(), Some(top.hash()), "adopted a block we do not hold");
+}
