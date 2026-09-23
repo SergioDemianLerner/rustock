@@ -155,6 +155,8 @@ pub struct EpochTrieStore {
     /// (it counts pre-compaction bytes), which is the safe direction: it
     /// rotates slightly early rather than letting an epoch overshoot.
     newest_written: AtomicU64,
+    /// Opened read-only: writing is a programming error, not a silent no-op.
+    read_only: bool,
     /// Counters, so a benchmark can see read amplification rather than infer it.
     pub reads: AtomicU64,
     pub read_probes: AtomicU64,
@@ -218,6 +220,24 @@ fn open_epoch(dir: &Path, cache: &rocksdb::Cache) -> Result<Arc<DB>> {
     Ok(Arc::new(db))
 }
 
+/// Open one epoch's database **read-only**.
+///
+/// RocksDB's read-only mode takes no LOCK and writes nothing -- not even the
+/// WAL replay a normal open performs -- so it cannot modify or damage the
+/// database it is pointed at. That is the whole reason it exists here: a
+/// benchmark or a diagnostic must never be able to hurt a 130 GB store it is
+/// only measuring.
+fn open_epoch_read_only(dir: &Path, cache: &rocksdb::Cache) -> Result<Arc<DB>> {
+    let db = DB::open_cf_descriptors_read_only(
+        &db_options(),
+        dir,
+        vec![ColumnFamilyDescriptor::new(CF_TRIE, cf_options(cache))],
+        false,
+    )
+    .with_context(|| format!("opening epoch read-only at {}", dir.display()))?;
+    Ok(Arc::new(db))
+}
+
 fn dir_size(p: &Path) -> u64 {
     let mut total = 0;
     if let Ok(rd) = std::fs::read_dir(p) {
@@ -250,6 +270,75 @@ impl EpochTrieStore {
     /// Existing epochs are discovered from the directory names, so the store
     /// reopens wherever a previous run left it -- including part-way through a
     /// cycle, which needs no recovery beyond restarting the cycle.
+    /// Open an existing epoch store **read-only**.
+    ///
+    /// Every epoch database is opened in RocksDB's read-only mode, so nothing
+    /// here can write, compact, replay a WAL or take a lock. Unlike
+    /// [`EpochTrieStore::open`] it creates no directories, seeds nothing and
+    /// rotates nothing -- it reflects exactly what is on disk.
+    ///
+    /// Writing through the returned store is a programming error and panics
+    /// rather than silently losing data; it exists for benchmarks and
+    /// diagnostics that must not be able to damage a live store.
+    ///
+    /// **Caveat.** RocksDB's read-only mode does not replay the write-ahead
+    /// log, so writes still sitting in a memtable are invisible here. Against
+    /// a live database that means the most recent blocks may be missing; point
+    /// this at a cleanly stopped node, which flushes on shutdown.
+    pub fn open_read_only(dir: impl AsRef<Path>, config: EpochConfig) -> Result<Self> {
+        let root = dir.as_ref().to_path_buf();
+        if !root.exists() {
+            anyhow::bail!("{} does not exist", root.display());
+        }
+
+        let mut seqs: Vec<u64> = std::fs::read_dir(&root)?
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.strip_prefix("epoch-").and_then(|s| s.parse::<u64>().ok())
+            })
+            .collect();
+        seqs.sort_unstable();
+        if seqs.is_empty() {
+            anyhow::bail!("no epochs under {}", root.display());
+        }
+
+        let cache = rocksdb::Cache::new_lru_cache(BLOCK_CACHE_BYTES);
+        let mut epochs = Vec::with_capacity(seqs.len());
+        for seq in &seqs {
+            let d = epoch_dir(&root, *seq);
+            let last_block = read_last_block(&d);
+            epochs.push(Epoch {
+                seq: *seq,
+                db: open_epoch_read_only(&d, &cache)?,
+                dir: d,
+                last_block,
+            });
+        }
+
+        info!(
+            target: "rustock::gc",
+            "Epoch store at {} opened READ-ONLY: {} epoch(s) {:?}",
+            root.display(), epochs.len(),
+            epochs.iter().map(|e| e.seq).collect::<Vec<_>>()
+        );
+
+        Ok(Self {
+            root,
+            config,
+            next_seq: AtomicU64::new(seqs.last().copied().unwrap_or(0) + 1),
+            epochs: RwLock::new(epochs),
+            cache,
+            newest_written: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            read_probes: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            collecting: std::sync::atomic::AtomicBool::new(false),
+            last_collect: RwLock::new(None),
+            read_only: true,
+        })
+    }
+
     pub fn open(dir: impl AsRef<Path>, config: EpochConfig) -> Result<Self> {
         config.validate()?;
         let root = dir.as_ref().to_path_buf();
@@ -328,6 +417,7 @@ impl EpochTrieStore {
             writes: AtomicU64::new(0),
             collecting: std::sync::atomic::AtomicBool::new(false),
             last_collect: RwLock::new(None),
+            read_only: false,
         })
     }
 
@@ -655,8 +745,19 @@ impl EpochTrieStore {
     }
 
     /// Flushes every epoch, so a clean shutdown loses nothing.
+    /// Flush every epoch's trie column family to SSTs.
+    ///
+    /// `db.flush()` flushes the *default* column family, and every byte of
+    /// trie data lives in `CF_TRIE` -- so the previous version of this method
+    /// flushed nothing that mattered. Normal operation never noticed, because
+    /// the WAL makes the writes durable anyway and a clean shutdown flushes
+    /// the memtables; it surfaced only when a read-only open, which does not
+    /// replay the WAL, came back one entry short.
     pub fn flush(&self) -> Result<()> {
         for e in self.epochs.read().unwrap().iter() {
+            if let Some(cf) = e.db.cf_handle(CF_TRIE) {
+                e.db.flush_cf(cf).ok();
+            }
             e.db.flush().ok();
         }
         Ok(())
@@ -686,6 +787,11 @@ impl TrieStore for EpochTrieStore {
     /// epoch is what makes a later sweep drop entries the current state still
     /// references.
     fn put(&self, key: &[u8], value: &[u8]) {
+        assert!(
+            !self.read_only,
+            "write to a read-only epoch store: this store was opened for measurement \
+             and must not be able to modify the database"
+        );
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.newest_written
             .fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
@@ -795,6 +901,43 @@ mod tests {
         }
         root.save(store, true);
         root.compute_hash(store)
+    }
+
+    /// A read-only store must see everything a writer committed, and must not
+    /// be able to write. The point is that a benchmark can be pointed at a
+    /// 130 GB production store without any possibility of damaging it.
+    #[test]
+    fn a_read_only_store_reads_everything_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root_hash, nodes_written) = {
+            let store = EpochTrieStore::open(dir.path(), cfg(3)).unwrap();
+            let h = build(&store, 64, 0);
+            let n = walk(&store, h).unwrap();
+            store.flush().unwrap();
+            (h, n)
+        };
+        assert!(nodes_written > 1, "the fixture wrote nothing to compare");
+
+        let ro = EpochTrieStore::open_read_only(dir.path(), cfg(3)).unwrap();
+        assert_eq!(
+            walk(&ro, root_hash).unwrap(),
+            nodes_written,
+            "the read-only store cannot see every node the writer committed"
+        );
+        assert!(ro.get(root_hash.as_slice()).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "read-only epoch store")]
+    fn writing_to_a_read_only_store_panics_rather_than_silently_losing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = EpochTrieStore::open(dir.path(), cfg(3)).unwrap();
+            build(&store, 4, 0);
+            store.flush();
+        }
+        let ro = EpochTrieStore::open_read_only(dir.path(), cfg(3)).unwrap();
+        ro.put(b"key", b"value");
     }
 
     fn walk(store: &dyn TrieStore, root: B256) -> Result<u64> {

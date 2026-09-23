@@ -10,6 +10,9 @@
 //! This module implements the consensus-critical subset (32 transaction-callable
 //! methods). Local-call-only getters are deferred to RPC support.
 
+pub mod btc_block_cache;
+#[cfg(test)]
+mod btc_block_cache_readpath_tests;
 pub mod btc_chain;
 pub mod btc_store;
 pub mod constants;

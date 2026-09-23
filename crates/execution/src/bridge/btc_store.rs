@@ -207,13 +207,50 @@ pub fn put_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, block: &StoredB
 }
 
 /// Load a StoredBlock by its hash.
+///
+/// Three layers, in this order, and the order is the correctness argument:
+///
+/// 1. **This block's own writes.** Always authoritative, never cached -- they
+///    are not committed yet and may still be discarded.
+/// 2. **The cache**, when one is installed. Safe to consult here because the
+///    key is the block's own hash and the value at that key never changes.
+/// 3. **The parent trie.** A value found here is what the cache records. A
+///    value *not* found here records nothing: see
+///    [`crate::bridge::btc_block_cache`] for why negative caching would turn a
+///    missing trie node into a wrong consensus answer.
 pub fn get_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, hash: &BlockHash) -> Option<StoredBlock> {
     let key = btc_hash_to_storage_key(hash);
-    let data = load_raw_bytes(ctx, key);
+
+    // 1. The overlay wins over everything.
+    if let Some(overlay) = ctx.chain_mut().raw_storage.get_overlay(BRIDGE_ADDR, key) {
+        let data = overlay.unwrap_or_default();
+        if data.is_empty() {
+            return None;
+        }
+        return StoredBlock::deserialize_compact(&data);
+    }
+
+    // 2. The cache, if the node installed one.
+    let cache = ctx.chain_mut().btc_block_cache.clone();
+    if let Some(cache) = &cache {
+        if let Some(block) = cache.get(hash) {
+            return Some(block);
+        }
+    }
+
+    // 3. The parent trie -- the only read a cache stands in front of.
+    let data = ctx.chain_mut().raw_storage.get_from_trie(BRIDGE_ADDR, key).unwrap_or_default();
     if data.is_empty() {
+        // Deliberately not recorded. An absence here may be a genuinely
+        // absent block or a trie node missing from an incomplete snapshot,
+        // and nothing at this layer can tell them apart.
         return None;
     }
-    StoredBlock::deserialize_compact(&data)
+    let block = StoredBlock::deserialize_compact(&data)?;
+    if let Some(cache) = &cache {
+        cache.insert(*hash, block.clone());
+    }
+    Some(block)
 }
 
 // ---------------------------------------------------------------------------

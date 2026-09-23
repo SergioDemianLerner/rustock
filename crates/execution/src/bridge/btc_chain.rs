@@ -319,7 +319,7 @@ fn set_chain_head<CTX: crate::RskContextTr>(
 /// parents (`getStoredBlockAtMainChainDepth`). We mirror that exactly — the
 /// index is empty pre-RSKIP199, so a height lookup must walk. Returns `None`
 /// when the height is above the head or the chain cannot be walked to it.
-pub(crate) fn stored_block_at_main_chain_height<CTX: crate::RskContextTr>(
+pub fn stored_block_at_main_chain_height<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     height: u32,
     rskip199: bool,
@@ -338,7 +338,7 @@ pub(crate) fn stored_block_at_main_chain_height<CTX: crate::RskContextTr>(
 /// `stored_block_at_main_chain_height`), but `getBtcTransactionConfirmations`
 /// maps them to two different error codes (-2 and -3), so the distinction has
 /// to survive.
-pub(crate) enum MainChainLookup {
+pub enum MainChainLookup {
     Found(StoredBlock),
     /// Java returned `null`: the walk ran off the end of what is stored.
     Absent,
@@ -353,7 +353,7 @@ pub(crate) enum MainChainLookup {
 ///
 /// `config` enables the RSKIP199 search-depth limit (l.213-233); pass `None`
 /// to skip it, which is what the pre-existing callers did.
-pub(crate) fn main_chain_block_at_height<CTX: crate::RskContextTr>(
+pub fn main_chain_block_at_height<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     height: u32,
     rskip199: bool,

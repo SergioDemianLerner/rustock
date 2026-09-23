@@ -96,6 +96,8 @@ pub struct TrieSection {
     pub backend: Option<String>,
     pub dir: Option<String>,
     pub node: Option<String>,
+    /// Entries in the BTC stored-block cache; 0 disables it.
+    pub btc_block_cache_entries: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -241,6 +243,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "max_inbound_per_ip",
     "max_inbound_per_cidr",
     "inbound_cidr_prefix",
+    "btc_block_cache_entries",
     "trie_backend",
     "trie_dir",
     "trie_node",
