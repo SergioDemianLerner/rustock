@@ -8,6 +8,7 @@ mod tracker;
 pub mod chain_activity;
 pub mod invariant;
 pub mod quota;
+pub mod rollback;
 pub mod tx_relay;
 pub mod txpool;
 pub mod watchdog;

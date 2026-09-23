@@ -4033,13 +4033,22 @@ async fn rolling_execution_back_lands_on_the_canonical_chain_not_the_orphans_par
         .with_block_processor(processor, trie, empty);
 
     assert!(
-        service.roll_execution_back(1),
+        service.roll_execution_back(rustock_storage::BlockRef::new(2, b2.hash())),
         "rollback gave up; execution is left stranded on the abandoned branch"
     );
 
+    // Genesis, not a1.
+    //
+    // a1 is canonical at #1 and its state is present, so a search by HEIGHT
+    // would choose it -- and that is precisely the 2026-09-23 bug. a1 is a
+    // *sibling* of b1, not an ancestor of b2: this node never executed it, so
+    // claiming it as the executed head is a lie the next block discovers as a
+    // nonce mismatch. The only block on b2's ancestry that is canonical with
+    // state is genesis, the fork point.
     let (exec_hash, exec_root) = store.exec_head().unwrap().unwrap();
-    assert_eq!(exec_hash, a1.hash(), "rolled back onto the wrong branch");
-    assert_eq!(exec_root, a1.state_root);
+    assert_eq!(exec_hash, genesis.hash(), "resumed at a block this node never executed");
+    assert_eq!(exec_root, genesis.state_root);
+    let _ = (&a1, &a2);
     assert_eq!(
         crate::invariant::check(&store, None, crate::Scope::Full),
         Ok(()),
@@ -4083,7 +4092,10 @@ async fn rolling_execution_back_skips_heights_whose_state_is_gone() {
     let mut service = SyncService::new(manager, peer_store, event_rx)
         .with_block_processor(processor, trie, empty);
 
-    assert!(service.roll_execution_back(4), "rollback gave up with a usable state at #2");
+    assert!(
+        service.roll_execution_back(rustock_storage::BlockRef::new(5, chain[5].hash())),
+        "rollback gave up with a usable state at #2"
+    );
 
     let (exec_hash, _) = store.exec_head().unwrap().unwrap();
     assert_eq!(exec_hash, chain[2].hash(), "landed on a height whose state is missing");
@@ -4118,7 +4130,10 @@ async fn rolling_execution_back_reports_when_no_state_survives() {
     let mut service = SyncService::new(manager, peer_store, event_rx)
         .with_block_processor(processor, trie, empty);
 
-    assert!(!service.roll_execution_back(1), "claimed success with no state to resume from");
+    assert!(
+        !service.roll_execution_back(rustock_storage::BlockRef::new(1, h.hash())),
+        "claimed success with no state to resume from"
+    );
 }
 
 /// Mainnet, 2026-09-23 14:10. The executed head was perfectly canonical — so

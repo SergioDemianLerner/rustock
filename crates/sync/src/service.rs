@@ -893,7 +893,7 @@ impl SyncService {
             "Reorg: executed head #{} ({:?}) orphaned (canonical child #{} builds on {:?})",
             header.number, exec_hash, child.number, child.parent_hash
         );
-        self.roll_execution_back(header.number.saturating_sub(1));
+        self.roll_execution_back(rustock_storage::BlockRef::new(header.number, exec_hash));
     }
 
     /// Drop follow-mode body requests a peer never answered.
@@ -1107,10 +1107,10 @@ impl SyncService {
                     Violation::StateRootMissing { at, .. } => {
                         warn!(
                             target: "rustock::sync",
-                            "Executed head #{at} has no state in the trie store; rolling \
-                             execution back to a height that does"
+                            "Executed head #{at} has no state in the trie store; resuming \
+                             from the highest ancestor that does"
                         );
-                        self.roll_execution_back(at);
+                        self.roll_execution_back(cursor.executed);
                     }
                     _ => {}
                 }
@@ -1276,94 +1276,84 @@ impl SyncService {
             }
         }
     }
-    /// Move the executed head back to the highest **canonical** block at or
-    /// below `from_number` whose state root we still hold.
+    /// Move execution to the highest block on the executed head's own ancestry
+    /// that is canonical and whose state we still hold.
     ///
-    /// Returns false when no such block is found within the search bound, and
-    /// says so loudly: an executed head left on an orphaned branch is what
-    /// breaks I5, and then I7 once the branch's state is reclaimed.
+    /// The decision itself is [`crate::rollback::choose_resume_point`], which
+    /// is pure and simulated over thousands of generated chains. This method
+    /// only applies it. Three bugs in one day lived in this decision when it
+    /// was written inline; the module docs list them.
     ///
-    /// # Why the canonical chain and not the orphan's parent
-    ///
-    /// Both rollback sites used to target `orphaned_head.parent_hash`. That
-    /// parent is on the branch being abandoned, so it is usually not canonical
-    /// either -- rolling onto it re-strands execution one block lower. On
-    /// mainnet 2026-09-23 the `Transition::Executed` canonicity guard refused
-    /// exactly that write, the caller gave up, and the executed head stayed on
-    /// the orphan: I5 broke within a minute and I7 half an hour later, when the
-    /// orphaned branch's state root was no longer in the trie store. The node
-    /// could not execute another block.
-    ///
-    /// The guard was right. The target was wrong.
-    pub(crate) fn roll_execution_back(&mut self, from_number: u64) -> bool {
-        /// A rollback deeper than this is not a reorg, it is a broken store.
-        const MAX_ROLLBACK: u64 = 1_024;
-
+    /// Returns false when nothing usable was found, and says so loudly: a node
+    /// that cannot resume needs a resync, not another retry.
+    pub(crate) fn roll_execution_back(&mut self, from: rustock_storage::BlockRef) -> bool {
         let Some(trie_store) = self.trie_store.clone() else { return false };
-        let store = &self.manager.store;
-        let floor = from_number.saturating_sub(MAX_ROLLBACK);
 
-        let mut height = from_number;
-        loop {
-            let Ok(Some(hash)) = store.canonical_hash(height) else {
-                if height == 0 || height == floor { break; }
-                height -= 1;
-                continue;
-            };
-            let Ok(Some(header)) = store.header(hash) else {
-                if height == 0 || height == floor { break; }
-                height -= 1;
-                continue;
-            };
-
-            // The state we would resume from has to actually be there. This is
-            // I7, checked before the write rather than reported after it.
-            if let Some(data) = trie_store.get(header.state_root.as_slice()) {
-                match Validated::prove(store, hash) {
-                    Ok(at) => {
-                        let at_block = at.block();
-                        match store.apply(&Transition::Executed {
-                            at,
-                            state_root: header.state_root,
-                        }) {
-                            Ok(_) => {
-                                self.current_state_root =
-                                    Some(TrieNode::from_message(&data, trie_store.as_ref()));
-                                self.last_body_height = header.number;
-                                self.follow_buffer.clear();
-                                warn!(
-                                    target: "rustock::sync",
-                                    "Rolled execution back to {} (from #{})",
-                                    at_block, from_number
-                                );
-                                return true;
-                            }
-                            Err(e) => warn!(
-                                target: "rustock::sync",
-                                "Rollback to {} refused: {:?}; trying lower", at_block, e
-                            ),
-                        }
-                    }
-                    Err(broken) => warn!(
-                        target: "rustock::sync",
-                        "Rollback candidate #{height} cannot be proved ({broken}); trying lower"
-                    ),
-                }
+        struct View<'a> {
+            store: &'a BlockStore,
+            trie: &'a dyn TrieStore,
+        }
+        impl crate::rollback::ChainView for View<'_> {
+            fn header(&self, hash: B256) -> Option<Header> {
+                self.store.header(hash).ok().flatten()
             }
-
-            if height == 0 || height == floor {
-                break;
+            fn canonical_hash(&self, number: u64) -> Option<B256> {
+                self.store.canonical_hash(number).ok().flatten()
             }
-            height -= 1;
+            fn has_state(&self, root: B256) -> bool {
+                self.trie.get(root.as_slice()).is_some()
+            }
         }
 
-        error!(
+        let target = {
+            let view = View { store: &self.manager.store, trie: trie_store.as_ref() };
+            match crate::rollback::choose_resume_point(&view, from) {
+                Ok(t) => t,
+                Err(why) => {
+                    error!(
+                        target: "rustock::sync",
+                        "No block on the ancestry of {from} is canonical with state in the \
+                         trie store ({why:?}); execution cannot resume and the node needs a \
+                         resync from a state that exists."
+                    );
+                    return false;
+                }
+            }
+        };
+
+        if target == from {
+            return true; // already usable; nothing to do
+        }
+
+        let store = &self.manager.store;
+        let Some(header) = store.header(target.hash).ok().flatten() else { return false };
+        let Some(data) = trie_store.get(header.state_root.as_slice()) else { return false };
+
+        let at = match Validated::prove(store, target.hash) {
+            Ok(v) => v,
+            Err(broken) => {
+                error!(
+                    target: "rustock::sync",
+                    "Resume point {target} cannot be proved ({broken}); execution not moved"
+                );
+                return false;
+            }
+        };
+        if let Err(e) = store.apply(&Transition::Executed { at, state_root: header.state_root }) {
+            error!(target: "rustock::sync", "Recording the resume point {target} failed: {e:?}");
+            return false;
+        }
+
+        self.current_state_root = Some(TrieNode::from_message(&data, trie_store.as_ref()));
+        self.last_body_height = header.number;
+        self.follow_buffer.clear();
+        self.pending_exec = None;
+        warn!(
             target: "rustock::sync",
-            "No canonical block between #{floor} and #{from_number} has a state root in the \
-             trie store; execution cannot be rolled back and the node is stuck. This needs \
-             a resync from a state that exists."
+            "Execution resumed at {target} (was {from}); {} block(s) will be re-executed",
+            from.number.saturating_sub(target.number)
         );
-        false
+        true
     }
 
     /// Retreat the head below an orphaned executed head, and roll execution
@@ -1401,7 +1391,11 @@ impl SyncService {
         // orphan's own parent here was the 2026-09-23 bug: that parent is on
         // the branch being abandoned, so recording execution at it is refused
         // and execution stays stranded. See `roll_execution_back`.
-        if self.roll_execution_back(dest.number) {
+        let executed = match store.cursor() {
+            Ok(Some(c)) => c.executed,
+            _ => return,
+        };
+        if self.roll_execution_back(executed) {
             warn!(
                 target: "rustock::sync",
                 "Orphan recovery: head and execution retreated to {}", dest
