@@ -4194,3 +4194,107 @@ async fn a_missing_state_root_at_the_executed_head_is_repaired_not_just_reported
         "still incoherent after the repair"
     );
 }
+
+/// Mainnet, 2026-09-23 17:21. `Transition::Retreat` rolled the *committed*
+/// executed head back on its own — that is what it is for — and the service's
+/// *in-memory* state root was never told. Follow mode refused to execute in
+/// that state, correctly, but refusing is not recovering, and the body
+/// pipeline had no such guard: it executed against the stale root and produced
+/// `NonceTooLow { tx: 240848, state: 240849 }`.
+///
+/// Two representations of one fact, and a code path reading the wrong one.
+#[tokio::test]
+async fn an_in_memory_state_root_ahead_of_the_committed_one_is_reloaded() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let mut chain = vec![genesis.clone()];
+    for n in 1..=3u64 {
+        let mut h = dummy_header(n, chain[(n - 1) as usize].hash(), U256::from(n + 1));
+        h.state_root = B256::repeat_byte(0x20 + n as u8);
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        chain.push(h);
+    }
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    // Two distinct, resolvable states: #2's and #3's.
+    let committed_node = rustock_trie::TrieNode::empty();
+    let committed_root = committed_node.compute_hash(trie.as_ref());
+    trie.put(committed_root.as_slice(), &committed_node.to_message(trie.as_ref()));
+
+    // The executed head commits #2 with that root.
+    store.set_exec_head(chain[2].hash(), committed_root).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+
+    // The service starts with a DIFFERENT in-memory root — the shape the
+    // retreat leaves behind.
+    let mut stale = rustock_trie::TrieNode::empty();
+    stale = stale.put(
+        &rustock_trie::TrieKeySlice::from_key(&[1u8, 2, 3]),
+        &[9u8; 8],
+        trie.as_ref(),
+    );
+    stale.save(trie.as_ref(), true);
+    let stale_root = stale.compute_hash(trie.as_ref());
+    assert_ne!(stale_root, committed_root, "fixture did not create a divergence");
+
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie.clone(), stale);
+
+    service.resync_state_root_with_exec_head();
+
+    let now = service
+        .current_state_root
+        .as_ref()
+        .map(|r| r.compute_hash(trie.as_ref()));
+    assert_eq!(
+        now,
+        Some(committed_root),
+        "the in-memory root was not reloaded from the committed one"
+    );
+}
+
+/// And it must not churn when they already agree.
+#[tokio::test]
+async fn a_matching_state_root_is_left_alone() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let node = rustock_trie::TrieNode::empty();
+    let root = node.compute_hash(trie.as_ref());
+    trie.put(root.as_slice(), &node.to_message(trie.as_ref()));
+    store.set_exec_head(genesis.hash(), root).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie.clone(), node);
+
+    service.follow_buffer.insert(
+        7,
+        (B256::repeat_byte(7), dummy_header(7, B256::ZERO, U256::from(1)), vec![], vec![]),
+    );
+    service.resync_state_root_with_exec_head();
+
+    assert_eq!(service.follow_buffer.len(), 1, "cleared the buffer when nothing was wrong");
+}
