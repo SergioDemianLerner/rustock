@@ -1,12 +1,16 @@
 pub mod trie_store;
 pub mod cached_trie_store;
 pub mod rskj_import;
+pub use position::{
+    BlockRef, Cursor, LineageBreak, Transition, Validated, verify_local_coherence,
+};
 pub use trie_store::RocksDbTrieStore;
 pub mod trie_tool;
 pub mod trie_snapshot;
 pub mod trie_inspect;
 pub mod epoch_store;
 pub mod window_store;
+pub mod position;
 pub mod pruner;
 pub use cached_trie_store::CachedTrieStore;
 
@@ -664,7 +668,17 @@ impl BlockStore {
     /// parent header — a tip-extension's walk stops at the top and never
     /// revisits such a hole, so it must be repaired explicitly at the block
     /// that exposes it.
-    pub fn ensure_canonical_lineage(&self, hash: B256) -> Result<u64> {
+    /// Write the canonical lineage of `hash` **without touching the head**.
+    ///
+    /// Crate-private on purpose. Writing `CF_NUMBERS` and leaving `KEY_HEAD`
+    /// behind is the shape of every sync stall this node has had -- most
+    /// directly stall 6, where mainnet #9,262,402 was held, linked, valid and
+    /// unreachable for three hours because every path that looks for work
+    /// reads the head.
+    ///
+    /// Callers outside this crate use [`Transition::Adopt`], which writes the
+    /// lineage and the head in one batch and cannot express the other thing.
+    pub(crate) fn ensure_canonical_lineage(&self, hash: B256) -> Result<u64> {
         // The whole walk commits as one batch. Writing pointer by pointer is
         // not crash-safe: the walk moves from the tip down to the fork point,
         // so an interruption part-way leaves the upper heights naming the new

@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+thiserror = { workspace = true }
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-trie = { version = "0.1.0", path = "../trie" }
 rocksdb = { workspace = true }

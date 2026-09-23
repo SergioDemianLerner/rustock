@@ -13,7 +13,7 @@ use rustock_networking::protocol::{
     BlockHashRequest, BlockIdentifier, BodyRequest, P2pMessage, RskMessage, RskSubMessage,
     SkeletonRequest,
 };
-use rustock_storage::BlockStore;
+use rustock_storage::{BlockStore, Transition, Validated};
 use rustock_trie::{TrieNode, TrieStore};
 use alloy_primitives::{B256, B512};
 use std::collections::{BTreeMap, HashMap};
@@ -25,6 +25,13 @@ use tracing::{info, debug, trace, warn, error};
 
 /// Timeout for pending requests before resetting to Idle.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a coherence violation must persist before it is worth reporting.
+///
+/// Long enough to cover the ordinary gap between canonicalising a header and
+/// executing its body -- which is a second or two, and happens on every tip --
+/// and far shorter than any stall the node has ever suffered.
+const VIOLATION_GRACE: Duration = Duration::from_secs(45);
 
 /// Faster reclaim for body requests: a body not back within this window is
 /// re-sent to another peer. Shorter than REQUEST_TIMEOUT because idempotent
@@ -75,6 +82,51 @@ const FOLLOW_BACKLOG_TOLERANCE: u64 = 2;
 ///
 /// Only applies to a node that executes: without a block processor there is no
 /// execution to fall behind.
+/// The highest canonical height at or above `from` that we hold a linked chain
+/// up to.
+///
+/// Walks up the canonical index while every step is present in the header
+/// store and links to the one below. Returns `None` when nothing above `from`
+/// qualifies.
+///
+/// Bounded: a damaged index must not turn a recovery into a full-chain sweep.
+pub(crate) fn canonical_top_held(store: &BlockStore, from: u64) -> Option<B256> {
+    const MAX_WALK_UP: u64 = 4_096;
+
+    let mut top_hash = store.canonical_hash(from).ok().flatten()?;
+    let mut top_number = from;
+
+    for _ in 0..MAX_WALK_UP {
+        let next = top_number + 1;
+        let Some(hash) = store.canonical_hash(next).ok().flatten() else { break };
+        let Some(header) = store.header(hash).ok().flatten() else { break };
+        if header.parent_hash != top_hash {
+            break;
+        }
+        top_hash = hash;
+        top_number = next;
+    }
+
+    Some(top_hash)
+}
+
+/// Record execution progress through a transition, so the executed head can
+/// never be set to a block whose lineage does not hold.
+pub(crate) fn record_execution(store: &BlockStore, hash: B256, state_root: B256) {
+    match Validated::prove(store, hash) {
+        Ok(at) => {
+            if let Err(e) = store.apply(&Transition::Executed { at, state_root }) {
+                error!(target: "rustock::sync", "Recording execution of {:?} failed: {:?}", hash, e);
+            }
+        }
+        Err(broken) => error!(
+            target: "rustock::sync",
+            "Executed {:?} but its lineage does not hold ({}); not recording it",
+            hash, broken
+        ),
+    }
+}
+
 pub(crate) fn backlog_needs_executing(has_processor: bool, downloaded: u64, executed: u64) -> bool {
     has_processor && downloaded > executed
 }
@@ -270,6 +322,16 @@ pub struct SyncService {
     /// When a coherence violation was last logged, so a persistent one reports
     /// steadily rather than once per tick.
     pub(crate) last_violation_log: Option<std::time::Instant>,
+    /// The violation currently outstanding, and when it was first seen.
+    ///
+    /// Several relations are transiently false in normal operation: a header
+    /// is canonicalised as soon as it links, and the head only advances once
+    /// the body is executed, so I6 is briefly true on essentially every new
+    /// tip. Reporting those would put a warning in the log every few seconds
+    /// and teach whoever reads it to skip the line -- which is the exact
+    /// failure this subsystem already had, where a stall printed 450 times and
+    /// was treated as nothing.
+    pub(crate) violation_since: Option<(String, std::time::Instant)>,
     /// When the follow buffer was first seen blocked behind a missing block.
     ///
     /// A block arriving before its predecessor is normal -- a gap-pull fires
@@ -332,6 +394,7 @@ impl SyncService {
             watchdog: ProgressWatchdog::default(),
             force_connection_search: false,
             last_violation_log: None,
+            violation_since: None,
             follow_gap_since: None,
             pending_follow_bodies: HashMap::new(),
             follow_buffer: BTreeMap::new(),
@@ -728,11 +791,38 @@ impl SyncService {
                      at #{}; treating it as orphaned and adopting {:?}",
                     header.number, exec_hash, stored_next.len(), header.number + 1, successor
                 );
-                if let Err(e) = store.ensure_canonical_lineage(successor) {
-                    warn!(
-                        target: "rustock::sync",
-                        "Orphan recovery: canonical lineage repair failed: {:?}", e
-                    );
+                // One transition: the lineage and the head move together, or
+                // neither does. Writing canonical entries and leaving KEY_HEAD
+                // behind is what wedged mainnet for three hours on
+                // 2026-09-22, and `Transition` has no way to express it.
+                match Validated::prove(store, successor) {
+                    Ok(head) => {
+                        if let Err(e) = store.apply(&Transition::Adopt { head }) {
+                            warn!(
+                                target: "rustock::sync",
+                                "Orphan recovery: adopting {:?} failed: {:?}", successor, e
+                            );
+                        }
+                    }
+                    Err(broken) => {
+                        // The only successor we know of hangs off a block we
+                        // never downloaded, so there is nothing to adopt.
+                        //
+                        // Retreat *here*, rather than doing nothing. The code
+                        // this replaced wrote the unprovable pointer anyway and
+                        // relied on a later round to notice it was broken and
+                        // recover -- a deliberate detour through an incoherent
+                        // store. Refusing to write it is right; refusing and
+                        // then standing still is a wedge, so the retreat that
+                        // the later round used to perform happens now.
+                        warn!(
+                            target: "rustock::sync",
+                            "Orphan recovery: cannot adopt {:?} ({}); retreating to #{} so the \
+                             height is downloaded again",
+                            successor, broken, header.number.saturating_sub(1)
+                        );
+                        self.retreat_below_orphaned_head(&header);
+                    }
                 }
                 return;
             }
@@ -751,36 +841,50 @@ impl SyncService {
         // downloads and executes the true canonical block at this height.
         //
         // That repair only works if we HOLD the true canonical block.
-        // `ensure_canonical_lineage` walks down from the hash it is given and
-        // stops at the first header the store does not have -- so when the
-        // replacement block was never downloaded, it writes nothing at all and
-        // returns success. The canonical pointer keeps naming the orphan, and
-        // because `our_head_number()` reads that pointer, every subsequent
-        // skeleton round asks from a hash that is no longer on the chain,
-        // stores the same dangling headers above it, and completes without
-        // advancing. Mainnet #9,258,222 sat in that loop for 15 minutes.
+        // This used to call a repair that walked down and stopped at the first
+        // header the store did not have -- so when the replacement block was
+        // never downloaded it wrote nothing, returned success, and left the
+        // canonical pointer naming the orphan. `Validated::prove` makes that a
+        // located error instead.
         //
         // When the block is absent there is nothing to repair the lineage TO,
         // so retreat instead: drop the canonical entry at this height and move
         // the head pointer down to the orphan's parent, which both branches
         // agree on. The connection-point search then re-runs from a block that
         // really is on the chain, and this height is downloaded again.
-        if store.header(child.parent_hash).ok().flatten().is_some() {
-            if let Err(e) = store.ensure_canonical_lineage(child.parent_hash) {
-                warn!(target: "rustock::sync", "Reorg: canonical lineage repair failed: {:?}", e);
+        // Either the true canonical block at this height can be proved -- held,
+        // and linked all the way down -- in which case adopt it; or it cannot,
+        // in which case retreat so the height is downloaded again.
+        //
+        // The proof is what decides. The old code asked only whether the header
+        // existed, then called a repair that silently wrote nothing when the
+        // lineage was broken further down, returned `Ok`, and left the pointer
+        // naming an orphan. Mainnet #9,258,222 sat in that loop for 15 minutes.
+        match Validated::prove(store, child.parent_hash) {
+            Ok(head) => {
+                if let Err(e) = store.apply(&Transition::Adopt { head }) {
+                    warn!(target: "rustock::sync", "Reorg: adopting the canonical block failed: {:?}", e);
+                }
             }
-        } else {
-            warn!(
-                target: "rustock::sync",
-                "Reorg: canonical block {:?} at #{} is not held; retreating head to #{} \
-                 so the height is downloaded again",
-                child.parent_hash, header.number, header.number - 1
-            );
-            if let Err(e) = store.delete_canonical_hash(header.number) {
-                warn!(target: "rustock::sync", "Reorg: dropping canonical #{} failed: {:?}", header.number, e);
-            }
-            if let Err(e) = store.set_head(header.parent_hash) {
-                warn!(target: "rustock::sync", "Reorg: retreating head failed: {:?}", e);
+            Err(broken) => {
+                warn!(
+                    target: "rustock::sync",
+                    "Reorg: canonical block {:?} at #{} cannot be proved ({}); retreating to #{} \
+                     so the height is downloaded again",
+                    child.parent_hash, header.number, broken, header.number - 1
+                );
+                match Validated::prove(store, header.parent_hash) {
+                    Ok(to) => {
+                        if let Err(e) = store.apply(&Transition::Retreat { to }) {
+                            warn!(target: "rustock::sync", "Reorg: retreat failed: {:?}", e);
+                        }
+                    }
+                    Err(b) => warn!(
+                        target: "rustock::sync",
+                        "Reorg: cannot retreat to {:?} either ({}); the chain below is broken",
+                        header.parent_hash, b
+                    ),
+                }
             }
         }
         // Orphaned: roll back to the executed head's parent.
@@ -813,9 +917,20 @@ impl SyncService {
                 return;
             }
         };
-        if let Err(e) = store.set_exec_head(parent_hash, state_root) {
-            error!(target: "rustock::sync", "Reorg rollback: set_exec_head failed: {:?}", e);
-            return;
+        match Validated::prove(store, parent_hash) {
+            Ok(at) => {
+                if let Err(e) = store.apply(&Transition::Executed { at, state_root }) {
+                    error!(target: "rustock::sync", "Reorg rollback: recording execution failed: {:?}", e);
+                    return;
+                }
+            }
+            Err(broken) => {
+                error!(
+                    target: "rustock::sync",
+                    "Reorg rollback: cannot roll execution back to {:?}: {}", parent_hash, broken
+                );
+                return;
+            }
         }
         self.current_state_root = Some(root_node);
         self.last_body_height = parent.number;
@@ -985,7 +1100,10 @@ impl SyncService {
         let store = &self.manager.store;
         let cursor = match invariant::derive_cursor(store) {
             Ok(Some(c)) => c,
-            Ok(None) => return,
+            Ok(None) => {
+                self.clear_violation();
+                return;
+            }
             Err(v) => {
                 self.report_violation(&v);
                 return;
@@ -1000,15 +1118,58 @@ impl SyncService {
             to: cursor.validated_head.number,
         };
         let trie = self.trie_store.as_deref();
-        if let Err(v) = invariant::check_with_cursor(store, trie, scope, &cursor) {
-            self.report_violation(&v);
+        match invariant::check_with_cursor(store, trie, scope, &cursor) {
+            Err(v) => {
+                self.report_violation(&v);
+                // I6 and I8 have a well-defined, safe repair: re-seat the head
+                // onto the canonical chain and walk it up as far as we hold
+                // linked blocks. Do it here rather than leaving it to the
+                // watchdog.
+                //
+                // Waiting for the watchdog meant three minutes of standing
+                // still every time an orphaned tip was adopted -- which is
+                // routine, several times an hour -- so the node sawtoothed
+                // between the tip and three minutes behind it. A liveness net
+                // is the wrong thing to make progress depend on: it exists for
+                // the failures nothing else understands, and a failure we can
+                // name and repair is not one of them.
+                if matches!(
+                    v,
+                    Violation::CanonicalAboveHead { .. } | Violation::HeadNotCanonical { .. }
+                ) {
+                    self.reverify_head_lineage(0);
+                }
+            }
+            Ok(()) => self.clear_violation(),
         }
     }
 
-    /// Report a broken relation, at most once every thirty seconds so a
-    /// persistent violation is visible without flooding the log.
+    /// Report a broken relation once it has *persisted*, then at most once
+    /// every thirty seconds.
+    ///
+    /// The grace period is what separates the pipeline from a stall. A
+    /// canonical entry above the head clears within a second or two on every
+    /// ordinary tip; the one that wedged mainnet on 2026-09-22 stood for three
+    /// hours. Only the second kind is worth a line in the log.
     fn report_violation(&mut self, v: &Violation) {
         let now = Instant::now();
+        let identity = format!("{}@{:?}", v.relation(), v.at());
+
+        let first_seen = match &self.violation_since {
+            Some((seen, at)) if *seen == identity => *at,
+            _ => {
+                // A different violation (or the first): start its clock and say
+                // nothing yet.
+                self.violation_since = Some((identity, now));
+                self.last_violation_log = None;
+                return;
+            }
+        };
+
+        if now.saturating_duration_since(first_seen) < VIOLATION_GRACE {
+            return;
+        }
+
         let due = self
             .last_violation_log
             .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(30));
@@ -1018,8 +1179,27 @@ impl SyncService {
         self.last_violation_log = Some(now);
         warn!(
             target: "rustock::sync",
-            "Coherence violation {}: {}", v.relation(), v
+            "Coherence violation {} unresolved for {}s: {}",
+            v.relation(),
+            now.saturating_duration_since(first_seen).as_secs(),
+            v
         );
+    }
+
+    /// The store is coherent again: forget whatever was outstanding.
+    fn clear_violation(&mut self) {
+        if let Some((relation, first_seen)) = self.violation_since.take() {
+            // Only worth a line if it had been reported.
+            if self.last_violation_log.is_some() {
+                info!(
+                    target: "rustock::sync",
+                    "Coherence restored after {}s ({} cleared)",
+                    Instant::now().saturating_duration_since(first_seen).as_secs(),
+                    relation
+                );
+            }
+        }
+        self.last_violation_log = None;
     }
 
     /// Outstanding network requests and the age of the oldest, across whichever
@@ -1121,147 +1301,178 @@ impl SyncService {
             }
         }
     }
-
-    /// Re-establish that the head is the top of the contiguous canonical chain
-    /// we actually hold, walking up first and retreating only if it is broken.
+    /// Retreat the head below an orphaned executed head, and roll execution
+    /// back with it.
     ///
-    /// Walking *up* is what clears stall 6: `ensure_canonical_lineage` can write
-    /// canonical entries above `KEY_HEAD`, and because every path that looks for
-    /// work reads `KEY_HEAD`, those blocks become unreachable -- held, linked,
-    /// valid, and invisible. Re-deriving the head from the index makes them
-    /// reachable again.
+    /// Both orphan paths use this, so they cannot drift apart: one finds a
+    /// canonical child that does not build on us, the other finds no canonical
+    /// child at all, and the recovery is the same in both cases.
     ///
-    /// Retreating is what clears stalls 2 and 5: when the canonical entry at the
-    /// head names a block we do not hold, or does not link to the one below,
-    /// dropping back makes the height be downloaded again.
-    pub(crate) fn reverify_head_lineage(&mut self, retreat: u64) {
+    /// Execution comes back with the head. Retreating one without the other is
+    /// how I4 gets broken by the act of recovering -- which is what the
+    /// watchdog's first deployment did to mainnet within fifteen seconds.
+    fn retreat_below_orphaned_head(&mut self, header: &Header) {
         let store = &self.manager.store;
-        let Ok(Some(head_hash)) = store.head() else { return };
-        let Ok(Some(head)) = store.header(head_hash) else { return };
+        let parent_hash = header.parent_hash;
 
-        // Anchor the walk to the canonical chain, not to whatever KEY_HEAD
-        // happens to name.
-        //
-        // The first deployment of this watchdog retreated when it should have
-        // walked up, because KEY_HEAD named a non-canonical block at its height
-        // and so nothing above it appeared to link back. Starting from the
-        // canonical hash makes the walk follow the chain the rest of the node
-        // agrees on, and re-seating the head onto it is itself the repair.
-        let mut head_hash = head_hash;
-        if let Ok(Some(canonical)) = store.canonical_hash(head.number) {
-            if canonical != head_hash {
+        let to = match Validated::prove(store, parent_hash) {
+            Ok(v) => v,
+            Err(broken) => {
                 warn!(
                     target: "rustock::sync",
-                    "Head re-verification: the head named {:?} at #{} but the canonical block \
-                     there is {:?}; re-seating the head onto the canonical chain",
-                    head_hash, head.number, canonical
+                    "Orphan recovery: cannot retreat to {:?} ({}); the chain below is broken",
+                    parent_hash, broken
                 );
-                if store.set_head(canonical).is_ok() {
-                    head_hash = canonical;
+                return;
+            }
+        };
+        let dest = to.block();
+        if let Err(e) = store.apply(&Transition::Retreat { to }) {
+            warn!(target: "rustock::sync", "Orphan recovery: retreat failed: {:?}", e);
+            return;
+        }
+
+        let Some(parent) = store.header(parent_hash).ok().flatten() else { return };
+        let state_root = parent.state_root;
+        let Some(trie_store) = self.trie_store.clone() else { return };
+        let Some(data) = trie_store.get(state_root.as_slice()) else {
+            warn!(
+                target: "rustock::sync",
+                "Orphan recovery: state root {:?} for {} is not in the trie store; \
+                 execution stays where it is",
+                state_root, dest
+            );
+            return;
+        };
+
+        match Validated::prove(store, parent_hash) {
+            Ok(at) => {
+                if let Err(e) = store.apply(&Transition::Executed { at, state_root }) {
+                    error!(
+                        target: "rustock::sync",
+                        "Orphan recovery: rolling execution back failed: {:?}", e
+                    );
+                    return;
+                }
+            }
+            Err(broken) => {
+                error!(
+                    target: "rustock::sync",
+                    "Orphan recovery: cannot roll execution back to {}: {}", dest, broken
+                );
+                return;
+            }
+        }
+
+        self.current_state_root = Some(TrieNode::from_message(&data, trie_store.as_ref()));
+        self.last_body_height = parent.number;
+        self.follow_buffer.clear();
+        warn!(
+            target: "rustock::sync",
+            "Orphan recovery: head and execution retreated to {}", dest
+        );
+    }
+
+    /// Re-establish that the head is the top of the contiguous canonical chain
+    /// we actually hold.
+    ///
+    /// Two moves, in this order:
+    ///
+    /// 1. **Adopt** the highest canonical block we hold a linked chain up to.
+    ///    This re-seats a head that has drifted off the canonical chain and
+    ///    picks up blocks stranded above it -- the shape that wedged mainnet
+    ///    for three hours.
+    /// 2. **Retreat**, if there is nothing above and the caller asked for it,
+    ///    so the range is downloaded again.
+    ///
+    /// Both go through `Transition`, so neither can leave the three position
+    /// keys disagreeing. Retreat never goes below the executed head: a head
+    /// under execution is not a recovery, it is a second incoherence.
+    pub(crate) fn reverify_head_lineage(&mut self, retreat: u64) {
+        let store = &self.manager.store;
+        let Ok(Some(cursor)) = store.cursor() else { return };
+        let head = cursor.validated_head;
+
+        // 1. Adopt the top of what we hold.
+        if let Some(top) = canonical_top_held(store, head.number) {
+            if top != head.hash {
+                match Validated::prove(store, top) {
+                    Ok(proved) => {
+                        let to = proved.block();
+                        match store.apply(&Transition::Adopt { head: proved }) {
+                            Ok(_) => {
+                                warn!(
+                                    target: "rustock::sync",
+                                    "Head re-verification: adopted {} (was {})", to, head
+                                );
+                                self.last_body_height = self.last_body_height.min(head.number);
+                                return;
+                            }
+                            Err(e) => warn!(
+                                target: "rustock::sync",
+                                "Head re-verification: adopting {} failed: {:?}", to, e
+                            ),
+                        }
+                    }
+                    Err(broken) => warn!(
+                        target: "rustock::sync",
+                        "Head re-verification: {:?} is canonical but cannot be proved ({})",
+                        top, broken
+                    ),
                 }
             }
         }
 
-        // Walk up while the index keeps naming blocks we hold that link back.
-        //
-        // Bounded: a damaged index must not turn recovery into a full-chain
-        // sweep on every escalation. A gap wider than this is not something to
-        // walk out of anyway -- it wants a sync round.
-        const MAX_WALK_UP: u64 = 4_096;
-        let mut top = (head.number, head_hash);
-        for _ in 0..MAX_WALK_UP {
-            let next = top.0 + 1;
-            let Ok(Some(hash)) = store.canonical_hash(next) else { break };
-            let Ok(Some(hdr)) = store.header(hash) else { break };
-            if hdr.parent_hash != top.1 {
-                break;
-            }
-            top = (next, hash);
-        }
-
-        if top.0 > head.number {
-            warn!(
-                target: "rustock::sync",
-                "Head re-verification: canonical chain is held up to #{} but the head said #{}; \
-                 advancing the head by {} block(s)",
-                top.0, head.number, top.0 - head.number
-            );
-            if let Err(e) = store.set_head(top.1) {
-                error!(target: "rustock::sync", "Head re-verification: set_head failed: {:?}", e);
-                return;
-            }
-            self.last_body_height = self.last_body_height.min(head.number);
-            return;
-        }
-
         if retreat == 0 {
             return;
         }
 
-        // Never retreat below what we have executed: that breaks I4 by
-        // construction, which the first deployment did within fifteen seconds
-        // of its first escalation. A head below the executed block is not a
-        // recovery, it is a second incoherence on top of the first.
-        let executed = store
-            .exec_head()
-            .ok()
-            .flatten()
-            .and_then(|(hash, _)| store.header(hash).ok().flatten())
-            .map(|h| h.number)
-            .unwrap_or(0);
-        let floor = head.number.min(executed);
-        let retreat = retreat.min(head.number.saturating_sub(floor));
-        if retreat == 0 {
+        // 2. Nothing above: retreat, but never below execution.
+        let floor = head.number.min(cursor.executed.number);
+        let depth = retreat.min(head.number.saturating_sub(floor));
+        if depth == 0 {
             debug!(
                 target: "rustock::sync",
                 "Head re-verification: nothing above the head and nothing to retreat to \
-                 (head #{}, executed #{})", head.number, executed
+                 (head {}, executed {})", head, cursor.executed
             );
             return;
         }
 
-        // Nothing above us, so the head itself is where progress is failing.
-        // Drop back and let the height be fetched again.
-        let target = head.number.saturating_sub(retreat);
-        let mut cursor = head_hash;
-        for _ in 0..retreat {
-            let Ok(Some(hdr)) = store.header(cursor) else { break };
-            if hdr.number == 0 {
+        let mut target = head.hash;
+        for _ in 0..depth {
+            let Ok(Some(h)) = store.header(target) else { return };
+            if h.number == 0 {
                 break;
             }
-            cursor = hdr.parent_hash;
+            target = h.parent_hash;
         }
-        if cursor == head_hash {
+        if target == head.hash {
             return;
         }
-        warn!(
-            target: "rustock::sync",
-            "Head re-verification: retreating the head from #{} to #{} so the range is \
-             downloaded again",
-            head.number, target
-        );
-        if let Err(e) = store.set_head(cursor) {
-            error!(target: "rustock::sync", "Head re-verification: set_head failed: {:?}", e);
-            return;
-        }
-        // Drop the canonical entries the retreat just orphaned.
-        //
-        // Without this the retreat leaves exactly the shape stall 6 was made
-        // of -- canonical entries above the head -- so the watchdog's own
-        // recovery would trip the invariant it is supposed to serve. Two
-        // mechanisms disagreeing about position is the thing this whole
-        // exercise exists to stop, and it would be poor form to add a seventh
-        // instance of it here.
-        for n in (target + 1)..=head.number {
-            if let Err(e) = store.delete_canonical_hash(n) {
-                warn!(
-                    target: "rustock::sync",
-                    "Head re-verification: could not drop the canonical entry at #{n}: {:?}", e
-                );
+
+        match Validated::prove(store, target) {
+            Ok(to) => {
+                let dest = to.block();
+                match store.apply(&Transition::Retreat { to }) {
+                    Ok(_) => {
+                        warn!(
+                            target: "rustock::sync",
+                            "Head re-verification: retreated from {} to {} so the range is \
+                             downloaded again", head, dest
+                        );
+                        self.last_body_height = self.last_body_height.min(dest.number);
+                    }
+                    Err(e) => warn!(target: "rustock::sync", "Head re-verification: retreat failed: {:?}", e),
+                }
             }
+            Err(broken) => warn!(
+                target: "rustock::sync",
+                "Head re-verification: cannot retreat to {:?} ({})", target, broken
+            ),
         }
-        self.last_body_height = self.last_body_height.min(target);
     }
+
 
     /// Abandon whatever round is in flight so the next tick starts a fresh one.
     fn restart_round(&mut self) {
@@ -2609,7 +2820,7 @@ impl SyncService {
                     wall_start.elapsed(),
                 );
                 trie_store.flush();
-                let _ = self.manager.store.set_exec_head(hash, result.state_root_hash);
+                record_execution(&self.manager.store, hash, result.state_root_hash);
                 info!(
                     target: "rustock::sync",
                     "Executed block #{}, state root: {:?}",
@@ -2777,7 +2988,7 @@ fn process_downloaded_blocks(
                 if blocks_since_flush >= 100 {
                     trie_store.flush();
                     blocks_since_flush = 0;
-                    let _ = store.set_exec_head(*hash, result.state_root_hash);
+                    record_execution(store, *hash, result.state_root_hash);
                 }
                 if processed.is_multiple_of(100) {
                     debug!(
@@ -2810,7 +3021,7 @@ fn process_downloaded_blocks(
         trie_store.flush();
         blocks_since_flush = 0;
         if let Some((hash, root_hash)) = last_executed {
-            let _ = store.set_exec_head(hash, root_hash);
+            record_execution(store, hash, root_hash);
         }
         info!(
             target: "rustock::sync",

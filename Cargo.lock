@@ -3353,6 +3353,7 @@ dependencies = [
  "rustock-trie",
  "sha3",
  "tempfile",
+ "thiserror",
  "tracing",
 ]
 
