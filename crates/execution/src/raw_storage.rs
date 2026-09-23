@@ -33,6 +33,12 @@ pub type RawWrite = (Address, U256, Option<Vec<u8>>);
 #[derive(Default)]
 pub struct RskChainExt {
     pub raw_storage: RawStorage,
+    /// Node-wide cache of BTC stored blocks, shared across blocks.
+    ///
+    /// `RskChainExt` is rebuilt for every block, so this has to be handed in
+    /// from outside to survive; `None` disables caching entirely, which is
+    /// what tests and one-shot tools use.
+    pub btc_block_cache: Option<Arc<crate::bridge::btc_block_cache::BtcBlockCache>>,
 }
 
 /// Raw-bytes storage overlay for the block being executed.
@@ -57,11 +63,32 @@ impl RawStorage {
     /// Read the raw bytes at `(addr, key)`: pending call writes first, then
     /// writes committed earlier in the block, then the parent trie.
     pub fn get(&self, addr: Address, key: U256) -> Option<Vec<u8>> {
+        match self.get_overlay(addr, key) {
+            Some(v) => v,
+            None => self.get_from_trie(addr, key),
+        }
+    }
+
+    /// Only this block's own writes: `Some(v)` when the overlay has an entry
+    /// for the key (`v` is `None` for a delete), `None` when it does not.
+    ///
+    /// Split out from [`RawStorage::get`] so a caller that caches trie reads
+    /// can keep the two layers in the right order. A cache must never be
+    /// consulted ahead of the overlay: the overlay is what this block has
+    /// written and has not yet committed, and it always wins.
+    pub fn get_overlay(&self, addr: Address, key: U256) -> Option<Option<Vec<u8>>> {
         for (a, k, v) in self.pending.iter().rev().chain(self.committed.iter().rev()) {
             if *a == addr && *k == key {
-                return v.clone();
+                return Some(v.clone());
             }
         }
+        None
+    }
+
+    /// Only the parent block's committed state. This is the read a cache may
+    /// stand in front of, because what it returns is fixed for the life of the
+    /// entry it reads.
+    pub fn get_from_trie(&self, addr: Address, key: U256) -> Option<Vec<u8>> {
         let (store, root) = self.reader.as_ref()?;
         let trie_key = storage_key(&addr, &B256::from(key));
         root.get(&TrieKeySlice::from_key(&trie_key), store.as_ref())

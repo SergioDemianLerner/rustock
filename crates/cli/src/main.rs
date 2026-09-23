@@ -485,6 +485,18 @@ struct Args {
     #[arg(long, default_value_t = 4_000)]
     gc_burial: u64,
 
+    /// Entries in the BTC stored-block cache, or 0 to disable it.
+    ///
+    /// Answering "which BTC block is at height H?" costs one trie read per
+    /// block of depth whenever the RSKIP199 height index cannot answer, so a
+    /// deep query walks thousands of nodes. The cache holds blocks the node
+    /// has already read for consensus; it never pre-loads and never records an
+    /// absence, so it changes latency and nothing else.
+    ///
+    /// About 200 bytes per entry -- ~2 MB at the default.
+    #[arg(long, default_value_t = 10_000)]
+    btc_block_cache_entries: usize,
+
     /// Serve the `mnr_*` merged-mining JSON-RPC namespace, so mining software
     /// can ask this node for work and submit Bitcoin solutions back.
     ///
@@ -617,6 +629,12 @@ fn apply_file_config(
         &mut a.inbound_cidr_prefix);
 
     apply(matches, "trie_backend", f.trie.backend.as_ref(), &mut a.trie_backend);
+    apply(
+        matches,
+        "btc_block_cache_entries",
+        f.trie.btc_block_cache_entries.as_ref(),
+        &mut a.btc_block_cache_entries,
+    );
     apply_opt(matches, "trie_dir", f.trie.dir.as_ref(), &mut a.trie_dir);
     apply_opt(matches, "trie_node", f.trie.node.as_ref(), &mut a.trie_node);
 
@@ -1180,10 +1198,28 @@ async fn main() -> Result<()> {
     }
 
     let hardfork_cfg = rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
-    let block_processor = rustock_execution::BlockProcessor::new(
+    let btc_block_cache = if args.btc_block_cache_entries > 0 {
+        let cache = Arc::new(rustock_execution::BtcBlockCache::new(
+            args.btc_block_cache_entries,
+        ));
+        info!(
+            "BTC block cache: {} entries (~{} MB at full occupancy), demand-populated",
+            args.btc_block_cache_entries,
+            args.btc_block_cache_entries * 200 / (1024 * 1024)
+        );
+        Some(cache)
+    } else {
+        info!("BTC block cache disabled");
+        None
+    };
+
+    let mut block_processor = rustock_execution::BlockProcessor::new(
         hardfork_cfg.clone(),
         store.clone(),
     );
+    if let Some(cache) = &btc_block_cache {
+        block_processor = block_processor.with_btc_block_cache(cache.clone());
+    }
     info!("Block processor wired (hardfork config: {:?})", hardfork_cfg);
 
     let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
@@ -1262,6 +1298,7 @@ async fn main() -> Result<()> {
     // seconds, so an empty window is itself worth noticing.
     {
         let activity = sync_service.chain_activity();
+        let cache_for_report = btc_block_cache.clone();
         tokio::spawn(async move {
             const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
             let mut ticker = tokio::time::interval(REPORT_EVERY);
@@ -1298,6 +1335,27 @@ async fn main() -> Result<()> {
                     a.cpu_nanos_per_gas(),
                     a.wall_nanos_per_gas(),
                 );
+
+                // Reported alongside the chain numbers so the cache's value is
+                // visible next to the cost it is meant to reduce. A hit rate
+                // that stays at zero means the workload never repeats a BTC
+                // lookup, and the memory is being spent for nothing.
+                if let Some(cache) = &cache_for_report {
+                    let s = cache.stats.snapshot();
+                    if s.lookups() > 0 {
+                        tracing::info!(
+                            target: "rustock::sync",
+                            "BTC block cache: {}/{} entries (~{} KB), {:.1}% hit rate                              ({} hits, {} misses, {} evictions)",
+                            cache.len(),
+                            cache.capacity(),
+                            cache.approx_bytes() / 1024,
+                            s.hit_rate().unwrap_or(0.0),
+                            s.hits,
+                            s.misses,
+                            s.evictions,
+                        );
+                    }
+                }
             }
         });
     }

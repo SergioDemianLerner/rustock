@@ -41,6 +41,13 @@ backend = "epoch"                  # epoch | single
 # dir = "/var/lib/rustock/trie-epochs"
 # node = "…"                       # diagnostic: start from this state root
 
+# BTC stored-block cache. Answering "which BTC block is at height H?" costs one
+# trie read per block of depth whenever the RSKIP199 height index cannot answer.
+# The cache holds blocks already read for consensus -- it never pre-loads and
+# never records an absence -- so it changes latency and nothing else.
+# ~200 bytes per entry; 0 disables.
+btc_block_cache_entries = 10000
+
 # Trie garbage collection. `burial` must exceed the deepest reorg worth
 # surviving: collecting against a root that is later reorganised away discards
 # state the chain needs to rebuild.

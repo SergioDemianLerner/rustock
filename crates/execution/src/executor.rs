@@ -53,9 +53,34 @@ pub struct RskExecutor {
     /// RSK addresses allowed to send free bridge txs (genesis federation +
     /// authorizers), derived from the bridge constants' public keys.
     free_bridge_senders: Vec<Address>,
+    /// Node-wide cache of BTC stored blocks, shared across every block this
+    /// executor runs. `None` disables it, which is the default so that tools
+    /// and tests get unchanged behaviour without opting out.
+    btc_block_cache: Option<Arc<crate::bridge::btc_block_cache::BtcBlockCache>>,
 }
 
 impl RskExecutor {
+    /// Share a BTC stored-block cache across every block this executor runs.
+    ///
+    /// Off unless a caller asks for it. The cache changes latency only: it is
+    /// populated solely from reads consensus already performed, and it holds no
+    /// negative entries, so a node with it and a node without it read the same
+    /// trie nodes and reach the same answers.
+    pub fn with_btc_block_cache(
+        mut self,
+        cache: Arc<crate::bridge::btc_block_cache::BtcBlockCache>,
+    ) -> Self {
+        self.btc_block_cache = Some(cache);
+        self
+    }
+
+    /// The cache in use, if any -- for the periodic report.
+    pub fn btc_block_cache(
+        &self,
+    ) -> Option<&Arc<crate::bridge::btc_block_cache::BtcBlockCache>> {
+        self.btc_block_cache.as_ref()
+    }
+
     pub fn new(hardfork_cfg: RskHardforkConfig, block_store: Arc<BlockStore>) -> Self {
         let remasc_config = crate::remasc::RemascConfig::mainnet();
         let bridge_constants = match hardfork_cfg.chain_id {
@@ -69,7 +94,14 @@ impl RskExecutor {
             .chain(bridge_constants.authorized_free_tx_keys.iter())
             .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
             .collect();
-        Self { hardfork_cfg, block_store, remasc_config, bridge_constants, free_bridge_senders }
+        Self {
+            hardfork_cfg,
+            block_store,
+            remasc_config,
+            bridge_constants,
+            free_bridge_senders,
+            btc_block_cache: None,
+        }
     }
 
     pub fn with_remasc_config(mut self, config: crate::remasc::RemascConfig) -> Self {
@@ -145,6 +177,7 @@ impl RskExecutor {
 
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
         chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
+        chain_ext.btc_block_cache = self.btc_block_cache.clone();
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
@@ -279,6 +312,7 @@ impl RskExecutor {
 
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
         chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
+        chain_ext.btc_block_cache = self.btc_block_cache.clone();
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)

@@ -135,6 +135,30 @@ impl BlockProcessor {
         }
     }
 
+    /// Share a BTC stored-block cache across every block this processor runs.
+    ///
+    /// Latency only: the cache is filled solely from reads consensus already
+    /// performed and holds no negative entries, so a node with it and a node
+    /// without it read the same trie nodes and reach the same answers.
+    pub fn with_btc_block_cache(
+        mut self,
+        cache: std::sync::Arc<crate::bridge::btc_block_cache::BtcBlockCache>,
+    ) -> Self {
+        self.executor = std::mem::replace(
+            &mut self.executor,
+            RskExecutor::new(self.hardfork_cfg.clone(), self.block_store.clone()),
+        )
+        .with_btc_block_cache(cache);
+        self
+    }
+
+    /// The BTC block cache in use, if any.
+    pub fn btc_block_cache(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::bridge::btc_block_cache::BtcBlockCache>> {
+        self.executor.btc_block_cache()
+    }
+
     /// Enable the RSKIP110 fork-detection check (off by default: it costs 449
     /// ancestor header reads per block).
     pub fn with_fork_detection_validation(mut self, enabled: bool) -> Self {
