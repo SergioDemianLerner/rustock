@@ -3969,3 +3969,154 @@ async fn the_immediate_repair_never_adopts_a_block_we_do_not_hold() {
 
     assert_eq!(store.head().unwrap(), Some(top.hash()), "adopted a block we do not hold");
 }
+
+/// Mainnet, 2026-09-23 03:34.
+///
+/// A reorg orphaned the executed head. The rollback targeted the orphan's own
+/// **parent**, which is on the branch being abandoned and therefore not
+/// canonical either — so `Transition::Executed` refused the write (correctly),
+/// the caller gave up, and the executed head stayed on the orphan. I5 broke
+/// within a minute, I7 half an hour later once that branch's state root was no
+/// longer in the trie, and the node could not execute another block.
+///
+/// The guard was right. The target was wrong. Rollback must land on the
+/// canonical chain.
+#[tokio::test]
+async fn rolling_execution_back_lands_on_the_canonical_chain_not_the_orphans_parent() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    // Canonical branch: a1, a2 — each with its own state root.
+    let mut a1 = dummy_header(1, genesis.hash(), U256::from(2));
+    a1.state_root = B256::repeat_byte(0xA1);
+    let mut a2 = dummy_header(2, a1.hash(), U256::from(3));
+    a2.state_root = B256::repeat_byte(0xA2);
+
+    // Abandoned branch: b1, b2 — b1 is NOT canonical, which is the whole point.
+    let mut b1 = dummy_header(1, genesis.hash(), U256::from(2));
+    b1.extra_data = vec![0xBB].into();
+    b1.state_root = B256::repeat_byte(0xB1);
+    let mut b2 = dummy_header(2, b1.hash(), U256::from(3));
+    b2.extra_data = vec![0xBB].into();
+    b2.state_root = B256::repeat_byte(0xB2);
+
+    for h in [&a1, &a2, &b1, &b2] {
+        store.put_header(h).unwrap();
+    }
+    store.put_canonical_hash(1, a1.hash()).unwrap();
+    store.put_canonical_hash(2, a2.hash()).unwrap();
+    store.set_head(a2.hash()).unwrap();
+
+    // Execution stranded on the abandoned branch.
+    store.set_exec_head(b2.hash(), b2.state_root).unwrap();
+
+    // The trie holds the canonical state, and deliberately NOT b1's — so a
+    // rollback onto the orphan's parent could not succeed even if it were
+    // allowed.
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(a1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+    trie.put(genesis.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+
+    assert!(
+        service.roll_execution_back(1),
+        "rollback gave up; execution is left stranded on the abandoned branch"
+    );
+
+    let (exec_hash, exec_root) = store.exec_head().unwrap().unwrap();
+    assert_eq!(exec_hash, a1.hash(), "rolled back onto the wrong branch");
+    assert_eq!(exec_root, a1.state_root);
+    assert_eq!(
+        crate::invariant::check(&store, None, crate::Scope::Full),
+        Ok(()),
+        "the store is incoherent after the rollback"
+    );
+}
+
+/// A rollback must not land on a canonical block whose state we no longer
+/// hold: that is I7, and the node would fail on its next execution instead of
+/// at the moment the decision was made.
+#[tokio::test]
+async fn rolling_execution_back_skips_heights_whose_state_is_gone() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let mut chain = vec![genesis.clone()];
+    for n in 1..=5u64 {
+        let mut h = dummy_header(n, chain[(n - 1) as usize].hash(), U256::from(n + 1));
+        h.state_root = B256::repeat_byte(n as u8);
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        chain.push(h);
+    }
+    store.set_exec_head(chain[5].hash(), chain[5].state_root).unwrap();
+
+    // Only #2's state survives; #3, #4 and #5 have been collected.
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(chain[2].state_root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+
+    assert!(service.roll_execution_back(4), "rollback gave up with a usable state at #2");
+
+    let (exec_hash, _) = store.exec_head().unwrap().unwrap();
+    assert_eq!(exec_hash, chain[2].hash(), "landed on a height whose state is missing");
+}
+
+/// With no usable state anywhere in range, the rollback must say so rather
+/// than leave execution somewhere it cannot continue from.
+#[tokio::test]
+async fn rolling_execution_back_reports_when_no_state_survives() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let mut h = dummy_header(1, genesis.hash(), U256::from(2));
+    h.state_root = B256::repeat_byte(0x11);
+    store.update_head(&h, U256::from(2)).unwrap();
+    store.set_exec_head(h.hash(), h.state_root).unwrap();
+
+    // An empty trie: nothing is resumable.
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+
+    assert!(!service.roll_execution_back(1), "claimed success with no state to resume from");
+}
