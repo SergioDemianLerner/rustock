@@ -170,6 +170,25 @@ pub fn check_in_transit(
     (total, alert)
 }
 
+/// Whether a periodic in-transit report should be emitted.
+///
+/// Three rules, kept here rather than inline so they can be tested:
+///
+/// * `every_secs == 0` disables the report entirely;
+/// * it fires no more often than `every_secs`;
+/// * **a total of zero is silent.** A line saying "0 BTC" every ten minutes
+///   teaches the reader to skip it, and then the line that matters gets
+///   skipped too.
+pub fn in_transit_report_due(
+    total_sats: u64,
+    since_last: std::time::Duration,
+    every_secs: u64,
+) -> bool {
+    every_secs != 0
+        && total_sats > 0
+        && since_last >= std::time::Duration::from_secs(every_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +273,25 @@ mod tests {
     fn an_unparseable_waiting_transaction_is_skipped_not_fatal() {
         let txs = parse_waiting_txs(vec![vec![0x00, 0x01, 0x02]]);
         assert!(txs.is_empty(), "malformed entry skipped, sweep continues");
+    }
+
+    #[test]
+    fn an_in_transit_report_is_silent_when_nothing_is_in_transit() {
+        let ten_min = std::time::Duration::from_secs(600);
+        assert!(!in_transit_report_due(0, ten_min, 600), "reported a zero total");
+        assert!(in_transit_report_due(1, ten_min, 600), "stayed silent with value in transit");
+    }
+
+    #[test]
+    fn an_in_transit_report_respects_its_interval() {
+        let every = 600;
+        assert!(!in_transit_report_due(btc(5), std::time::Duration::from_secs(599), every));
+        assert!(in_transit_report_due(btc(5), std::time::Duration::from_secs(600), every));
+    }
+
+    #[test]
+    fn an_in_transit_report_interval_of_zero_disables_it() {
+        let a_long_time = std::time::Duration::from_secs(86_400);
+        assert!(!in_transit_report_due(btc(5_000), a_long_time, 0));
     }
 }
