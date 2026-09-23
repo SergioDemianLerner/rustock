@@ -211,9 +211,13 @@ impl Watcher {
             .iter()
             .filter(|(created, _)| number.saturating_sub(*created) < self.cfg.confirmations)
             .count();
+        // Leading label, not a number: every other periodic line in the node
+        // reads "Mempool in the last 5m:", "Chain in the last 5m:", "BTC block
+        // cache:", and a line that starts with its own value cannot be grepped
+        // for without knowing the value first.
         tracing::info!(
             target: "rustock::pegout_alerts",
-            "{} BTC in peg-out transit across {} transaction(s) at #{number} \
+            "Peg-out transit: {} BTC across {} transaction(s) at #{number} \
              ({} waiting, {} confirmations to clear) [{why}]",
             crate::config::sats_to_btc_string(total_sats),
             counted,
