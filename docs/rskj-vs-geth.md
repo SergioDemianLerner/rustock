@@ -186,6 +186,74 @@ Two smaller notes on the same method:
 
 ---
 
+## The `txpool` namespace is rskj's, field for field
+
+`txpool_content`, `txpool_inspect` and `txpool_status` share a grouping
+function, and it differs from go-ethereum's in four ways at once. A client
+written against geth misreads all three methods.
+
+| | go-ethereum | rskj |
+|---|---|---|
+| sender key | `0x` + EIP-55 mixed case | **bare hex, no prefix, lowercase** |
+| value at a nonce | the transaction object | **an array of transactions** |
+| `txpool_status` counts | `hexutil.Uint` — `"0x2"` | **JSON numbers** — `2` |
+| `blockHash` of an unmined tx | `null` | **the 32-byte zero hash** |
+
+**source:** `co/rsk/rpc/modules/txpool/TxPoolModuleImpl.java`
+
+```java
+// the sender key
+senderProps.put(entrySender.getKey().toString(), ...);   // RskAddress.toString() == ByteUtil.toHexString(bytes)
+
+// the value at a nonce
+ArrayNode txsNodes = jsonNodeFactory.arrayNode();
+for (Transaction tx : entryNonce.getValue()) { txsNodes.add(txSerializer.apply(tx)); }
+nonceProps.put(entryNonce.getKey().toString(), txsNodes);
+
+// status
+txProps.put(PENDING, jsonNodeFactory.numberNode(transactionPool.getPendingTransactions().size()));
+```
+
+**Cost of getting it wrong.** The sender key is the worst of the four, because
+it fails *silently and completely*: a consumer looking up `"0xab…"` in a map
+keyed `"ab…"` finds nothing for every sender and concludes the pool is empty.
+This is the same trap as `eth_bridgeState`'s unprefixed hashes — rskj
+distinguishes `toString()` (bare, documented as "a DEBUG representation")
+from `toJsonString()` (prefixed), and the txpool module uses the debug one.
+
+### `value` and `gasPrice` are byte dumps, not quantities
+
+In the same object, `gas` and `nonce` go through `toQuantityJsonHex` and are
+canonical, while `value` and `gasPrice` go through
+`HexUtils.toJsonHex(Coin.getBytes())` — and `Coin.getBytes()` is
+`BigInteger.toByteArray()`, which is **two's-complement**:
+
+```java
+txNode.put("gas", HexUtils.toQuantityJsonHex(tx.getGasLimitAsInteger()));  // 0x5208
+txNode.put("value", HexUtils.toJsonHex(tx.getValue().getBytes()));         // 0x03e8, and 0x00ff for 255
+```
+
+So a value of 255 renders as `0x00ff`, a value of 1000 as `0x03e8`, and zero
+as `0x00` — the same amounts that `eth_getTransactionByHash` reports as
+`0xff`, `0x3e8` and `0x0`. A strict hex-quantity parser rejects the leading
+zero; a lenient one is fine. And because `toJsonHex` maps an empty array to
+`0x00`, **a contract creation's `to` is the string `0x00`**, not null.
+
+### `txpool_inspect`'s summary string
+
+```java
+String.format("%s: %s wei + %d x %s gas",
+        tx.getReceiveAddress().toString(), tx.getValue().toString(),
+        tx.getGasLimitAsInteger(), tx.getGasPrice().toString());
+```
+
+Against geth's `"%s: %v wei + %v gas × %v wei"`: a plain ASCII `x` rather than
+`×`, the gas limit and gas price in the opposite order, and the word `gas`
+last. The address is bare hex, so a contract creation's summary begins with
+`": "`. Consumers parse this string, so the difference is not cosmetic.
+
+---
+
 ## How to add an entry
 
 When implementing anything against rskj, if the Java does not match what the

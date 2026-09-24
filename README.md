@@ -174,7 +174,12 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
 
 **Pool:**
 
-- `txpool_status`
+- `txpool_status`, `txpool_content`, `txpool_inspect`
+
+  These follow rskj's `TxPoolModuleImpl`, not go-ethereum's txpool namespace:
+  sender keys are bare hex with no `0x`, each nonce maps to an *array* of
+  transactions, and `txpool_status` counts are JSON numbers rather than hex
+  strings. See [docs/rskj-vs-geth.md](docs/rskj-vs-geth.md).
 
 **Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), and the `debug_*`, `trace_*`, `personal_*`, `evm_*`, `mnr_*`, `db_*`, `sco_*` namespaces.
 

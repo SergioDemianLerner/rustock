@@ -454,7 +454,7 @@ async fn test_unsupported_personal_method() {
 }
 
 #[tokio::test]
-async fn test_unsupported_txpool_method() {
+async fn test_txpool_status_without_a_pool_is_unavailable() {
     let (state, _tmp) = setup_state();
     let req = make_request("txpool_status", json!([]));
     let resp = dispatch_for_test(&state, req).await;
@@ -1931,6 +1931,12 @@ impl crate::server::TxPoolReader for OnePendingTx {
     fn pool_status(&self) -> (usize, usize) {
         (1, 0)
     }
+    fn pool_content(&self) -> crate::server::PoolContent {
+        crate::server::PoolContent {
+            pending: vec![(self.sender, vec![(self.tx.nonce, self.tx.clone())])],
+            queued: Vec::new(),
+        }
+    }
 }
 
 fn setup_state_with_pending_tx() -> (RpcState, B256, tempfile::TempDir) {
@@ -2704,4 +2710,313 @@ async fn test_block_size_counts_the_whole_block_not_just_the_header() {
         "size {size} must include the 500-byte payload on top of the {}-byte header",
         header_rlp.len()
     );
+}
+
+// ========== txpool_content / txpool_inspect / txpool_status ==========
+//
+// Every expected string here was read off rskj's `TxPoolModuleImpl` at the
+// revision pinned in docs/rskj-reference.md. The formats are deliberately
+// asserted literally: the ways this method differs from go-ethereum are all
+// formatting, so a test that merely checked structure would pass against the
+// wrong output.
+
+/// A pool with whatever contents a test needs.
+struct PoolDouble {
+    pending: Vec<(alloy_primitives::Address, Vec<(u64, rustock_core::Transaction)>)>,
+    queued: Vec<(alloy_primitives::Address, Vec<(u64, rustock_core::Transaction)>)>,
+}
+
+impl crate::server::TxPoolReader for PoolDouble {
+    fn get_pending_tx(
+        &self,
+        _hash: &B256,
+    ) -> Option<(rustock_core::Transaction, alloy_primitives::Address, B256)> {
+        None
+    }
+    fn pending_nonce(&self, _addr: &alloy_primitives::Address) -> Option<u64> {
+        None
+    }
+    fn pool_status(&self) -> (usize, usize) {
+        let count = |g: &Vec<(alloy_primitives::Address, Vec<(u64, rustock_core::Transaction)>)>| {
+            g.iter().map(|(_, txs)| txs.len()).sum::<usize>()
+        };
+        (count(&self.pending), count(&self.queued))
+    }
+    fn pool_content(&self) -> crate::server::PoolContent {
+        crate::server::PoolContent {
+            pending: self.pending.clone(),
+            queued: self.queued.clone(),
+        }
+    }
+}
+
+fn pool_tx(nonce: u64, to: Vec<u8>, value: U256, gas_price: U256) -> rustock_core::Transaction {
+    rustock_core::Transaction {
+        nonce,
+        gas_price,
+        gas_limit: U256::from(21_000),
+        to: alloy_primitives::Bytes::from(to),
+        value,
+        input: alloy_primitives::Bytes::new(),
+        v: 27,
+        r: U256::from(1u64),
+        s: U256::from(2u64),
+        cached_rlp: None,
+    }
+}
+
+fn state_with_pool(pool: PoolDouble) -> (RpcState, tempfile::TempDir) {
+    let (mut state, tmp) = setup_state();
+    state.tx_pool = Some(Arc::new(pool));
+    (state, tmp)
+}
+
+#[tokio::test]
+async fn test_txpool_content_groups_by_sender_then_nonce() {
+    let alice = alloy_primitives::Address::repeat_byte(0xa1);
+    let bob = alloy_primitives::Address::repeat_byte(0xb2);
+    let (state, _tmp) = state_with_pool(PoolDouble {
+        pending: vec![
+            (
+                alice,
+                vec![
+                    (5, pool_tx(5, vec![0x11; 20], U256::from(1), U256::from(1))),
+                    (6, pool_tx(6, vec![0x11; 20], U256::from(2), U256::from(1))),
+                ],
+            ),
+            (bob, vec![(0, pool_tx(0, vec![0x22; 20], U256::from(3), U256::from(1)))]),
+        ],
+        queued: vec![(alice, vec![(9, pool_tx(9, vec![0x11; 20], U256::from(4), U256::from(1)))])],
+    });
+
+    let result = dispatch_for_test(&state, make_request("txpool_content", json!([])))
+        .await
+        .result
+        .unwrap();
+
+    // Sender keys are bare hex: rskj uses RskAddress.toString(), not toJsonString().
+    let alice_key = "a1".repeat(20);
+    let bob_key = "b2".repeat(20);
+    assert!(
+        result["pending"].get(&alice_key).is_some(),
+        "sender keys must be bare hex with no 0x prefix, got {:?}",
+        result["pending"].as_object().unwrap().keys().collect::<Vec<_>>()
+    );
+    assert!(result["pending"].get(format!("0x{alice_key}")).is_none());
+
+    // Nonce keys are decimal, and each maps to an ARRAY.
+    let alice_pending = &result["pending"][&alice_key];
+    assert_eq!(
+        alice_pending.as_object().unwrap().keys().collect::<Vec<_>>(),
+        vec!["5", "6"],
+        "nonce keys are decimal"
+    );
+    assert!(alice_pending["5"].is_array(), "rskj emits an ArrayNode per nonce");
+    assert_eq!(alice_pending["5"].as_array().unwrap().len(), 1);
+    assert_eq!(alice_pending["5"][0]["nonce"], json!("0x5"));
+
+    assert_eq!(result["pending"][&bob_key]["0"][0]["nonce"], json!("0x0"));
+    assert_eq!(
+        result["queued"][&alice_key]["9"][0]["nonce"],
+        json!("0x9"),
+        "a nonce gap belongs under queued"
+    );
+    assert!(result["queued"].get(&bob_key).is_none());
+}
+
+#[tokio::test]
+async fn test_txpool_content_transaction_fields_match_rskj() {
+    let alice = alloy_primitives::Address::repeat_byte(0xa1);
+    let tx = pool_tx(
+        7,
+        vec![0xcd; 20],
+        U256::from(1_000u64),
+        U256::from(20_000_000_000u64),
+    );
+    let (state, _tmp) = state_with_pool(PoolDouble {
+        pending: vec![(alice, vec![(7, tx.clone())])],
+        queued: vec![],
+    });
+
+    let result = dispatch_for_test(&state, make_request("txpool_content", json!([])))
+        .await
+        .result
+        .unwrap();
+    let node = &result["pending"][&"a1".repeat(20)]["7"][0];
+
+    // rskj writes the ZERO HASH here, not null -- while the two fields beside
+    // it are null. go-ethereum nulls all three.
+    assert_eq!(
+        node["blockHash"],
+        json!("0x0000000000000000000000000000000000000000000000000000000000000000")
+    );
+    assert_eq!(node["blockNumber"], json!(null));
+    assert_eq!(node["transactionIndex"], json!(null));
+
+    assert_eq!(node["from"], json!(format!("0x{}", "a1".repeat(20))));
+    assert_eq!(node["to"], json!(format!("0x{}", "cd".repeat(20))));
+    assert_eq!(node["hash"], json!(format!("{:#x}", tx.tx_hash())));
+    assert_eq!(node["gas"], json!("0x5208"), "gas is a canonical quantity");
+    assert_eq!(node["nonce"], json!("0x7"));
+    assert_eq!(node["input"], json!("0x"), "empty data is 0x, not 0x00");
+    assert_eq!(node["value"], json!("0x03e8"));
+    assert_eq!(node["gasPrice"], json!("0x04a817c800"));
+
+    // No signature or type fields: rskj's fullSerializer writes eleven keys.
+    let keys: Vec<&String> = node.as_object().unwrap().keys().collect();
+    assert_eq!(keys.len(), 11, "unexpected fields: {keys:?}");
+    for absent in ["v", "r", "s", "type", "chainId"] {
+        assert!(node.get(absent).is_none(), "{absent} is a geth field");
+    }
+}
+
+#[tokio::test]
+async fn test_txpool_content_value_is_a_twos_complement_byte_dump() {
+    // rskj renders value and gasPrice with HexUtils.toJsonHex(Coin.getBytes()),
+    // and Coin.getBytes() is BigInteger.toByteArray(). A value whose top bit is
+    // set therefore gains a leading 00 -- it is not a JSON-RPC quantity, even
+    // though `gas` and `nonce` in the same object are.
+    let alice = alloy_primitives::Address::repeat_byte(0xa1);
+    let (state, _tmp) = state_with_pool(PoolDouble {
+        pending: vec![(
+            alice,
+            vec![
+                (0, pool_tx(0, vec![0x11; 20], U256::from(0xffu64), U256::ZERO)),
+                (1, pool_tx(1, vec![0x11; 20], U256::ZERO, U256::from(0x7fu64))),
+            ],
+        )],
+        queued: vec![],
+    });
+
+    let result = dispatch_for_test(&state, make_request("txpool_content", json!([])))
+        .await
+        .result
+        .unwrap();
+    let by_nonce = &result["pending"][&"a1".repeat(20)];
+
+    assert_eq!(by_nonce["0"][0]["value"], json!("0x00ff"), "high bit set");
+    assert_eq!(by_nonce["1"][0]["value"], json!("0x00"), "zero is one 0x00 byte");
+    assert_eq!(by_nonce["1"][0]["gasPrice"], json!("0x7f"), "high bit clear");
+}
+
+#[tokio::test]
+async fn test_txpool_content_contract_creation_has_no_recipient() {
+    // rskj's getReceiveAddress() is the null address for a creation, whose
+    // bytes are empty -- and toJsonHex turns an empty array into "0x00".
+    let alice = alloy_primitives::Address::repeat_byte(0xa1);
+    let (state, _tmp) = state_with_pool(PoolDouble {
+        pending: vec![(alice, vec![(0, pool_tx(0, vec![], U256::from(1), U256::from(1)))])],
+        queued: vec![],
+    });
+
+    let content = dispatch_for_test(&state, make_request("txpool_content", json!([])))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(content["pending"][&"a1".repeat(20)]["0"][0]["to"], json!("0x00"));
+
+    let inspect = dispatch_for_test(&state, make_request("txpool_inspect", json!([])))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(
+        inspect["pending"][&"a1".repeat(20)]["0"][0],
+        json!(": 1 wei + 21000 x 1 gas"),
+        "an empty recipient leaves the summary starting with a colon"
+    );
+}
+
+#[tokio::test]
+async fn test_txpool_inspect_summary_matches_rskj_format() {
+    // String.format("%s: %s wei + %d x %s gas", to, value, gasLimit, gasPrice)
+    //
+    // Not geth's "%s: %v wei + %v gas × %v wei": ASCII x rather than the
+    // multiplication sign, gas limit and price in the other order, and the
+    // word `gas` last. The address is bare hex and all three numbers decimal.
+    let alice = alloy_primitives::Address::repeat_byte(0xa1);
+    let (state, _tmp) = state_with_pool(PoolDouble {
+        pending: vec![(
+            alice,
+            vec![(
+                3,
+                pool_tx(
+                    3,
+                    vec![0xcd; 20],
+                    U256::from(1_000_000_000_000_000_000u64),
+                    U256::from(20_000_000_000u64),
+                ),
+            )],
+        )],
+        queued: vec![],
+    });
+
+    let result = dispatch_for_test(&state, make_request("txpool_inspect", json!([])))
+        .await
+        .result
+        .unwrap();
+
+    assert_eq!(
+        result["pending"][&"a1".repeat(20)]["3"][0],
+        json!(format!(
+            "{}: 1000000000000000000 wei + 21000 x 20000000000 gas",
+            "cd".repeat(20)
+        ))
+    );
+}
+
+#[tokio::test]
+async fn test_txpool_status_is_numbers_and_agrees_with_content() {
+    let alice = alloy_primitives::Address::repeat_byte(0xa1);
+    let bob = alloy_primitives::Address::repeat_byte(0xb2);
+    let (state, _tmp) = state_with_pool(PoolDouble {
+        pending: vec![
+            (alice, vec![(0, pool_tx(0, vec![0x11; 20], U256::from(1), U256::from(1)))]),
+            (bob, vec![(0, pool_tx(0, vec![0x22; 20], U256::from(1), U256::from(1)))]),
+        ],
+        queued: vec![(alice, vec![(4, pool_tx(4, vec![0x11; 20], U256::from(1), U256::from(1)))])],
+    });
+
+    let status = dispatch_for_test(&state, make_request("txpool_status", json!([])))
+        .await
+        .result
+        .unwrap();
+
+    // rskj emits numberNode, go-ethereum emits hexutil.Uint ("0x2").
+    assert_eq!(status["pending"], json!(2));
+    assert_eq!(status["queued"], json!(1));
+    assert!(status["pending"].is_number(), "rskj reports counts as JSON numbers");
+
+    let content = dispatch_for_test(&state, make_request("txpool_content", json!([])))
+        .await
+        .result
+        .unwrap();
+    let total = |side: &Value| -> u64 {
+        side.as_object()
+            .unwrap()
+            .values()
+            .map(|by_nonce| by_nonce.as_object().unwrap().values()
+                .map(|txs| txs.as_array().unwrap().len() as u64).sum::<u64>())
+            .sum()
+    };
+    assert_eq!(total(&content["pending"]), 2, "status and content are the same pool");
+    assert_eq!(total(&content["queued"]), 1);
+}
+
+#[tokio::test]
+async fn test_txpool_empty_pool_returns_empty_objects() {
+    let (state, _tmp) = state_with_pool(PoolDouble { pending: vec![], queued: vec![] });
+
+    for method in ["txpool_content", "txpool_inspect"] {
+        let result = dispatch_for_test(&state, make_request(method, json!([])))
+            .await
+            .result
+            .unwrap();
+        assert_eq!(result, json!({"pending": {}, "queued": {}}), "{method}");
+    }
+
+    let status = dispatch_for_test(&state, make_request("txpool_status", json!([])))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(status, json!({"pending": 0, "queued": 0}));
 }
