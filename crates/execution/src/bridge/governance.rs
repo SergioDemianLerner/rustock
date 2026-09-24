@@ -1244,6 +1244,11 @@ pub fn get_active_federation_creation_block_height<CTX: crate::RskContextTr>(
 /// BTC keys as RLP elements. This is the legacy (pre-RSKIP123) pending
 /// federation format AND the preimage of `PendingFederation.getHash()` at
 /// every era (the hash a commit vote must match).
+pub(crate) fn pending_federation_hash(members: &[StoredMember]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    Keccak256::digest(serialize_pending_federation_btc_keys(members)).into()
+}
+
 fn serialize_pending_federation_btc_keys(members: &[StoredMember]) -> Vec<u8> {
     let mut keys: Vec<[u8; 33]> = members.iter().map(|m| m.btc).collect();
     keys.sort();

@@ -241,6 +241,24 @@ Fix: sort entries by hash160 ascending in both serializers; the Java-HashMap
 bucket-order helpers were removed. (`crates/execution/src/bridge/storage.rs`,
 superseding the approach in commit `a75a432`).
 
+The same `TreeMap` governs the **local-only getters**, with two consequences
+that are the opposite of what the Java types suggest:
+
+* `getLockWhitelistAddress(index)` walks the one-off and unlimited entries
+  *merged* into one map and ordered by hash160 -- not one list after the
+  other, and not an arbitrary hash order. The index order is fully defined.
+* `getLockWhitelistEntryByAddress(address)` **ignores the version byte**. A
+  `TreeMap` looks up with its comparator, and this one compares
+  `getHash160()` alone, so `Address.equals` -- which *does* compare the
+  version -- never runs. A whitelisted P2PKH entry is found by the P2SH
+  rendering of the same hash160. The version is still parsed, because
+  `Address.fromBase58` rejects a header belonging to another network.
+
+(`crates/execution/src/bridge/getters.rs` `merged_whitelist`; tests
+`lock_whitelist_address_walks_hash160_order_and_renders_p2pkh`,
+`lock_whitelist_entry_by_address_matches_on_hash160_alone`,
+`lock_whitelist_order_is_unsigned`.)
+
 ---
 
 ## 17. BlockHeaderContract `getGasLimit` Returns Raw Header Bytes

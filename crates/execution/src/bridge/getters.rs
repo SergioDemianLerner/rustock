@@ -63,87 +63,113 @@ pub fn get_retiring_federation_address<CTX: crate::RskContextTr>(
 }
 
 /// `getFederationSize()` → int256
+///
+/// Reads whichever federation is **active**, not `newFederation`. During a new
+/// federation's activation window the old one is still the active one, and
+/// with nothing stored it is the genesis federation -- reading the storage key
+/// directly answered 0 there, as though the Bridge had no federation at all.
 pub fn get_federation_size<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let fed_data = bridge_load_bytes_named(ctx, NEW_FEDERATION_KEY);
-    if fed_data.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(0)));
-    }
-    let size = decode_federation_size(&fed_data);
-    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(size as i64)))
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let fed = super::peg::active_federation(ctx, config, hardfork_cfg, block_number);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(fed.members.len() as i64)))
 }
 
-/// `getFederationThreshold()` → int256
+/// `getFederationThreshold()` → int256, i.e. the multisig `M`.
 pub fn get_federation_threshold<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let fed_data = bridge_load_bytes_named(ctx, NEW_FEDERATION_KEY);
-    if fed_data.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(0)));
-    }
-    let size = decode_federation_size(&fed_data);
-    let threshold = (size / 2) + 1;
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let fed = super::peg::active_federation(ctx, config, hardfork_cfg, block_number);
+    let threshold = (fed.members.len() / 2) + 1;
     Ok(PrecompileOutput::new(gas_cost, abi_encode_int(threshold as i64)))
 }
 
-/// `getFederationCreationBlockNumber()` → int256
+/// `getFederationCreationBlockNumber()` → int256.
+///
+/// rskj answers with `Federation.getCreationBlockNumber()` -- the block stored
+/// *inside* the federation -- not the `activeFedCreationBlockHeight` cell,
+/// which is RSKIP186's separate record and is absent before it.
 pub fn get_federation_creation_block_number<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let val = bridge_load_u256(ctx, ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY);
-    Ok(PrecompileOutput::new(gas_cost, abi_encode_u256(val)))
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let fed = super::peg::active_federation(ctx, config, hardfork_cfg, block_number);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(fed.creation_block as i64)))
 }
 
-/// `getFederationCreationTime()` → int256
+/// `getFederationCreationTime()` → int256.
+///
+/// **The unit changes at RSKIP419**: milliseconds before, seconds from there
+/// on (`Bridge.getFederationCreationTimeEpochBasedOnActivation`). Storage
+/// always holds milliseconds, so returning the stored number unchanged -- as
+/// this did -- is off by a factor of 1000 for every call after lovell700.
 pub fn get_federation_creation_time<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let fed_data = bridge_load_bytes_named(ctx, NEW_FEDERATION_KEY);
-    if fed_data.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(0)));
-    }
-    let creation_time = decode_federation_creation_time(&fed_data);
-    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(creation_time as i64)))
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let fed = super::peg::active_federation(ctx, config, hardfork_cfg, block_number);
+    let value = creation_time_for_era(fed.creation_time_millis, hardfork_cfg, block_number);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
 }
 
-/// `getFederatorPublicKey(int256 index)` → bytes
+/// `getFederatorPublicKey(int256 index)` → bytes (the BTC key).
+///
+/// An index past the end **reverts**: rskj's `getActiveFederatorBtcPublicKey`
+/// throws `IndexOutOfBoundsException` and the Bridge turns that into a
+/// `VMException`. Returning empty bytes instead made an out-of-range index
+/// look like a federator with no key.
 pub fn get_federator_public_key<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if args.len() < 32 {
         return Err(PrecompileError::other("getFederatorPublicKey: args too short"));
     }
-    let _index = U256::from_be_slice(&args[..32]).to::<usize>();
-
-    let fed_data = bridge_load_bytes_named(ctx, NEW_FEDERATION_KEY);
-    if fed_data.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
-
-    let keys = decode_federation_keys(&fed_data);
-    if _index < keys.len() {
-        let output = abi_encode_bytes(&keys[_index]);
-        Ok(PrecompileOutput::new(gas_cost, output.into()))
-    } else {
-        Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
-    }
+    let index: usize = U256::from_be_slice(&args[..32])
+        .try_into()
+        .map_err(|_| PrecompileError::other("getFederatorPublicKey: index out of range"))?;
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let fed = super::peg::active_federation(ctx, config, hardfork_cfg, block_number);
+    let key = member_key_at(&fed.members, index, KeyType::Btc, "Federator")?;
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&key).into()))
 }
 
 /// `getFederatorPublicKeyOfType(int256 index, string keyType)` → bytes
+///
+/// This used to delegate to `getFederatorPublicKey`, i.e. answer with the BTC
+/// key whatever was asked. Post-RSKIP123 federations carry three distinct keys
+/// per member, and the RSK key is the one that identifies a federator's RSK
+/// address -- returning the BTC key for `"rsk"` gives a different address, so
+/// a caller checking who signed would have compared against the wrong one.
 pub fn get_federator_public_key_of_type<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // Simplified: delegates to get_federator_public_key (BTC key)
-    get_federator_public_key(ctx, args, gas_cost)
+    let (index, key_type) = decode_index_and_key_type(args)?;
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let fed = super::peg::active_federation(ctx, config, hardfork_cfg, block_number);
+    let key = member_key_at(&fed.members, index, key_type, "Federator")?;
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&key).into()))
 }
 
 /// `getFeePerKb()` → int256
@@ -178,31 +204,36 @@ pub fn get_minimum_lock_tx_value(
     Ok(PrecompileOutput::new(gas_cost, abi_encode_u256(wei)))
 }
 
-/// `getRetiringFederationSize()` → int256
+/// `getRetiringFederationSize()` → int256, `-1` when there is none.
+///
+/// "There is a retiring federation" is not "oldFederation is stored": rskj
+/// also requires the new federation to have reached its activation age. During
+/// the window the old federation sits in storage and is still the *active*
+/// one, and rskj reports no retiring federation -- which is what
+/// `peg::retiring_federation` encodes.
 pub fn get_retiring_federation_size<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let fed_data = bridge_load_bytes_named(ctx, OLD_FEDERATION_KEY);
-    if fed_data.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(-1)));
-    }
-    let size = decode_federation_size(&fed_data);
-    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(size as i64)))
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let value = super::peg::retiring_federation(ctx, config, hardfork_cfg, block_number)
+        .map_or(FEDERATION_NON_EXISTENT, |fed| fed.members.len() as i64);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
 }
 
-/// `getRetiringFederationThreshold()` → int256
+/// `getRetiringFederationThreshold()` → int256, `-1` when there is none.
 pub fn get_retiring_federation_threshold<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let fed_data = bridge_load_bytes_named(ctx, OLD_FEDERATION_KEY);
-    if fed_data.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(-1)));
-    }
-    let size = decode_federation_size(&fed_data);
-    let threshold = (size / 2) + 1;
-    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(threshold as i64)))
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let value = super::peg::retiring_federation(ctx, config, hardfork_cfg, block_number)
+        .map_or(FEDERATION_NON_EXISTENT, |fed| (fed.members.len() / 2 + 1) as i64);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
 }
 
 /// `getPendingFederationSize()` → int256
@@ -212,7 +243,7 @@ pub fn get_pending_federation_size<CTX: crate::RskContextTr>(
 ) -> Result<PrecompileOutput, PrecompileError> {
     let fed_data = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
     if fed_data.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(-1)));
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(FEDERATION_NON_EXISTENT)));
     }
     // The pending federation is a flat member list (legacy keys or multikey
     // member lists), unlike the Federation format.
@@ -259,6 +290,535 @@ pub fn is_btc_tx_hash_already_processed<CTX: crate::RskContextTr>(
     hash_internal.reverse();
     let processed = super::tx::is_btc_tx_processed(ctx, &hash_internal);
     Ok(PrecompileOutput::new(gas_cost, abi_encode_bool(processed)))
+}
+
+// ---------------------------------------------------------------------------
+// Lock whitelist
+// ---------------------------------------------------------------------------
+//
+// rskj's `LockWhitelist` is a **`TreeMap` ordered by hash160**, not a HashMap:
+//
+// ```java
+// private static final Comparator<Address> LEXICOGRAPHICAL_COMPARATOR
+//     = Comparator.comparing(Address::getHash160, UnsignedBytes.lexicographicalComparator());
+// private SortedMap<Address, LockWhitelistEntry> whitelistedAddresses;
+// ```
+//
+// Two things follow, and both are the opposite of what the types suggest:
+//
+// * **The index order is defined**, and it is the one-off and unlimited
+//   entries *merged* and sorted by hash160 ascending -- not one list after the
+//   other, and not an arbitrary hash order.
+// * **Lookup ignores the version byte.** A `TreeMap` searches with its
+//   comparator, and this one compares `getHash160()` alone, so `Address.equals`
+//   -- which does compare the version -- never runs. The same hash160
+//   presented as a P2SH address finds a whitelisted P2PKH entry.
+//
+// (See docs/quirks-java-artifacts.md §11b, where the same TreeMap ordering
+// was found from the *serialized* whitelist cells at mainnet #1,590,999.)
+
+/// `getLockWhitelistSize()` → int256, one-off plus unlimited entries.
+pub fn get_lock_whitelist_size<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let entries = merged_whitelist(ctx);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(entries.len() as i64)))
+}
+
+/// `getLockWhitelistAddress(int256 index)` → string, `""` when out of range.
+///
+/// The index walks the merged whitelist in hash160 order (see above). The
+/// address is rendered **P2PKH**, because that is how rskj reconstructs it
+/// from the stored hash160 (`new Address(parameters, hash160)`) -- so a P2SH
+/// address that was whitelisted comes back as a different string than the one
+/// that was added.
+pub fn get_lock_whitelist_address<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    gas_cost: u64,
+    config: &BridgeConstants,
+) -> Result<PrecompileOutput, PrecompileError> {
+    if args.len() < 32 {
+        return Err(PrecompileError::other("getLockWhitelistAddress: args too short"));
+    }
+    let index = U256::from_be_slice(&args[..32]);
+    let entries = merged_whitelist(ctx);
+
+    let address = match index.try_into().ok().and_then(|i: usize| entries.get(i)) {
+        // rskj: "Empty string is returned when address is not found".
+        None => String::new(),
+        Some((hash160, _)) => p2pkh_base58_address(hash160, config),
+    };
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_string(&address).into()))
+}
+
+/// `getLockWhitelistEntryByAddress(string address)` → int256.
+///
+/// rskj's `WhitelistResponseCode`: the one-off entry's `maxTransferValue` in
+/// satoshis, `0` (UNLIMITED_MODE) for an unlimited entry, `-1`
+/// (ADDRESS_NOT_EXIST) when the address is not whitelisted **or does not
+/// parse**. `-2` (INVALID_ADDRESS_FORMAT) is unreachable in rskj: it is
+/// returned only if `(String) args[0]` fails to cast, and by then the ABI
+/// decoder has already produced a String or thrown.
+///
+/// A parse failure answering with the same `-1` as "not whitelisted" is rskj's
+/// behaviour, not a simplification: `WhitelistSupportImpl` catches
+/// `AddressFormatException` and returns `Optional.empty()`, which the Bridge
+/// maps to ADDRESS_NOT_EXIST. What *does* fail to parse is an address whose
+/// version byte belongs to another network -- bitcoinj's `Address.fromBase58`
+/// accepts only this network's P2PKH and P2SH headers.
+pub fn get_lock_whitelist_entry_by_address<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    gas_cost: u64,
+    config: &BridgeConstants,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let Some(addr_str) = abi_decode_string(args, 0) else {
+        return Err(PrecompileError::other(
+            "getLockWhitelistEntryByAddress: malformed string argument",
+        ));
+    };
+
+    let Some(hash160) = parse_network_address_hash160(&addr_str, config) else {
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(ADDRESS_NOT_EXIST)));
+    };
+
+    let value = merged_whitelist(ctx)
+        .into_iter()
+        .find(|(h, _)| *h == hash160)
+        .map_or(ADDRESS_NOT_EXIST, |(_, cap)| match cap {
+            // rskj returns UNLIMITED_MODE for an UnlimitedWhiteListEntry and
+            // the cap for a OneOffWhiteListEntry.
+            None => UNLIMITED_MODE,
+            Some(satoshis) => satoshis as i64,
+        });
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
+}
+
+/// The whitelist as rskj's `LockWhitelist` holds it: one-off and unlimited
+/// entries in one map, ordered by hash160 ascending. `None` marks an unlimited
+/// entry, `Some(cap)` a one-off entry's `maxTransferValue`.
+fn merged_whitelist<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<([u8; 20], Option<u64>)> {
+    let mut entries: Vec<([u8; 20], Option<u64>)> = load_one_off_whitelist(ctx)
+        .0
+        .into_iter()
+        .map(|(hash160, cap)| (hash160, Some(cap)))
+        .collect();
+    entries.extend(load_unlimited_whitelist(ctx).into_iter().map(|h| (h, None)));
+    // `UnsignedBytes.lexicographicalComparator()` over the 20-byte hash160.
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+/// Base58Check P2PKH address for a hash160 (bitcoinj
+/// `new Address(parameters, hash160).toBase58()`; mainnet version 0x00,
+/// testnet/regtest 0x6f).
+fn p2pkh_base58_address(hash160: &[u8; 20], config: &BridgeConstants) -> String {
+    let mut payload = [0u8; 21];
+    payload[0] = p2pkh_version(config);
+    payload[1..].copy_from_slice(hash160);
+    bitcoin::base58::encode_check(&payload)
+}
+
+fn p2pkh_version(config: &BridgeConstants) -> u8 {
+    match config.btc_network {
+        super::constants::BtcNetwork::Mainnet => 0,
+        _ => 111,
+    }
+}
+
+fn p2sh_version(config: &BridgeConstants) -> u8 {
+    match config.btc_network {
+        super::constants::BtcNetwork::Mainnet => 5,
+        _ => 196,
+    }
+}
+
+/// The hash160 of a Base58Check address that bitcoinj's
+/// `Address.fromBase58(params, s)` would accept for this network: either
+/// version header, P2PKH or P2SH. Anything else throws `WrongNetworkException`.
+///
+/// The version is checked but then discarded, because the whitelist's TreeMap
+/// comparator looks at the hash160 alone.
+fn parse_network_address_hash160(addr: &str, config: &BridgeConstants) -> Option<[u8; 20]> {
+    let decoded = bitcoin::base58::decode_check(addr).ok()?;
+    if decoded.len() != 21 {
+        return None;
+    }
+    if decoded[0] != p2pkh_version(config) && decoded[0] != p2sh_version(config) {
+        return None;
+    }
+    decoded[1..21].try_into().ok()
+}
+
+/// rskj `WhitelistResponseCode.ADDRESS_NOT_EXIST`.
+const ADDRESS_NOT_EXIST: i64 = -1;
+/// rskj `WhitelistResponseCode.UNLIMITED_MODE`.
+const UNLIMITED_MODE: i64 = 0;
+/// rskj `FederationChangeResponseCode.FEDERATION_NON_EXISTENT`.
+const FEDERATION_NON_EXISTENT: i64 = -1;
+
+// ---------------------------------------------------------------------------
+// Federator public keys, by key type
+// ---------------------------------------------------------------------------
+
+/// rskj `FederationMember.KeyType`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KeyType {
+    Btc,
+    Rsk,
+    Mst,
+}
+
+/// rskj `FederationMember.KeyType.byValue`, which throws on anything else --
+/// and the Bridge turns that throw into a `VMException`, i.e. the call
+/// reverts. It does not fall back to the BTC key.
+fn parse_key_type(value: &str) -> Option<KeyType> {
+    match value {
+        "btc" => Some(KeyType::Btc),
+        "rsk" => Some(KeyType::Rsk),
+        "mst" => Some(KeyType::Mst),
+        _ => None,
+    }
+}
+
+fn member_key(member: &super::federation::StoredMember, key_type: KeyType) -> [u8; 33] {
+    match key_type {
+        KeyType::Btc => member.btc,
+        KeyType::Rsk => member.rsk,
+        KeyType::Mst => member.mst,
+    }
+}
+
+/// The `(index, keyType)` pair the `*PublicKeyOfType` methods take.
+fn decode_index_and_key_type(args: &[u8]) -> Result<(usize, KeyType), PrecompileError> {
+    if args.len() < 64 {
+        return Err(PrecompileError::other("PublicKeyOfType: args too short"));
+    }
+    let index = U256::from_be_slice(&args[..32])
+        .try_into()
+        .map_err(|_| PrecompileError::other("PublicKeyOfType: index out of range"))?;
+    let key_type = abi_decode_string(args, 1)
+        .as_deref()
+        .and_then(parse_key_type)
+        .ok_or_else(|| PrecompileError::other("PublicKeyOfType: unknown key type"))?;
+    Ok((index, key_type))
+}
+
+/// rskj `FederationSupportImpl.getFederationMemberPublicKeyOfType`: an index
+/// outside the member list throws `IndexOutOfBoundsException`, which the
+/// Bridge turns into a `VMException` -- the call **reverts**, it does not
+/// return empty bytes.
+fn member_key_at(
+    members: &[super::federation::StoredMember],
+    index: usize,
+    key_type: KeyType,
+    who: &'static str,
+) -> Result<[u8; 33], PrecompileError> {
+    members
+        .get(index)
+        .map(|m| member_key(m, key_type))
+        .ok_or_else(|| {
+            PrecompileError::Other(
+                format!("{who} index must be between 0 and {}", members.len() as i64 - 1).into(),
+            )
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Pending federation
+// ---------------------------------------------------------------------------
+
+/// `getPendingFederationHash()` → bytes.
+///
+/// `PendingFederation.getHash()` is keccak over `serializeOnlyBtcKeys()` at
+/// **every** era, including after RSKIP123 stored the pending federation in
+/// multikey form -- the hash a `commitFederation` vote has to match. Empty
+/// bytes when there is no pending federation.
+pub fn get_pending_federation_hash<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let members = pending_federation_members(ctx);
+    if members.is_empty() && bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY).is_empty() {
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into()));
+    }
+    let hash = super::governance::pending_federation_hash(&members);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&hash).into()))
+}
+
+/// `getPendingFederatorPublicKey(int256 index)` → bytes (the BTC key).
+///
+/// No pending federation is **empty bytes**, not an empty return: rskj's
+/// `getPendingFederatorBtcPublicKey` returns `EMPTY_BYTE_ARRAY`, which is
+/// non-null and so gets ABI-encoded. An index past the end reverts --
+/// `publicKeys.get(index)` has no bounds check there.
+pub fn get_pending_federator_public_key<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    if args.len() < 32 {
+        return Err(PrecompileError::other("getPendingFederatorPublicKey: args too short"));
+    }
+    let index: usize = U256::from_be_slice(&args[..32])
+        .try_into()
+        .map_err(|_| PrecompileError::other("getPendingFederatorPublicKey: index out of range"))?;
+
+    if bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY).is_empty() {
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into()));
+    }
+    let members = pending_federation_members(ctx);
+    let key = member_key_at(&members, index, KeyType::Btc, "Pending federator")?;
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&key).into()))
+}
+
+/// `getPendingFederatorPublicKeyOfType(int256 index, string keyType)` → bytes.
+pub fn get_pending_federator_public_key_of_type<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let (index, key_type) = decode_index_and_key_type(args)?;
+    if bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY).is_empty() {
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into()));
+    }
+    let members = pending_federation_members(ctx);
+    let key = member_key_at(&members, index, key_type, "Pending federator")?;
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&key).into()))
+}
+
+fn pending_federation_members<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+) -> Vec<super::federation::StoredMember> {
+    let data = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
+    serialization::rlp_decode_list(&data)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| super::federation::StoredMember::from_stored(m))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Retiring federation
+// ---------------------------------------------------------------------------
+
+/// `getRetiringFederationCreationBlockNumber()` → int256, `-1` when there is
+/// no retiring federation.
+pub fn get_retiring_federation_creation_block_number<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let value = super::peg::retiring_federation(ctx, config, hardfork_cfg, block_number)
+        .map_or(FEDERATION_NON_EXISTENT, |fed| fed.creation_block as i64);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
+}
+
+/// `getRetiringFederationCreationTime()` → int256, `-1` when there is none.
+///
+/// The unit changes at RSKIP419: milliseconds before, **seconds** after
+/// (`Bridge.getFederationCreationTimeEpochBasedOnActivation`). Storage always
+/// holds milliseconds; only the answer changes.
+pub fn get_retiring_federation_creation_time<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let value = super::peg::retiring_federation(ctx, config, hardfork_cfg, block_number)
+        .map_or(FEDERATION_NON_EXISTENT, |fed| {
+            creation_time_for_era(fed.creation_time_millis, hardfork_cfg, block_number)
+        });
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
+}
+
+/// `getRetiringFederatorPublicKey(int256 index)` → bytes (BTC key), empty
+/// bytes when there is no retiring federation.
+pub fn get_retiring_federator_public_key<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> Result<PrecompileOutput, PrecompileError> {
+    if args.len() < 32 {
+        return Err(PrecompileError::other("getRetiringFederatorPublicKey: args too short"));
+    }
+    let index: usize = U256::from_be_slice(&args[..32])
+        .try_into()
+        .map_err(|_| PrecompileError::other("getRetiringFederatorPublicKey: index out of range"))?;
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let Some(fed) = super::peg::retiring_federation(ctx, config, hardfork_cfg, block_number) else {
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into()));
+    };
+    let key = member_key_at(&fed.members, index, KeyType::Btc, "Retiring federator")?;
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&key).into()))
+}
+
+/// `getRetiringFederatorPublicKeyOfType(int256 index, string keyType)` → bytes.
+pub fn get_retiring_federator_public_key_of_type<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let (index, key_type) = decode_index_and_key_type(args)?;
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let Some(fed) = super::peg::retiring_federation(ctx, config, hardfork_cfg, block_number) else {
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into()));
+    };
+    let key = member_key_at(&fed.members, index, key_type, "Retiring federator")?;
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&key).into()))
+}
+
+// ---------------------------------------------------------------------------
+// Proposed federation (RSKIP419 / SVP)
+// ---------------------------------------------------------------------------
+
+/// `getProposedFederationAddress()` → string, `""` when there is none.
+pub fn get_proposed_federation_address<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+    config: &BridgeConstants,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let Some(fed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY) else {
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_string("").into()));
+    };
+    let keys: Vec<[u8; 33]> = fed.members.iter().map(|m| m.btc).collect();
+    let format = super::peg::federation_format_version_pub(ctx, PROPOSED_FEDERATION_FORMAT_VERSION_KEY);
+    let redeem = super::peg::federation_redeem_for_format_pub(&keys, format, config);
+    let hash160 = super::peg::federation_output_hash160(&redeem, format);
+    let address = super::governance::p2sh_base58_address(&hash160, config);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_string(&address).into()))
+}
+
+/// `getProposedFederationSize()` → int256, `-1` when there is none.
+pub fn get_proposed_federation_size<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let value = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
+        .map_or(FEDERATION_NON_EXISTENT, |fed| fed.members.len() as i64);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
+}
+
+/// `getProposedFederationCreationTime()` → int256, **always in seconds**.
+///
+/// Unlike the active and retiring variants this one does not consult
+/// RSKIP419: `Bridge.getProposedFederationCreationTime` calls
+/// `Instant::getEpochSecond` directly. A proposed federation cannot exist
+/// before RSKIP419 anyway, so there is no era in which the other branch could
+/// be taken.
+pub fn get_proposed_federation_creation_time<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let value = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
+        .map_or(-1i64, |fed| (fed.creation_time_millis / 1000) as i64);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
+}
+
+/// `getProposedFederationCreationBlockNumber()` → int256, `-1` when none.
+pub fn get_proposed_federation_creation_block_number<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let value = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
+        .map_or(FEDERATION_NON_EXISTENT, |fed| fed.creation_block as i64);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
+}
+
+/// `getProposedFederatorPublicKeyOfType(int256 index, string keyType)` → bytes.
+pub fn get_proposed_federator_public_key_of_type<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let (index, key_type) = decode_index_and_key_type(args)?;
+    let Some(fed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY) else {
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into()));
+    };
+    let key = member_key_at(&fed.members, index, key_type, "Proposed Federator")?;
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&key).into()))
+}
+
+// ---------------------------------------------------------------------------
+// BTC transaction index
+// ---------------------------------------------------------------------------
+
+/// `getBtcTxHashProcessedHeight(string btcTxHash)` → int256, `-1` when the
+/// transaction has not been processed.
+///
+/// The hash argument is in **display order** (the string bitcoin explorers
+/// show), which is the reverse of the internal byte order the index is keyed
+/// by -- the same convention `isBtcTxHashAlreadyProcessed` takes.
+pub fn get_btc_tx_hash_processed_height<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let Some(hash_hex) = abi_decode_string(args, 0) else {
+        return Err(PrecompileError::other(
+            "getBtcTxHashProcessedHeight: malformed string argument",
+        ));
+    };
+    let Some(mut hash) = parse_btc_hash_display(&hash_hex) else {
+        // rskj: `Sha256Hash.wrap` throws, the Bridge wraps it in a VMException.
+        return Err(PrecompileError::other(
+            "getBtcTxHashProcessedHeight: not a 32-byte hash",
+        ));
+    };
+    hash.reverse();
+    let height = super::tx::get_btc_tx_processed_height(ctx, &hash).map_or(-1i64, |h| h as i64);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_int(height)))
+}
+
+fn parse_btc_hash_display(hex_str: &str) -> Option<[u8; 32]> {
+    if hex_str.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(hex_str.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The federation creation time as the era reports it: milliseconds before
+/// RSKIP419, seconds from RSKIP419 on. Storage always holds milliseconds.
+fn creation_time_for_era(
+    millis: u64,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    block_number: u64,
+) -> i64 {
+    if hardfork_cfg.has_rskip419(block_number) {
+        (millis / 1000) as i64
+    } else {
+        millis as i64
+    }
+}
+
+/// ABI-decode the `string` at parameter slot `slot`.
+fn abi_decode_string(args: &[u8], slot: usize) -> Option<String> {
+    let head = slot * 32;
+    if args.len() < head + 32 {
+        return None;
+    }
+    let offset: usize = U256::from_be_slice(&args[head..head + 32]).try_into().ok()?;
+    if args.len() < offset + 32 {
+        return None;
+    }
+    let len: usize = U256::from_be_slice(&args[offset..offset + 32]).try_into().ok()?;
+    if args.len() < offset + 32 + len {
+        return None;
+    }
+    String::from_utf8(args[offset + 32..offset + 32 + len].to_vec()).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -315,57 +875,498 @@ fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
     output
 }
 
-// ---------------------------------------------------------------------------
-// Federation data decoding (from RLP-serialized format)
-// ---------------------------------------------------------------------------
 
-/// Decode the number of members from serialized federation data.
-/// Federation RLP: [creation_time, creation_block, [member...]].
-fn decode_federation_size(data: &[u8]) -> usize {
-    if let Some(items) = serialization::rlp_decode_list(data) {
-        if let Some(members) = items.get(2).and_then(|m| serialization::rlp_decode_list(m)) {
-            return members.len();
-        }
-    }
-    0
-}
 
-/// Decode the creation time from serialized federation data.
-fn decode_federation_creation_time(data: &[u8]) -> u64 {
-    if let Some(items) = serialization::rlp_decode_list(data) {
-        if !items.is_empty() {
-            let time_bytes = &items[0];
-            if time_bytes.is_empty() {
-                return 0;
-            }
-            let mut padded = [0u8; 8];
-            let start = 8usize.saturating_sub(time_bytes.len());
-            let copy_len = time_bytes.len().min(8);
-            padded[start..start + copy_len].copy_from_slice(&time_bytes[..copy_len]);
-            return u64::from_be_bytes(padded);
-        }
-    }
-    0
-}
-
-/// Decode the BTC public keys from serialized federation data (both the
-/// legacy and the post-RSKIP123 multikey member shapes).
-fn decode_federation_keys(data: &[u8]) -> Vec<Vec<u8>> {
-    if let Some(items) = serialization::rlp_decode_list(data) {
-        if let Some(members) = items.get(2).and_then(|m| serialization::rlp_decode_list(m)) {
-            return members
-                .iter()
-                .filter_map(|m| super::federation::StoredMember::from_stored(m))
-                .map(|m| m.btc.to_vec())
-                .collect();
-        }
-    }
-    Vec::new()
-}
 
 #[cfg(test)]
 mod tests {
     use super::abi_encode_bytes;
+    use super::*;
+    use crate::bridge::constants::BridgeConstants;
+    use crate::bridge::federation::StoredMember;
+    use crate::bridge::storage::*;
+    use crate::hardfork::RskHardforkConfig;
+
+    /// A writable Bridge context at `block_number`, backed by the raw-storage
+    /// overlay alone -- no trie, no database. Everything these getters read is
+    /// written through `bridge_store_bytes_named`, so the overlay is the whole
+    /// world.
+    fn ctx_at(block_number: u64) -> impl crate::RskContextTr {
+        use revm::MainContext;
+        let chain_ext = crate::raw_storage::RskChainExt::default();
+        let mut block_env = revm::context::BlockEnv::default();
+        block_env.number = U256::from(block_number);
+        revm::Context::mainnet().with_block(block_env).with_chain(chain_ext)
+    }
+
+    fn mainnet() -> BridgeConstants {
+        BridgeConstants::mainnet()
+    }
+
+    fn hardforks() -> RskHardforkConfig {
+        RskHardforkConfig::mainnet()
+    }
+
+    fn member(tag: u8) -> StoredMember {
+        StoredMember {
+            btc: key_of(0x02, tag),
+            rsk: key_of(0x03, tag),
+            mst: key_of(0x02, tag.wrapping_add(0x40)),
+        }
+    }
+
+    fn key_of(prefix: u8, tag: u8) -> [u8; 33] {
+        let mut k = [tag; 33];
+        k[0] = prefix;
+        k
+    }
+
+    /// The last 32 bytes of an ABI `int256` return, as a signed value.
+    fn as_int(out: &PrecompileOutput) -> i64 {
+        let b = out.bytes.as_ref();
+        assert_eq!(b.len(), 32, "int256 returns are one word");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&b[24..32]);
+        i64::from_be_bytes(buf)
+    }
+
+    /// The payload of an ABI `bytes`/`string` return.
+    fn as_bytes(out: &PrecompileOutput) -> Vec<u8> {
+        let b = out.bytes.as_ref();
+        assert!(b.len() >= 64, "dynamic returns carry offset and length");
+        let len = U256::from_be_slice(&b[32..64]).to::<usize>();
+        b[64..64 + len].to_vec()
+    }
+
+    fn as_string(out: &PrecompileOutput) -> String {
+        String::from_utf8(as_bytes(out)).unwrap()
+    }
+
+    // ---- lock whitelist ----
+
+    #[test]
+    fn lock_whitelist_size_counts_both_lists() {
+        let mut ctx = ctx_at(1_000_000);
+        store_one_off_whitelist(&mut ctx, &[([0x11; 20], 500), ([0x22; 20], 600)], 1_000);
+        store_unlimited_whitelist(&mut ctx, &[[0x33; 20]]);
+
+        let out = get_lock_whitelist_size(&mut ctx, 0).unwrap();
+        assert_eq!(as_int(&out), 3);
+    }
+
+    #[test]
+    fn lock_whitelist_entry_by_address_reports_the_transfer_cap() {
+        let mut ctx = ctx_at(1_000_000);
+        let config = mainnet();
+        store_one_off_whitelist(&mut ctx, &[([0x11; 20], 12_345)], 1_000);
+        store_unlimited_whitelist(&mut ctx, &[[0x22; 20]]);
+
+        let one_off = p2pkh_base58_address(&[0x11; 20], &config);
+        let unlimited = p2pkh_base58_address(&[0x22; 20], &config);
+        let stranger = p2pkh_base58_address(&[0x99; 20], &config);
+
+        assert_eq!(as_int(&query_whitelist(&mut ctx, &one_off, &config)), 12_345);
+        assert_eq!(
+            as_int(&query_whitelist(&mut ctx, &unlimited, &config)),
+            0,
+            "an unlimited entry is UNLIMITED_MODE (0), not its cap"
+        );
+        assert_eq!(as_int(&query_whitelist(&mut ctx, &stranger, &config)), -1);
+        assert_eq!(
+            as_int(&query_whitelist(&mut ctx, "not an address", &config)),
+            -1,
+            "a parse failure is ADDRESS_NOT_EXIST, not INVALID_ADDRESS_FORMAT"
+        );
+    }
+
+    /// The whitelist is a `TreeMap` keyed by a comparator over `getHash160()`
+    /// alone, so lookup never reaches `Address.equals` and the version byte
+    /// does not have to match: a whitelisted P2PKH entry is found by the P2SH
+    /// rendering of the same hash160.
+    ///
+    /// The version is still *parsed*, because `Address.fromBase58` rejects a
+    /// header belonging to another network.
+    #[test]
+    fn lock_whitelist_entry_by_address_matches_on_hash160_alone() {
+        let mut ctx = ctx_at(1_000_000);
+        let config = mainnet();
+        store_one_off_whitelist(&mut ctx, &[([0x11; 20], 12_345)], 1_000);
+
+        let p2sh = crate::bridge::governance::p2sh_base58_address(&[0x11; 20], &config);
+        assert_eq!(
+            as_int(&query_whitelist(&mut ctx, &p2sh, &config)),
+            12_345,
+            "the TreeMap comparator compares hash160, not the version byte"
+        );
+
+        // A testnet-header address is a different network and does not parse.
+        let mut foreign = [0u8; 21];
+        foreign[0] = 111;
+        foreign[1..].copy_from_slice(&[0x11; 20]);
+        let foreign = bitcoin::base58::encode_check(&foreign);
+        assert_eq!(as_int(&query_whitelist(&mut ctx, &foreign, &config)), -1);
+    }
+
+    fn query_whitelist<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        address: &str,
+        config: &BridgeConstants,
+    ) -> PrecompileOutput {
+        get_lock_whitelist_entry_by_address(ctx, &abi_string_arg(address), 0, config).unwrap()
+    }
+
+    /// ABI head+tail for a single `string` argument.
+    fn abi_string_arg(s: &str) -> Vec<u8> {
+        let mut out = vec![0u8; 32];
+        out[31] = 32;
+        let mut len = [0u8; 32];
+        len[24..32].copy_from_slice(&(s.len() as u64).to_be_bytes());
+        out.extend_from_slice(&len);
+        out.extend_from_slice(s.as_bytes());
+        out.resize(64 + s.len().div_ceil(32) * 32, 0);
+        out
+    }
+
+    /// ABI head+tail for `(int256, string)`.
+    fn abi_index_and_key_type(index: u64, key_type: &str) -> Vec<u8> {
+        let mut out = vec![0u8; 64];
+        out[24..32].copy_from_slice(&index.to_be_bytes());
+        out[63] = 64; // offset to the string
+        let mut len = [0u8; 32];
+        len[24..32].copy_from_slice(&(key_type.len() as u64).to_be_bytes());
+        out.extend_from_slice(&len);
+        out.extend_from_slice(key_type.as_bytes());
+        out.resize(96 + key_type.len().div_ceil(32) * 32, 0);
+        out
+    }
+
+    /// The index order is the two lists **merged** and sorted by hash160, not
+    /// one list after the other: rskj's `LockWhitelist` copies both into one
+    /// `TreeMap` ordered by `UnsignedBytes.lexicographicalComparator()` over
+    /// the hash160. Here the unlimited entry sorts *before* the one-off one.
+    #[test]
+    fn lock_whitelist_address_walks_hash160_order_and_renders_p2pkh() {
+        let mut ctx = ctx_at(1_000_000);
+        let config = mainnet();
+        store_one_off_whitelist(&mut ctx, &[([0xcc; 20], 1)], 1_000);
+        store_unlimited_whitelist(&mut ctx, &[[0x22; 20]]);
+
+        let at = |ctx: &mut _, i: u64| {
+            let mut arg = [0u8; 32];
+            arg[24..32].copy_from_slice(&i.to_be_bytes());
+            as_string(&get_lock_whitelist_address(ctx, &arg, 0, &config).unwrap())
+        };
+        assert_eq!(
+            at(&mut ctx, 0),
+            p2pkh_base58_address(&[0x22; 20], &config),
+            "0x22 sorts before 0xcc even though it is the unlimited entry"
+        );
+        assert_eq!(at(&mut ctx, 1), p2pkh_base58_address(&[0xcc; 20], &config));
+        assert_eq!(at(&mut ctx, 2), "", "out of range is the empty string");
+    }
+
+    /// Unsigned lexicographic order, so a hash160 starting 0xff sorts last --
+    /// signed byte comparison would put it first.
+    #[test]
+    fn lock_whitelist_order_is_unsigned() {
+        let mut ctx = ctx_at(1_000_000);
+        store_one_off_whitelist(&mut ctx, &[([0xff; 20], 1), ([0x01; 20], 2)], 1_000);
+        let merged = merged_whitelist(&mut ctx);
+        assert_eq!(
+            merged.iter().map(|(h, _)| h[0]).collect::<Vec<_>>(),
+            vec![0x01, 0xff]
+        );
+    }
+
+    // ---- federator public keys ----
+
+    /// The regression this replaces: `getFederatorPublicKeyOfType` used to
+    /// delegate to the BTC-key getter, so `"rsk"` and `"mst"` both answered
+    /// with the BTC key.
+    #[test]
+    fn federator_public_key_of_type_returns_the_requested_key() {
+        let mut ctx = ctx_at(6_500_000);
+        let (config, forks) = (mainnet(), hardforks());
+        let members = vec![member(1), member(2)];
+        store_federation(&mut ctx, NEW_FEDERATION_KEY, &members, 1_000, 100);
+
+        let index = sorted_index(&members, 0);
+        let btc = as_bytes(
+            &get_federator_public_key_of_type(
+                &mut ctx,
+                &abi_index_and_key_type(index as u64, "btc"),
+                0,
+                &config,
+                &forks,
+            )
+            .unwrap(),
+        );
+        let rsk = as_bytes(
+            &get_federator_public_key_of_type(
+                &mut ctx,
+                &abi_index_and_key_type(index as u64, "rsk"),
+                0,
+                &config,
+                &forks,
+            )
+            .unwrap(),
+        );
+        let mst = as_bytes(
+            &get_federator_public_key_of_type(
+                &mut ctx,
+                &abi_index_and_key_type(index as u64, "mst"),
+                0,
+                &config,
+                &forks,
+            )
+            .unwrap(),
+        );
+
+        assert_ne!(btc, rsk, "the BTC and RSK keys of a member are different");
+        assert_ne!(btc, mst);
+        assert_eq!(btc.len(), 33);
+    }
+
+    #[test]
+    fn federator_public_key_of_type_rejects_an_unknown_key_type() {
+        let mut ctx = ctx_at(6_500_000);
+        let (config, forks) = (mainnet(), hardforks());
+        store_federation(&mut ctx, NEW_FEDERATION_KEY, &[member(1)], 1_000, 100);
+
+        assert!(
+            get_federator_public_key_of_type(
+                &mut ctx,
+                &abi_index_and_key_type(0, "eth"),
+                0,
+                &config,
+                &forks
+            )
+            .is_err(),
+            "KeyType.byValue throws, and the Bridge turns that into a revert"
+        );
+    }
+
+    /// rskj bounds-checks and throws; returning empty bytes would look like a
+    /// federator that has no key.
+    #[test]
+    fn federator_public_key_out_of_range_reverts() {
+        let mut ctx = ctx_at(6_500_000);
+        let (config, forks) = (mainnet(), hardforks());
+        store_federation(&mut ctx, NEW_FEDERATION_KEY, &[member(1)], 1_000, 100);
+
+        let mut arg = [0u8; 32];
+        arg[31] = 5;
+        assert!(get_federator_public_key(&mut ctx, &arg, 0, &config, &forks).is_err());
+    }
+
+    // ---- pending federation ----
+
+    #[test]
+    fn pending_federation_hash_matches_the_btc_key_serialization() {
+        use sha3::{Digest, Keccak256};
+        let mut ctx = ctx_at(6_500_000);
+        let members = vec![member(3), member(4)];
+        bridge_store_bytes_named(
+            &mut ctx,
+            PENDING_FEDERATION_KEY,
+            &pending_multikey_bytes(&members),
+        );
+
+        let out = get_pending_federation_hash(&mut ctx, 0).unwrap();
+        let expected: [u8; 32] =
+            Keccak256::digest(sorted_btc_key_rlp(&members)).into();
+        assert_eq!(as_bytes(&out), expected.to_vec());
+    }
+
+    #[test]
+    fn pending_federation_getters_with_no_pending_federation() {
+        let mut ctx = ctx_at(6_500_000);
+        // Empty bytes, ABI-encoded -- rskj returns EMPTY_BYTE_ARRAY, which is
+        // non-null and so gets encoded, rather than an empty return.
+        let hash = get_pending_federation_hash(&mut ctx, 0).unwrap();
+        assert_eq!(as_bytes(&hash), Vec::<u8>::new());
+        assert_eq!(hash.bytes.len(), 96, "empty `bytes` is still 96 bytes");
+
+        let key = get_pending_federator_public_key_of_type(
+            &mut ctx,
+            &abi_index_and_key_type(0, "btc"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(as_bytes(&key), Vec::<u8>::new());
+    }
+
+    // ---- retiring federation ----
+
+    /// A stored `oldFederation` is not by itself a retiring federation: the
+    /// new one must have reached its activation age first.
+    #[test]
+    fn retiring_federation_is_none_during_the_activation_window() {
+        let (config, forks) = (mainnet(), hardforks());
+        let new_creation_block = 6_000_000u64;
+        let age = crate::bridge::governance::federation_activation_age(
+            &config,
+            &forks,
+            new_creation_block,
+        );
+
+        let mut during = ctx_at(new_creation_block + age - 1);
+        store_federation(&mut during, NEW_FEDERATION_KEY, &[member(1)], 1_000, new_creation_block);
+        store_federation(&mut during, OLD_FEDERATION_KEY, &[member(2), member(3)], 900, 5_000_000);
+        assert_eq!(
+            as_int(&get_retiring_federation_size(&mut during, 0, &config, &forks).unwrap()),
+            -1,
+            "inside the window there is no retiring federation"
+        );
+
+        let mut after = ctx_at(new_creation_block + age);
+        store_federation(&mut after, NEW_FEDERATION_KEY, &[member(1)], 1_000, new_creation_block);
+        store_federation(&mut after, OLD_FEDERATION_KEY, &[member(2), member(3)], 900, 5_000_000);
+        assert_eq!(
+            as_int(&get_retiring_federation_size(&mut after, 0, &config, &forks).unwrap()),
+            2
+        );
+        assert_eq!(
+            as_int(
+                &get_retiring_federation_creation_block_number(&mut after, 0, &config, &forks)
+                    .unwrap()
+            ),
+            5_000_000
+        );
+    }
+
+    // ---- creation time units ----
+
+    /// RSKIP419 changes the unit from milliseconds to seconds. Storage keeps
+    /// milliseconds either way.
+    #[test]
+    fn federation_creation_time_unit_changes_at_rskip419() {
+        let (config, forks) = (mainnet(), hardforks());
+        let millis = 1_700_000_000_000u64;
+
+        let before = 7_338_023u64; // lovell700 - 1
+        let after = 7_338_024u64; // lovell700
+        assert!(!forks.has_rskip419(before) && forks.has_rskip419(after));
+
+        let mut ctx_before = ctx_at(before);
+        store_federation(&mut ctx_before, NEW_FEDERATION_KEY, &[member(1)], millis, 100);
+        assert_eq!(
+            as_int(&get_federation_creation_time(&mut ctx_before, 0, &config, &forks).unwrap()),
+            millis as i64
+        );
+
+        let mut ctx_after = ctx_at(after);
+        store_federation(&mut ctx_after, NEW_FEDERATION_KEY, &[member(1)], millis, 100);
+        assert_eq!(
+            as_int(&get_federation_creation_time(&mut ctx_after, 0, &config, &forks).unwrap()),
+            (millis / 1000) as i64
+        );
+    }
+
+    // ---- proposed federation ----
+
+    #[test]
+    fn proposed_federation_getters_report_minus_one_when_absent() {
+        let mut ctx = ctx_at(7_400_000);
+        assert_eq!(as_int(&get_proposed_federation_size(&mut ctx, 0).unwrap()), -1);
+        assert_eq!(
+            as_int(&get_proposed_federation_creation_block_number(&mut ctx, 0).unwrap()),
+            -1
+        );
+        assert_eq!(
+            as_int(&get_proposed_federation_creation_time(&mut ctx, 0).unwrap()),
+            -1
+        );
+    }
+
+    /// Unlike the active and retiring variants, this one is in seconds at
+    /// every height: rskj calls `Instant::getEpochSecond` directly.
+    #[test]
+    fn proposed_federation_creation_time_is_always_seconds() {
+        let mut ctx = ctx_at(7_400_000);
+        store_federation(&mut ctx, PROPOSED_FEDERATION_KEY, &[member(1)], 1_700_000_000_000, 7_399_000);
+        assert_eq!(
+            as_int(&get_proposed_federation_creation_time(&mut ctx, 0).unwrap()),
+            1_700_000_000
+        );
+        assert_eq!(as_int(&get_proposed_federation_size(&mut ctx, 0).unwrap()), 1);
+    }
+
+    // ---- BTC tx index ----
+
+    #[test]
+    fn btc_tx_hash_processed_height_reports_minus_one_when_unprocessed() {
+        let mut ctx = ctx_at(6_500_000);
+        let display = "a".repeat(64);
+        let out =
+            get_btc_tx_hash_processed_height(&mut ctx, &abi_string_arg(&display), 0).unwrap();
+        assert_eq!(as_int(&out), -1);
+    }
+
+    #[test]
+    fn btc_tx_hash_processed_height_reads_the_index() {
+        let mut ctx = ctx_at(6_500_000);
+        // The argument is in display order; the index is keyed by the reverse.
+        let mut internal = [0u8; 32];
+        for (i, b) in internal.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        crate::bridge::tx::set_btc_tx_processed(&mut ctx, &internal, 4_242_000, true);
+
+        let mut display = internal;
+        display.reverse();
+        let display_hex: String = display.iter().map(|b| format!("{b:02x}")).collect();
+
+        let out =
+            get_btc_tx_hash_processed_height(&mut ctx, &abi_string_arg(&display_hex), 0).unwrap();
+        assert_eq!(as_int(&out), 4_242_000);
+    }
+
+    #[test]
+    fn btc_tx_hash_processed_height_rejects_a_malformed_hash() {
+        let mut ctx = ctx_at(6_500_000);
+        assert!(get_btc_tx_hash_processed_height(&mut ctx, &abi_string_arg("beef"), 0).is_err());
+    }
+
+    // ---- helpers for the federation fixtures ----
+
+    fn store_federation<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        key: &str,
+        members: &[StoredMember],
+        creation_time_millis: u64,
+        creation_block: u64,
+    ) {
+        let data = crate::bridge::federation::serialize_federation_multikey(
+            members,
+            creation_time_millis,
+            creation_block,
+        );
+        bridge_store_bytes_named(ctx, key, &data);
+    }
+
+    /// Members are stored sorted, so a member's index is its position in the
+    /// sorted order, not the order the fixture lists them in.
+    fn sorted_index(members: &[StoredMember], which: usize) -> usize {
+        let mut sorted = members.to_vec();
+        sorted.sort();
+        sorted.iter().position(|m| *m == members[which]).unwrap()
+    }
+
+    fn pending_multikey_bytes(members: &[StoredMember]) -> Vec<u8> {
+        let mut sorted = members.to_vec();
+        sorted.sort();
+        let encoded: Vec<Vec<u8>> = sorted.iter().map(|m| m.to_rlp()).collect();
+        crate::bridge::serialization::rlp_encode_list(&encoded)
+    }
+
+    fn sorted_btc_key_rlp(members: &[StoredMember]) -> Vec<u8> {
+        use crate::bridge::serialization::{rlp_encode_element, rlp_encode_list};
+        let mut keys: Vec<[u8; 33]> = members.iter().map(|m| m.btc).collect();
+        keys.sort();
+        let items: Vec<Vec<u8>> = keys.iter().map(|k| rlp_encode_element(k)).collect();
+        rlp_encode_list(&items)
+    }
 
     /// rskj's `SolidityType.BytesType.encode` emits one zero word even for an
     /// empty array (`-1 / 32 == 0` → 1 word), so empty `bytes` returns are 96

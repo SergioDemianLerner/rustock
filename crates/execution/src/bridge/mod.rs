@@ -960,22 +960,72 @@ fn execute_method<CTX: crate::RskContextTr>(
 
         // Local-only getters with real storage reads
         "getFederationAddress" => getters::get_federation_address(ctx, gas_cost, config, hardfork_cfg),
-        "getFederationSize" => getters::get_federation_size(ctx, gas_cost),
-        "getFederationThreshold" => getters::get_federation_threshold(ctx, gas_cost),
-        "getFederationCreationBlockNumber" => getters::get_federation_creation_block_number(ctx, gas_cost),
-        "getFederationCreationTime" => getters::get_federation_creation_time(ctx, gas_cost),
-        "getFederatorPublicKey" => getters::get_federator_public_key(ctx, args, gas_cost),
-        "getFederatorPublicKeyOfType" => getters::get_federator_public_key_of_type(ctx, args, gas_cost),
+        "getFederationSize" => getters::get_federation_size(ctx, gas_cost, config, hardfork_cfg),
+        "getFederationThreshold" => getters::get_federation_threshold(ctx, gas_cost, config, hardfork_cfg),
+        "getFederationCreationBlockNumber" => getters::get_federation_creation_block_number(ctx, gas_cost, config, hardfork_cfg),
+        "getFederationCreationTime" => getters::get_federation_creation_time(ctx, gas_cost, config, hardfork_cfg),
+        "getFederatorPublicKey" => getters::get_federator_public_key(ctx, args, gas_cost, config, hardfork_cfg),
+        "getFederatorPublicKeyOfType" => getters::get_federator_public_key_of_type(ctx, args, gas_cost, config, hardfork_cfg),
         "getFeePerKb" => getters::get_fee_per_kb(ctx, gas_cost),
         "getLockingCap" => getters::get_locking_cap(ctx, gas_cost, config),
         "getMinimumLockTxValue" => getters::get_minimum_lock_tx_value(gas_cost, config),
         "getRetiringFederationAddress" => getters::get_retiring_federation_address(ctx, gas_cost, config, hardfork_cfg),
-        "getRetiringFederationSize" => getters::get_retiring_federation_size(ctx, gas_cost),
-        "getRetiringFederationThreshold" => getters::get_retiring_federation_threshold(ctx, gas_cost),
+        "getRetiringFederationSize" => getters::get_retiring_federation_size(ctx, gas_cost, config, hardfork_cfg),
+        "getRetiringFederationThreshold" => getters::get_retiring_federation_threshold(ctx, gas_cost, config, hardfork_cfg),
+        "getRetiringFederationCreationBlockNumber" => getters::get_retiring_federation_creation_block_number(ctx, gas_cost, config, hardfork_cfg),
+        "getRetiringFederationCreationTime" => getters::get_retiring_federation_creation_time(ctx, gas_cost, config, hardfork_cfg),
+        "getRetiringFederatorPublicKey" => getters::get_retiring_federator_public_key(ctx, args, gas_cost, config, hardfork_cfg),
+        "getRetiringFederatorPublicKeyOfType" => getters::get_retiring_federator_public_key_of_type(ctx, args, gas_cost, config, hardfork_cfg),
         "getPendingFederationSize" => getters::get_pending_federation_size(ctx, gas_cost),
+        "getPendingFederationHash" => getters::get_pending_federation_hash(ctx, gas_cost),
+        "getPendingFederatorPublicKey" => getters::get_pending_federator_public_key(ctx, args, gas_cost),
+        "getPendingFederatorPublicKeyOfType" => getters::get_pending_federator_public_key_of_type(ctx, args, gas_cost),
+        "getProposedFederationAddress" => getters::get_proposed_federation_address(ctx, gas_cost, config),
+        "getProposedFederationSize" => getters::get_proposed_federation_size(ctx, gas_cost),
+        "getProposedFederationCreationTime" => getters::get_proposed_federation_creation_time(ctx, gas_cost),
+        "getProposedFederationCreationBlockNumber" => getters::get_proposed_federation_creation_block_number(ctx, gas_cost),
+        "getProposedFederatorPublicKeyOfType" => getters::get_proposed_federator_public_key_of_type(ctx, args, gas_cost),
+        "getLockWhitelistSize" => getters::get_lock_whitelist_size(ctx, gas_cost),
+        "getLockWhitelistAddress" => getters::get_lock_whitelist_address(ctx, args, gas_cost, config),
+        "getLockWhitelistEntryByAddress" => getters::get_lock_whitelist_entry_by_address(ctx, args, gas_cost, config),
+        "getBtcTxHashProcessedHeight" => getters::get_btc_tx_hash_processed_height(ctx, args, gas_cost),
         "isBtcTxHashAlreadyProcessed" => getters::is_btc_tx_hash_already_processed(ctx, args, gas_cost),
-        _ => Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
+        "getBtcBlockchainInitialBlockHeight" => btc_chain::get_initial_block_height(gas_cost, config),
+        "getBtcBlockchainBlockHashAtDepth" => btc_chain::get_block_hash_at_depth(ctx, args, gas_cost, config, hardfork_cfg),
+
+        // Registered in the method table, deliberately not implemented
+        // (issue #97). See `unimplemented_method` for why this is an error
+        // rather than empty bytes.
+        "getBtcBlockchainBlockLocator"
+        | "getStateForBtcReleaseClient"
+        | "getStateForSvpClient"
+        | "getStateForDebugging" => unimplemented_method(method_name),
+
+        // Every method in `bridge_method_table` must appear above. A name that
+        // reaches here is a table entry with no implementation, which is a bug
+        // in this file, not a caller error -- `bridge_method_table_is_fully_dispatched`
+        // fails if one is added without an arm.
+        _ => unimplemented_method(method_name),
     }
+}
+
+/// A Bridge method that is registered -- correct selector, gas and permission
+/// -- but has no implementation.
+///
+/// It must **fail**, not return empty bytes. Every one of these is
+/// `LocalOnly`, so it is reachable only through `eth_call` and cannot affect
+/// consensus; the cost of the old catch-all was wrong answers that looked
+/// right. `getLockWhitelistSize` returning empty bytes decodes as `0` -- "the
+/// whitelist is empty" -- and nothing in the response says the method was
+/// never written. An error is unambiguous, and it is what rskj produces for a
+/// method that throws.
+///
+/// This is the same shape as audit finding FRCR-280: a default arm that
+/// manufactures a plausible value instead of failing.
+fn unimplemented_method(method: &str) -> Result<PrecompileOutput, PrecompileError> {
+    Err(PrecompileError::Other(
+        format!("Bridge method {method} is registered but not implemented").into(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +1035,66 @@ fn execute_method<CTX: crate::RskContextTr>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every method in the table must have a dispatch arm, or be one of the
+    /// four that are deliberately unimplemented.
+    ///
+    /// The old catch-all `_ => Ok(PrecompileOutput::new(gas_cost, Bytes::new()))`
+    /// meant a table entry with no arm answered with empty bytes, which
+    /// decodes as zero or "" rather than failing. Twenty-two methods were in
+    /// that state. This test is what stops the twenty-third: adding a row to
+    /// `BRIDGE_METHODS` without an arm now fails here rather than shipping a
+    /// getter that quietly says nothing.
+    ///
+    /// The check is over this file's source because match arms are not
+    /// reflectable. It is coarse -- a name mentioned anywhere in the dispatch
+    /// region counts -- but it cannot miss an entirely absent method, which is
+    /// the failure it exists to catch.
+    #[test]
+    fn bridge_method_table_is_fully_dispatched() {
+        const SOURCE: &str = include_str!("mod.rs");
+        let start = SOURCE
+            .find("    match method_name {\n        // Phase 2: BTC header chain")
+            .expect("dispatch match not found -- did its shape change?");
+        let end = SOURCE[start..]
+            .find("        _ => unimplemented_method(method_name),")
+            .expect("dispatch default arm not found")
+            + start;
+        let dispatch = &SOURCE[start..end];
+
+        /// Registered, reachable only through `eth_call`, and not implemented
+        /// -- tracked in issue #97. `getBtcBlockchainBlockLocator` was removed
+        /// at RSKIP89 (orchid) and needs the checkpoints file; the three
+        /// `getStateFor*` methods are large serializations of federator-client
+        /// state. All four return an explicit error rather than a plausible
+        /// empty value.
+        const DELIBERATELY_UNIMPLEMENTED: [&str; 4] = [
+            "getBtcBlockchainBlockLocator",
+            "getStateForBtcReleaseClient",
+            "getStateForSvpClient",
+            "getStateForDebugging",
+        ];
+
+        let mut missing = Vec::new();
+        for m in BRIDGE_METHODS.iter() {
+            let quoted = format!("\"{}\"", m.name);
+            if !dispatch.contains(&quoted) {
+                missing.push(m.name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "registered with no dispatch arm, so they would answer with an error \
+             instead of a value: {missing:?}"
+        );
+
+        for name in DELIBERATELY_UNIMPLEMENTED {
+            assert!(
+                BRIDGE_METHODS.iter().any(|m| m.name == name),
+                "{name} is listed as unimplemented but is not in the method table"
+            );
+        }
+    }
 
     #[test]
     fn method_table_has_70_entries() {
