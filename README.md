@@ -142,7 +142,9 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
 **Chain and node info:**
 
 - `eth_blockNumber`, `eth_chainId`, `eth_syncing`, `eth_protocolVersion`
-- `eth_gasPrice`, `eth_mining`, `eth_hashrate`, `eth_accounts`, `eth_coinbase`
+- `eth_gasPrice` (a percentile over recent transactions, not the block minimum
+  — see [docs/gas-price.md](docs/gas-price.md)), `eth_mining`, `eth_hashrate`,
+  `eth_accounts`, `eth_coinbase`
 - `eth_getBlockByHash`, `eth_getBlockByNumber`
 - `eth_getBlockTransactionCountByHash`, `eth_getBlockTransactionCountByNumber`
 - `eth_getUncleCountByBlockHash`, `eth_getUncleCountByBlockNumber`

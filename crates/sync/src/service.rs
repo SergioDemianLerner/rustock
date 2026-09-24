@@ -374,6 +374,7 @@ pub struct SyncService {
     /// Refreshed every time the loop takes an event, so a reader sees the live
     /// backlog rather than a sample taken on some other schedule.
     wire_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+    gas_price: Arc<crate::gas_price::GasPriceTracker>,
     pub(crate) state: SyncState,
     pub(crate) last_progress: Instant,
     /// Per-peer body-request timeout strikes: incremented when a request to a
@@ -479,6 +480,7 @@ impl SyncService {
             peer_store,
             event_rx,
             wire_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            gas_price: Arc::new(crate::gas_price::GasPriceTracker::default()),
             state: SyncState::Idle,
             last_progress: Instant::now(),
             body_peer_strikes: HashMap::new(),
@@ -562,6 +564,7 @@ impl SyncService {
         let store = self.manager.store.clone();
         let tx_pool = self.tx_pool.clone();
         let activity = self.chain_activity.clone();
+        let gas_price = self.gas_price.clone();
         self.exec_fn = Some(Arc::new(move |state_root, blocks_since_flush, pending| {
             process_downloaded_blocks(
                 &processor,
@@ -572,6 +575,7 @@ impl SyncService {
                 blocks_since_flush,
                 &pending,
                 &activity,
+                &gas_price,
             )
         }));
         self
@@ -581,6 +585,26 @@ impl SyncService {
     /// the service is moved into its task.
     pub fn chain_activity(&self) -> Arc<crate::chain_activity::ChainActivity> {
         self.chain_activity.clone()
+    }
+
+    /// Share a gas-price tracker with the transaction pool, which needs the
+    /// same one: the limiter's low-gas-price factor and `eth_gasPrice` must
+    /// not disagree about the market.
+    pub fn with_gas_price_tracker(
+        mut self,
+        tracker: Arc<crate::gas_price::GasPriceTracker>,
+    ) -> Self {
+        self.gas_price = tracker;
+        self
+    }
+
+    /// The gas-price tracker, fed by every block this node executes.
+    ///
+    /// rskj feeds its tracker from an `EthereumListener` on the same events;
+    /// here the execution paths call it directly, which keeps "a block was
+    /// executed" and "the tracker saw it" in one place rather than two.
+    pub fn gas_price_tracker(&self) -> Arc<crate::gas_price::GasPriceTracker> {
+        self.gas_price.clone()
     }
 
     /// Test seam: install a controllable execution step and a starting state
@@ -3121,6 +3145,8 @@ impl SyncService {
                     "Executed block #{}, state root: {:?}",
                     header.number, result.state_root_hash
                 );
+                self.gas_price.on_block(header, &block.transactions);
+                self.gas_price.on_best_block(header);
                 self.current_state_root = Some(result.new_state_root);
                 true
             }
@@ -3188,6 +3214,7 @@ fn process_downloaded_blocks(
     mut blocks_since_flush: u64,
     pending_headers: &[(B256, Header)],
     activity: &crate::chain_activity::ChainActivity,
+    gas_price: &crate::gas_price::GasPriceTracker,
 ) -> ExecOutcome {
     let mut current_root = state_root;
     let mut processed = 0u64;
@@ -3287,6 +3314,7 @@ fn process_downloaded_blocks(
                     crate::chain_activity::thread_cpu_time().saturating_sub(cpu_start),
                     wall_start.elapsed(),
                 );
+                gas_price.on_block(header, &block.transactions);
                 current_root = result.new_state_root;
                 last_executed = Some((*hash, result.state_root_hash));
                 processed += 1;

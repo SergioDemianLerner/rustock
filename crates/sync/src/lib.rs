@@ -6,6 +6,7 @@ mod service;
 mod state;
 mod tracker;
 pub mod chain_activity;
+pub mod gas_price;
 pub mod invariant;
 pub mod quota;
 pub mod rollback;

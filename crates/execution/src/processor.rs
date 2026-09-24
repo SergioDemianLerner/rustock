@@ -644,7 +644,11 @@ impl BlockProcessor {
 
     /// Detect the REMASC synthetic transaction appended to every RSK block.
     /// Pattern: `to == REMASC_ADDR && v == 0 && r == 0 && s == 0 && gas_limit == 0`.
-    fn is_remasc_tx(tx: &Transaction) -> bool {
+    ///
+    /// Public because the gas-price tracker has to exclude it for the same
+    /// reason rskj does: REMASC carries no gas price and would drag the
+    /// percentile to zero.
+    pub fn is_remasc_tx(tx: &Transaction) -> bool {
         if tx.v != 0 || !tx.r.is_zero() || !tx.s.is_zero() {
             return false;
         }

@@ -58,6 +58,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
+        gas_price: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -570,6 +571,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
+        gas_price: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -616,6 +618,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
+        gas_price: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -695,6 +698,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
+        gas_price: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -826,6 +830,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
+        gas_price: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -922,6 +927,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
+        gas_price: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -1093,6 +1099,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
+        gas_price: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -1318,6 +1325,7 @@ async fn test_receipt_dto_failed_status() {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
+        gas_price: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -2166,6 +2174,7 @@ fn setup_state_with_receipts(
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
+        gas_price: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -2431,6 +2440,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
+        gas_price: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -3224,4 +3234,38 @@ async fn test_debug_account_transaction_quota_rejects_a_bad_address() {
     )
     .await;
     assert!(r.error.is_some());
+}
+
+// ========== eth_gasPrice ==========
+
+struct FixedGasPrice(u64);
+impl crate::server::GasPriceSource for FixedGasPrice {
+    fn gas_price(&self) -> U256 {
+        U256::from(self.0)
+    }
+}
+
+/// rskj answers with `GasPriceTracker.getGasPrice()` -- a percentile over
+/// recent transactions, floored at the block minimum times 1.1 -- not with the
+/// block's `minimumGasPrice`, which is the floor for *validity* rather than
+/// the price to pay for inclusion. A wallet trusting the floor during
+/// congestion underpays and waits.
+#[tokio::test]
+async fn test_eth_gas_price_uses_the_tracker() {
+    let (mut state, _tmp) = setup_state();
+    // The head's minimum is 59,240,000 (see `test_header`); the tracker's
+    // answer must win.
+    state.gas_price = Some(Arc::new(FixedGasPrice(123_456_789)));
+
+    let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
+    assert_eq!(r.result.unwrap(), json!("0x75bcd15"));
+}
+
+/// Without a tracker -- a node built without sync -- the head's minimum is the
+/// documented fallback rather than an error.
+#[tokio::test]
+async fn test_eth_gas_price_falls_back_to_the_block_minimum() {
+    let (state, _tmp) = setup_state();
+    let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
+    assert_eq!(r.result.unwrap(), json!("0x387ee40"), "59,240,000");
 }
