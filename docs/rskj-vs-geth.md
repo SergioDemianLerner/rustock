@@ -168,6 +168,12 @@ the node that lacks the block, the real cumulative difficulty on the node that
 has it — purely because of what each happened to store. Nothing in the response
 says which branch produced it.
 
+**Nor is it deterministic on one node over time.** The same node answers
+differently at two moments if it acquires the uncle's block in between — which
+is what a reorg at the tip does — or prunes it afterwards. So the answer cannot
+be cached, and two calls a minute apart are not guaranteed to agree with each
+other any more than two nodes are.
+
 **Cost of getting it wrong.** Hard-coding `transactions: []` looks correct and
 passes against any node that never saw the competing branch — which, measured
 on this node, is *every* uncle: 3,818 uncles across 1,971 blocks below
