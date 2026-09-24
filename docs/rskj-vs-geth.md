@@ -103,6 +103,40 @@ different hash.** Hash the message *as received*; do not rebuild it.
 
 ---
 
+## `eth_bridgeState` returns two fields, not the Bridge
+
+| | |
+|---|---|
+| **What the name implies** | the Bridge's state: federation, UTXOs, queues, pegouts |
+| **rskj** | exactly two fields — `rskTxsWaitingForSignatures` and `btcBlockchainBestChainHeight` |
+| **source** | `co/rsk/peg/BridgeState.java`, `stateToMap()`; `co/rsk/rpc/modules/eth/EthModule.java`, `bridgeState()` |
+
+```java
+public Map<String, Object> stateToMap() {
+    Map<String, Object> result = new HashMap<>();
+    result.put("rskTxsWaitingForSignatures", this.toStringList(rskTxsWaitingForSignatures.keySet()));
+    result.put("btcBlockchainBestChainHeight", this.btcBlockchainBestChainHeight);
+    return result;
+}
+```
+
+`BridgeState` *holds* the UTXO set, the federation, the release request queue
+and the pegouts waiting for confirmations. `stateToMap()` exposes none of them;
+they appear only in `getEncoded()`, which the RPC never calls. The class name is
+the trap.
+
+Two further details:
+
+* **No block parameter.** `EthModule.bridgeState()` reads
+  `blockchain.getBestBlock()` unconditionally. There is no way to ask about a
+  historical block, and an implementation that accepts one would be inventing a
+  capability rskj does not have.
+* **The hashes carry no `0x` prefix.** `Keccak256.toHexString()` is
+  `Hex.toHexString(bytes)` — bare hex, where almost every other hash in
+  JSON-RPC is prefixed. A consumer finds this by failing to parse.
+
+---
+
 ## How to add an entry
 
 When implementing anything against rskj, if the Java does not match what the
