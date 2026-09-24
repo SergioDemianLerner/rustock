@@ -202,6 +202,7 @@ impl P2pHandler for SyncHandler {
                         best_hash: s.best_block_hash,
                         total_difficulty: s.total_difficulty.unwrap_or_default(),
                         client_id: "".to_string(),
+                        address: None,
                     };
                     let peer_store = self.manager.peer_store.clone();
                     tokio::spawn(async move {

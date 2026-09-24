@@ -74,6 +74,7 @@ pub struct OutboundConnector {
     peer_store: Arc<PeerStore>,
     handlers: Vec<Arc<dyn P2pHandler>>,
     max_outbound: usize,
+    scoring: Option<Arc<crate::scoring::ScoringService>>,
 }
 
 impl OutboundConnector {
@@ -84,7 +85,13 @@ impl OutboundConnector {
         handlers: Vec<Arc<dyn P2pHandler>>,
         max_outbound: usize
     ) -> Self {
-        Self { config, table, peer_store, handlers, max_outbound }
+        Self { config, table, peer_store, handlers, max_outbound, scoring: None }
+    }
+
+    /// Attach peer scoring, so a banned or punished address is never dialed.
+    pub fn with_scoring(mut self, scoring: Option<Arc<crate::scoring::ScoringService>>) -> Self {
+        self.scoring = scoring;
+        self
     }
 
     /// Starts the outbound connection loop.
@@ -170,8 +177,19 @@ impl OutboundConnector {
                     continue;
                 }
 
+                // Do not dial a peer we would refuse on arrival. Without this
+                // the connector spends its attempt budget on hosts that will
+                // be dropped, which is how a node ends up under target while
+                // the discovery table looks full.
+                if let Some(scoring) = &self.scoring {
+                    if !scoring.address_is_welcome(ip) || !scoring.node_is_welcome(node.id) {
+                        continue;
+                    }
+                }
+
                 pending.lock().await.insert(addr, Instant::now());
 
+                let scoring = self.scoring.clone();
                 let config = self.config.clone();
                 let handlers = self.handlers.clone();
                 let peer_store = self.peer_store.clone();
@@ -182,7 +200,7 @@ impl OutboundConnector {
 
                 tokio::spawn(async move {
                     stats.attempts.fetch_add(1, Ordering::Relaxed);
-                    let outcome = dial(addr, remote_id, config, handlers, peer_store, &stats).await;
+                    let outcome = dial(addr, remote_id, config, handlers, peer_store, &stats, scoring).await;
                     pending.lock().await.remove(&addr);
                     let mut bo = backoff.lock().await;
                     match outcome {
@@ -232,6 +250,7 @@ async fn dial(
     handlers: Vec<Arc<dyn P2pHandler>>,
     peer_store: Arc<PeerStore>,
     stats: &DialStats,
+    scoring: Option<Arc<crate::scoring::ScoringService>>,
 ) -> DialOutcome {
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
@@ -253,7 +272,16 @@ async fn dial(
         Ok(Ok((peer_id, rsk_status, framed))) => {
             stats.successes.fetch_add(1, Ordering::Relaxed);
             debug!(target: "rustock::net", "Outbound handshake successful: {:?}", &peer_id.as_slice()[..4]);
-            let _ = register_and_run_session(peer_id, rsk_status, framed, handlers, peer_store).await;
+            let _ = register_and_run_session(
+                peer_id,
+                rsk_status,
+                framed,
+                handlers,
+                peer_store,
+                scoring,
+                Some(addr.ip()),
+            )
+            .await;
             // Session ended (peer disconnected) — treat as a successful contact,
             // not a failure: it was a valid peer that may accept again later.
             DialOutcome::Connected

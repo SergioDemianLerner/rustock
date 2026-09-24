@@ -88,6 +88,12 @@ pub struct PeersSection {
     pub max_inbound_per_ip: Option<usize>,
     pub max_inbound_per_cidr: Option<usize>,
     pub inbound_cidr_prefix: Option<u8>,
+    /// Addresses or CIDR blocks refused at connection time, as rskj's
+    /// `peer.bannedPeerIPs`.
+    pub banned_peers: Option<Vec<String>>,
+    /// Count scoring events but never punish (rskj
+    /// `scoring.punishmentEnabled = false`).
+    pub no_peer_punishment: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -243,6 +249,8 @@ pub const CONFIGURABLE: &[&str] = &[
     "max_inbound_per_ip",
     "max_inbound_per_cidr",
     "inbound_cidr_prefix",
+    "banned_peers",
+    "no_peer_punishment",
     "btc_block_cache_entries",
     "trie_backend",
     "trie_dir",

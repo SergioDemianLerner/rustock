@@ -249,8 +249,8 @@ mod tests {
         let mut tracker = PeerChunkTracker::new(22);
         tracker.next_to_process = 3;
         tracker.next_to_assign = 9;
-        tracker.buffered.insert(5, Vec::new());
-        tracker.buffered.insert(6, Vec::new());
+        tracker.buffered.insert(5, (B512::ZERO, Vec::new()));
+        tracker.buffered.insert(6, (B512::ZERO, Vec::new()));
         let peer = B512::repeat_byte(0x11);
         tracker.in_flight.entry(peer).or_default().extend([3usize, 4]);
 

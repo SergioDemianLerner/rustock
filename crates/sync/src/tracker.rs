@@ -15,8 +15,15 @@ pub struct PeerChunkTracker {
     pub(crate) next_to_assign: usize,
     /// Next chunk index to process (must process in order for correct TD chain).
     pub(crate) next_to_process: usize,
-    /// Buffer for responses that arrived ahead of processing order.
-    pub(crate) buffered: BTreeMap<usize, Vec<Header>>,
+    /// Buffer for responses that arrived ahead of processing order, with the
+    /// peer that supplied each.
+    ///
+    /// The peer is carried because a chunk that fails to validate is a
+    /// **punishing** scoring event, and chunks are processed in skeleton order
+    /// rather than arrival order -- so the peer whose response happened to
+    /// trigger the drain is usually not the one that sent the bad chunk.
+    /// Punishing that peer would be worse than not punishing at all.
+    pub(crate) buffered: BTreeMap<usize, (B512, Vec<Header>)>,
     /// Total number of chunks in this skeleton.
     pub(crate) total_chunks: usize,
     /// Per-peer instant since which we have been waiting for a response
@@ -71,17 +78,18 @@ impl PeerChunkTracker {
         idx
     }
 
-    /// Buffers a response for the given chunk index.
-    pub fn buffer_response(&mut self, chunk_idx: usize, headers: Vec<Header>) {
-        self.buffered.insert(chunk_idx, headers);
+    /// Buffers a response for the given chunk index, remembering its source.
+    pub fn buffer_response(&mut self, peer: B512, chunk_idx: usize, headers: Vec<Header>) {
+        self.buffered.insert(chunk_idx, (peer, headers));
     }
 
     /// Drains all consecutive ready chunks starting from `next_to_process`.
     /// Returns them in order.
-    pub fn drain_ready(&mut self) -> Vec<(usize, Vec<Header>)> {
+    /// Each entry is `(chunk index, supplying peer, headers)`.
+    pub fn drain_ready(&mut self) -> Vec<(usize, B512, Vec<Header>)> {
         let mut ready = Vec::new();
-        while let Some(headers) = self.buffered.remove(&self.next_to_process) {
-            ready.push((self.next_to_process, headers));
+        while let Some((peer, headers)) = self.buffered.remove(&self.next_to_process) {
+            ready.push((self.next_to_process, peer, headers));
             self.next_to_process += 1;
         }
         ready

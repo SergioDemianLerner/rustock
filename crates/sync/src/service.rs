@@ -461,6 +461,15 @@ pub struct SyncService {
     /// Peers excluded from header-chunk assignment (stalled mid-round),
     /// mapped to the instant their sideline expires.
     pub(crate) sidelined: HashMap<B512, Instant>,
+    /// Peer scoring, when the node was built with it.
+    ///
+    /// The sidelining below **feeds** this rather than being replaced by it.
+    /// The two answer different questions: sidelining says "do not assign this
+    /// peer work in the current round", which has to be immediate and
+    /// round-local; scoring says "this peer has a history", which outlives the
+    /// round and the process. A peer sidelined once is not banned; a peer
+    /// sidelined every round accumulates a record an operator can see.
+    pub(crate) scoring: Option<Arc<rustock_networking::scoring::ScoringService>>,
     /// Start height of the last skeleton pre-fetch request, so the request
     /// is sent once per round instead of on every incoming event.
     last_prefetch_start: Option<u64>,
@@ -504,6 +513,7 @@ impl SyncService {
             tx_pool: None,
             blocks_since_flush: 0,
             sidelined: HashMap::new(),
+            scoring: None,
             last_prefetch_start: None,
             block_source: None,
         }
@@ -526,6 +536,15 @@ impl SyncService {
             Some((txs, ommers)) => self.manager.store.put_body(hash, &txs, &ommers).is_ok(),
             None => false,
         }
+    }
+
+    /// Attach peer scoring. Without it the service behaves exactly as before.
+    pub fn with_scoring(
+        mut self,
+        scoring: Option<Arc<rustock_networking::scoring::ScoringService>>,
+    ) -> Self {
+        self.scoring = scoring;
+        self
     }
 
     /// Attach a transaction pool for removing mined txs during block processing.
@@ -804,6 +823,12 @@ impl SyncService {
                 );
                 tracker.handle_peer_disconnect(&peer);
                 self.sidelined.insert(peer, Instant::now() + PEER_SIDELINE_DURATION);
+                if let Some(scoring) = &self.scoring {
+                    scoring.record_peer(
+                        peer,
+                        rustock_networking::scoring::EventType::TimeoutMessage,
+                    );
+                }
                 any_removed = true;
             }
             if any_removed {
@@ -2306,7 +2331,7 @@ impl SyncService {
 
                 match chunk_idx {
                     Some(idx) if idx < tracker.total_chunks => {
-                        tracker.buffer_response(idx, headers);
+                        tracker.buffer_response(peer, idx, headers);
                     }
                     _ => {
                         // Response doesn't match any skeleton entry. This happens when
@@ -2331,12 +2356,26 @@ impl SyncService {
 
                 // Process all consecutive ready chunks
                 let ready = tracker.drain_ready();
-                for (_idx, chunk_headers) in &ready {
+                for (_idx, chunk_peer, chunk_headers) in &ready {
                     if let Err(e) = self.manager.handle_headers_response(chunk_headers.clone()) {
                         error!(
                             target: "rustock::sync",
                             "Failed to process headers chunk: {:?}", e
                         );
+                        // INVALID_HEADER is one of the three counters that
+                        // cost reputation in rskj, so this is a punishing
+                        // event -- which is right: a chunk that fails to
+                        // validate came from a peer serving a chain we
+                        // cannot use.
+                        // `chunk_peer`, not `peer`: chunks are processed in
+                        // skeleton order, so the response that triggered this
+                        // drain is usually not the one carrying the bad chunk.
+                        if let Some(scoring) = &self.scoring {
+                            scoring.record_peer(
+                                *chunk_peer,
+                                rustock_networking::scoring::EventType::InvalidHeader,
+                            );
+                        }
                         self.state = SyncState::Idle;
                         return;
                     }
@@ -2407,6 +2446,7 @@ impl SyncService {
                     best_hash: id.hash,
                     total_difficulty: alloy_primitives::U256::ZERO,
                     client_id: String::new(),
+                    address: None,
                 };
                 self.peer_store.update_metadata(&peer, metadata).await;
 
@@ -2837,7 +2877,7 @@ impl SyncService {
             return;
         }
 
-        let SyncService { state, body_peer_strikes, peer_store, .. } = self;
+        let SyncService { state, body_peer_strikes, peer_store, scoring, .. } = self;
         let SyncState::DownloadingBodies { pending_headers, in_flight, id_index, .. } = state
         else {
             return;
@@ -2850,6 +2890,14 @@ impl SyncService {
             let old_peer = in_flight.get(&idx).map(|r| r.peer);
             if let Some(p) = old_peer {
                 *body_peer_strikes.entry(p).or_default() += 1;
+                if let Some(scoring) = scoring.as_ref() {
+                    // The strike is round-local and forgotten on the next
+                    // successful body; the scoring counter is not.
+                    scoring.record_peer(
+                        p,
+                        rustock_networking::scoring::EventType::TimeoutMessage,
+                    );
+                }
                 if let Some(c) = load.get_mut(&p) {
                     *c = c.saturating_sub(1);
                 }

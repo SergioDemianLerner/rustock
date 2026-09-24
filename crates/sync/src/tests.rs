@@ -1349,10 +1349,10 @@ fn test_tracker_identify_unknown_peer() {
 fn test_tracker_drain_ready_in_order() {
     let mut tracker = PeerChunkTracker::new(5);
     // Simulate: chunks 1, 2, 3, 4 all buffered
-    tracker.buffer_response(1, vec![]);
-    tracker.buffer_response(2, vec![]);
-    tracker.buffer_response(3, vec![]);
-    tracker.buffer_response(4, vec![]);
+    tracker.buffer_response(B512::ZERO, 1, vec![]);
+    tracker.buffer_response(B512::ZERO, 2, vec![]);
+    tracker.buffer_response(B512::ZERO, 3, vec![]);
+    tracker.buffer_response(B512::ZERO, 4, vec![]);
 
     let ready = tracker.drain_ready();
     assert_eq!(ready.len(), 4);
@@ -1368,18 +1368,18 @@ fn test_tracker_drain_ready_out_of_order() {
     let mut tracker = PeerChunkTracker::new(5);
 
     // Chunk 3 arrives first — can't process yet
-    tracker.buffer_response(3, vec![]);
+    tracker.buffer_response(B512::ZERO, 3, vec![]);
     let ready = tracker.drain_ready();
     assert!(ready.is_empty());
     assert_eq!(tracker.next_to_process, 1);
 
     // Chunk 2 arrives — still can't process (waiting for 1)
-    tracker.buffer_response(2, vec![]);
+    tracker.buffer_response(B512::ZERO, 2, vec![]);
     let ready = tracker.drain_ready();
     assert!(ready.is_empty());
 
     // Chunk 1 arrives — now process 1, 2, 3 consecutively
-    tracker.buffer_response(1, vec![]);
+    tracker.buffer_response(B512::ZERO, 1, vec![]);
     let ready = tracker.drain_ready();
     assert_eq!(ready.len(), 3);
     assert_eq!(ready[0].0, 1);
@@ -1388,11 +1388,38 @@ fn test_tracker_drain_ready_out_of_order() {
     assert_eq!(tracker.next_to_process, 4);
 
     // Chunk 4 arrives — immediately ready
-    tracker.buffer_response(4, vec![]);
+    tracker.buffer_response(B512::ZERO, 4, vec![]);
     let ready = tracker.drain_ready();
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].0, 4);
     assert!(tracker.is_complete());
+}
+
+/// Each drained chunk names **its own** supplier.
+///
+/// This is the difference between punishing the peer that sent a bad header
+/// chunk and punishing whichever peer's response happened to unblock the
+/// queue. Chunks are processed in skeleton order, not arrival order, so those
+/// are routinely different peers -- and an invalid header is a punishing
+/// scoring event, so getting it wrong bans an innocent peer.
+#[test]
+fn drained_chunks_carry_the_peer_that_sent_them() {
+    let mut tracker = PeerChunkTracker::new(4);
+    let slow = B512::repeat_byte(0xA1);
+    let fast = B512::repeat_byte(0xB2);
+
+    // The fast peer's later chunks arrive first and wait.
+    tracker.buffer_response(fast, 2, vec![]);
+    tracker.buffer_response(fast, 3, vec![]);
+    assert!(tracker.drain_ready().is_empty(), "nothing can be processed before chunk 1");
+
+    // The slow peer's chunk 1 finally arrives and releases all three.
+    tracker.buffer_response(slow, 1, vec![]);
+    let ready = tracker.drain_ready();
+    assert_eq!(ready.len(), 3);
+    assert_eq!(ready[0].1, slow, "chunk 1 came from the slow peer");
+    assert_eq!(ready[1].1, fast);
+    assert_eq!(ready[2].1, fast);
 }
 
 #[test]
@@ -1460,7 +1487,7 @@ fn test_tracker_disconnect_with_buffered_chunk() {
     tracker.next_to_assign = 4;
 
     // Chunk 2 already buffered (response received but not processed)
-    tracker.buffer_response(2, vec![]);
+    tracker.buffer_response(B512::ZERO, 2, vec![]);
 
     // Peer disconnects — only chunks 1 and 3 need reassignment (2 is buffered)
     tracker.handle_peer_disconnect(&peer);

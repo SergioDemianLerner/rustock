@@ -177,6 +177,19 @@ It is the foundation for `debug_traceTransaction` and the `trace_*` namespace:
 the difference between knowing a transaction failed and knowing why. Structured
 so that tracing provably does not change gas, output or logs.
 
+## Peer scoring, punishment and banning
+
+A port of rskj's `co.rsk.scoring`: fifteen event counters per peer, kept by
+node id **and** by address, a punishment whose length grows on repeat
+offences, and address/CIDR bans that persist across restarts — with the
+`sco_*` namespace to inspect and override it all.
+
+It was the one defensive gap against rskj. Before it, a peer feeding bad
+headers or flooding the mempool was sidelined for minutes and then welcomed
+back, with no operator control and no visibility. The care in it is aimed at
+the failure nobody notices: an honest-but-unreliable peer must never be
+punished, because a node that excludes peers rskj keeps ends up partitioned.
+
 ## The rskj compatibility catalogue
 
 Thirty documents recording, with rskj source citations, every place where

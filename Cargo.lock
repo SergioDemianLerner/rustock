@@ -3287,6 +3287,7 @@ dependencies = [
  "serde",
  "sha2",
  "sha3",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

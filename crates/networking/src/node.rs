@@ -36,6 +36,9 @@ pub struct Node {
     pub config: NodeConfig,
     pub handlers: Vec<Arc<dyn P2pHandler>>,
     peer_store: Arc<PeerStore>,
+    /// Peer scoring and banning. `None` runs the node exactly as before:
+    /// every peer welcome, nothing recorded.
+    scoring: Option<Arc<crate::scoring::ScoringService>>,
 }
 
 /// Configuration for the P2P node.
@@ -83,10 +86,11 @@ pub struct NodeConfig {
 
 impl Node {
     pub fn new(config: NodeConfig) -> Self {
-        Self { 
+        Self {
             config,
             handlers: Vec::new(),
             peer_store: Arc::new(PeerStore::new()),
+            scoring: None,
         }
     }
 
@@ -95,7 +99,19 @@ impl Node {
             config,
             handlers: Vec::new(),
             peer_store,
+            scoring: None,
         }
+    }
+
+    /// Attach peer scoring. Without this the node behaves as it always did.
+    pub fn with_scoring(mut self, scoring: Arc<crate::scoring::ScoringService>) -> Self {
+        self.scoring = Some(scoring);
+        self
+    }
+
+    /// The scoring service, for the RPC layer and the sync service.
+    pub fn scoring(&self) -> Option<Arc<crate::scoring::ScoringService>> {
+        self.scoring.clone()
     }
 
     /// Adds a message handler to the node.
@@ -219,7 +235,8 @@ impl Node {
             self.peer_store.clone(),
             all_handlers.clone(),
             self.config.max_outbound_peers,
-        );
+        )
+        .with_scoring(self.scoring.clone());
         tokio::spawn(outbound.start());
 
         // Bounds concurrent inbound connections. Each one spawns a task that
@@ -289,15 +306,37 @@ impl Node {
                 *count += 1;
             }
 
+            // Reputation is checked *before* the ECIES handshake, which is
+            // the expensive part: a banned host must not be able to make this
+            // node do secp256k1 work by reconnecting. rskj checks in
+            // `HandshakeHandler` after decoding, which is later than it needs
+            // to be.
+            if let Some(scoring) = &self.scoring {
+                if !scoring.address_is_welcome(ip) {
+                    debug!(
+                        target: "rustock::net",
+                        "Refusing {}: address is banned or serving a punishment", peer_addr
+                    );
+                    release_inbound_slot(&per_ip, ip).await;
+                    release_inbound_slot(&per_cidr, block).await;
+                    drop(stream);
+                    continue;
+                }
+            }
+
             debug!(target: "rustock::net", "New connection from: {}", peer_addr);
 
             let config = self.config.clone();
             let handlers = all_handlers.clone();
             let peer_store = self.peer_store.clone();
+            let scoring = self.scoring.clone();
             let per_ip_task = per_ip.clone();
             let per_cidr_task = per_cidr.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_incoming(stream, config, handlers, peer_store).await {
+                if let Err(e) =
+                    handle_incoming(stream, config, handlers, peer_store, scoring, Some(peer_addr))
+                        .await
+                {
                     error!(target: "rustock::net", "Error handling peer {}: {:?}", peer_addr, e);
                 }
                 // Release both slots however the session ended, including panics
@@ -338,7 +377,23 @@ pub(crate) async fn register_and_run_session(
     framed: tokio_util::codec::Framed<TcpStream, crate::handshake::HandshakeCodec>,
     handlers: Vec<Arc<dyn P2pHandler>>,
     peer_store: Arc<PeerStore>,
+    scoring: Option<Arc<crate::scoring::ScoringService>>,
+    address: Option<IpAddr>,
 ) -> Result<()> {
+    // A node id can be banned even when its address is not -- and the id is
+    // only known once the handshake has produced it, so this is the earliest
+    // it can be checked.
+    if let Some(scoring) = &scoring {
+        if !scoring.node_is_welcome(peer_id) {
+            debug!(
+                target: "rustock::net",
+                "Dropping {:?}: node id is banned or serving a punishment",
+                &peer_id.as_slice()[..4]
+            );
+            return Ok(());
+        }
+    }
+
     let (tx, rx) = mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
 
     if !peer_store.add_peer(peer_id, tx).await {
@@ -346,11 +401,23 @@ pub(crate) async fn register_and_run_session(
         return Ok(());
     }
 
+    if let Some(scoring) = &scoring {
+        if let Some(address) = address {
+            scoring.note_address(peer_id, address);
+        }
+        scoring.record(
+            Some(peer_id),
+            address,
+            crate::scoring::EventType::SuccessfulHandshake,
+        );
+    }
+
     let metadata = crate::peers::PeerMetadata {
         best_number: rsk_status.best_block_number,
         best_hash: rsk_status.best_block_hash,
         total_difficulty: rsk_status.total_difficulty.unwrap_or_default(),
         client_id: String::new(),
+        address,
     };
     peer_store.update_metadata(&peer_id, metadata).await;
 
@@ -364,6 +431,18 @@ pub(crate) async fn register_and_run_session(
 
     let res = session.run().await;
     peer_store.remove_peer(&peer_id).await;
+    if let Some(scoring) = &scoring {
+        // rskj records DISCONNECTION on every session end, clean or not. It
+        // does not move the score -- it falls in the "increments while
+        // non-negative" group -- so this is a counter for the operator's
+        // report rather than a punishment.
+        scoring.record(
+            Some(peer_id),
+            address,
+            crate::scoring::EventType::Disconnection,
+        );
+        scoring.forget_address(&peer_id);
+    }
     res
 }
 
@@ -380,12 +459,47 @@ pub async fn handle_incoming(
     config: NodeConfig,
     handlers: Vec<Arc<dyn P2pHandler>>,
     peer_store: Arc<PeerStore>,
+    scoring: Option<Arc<crate::scoring::ScoringService>>,
+    peer_addr: Option<std::net::SocketAddr>,
 ) -> Result<()> {
+    let address = peer_addr.map(|a| a.ip());
     let handshake = Handshake::new(stream, config, None);
-    let (peer_id, rsk_status, framed) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake.run())
+    let outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake.run()).await;
+
+    // rskj records FAILED_HANDSHAKE against the address (the node id is not
+    // known yet, which is why `recordEvent` takes both as optional). It costs
+    // no score there, and costs none here -- the counter is what an operator
+    // reads when a host is hammering the listener.
+    let failed = |scoring: &Option<Arc<crate::scoring::ScoringService>>| {
+        if let Some(scoring) = scoring {
+            scoring.record(None, address, crate::scoring::EventType::FailedHandshake);
+        }
+    };
+
+    let (peer_id, rsk_status, framed) = match outcome {
+        Ok(Ok(parts)) => parts,
+        Ok(Err(e)) => {
+            failed(&scoring);
+            return Err(e);
+        }
+        Err(e) => {
+            failed(&scoring);
+            return Err(anyhow::Error::new(e).context("Inbound handshake timed out"));
+        }
+    };
+    register_and_run_session(peer_id, rsk_status, framed, handlers, peer_store, scoring, address)
         .await
-        .context("Inbound handshake timed out")??;
-    register_and_run_session(peer_id, rsk_status, framed, handlers, peer_store).await
+}
+
+/// Give back one inbound slot from the per-IP or per-block table.
+async fn release_inbound_slot(map: &Arc<Mutex<HashMap<IpAddr, usize>>>, key: IpAddr) {
+    let mut map = map.lock().await;
+    if let Some(count) = map.get_mut(&key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            map.remove(&key);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -484,7 +598,7 @@ mod tests {
 
         let node1_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = timeout(Duration::from_secs(2), handle_incoming(stream, node1_config, vec![], node1_store)).await;
+            let _ = timeout(Duration::from_secs(2), handle_incoming(stream, node1_config, vec![], node1_store, None, None)).await;
         });
 
         let node2_task = tokio::spawn(async move {

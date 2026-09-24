@@ -329,6 +329,23 @@ public String toJsonString() {
 carrying `"0x0000…0000"`. A consumer indexing by `action.to` must treat an
 absent key as the zero address, not as malformed input.
 
+### The `sco_*` namespace has no go-ethereum counterpart
+
+geth exposes peer management through `admin_addPeer` / `admin_removePeer` and
+nothing about reputation; its scoring is internal and unqueryable. rskj's six
+`sco_*` methods have no equivalent to compare against, so the only reference
+is rskj itself. `docs/peer-scoring.md` has the detail; two shapes worth
+repeating here:
+
+- `sco_peerList` returns counters, `score`, `punishments` and `punishedUntil`
+  as JSON **numbers**, not hex strings — `PeerScoringInformation` is a plain
+  bean of `int`s and a `long`. The same trap as `trace_*`.
+- `sco_clearPeerScoring` resolves its argument with
+  `InetAddress.getByName(id)` **first**, which resolves DNS names, and falls
+  back to treating it as a node id. So a hostname argument clears whatever it
+  resolves to at that moment. rustock parses only literal addresses and treats
+  anything else as a node id.
+
 ---
 
 ## How to add an entry

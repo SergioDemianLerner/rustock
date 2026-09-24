@@ -6,6 +6,7 @@ use lru::LruCache;
 use rustock_networking::peers::PeerStore;
 use rustock_networking::protocol::rsk::{RskMessage, RskSubMessage};
 use rustock_networking::protocol::{P2pHandler, P2pMessage};
+use rustock_networking::scoring::{EventType, ScoringService};
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
 use tracing::{debug, trace};
@@ -18,6 +19,7 @@ pub struct TxRelay {
     peer_store: Arc<PeerStore>,
     seen: Mutex<LruCache<B256, ()>>,
     pool: Option<Arc<TransactionPool>>,
+    scoring: Option<Arc<ScoringService>>,
 }
 
 impl TxRelay {
@@ -28,6 +30,7 @@ impl TxRelay {
                 NonZeroUsize::new(SEEN_CACHE_SIZE).expect("SEEN_CACHE_SIZE is non-zero"),
             )),
             pool: None,
+            scoring: None,
         }
     }
 
@@ -38,6 +41,7 @@ impl TxRelay {
                 NonZeroUsize::new(SEEN_CACHE_SIZE).expect("SEEN_CACHE_SIZE is non-zero"),
             )),
             pool: Some(pool),
+            scoring: None,
         }
     }
 
@@ -45,7 +49,15 @@ impl TxRelay {
         B256::from_slice(&Keccak256::digest(data))
     }
 
-    fn filter_and_validate(&self, txs: &[Bytes]) -> Vec<Bytes> {
+    /// Attach peer scoring, so a peer flooding invalid transactions is
+    /// counted. rskj records `VALID_TRANSACTION` / `INVALID_TRANSACTION` from
+    /// `MessageVisitor.apply(TransactionsMessage)` for the same reason.
+    pub fn with_scoring(mut self, scoring: Option<Arc<ScoringService>>) -> Self {
+        self.scoring = scoring;
+        self
+    }
+
+    fn filter_and_validate(&self, txs: &[Bytes], from: Option<B512>) -> Vec<Bytes> {
         let mut seen = self.seen.lock().expect("seen cache lock poisoned");
         let mut valid_txs = Vec::new();
         for tx_bytes in txs {
@@ -56,7 +68,24 @@ impl TxRelay {
             seen.put(hash, ());
 
             if let Some(pool) = &self.pool {
-                match pool.add_transaction(tx_bytes) {
+                let accepted = pool.add_transaction(tx_bytes);
+                if let (Some(scoring), Some(from)) = (&self.scoring, from) {
+                    // INVALID_TRANSACTION drives the score negative in rskj,
+                    // but it is **not** one of the three counters that decide
+                    // reputation -- so a peer relaying junk is recorded and
+                    // scored down without being punished for it. That is
+                    // rskj's choice: transaction validity depends on local
+                    // state a peer may legitimately not share.
+                    scoring.record_peer(
+                        from,
+                        if accepted.is_ok() {
+                            EventType::ValidTransaction
+                        } else {
+                            EventType::InvalidTransaction
+                        },
+                    );
+                }
+                match accepted {
                     Ok(_) => valid_txs.push(tx_bytes.clone()),
                     Err(e) => {
                         trace!(tx_hash = %hash, err = %e, "Rejected incoming transaction");
@@ -99,7 +128,7 @@ impl P2pHandler for TxRelay {
     fn handle_message(&self, id: B512, msg: &P2pMessage) -> Option<P2pMessage> {
         if let P2pMessage::RskMessage(m) = msg {
             if let RskSubMessage::Transactions(txs) = &m.sub_message {
-                let valid_txs = self.filter_and_validate(txs);
+                let valid_txs = self.filter_and_validate(txs, Some(id));
                 if valid_txs.is_empty() {
                     trace!(from = %id, "No valid new transactions to relay");
                     return None;
