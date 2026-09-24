@@ -11,10 +11,15 @@ use std::sync::Arc;
 fn test_header(number: u64) -> Header {
     Header {
         parent_hash: B256::ZERO,
-        ommers_hash: B256::ZERO,
+        // A real header never carries ZERO here. An empty block's roots are
+        // the empty-trie roots, and the block getters now rely on that to tell
+        // "this block has nothing in it" from "we have not downloaded its body
+        // yet" -- so a fixture using ZERO would be testing a header the chain
+        // cannot produce. See `header_claims_an_empty_body`.
+        ommers_hash: rustock_execution::processor::compute_ommers_hash(&[]),
         beneficiary: Address::ZERO,
         state_root: B256::ZERO,
-        transactions_root: B256::ZERO,
+        transactions_root: rustock_core::ordered_tx_trie_root(&[], true),
         receipts_root: B256::ZERO,
         logs_bloom: Bloom::ZERO,
         extension_data: None,
@@ -3019,4 +3024,105 @@ async fn test_txpool_empty_pool_returns_empty_objects() {
         .result
         .unwrap();
     assert_eq!(status, json!({"pending": 0, "queued": 0}));
+}
+
+// ========== a block is only served when the node has it ==========
+
+/// Sync is header-first: headers arrive in batches and bodies follow. A block
+/// in that window has a header claiming transactions and no body, and the node
+/// used to render it as `transactions: []` -- a wrong answer, not merely an
+/// incomplete one.
+///
+/// rskj cannot reach this state: `saveBlock` writes `block.getEncoded()`, body
+/// included, under one key, so `getBlockByHash` returns a complete block or
+/// null. `null` is both the truthful answer and the rskj-compatible one.
+#[tokio::test]
+async fn test_a_block_whose_body_is_missing_is_not_served() {
+    let (state, _tmp) = setup_state();
+
+    let mut header = test_header(77);
+    // A header that claims transactions: the empty-trie root would mean there
+    // is nothing to fetch.
+    header.transactions_root = B256::repeat_byte(0x33);
+    let hash = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_canonical_hash(77, hash).unwrap();
+
+    for (method, params) in [
+        ("eth_getBlockByHash", json!([format!("{:#x}", hash), false])),
+        ("eth_getBlockByNumber", json!(["0x4d", false])),
+        ("eth_getBlockTransactionCountByHash", json!([format!("{:#x}", hash)])),
+        ("eth_getBlockTransactionCountByNumber", json!(["0x4d"])),
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, params)).await;
+        assert_eq!(
+            resp.result.unwrap(),
+            Value::Null,
+            "{method} must not report a block whose body the node has not downloaded"
+        );
+    }
+}
+
+/// The other half of the same rule: a block whose header says there is nothing
+/// to store is served even with no body row, because there is nothing missing.
+///
+/// This is not hypothetical -- genesis is written by `setup_genesis`, which
+/// stores the header, total difficulty, canonical entry and head, and no body.
+/// A rule of "no body, no block" would have made `eth_getBlockByNumber("0x0")`
+/// answer null on every node.
+#[tokio::test]
+async fn test_a_genuinely_empty_block_is_served_without_a_body_row() {
+    let (state, _tmp) = setup_state();
+
+    let header = test_header(78); // empty-trie roots, as a real empty block has
+    let hash = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_canonical_hash(78, hash).unwrap();
+    assert!(state.store.body(hash).unwrap().is_none(), "no body row at all");
+
+    let result = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockByHash", json!([format!("{:#x}", hash), false])),
+    )
+    .await
+    .result
+    .unwrap();
+    assert_eq!(result["number"], json!("0x4e"), "the block is still served");
+    assert_eq!(result["transactions"], json!([]));
+
+    let count = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockTransactionCountByHash", json!([format!("{:#x}", hash)])),
+    )
+    .await
+    .result
+    .unwrap();
+    assert_eq!(count, json!("0x0"), "and the count agrees with it");
+}
+
+/// An uncle is the deliberate exception. rskj synthesises an empty block from
+/// the uncle's header when it does not hold that block
+/// (`Block.createBlockFromHeader`), so empty `transactions` there is the
+/// correct answer rather than a missing one -- and the uncle getters must keep
+/// doing it even though the block getters no longer do.
+#[tokio::test]
+async fn test_an_uncle_is_still_synthesised_from_its_header() {
+    let (state, _tmp) = setup_state();
+
+    let mut uncle = uncle_header(800, 9);
+    uncle.transactions_root = B256::repeat_byte(0x44); // it did have transactions
+    uncle.cached_hash = None;
+    let block = store_block_with_uncles(&state.store, 801, &[uncle.clone()]);
+
+    let result = dispatch_for_test(
+        &state,
+        make_request("eth_getUncleByBlockHashAndIndex", json!([format!("{:#x}", block), "0x0"])),
+    )
+    .await
+    .result
+    .unwrap();
+
+    assert_ne!(result, Value::Null, "an uncle we lack the block for is still rendered");
+    assert_eq!(result["transactions"], json!([]), "synthesised from the header, as rskj does");
+    assert_eq!(result["hash"], json!(format!("{:#x}", uncle.hash())));
 }

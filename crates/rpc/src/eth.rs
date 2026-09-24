@@ -178,17 +178,25 @@ pub fn eth_get_block_transaction_count_by_hash(id: Value, params: &Value, store:
     let Some(hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
     };
-    match store.body(hash) {
-        Ok(Some((txs, _))) => JsonRpcResponse::success(id, json!(to_hex_u64(txs.len() as u64))),
-        Ok(None) => {
-            // No body stored, but block may exist (header-only)
-            if store.has_block(hash).unwrap_or(false) {
-                JsonRpcResponse::success(id, json!("0x0"))
-            } else {
-                JsonRpcResponse::success(id, Value::Null)
-            }
-        }
-        Err(_) => JsonRpcResponse::success(id, Value::Null),
+    JsonRpcResponse::success(id, transaction_count(store, hash))
+}
+
+/// `null` when the node does not have the block, otherwise how many
+/// transactions it holds.
+///
+/// This used to answer `0x0` for a block it held only the header of, which is
+/// the same wrong answer `eth_getBlockByHash` gave and for the same reason.
+/// The two must agree: a caller that reads a count of zero here and an empty
+/// `transactions` array there has been told twice that an unfetched block is
+/// empty.
+fn transaction_count(store: &BlockStore, hash: alloy_primitives::B256) -> Value {
+    let Some(header) = store.header(hash).ok().flatten() else {
+        return Value::Null;
+    };
+    match held_or_implied_body(store, hash, &header) {
+        Some(Some((txs, _))) => json!(to_hex_u64(txs.len() as u64)),
+        Some(None) => json!("0x0"),
+        None => Value::Null,
     }
 }
 
@@ -204,10 +212,7 @@ pub fn eth_get_block_transaction_count_by_number(id: Value, params: &Value, stor
         Ok(Some(h)) => h,
         _ => return JsonRpcResponse::success(id, Value::Null),
     };
-    match store.body(hash) {
-        Ok(Some((txs, _))) => JsonRpcResponse::success(id, json!(to_hex_u64(txs.len() as u64))),
-        _ => JsonRpcResponse::success(id, json!("0x0")),
-    }
+    JsonRpcResponse::success(id, transaction_count(store, hash))
 }
 
 pub fn eth_get_uncle_count_by_block_hash(id: Value, params: &Value, store: &BlockStore) -> JsonRpcResponse {
@@ -363,8 +368,59 @@ fn build_block_dto_with_full_txs(
     // An unknown total difficulty is reported as zero; the block is still
     // returned.
     let td = store.total_difficulty(hash).ok().flatten().unwrap_or_default();
-    let body = store.body(hash).ok().flatten();
+    let body = held_or_implied_body(store, hash, &header)?;
     Some(BlockResultDto::from_header_with_body(&header, hash, td, body.as_ref(), full_txs))
+}
+
+/// The block's body, or `None` when the node does not actually have the block.
+///
+/// Sync is header-first: headers arrive in batches and bodies are filled in
+/// afterwards, so a block exists with a header and no body for as long as its
+/// body takes to arrive. Rendering that as `transactions: []` answers a
+/// question the node cannot answer -- and answers it *wrongly*, because the
+/// block does have transactions. rskj cannot reach this state at all: it
+/// stores `block.getEncoded()`, body included, under one key, so
+/// `getBlockByHash` returns a complete block or `null`. `null` is therefore
+/// both the truthful answer and the rskj-compatible one.
+///
+/// **A missing body is not the same as an empty one.** A block whose header
+/// claims an empty transaction trie and no uncles has nothing to store, and
+/// some such blocks are held without a body row at all -- genesis is written
+/// by `setup_genesis`, which writes the header, total difficulty, canonical
+/// entry and head, and no body. Those must still be served, so the header's
+/// own claims decide: if it says there is nothing, the empty body is implied.
+///
+/// Returns `Some(None)` for "held, and genuinely empty", `Some(Some(body))`
+/// for "held, with this body", and `None` for "not held".
+#[allow(clippy::type_complexity)]
+fn held_or_implied_body(
+    store: &BlockStore,
+    hash: alloy_primitives::B256,
+    header: &rustock_core::types::header::Header,
+) -> Option<Option<(Vec<rustock_core::Transaction>, Vec<rustock_core::types::header::Header>)>> {
+    if let Some(body) = store.body(hash).ok().flatten() {
+        return Some(Some(body));
+    }
+    if header_claims_an_empty_body(header) {
+        return Some(None);
+    }
+    None
+}
+
+/// Does this header claim a body with nothing in it?
+///
+/// Both eras of the transaction trie count: RSKIP126 changed the empty root
+/// from the Ethereum keccak-of-empty-RLP to the unitrie's, and a node serves
+/// blocks from both sides of that fork. Comparing against both avoids
+/// threading the activation height through the RPC layer for a question whose
+/// answer is two constants.
+fn header_claims_an_empty_body(header: &rustock_core::types::header::Header) -> bool {
+    use rustock_core::{ordered_tx_trie_root, Header};
+    let empty_txs = header.transactions_root == ordered_tx_trie_root(&[], false)
+        || header.transactions_root == ordered_tx_trie_root(&[], true);
+    let empty_ommers =
+        header.ommers_hash == rustock_execution::processor::compute_ommers_hash(&[] as &[Header]);
+    empty_txs && empty_ommers
 }
 
 pub async fn eth_send_raw_transaction(

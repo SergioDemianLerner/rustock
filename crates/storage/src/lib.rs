@@ -858,13 +858,6 @@ impl BlockStore {
         }
     }
 
-    /// Stores a full block (header + body).
-    pub fn put_block(&self, block: &Block) -> Result<()> {
-        let hash = block.hash();
-        self.put_header(&block.header)?;
-        self.put_body(hash, &block.transactions, &block.ommers)?;
-        self.put_canonical_hash(block.header.number, hash)
-    }
 
     /// Returns a full block (header + body) by hash.
     /// If only the header is stored (no body), returns a header-only block
@@ -1852,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn test_put_block_stores_header_and_body() {
+    fn test_storing_a_block_stores_header_and_body() {
         let dir = tempdir().unwrap();
         let store = BlockStore::open(dir.path()).unwrap();
 
@@ -1865,7 +1858,9 @@ mod tests {
         };
         let hash = block.hash();
 
-        store.put_block(&block).unwrap();
+        store.put_header(&block.header).unwrap();
+        store.put_body(block.hash(), &block.transactions, &block.ommers).unwrap();
+        store.put_canonical_hash(block.header.number, block.hash()).unwrap();
 
         // Header should be stored
         let h = store.header(hash).unwrap().unwrap();
@@ -1940,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_put_block_full_roundtrip() {
+    fn test_storing_a_block_round_trips() {
         let dir = tempdir().unwrap();
         let store = BlockStore::open(dir.path()).unwrap();
 
@@ -1954,7 +1949,9 @@ mod tests {
         };
         let hash = block.hash();
 
-        store.put_block(&block).unwrap();
+        store.put_header(&block.header).unwrap();
+        store.put_body(block.hash(), &block.transactions, &block.ommers).unwrap();
+        store.put_canonical_hash(block.header.number, block.hash()).unwrap();
 
         let full = store.block(hash).unwrap().unwrap();
         assert_eq!(full.header.number, 42);
