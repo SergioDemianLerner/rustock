@@ -442,6 +442,42 @@ impl TrieNode {
         node.value.clone()
     }
 
+    /// Every node on the path from this one to `key`, **leaf first, root last**.
+    ///
+    /// rskj `Trie.findNodes`. The ordering is not the obvious one and is worth
+    /// stating: each level appends *itself* after recursing into its child, so
+    /// the caller receives the deepest node first and this node last.
+    ///
+    /// ```text
+    ///   rskj:  subnodes = child.findNodes(...);  subnodes.add(this);
+    ///                                            ^^^^^^^^^^^^^^^^^ after
+    /// ```
+    ///
+    /// `None` when the key is not in the trie -- the same condition under which
+    /// [`TrieNode::find`] returns `None`, so a proof is never half-built.
+    pub fn nodes_on_path(&self, key: &TrieKeySlice, store: &dyn TrieStore) -> Option<Vec<TrieNode>> {
+        if self.shared_path.length() > key.length() {
+            return None;
+        }
+
+        let common = key.common_path(&self.shared_path);
+        if common.length() < self.shared_path.length() {
+            return None;
+        }
+
+        if common.length() == key.length() {
+            return Some(vec![self.clone()]);
+        }
+
+        let bit = key.get(common.length());
+        let child_ref = if bit == 0 { &self.left } else { &self.right };
+        let child = child_ref.resolve(store)?;
+        let sub_key = key.slice(common.length() + 1, key.length());
+        let mut subnodes = child.nodes_on_path(&sub_key, store)?;
+        subnodes.push(self.clone());
+        Some(subnodes)
+    }
+
     fn find(&self, key: &TrieKeySlice, store: &dyn TrieStore) -> Option<TrieNode> {
         if self.shared_path.length() > key.length() {
             return None;

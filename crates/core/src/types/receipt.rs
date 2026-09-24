@@ -193,22 +193,41 @@ impl Decodable for Log {
 /// hash; before activation it is the legacy Orchid hash
 /// (`Trie.getHashOrchid(false)`).
 pub fn ordered_trie_root(receipts: &[Receipt], rskip126: bool) -> B256 {
-    use rustock_trie::{MemoryTrieStore, TrieKeySlice, TrieNode};
+    use rustock_trie::MemoryTrieStore;
 
     let store = MemoryTrieStore::new();
-    let mut root = TrieNode::empty();
-
-    for (i, receipt) in receipts.iter().enumerate() {
-        let key_bytes = rlp_encode_int(i as u32);
-        let key = TrieKeySlice::from_key(&key_bytes);
-        root = root.put(&key, &receipt.rlp_encode(), &store);
-    }
+    let root = build_receipts_trie(receipts, &store);
 
     if rskip126 {
         root.compute_hash(&store)
     } else {
         root.compute_hash_orchid(false, &store)
     }
+}
+
+/// The receipts trie itself, rather than only its hash.
+///
+/// Split out of [`ordered_trie_root`] so a caller that needs the *nodes* --
+/// `rsk_getTransactionReceiptNodesByHash`, which serves receipt proofs -- builds
+/// the same trie by the same code rather than a second one that might drift.
+/// The store must outlive the returned node: children may be referenced by hash.
+pub fn build_receipts_trie(
+    receipts: &[Receipt],
+    store: &dyn rustock_trie::TrieStore,
+) -> rustock_trie::TrieNode {
+    use rustock_trie::{TrieKeySlice, TrieNode};
+
+    let mut root = TrieNode::empty();
+    for (i, receipt) in receipts.iter().enumerate() {
+        let key = TrieKeySlice::from_key(&receipt_trie_key(i as u32));
+        root = root.put(&key, &receipt.rlp_encode(), store);
+    }
+    root
+}
+
+/// The trie key for the receipt at `index`: rskj's `RLP.encodeInt(index)`.
+pub fn receipt_trie_key(index: u32) -> Vec<u8> {
+    rlp_encode_int(index)
 }
 
 /// Compute the transactions trie root, matching rskj's

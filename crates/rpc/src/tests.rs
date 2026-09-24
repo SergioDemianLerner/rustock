@@ -2075,3 +2075,225 @@ async fn test_rsk_get_storage_bytes_at_reads_the_requested_block() {
         "block #42 is the head in this fixture, so the two must agree"
     );
 }
+
+// ========== rsk receipt proofs (#87) ==========
+
+/// A block of `n` transactions with matching receipts, canonical, indexed.
+/// Returns the state, the block hash, the transaction hashes and the receipts.
+fn setup_state_with_receipts(
+    n: usize,
+) -> (RpcState, B256, Vec<B256>, Vec<rustock_core::Receipt>, tempfile::TempDir) {
+    use alloy_rlp::Encodable;
+    use sha3::{Digest, Keccak256};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+
+    let mut txs = Vec::new();
+    let mut tx_hashes = Vec::new();
+    let mut receipts = Vec::new();
+    for i in 0..n {
+        let tx = rustock_core::Transaction {
+            nonce: i as u64,
+            gas_price: U256::from(20_000_000_000u64),
+            gas_limit: U256::from(21_000),
+            to: alloy_primitives::Bytes::from(vec![0x12u8; 20]),
+            value: U256::from(1_000_000u64 + i as u64),
+            input: alloy_primitives::Bytes::default(),
+            v: 27,
+            r: U256::from(100u64 + i as u64),
+            s: U256::from(200u64),
+            cached_rlp: None,
+        };
+        let mut buf = Vec::new();
+        tx.encode(&mut buf);
+        tx_hashes.push(B256::from_slice(&Keccak256::digest(&buf)));
+        receipts.push(rustock_core::Receipt {
+            post_tx_state: vec![0x01],
+            cumulative_gas_used: 21_000 * (i as u64 + 1),
+            gas_used: 21_000,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            logs: vec![],
+            status: true,
+        });
+        txs.push(tx);
+    }
+
+    // The header carries the real receipts root, so a proof can be checked
+    // against it rather than against something the test computed twice.
+    let receipts_root = rustock_core::types::receipt::ordered_trie_root(&receipts, true);
+    let header = Header { receipts_root, ..test_header(1) };
+    let block_hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(1, block_hash).unwrap();
+    store.set_head(block_hash).unwrap();
+    store.put_total_difficulty(block_hash, U256::from(1000)).unwrap();
+    store.put_body(block_hash, &txs, &[]).unwrap();
+    for (i, h) in tx_hashes.iter().enumerate() {
+        store.put_tx_index(*h, block_hash, i as u32).unwrap();
+    }
+    store.put_receipts(block_hash, &receipts).unwrap();
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: None,
+        trie_store: None,
+        hardfork_cfg: None,
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
+        epoch_store: None,
+        miner: None,
+        admin_enabled: false,
+        gc_burial: 4000,
+        prune_keep_depth: 100_000,
+        prune_max_batch: 50_000,
+    };
+    (state, block_hash, tx_hashes, receipts, tmp)
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    hex::decode(s.trim_start_matches("0x")).expect("hex")
+}
+
+/// **The test that matters: verify the proof, do not just inspect its shape.**
+///
+/// A proof test that does not verify the proof is checking nothing. This takes
+/// the returned nodes, loads them into an otherwise-empty trie store, rebuilds
+/// the root from the last one, and asks it for the receipt — so a pass means
+/// the nodes really are sufficient to reach the value from the root, and that
+/// the root really is the block's `receiptsRoot`.
+#[tokio::test]
+async fn test_receipt_proof_verifies_against_the_blocks_receipts_root() {
+    use rustock_core::types::receipt::receipt_trie_key;
+    use rustock_trie::{MemoryTrieStore, TrieKeySlice, TrieNode, TrieStore};
+
+    let (state, block_hash, tx_hashes, receipts, _tmp) = setup_state_with_receipts(8);
+    let target = 5usize; // a deep path, not a single-entry trie
+
+    let nodes_resp = dispatch_for_test(
+        &state,
+        make_request(
+            "rsk_getTransactionReceiptNodesByHash",
+            json!([format!("0x{}", hex::encode(block_hash)), format!("0x{}", hex::encode(tx_hashes[target]))]),
+        ),
+    )
+    .await;
+    let nodes: Vec<String> = serde_json::from_value(nodes_resp.result.unwrap()).unwrap();
+    assert!(nodes.len() > 1, "a path through an 8-entry trie should be more than one node");
+
+    let raw_resp = dispatch_for_test(
+        &state,
+        make_request("rsk_getRawTransactionReceiptByHash", json!([format!("0x{}", hex::encode(tx_hashes[target]))])),
+    )
+    .await;
+    let raw = unhex(raw_resp.result.unwrap().as_str().unwrap());
+    assert_eq!(raw, receipts[target].rlp_encode(), "the raw receipt is not the encoding that went into the trie");
+
+    // Load only what the proof supplied, keyed by the hash of the bytes as
+    // sent. A node hash is `keccak(to_message)`, and `to_message` consults the
+    // store — so re-serialising a node whose siblings are absent, which is
+    // exactly what a proof is, would produce different bytes and a different
+    // hash. The message that arrived is the message that was hashed.
+    use sha3::{Digest, Keccak256};
+    let proof_store = MemoryTrieStore::new();
+    let mut root_message = Vec::new();
+    for (i, n) in nodes.iter().enumerate() {
+        let bytes = unhex(n);
+        let h = B256::from_slice(&Keccak256::digest(&bytes));
+        TrieStore::put(&proof_store, h.as_slice(), &bytes);
+        if i == nodes.len() - 1 {
+            root_message = bytes; // leaf first, root LAST
+        }
+    }
+
+    // 1. The root of the proof is the block's receipts root.
+    let header = state.store.header(block_hash).unwrap().unwrap();
+    assert_eq!(
+        B256::from_slice(&Keccak256::digest(&root_message)),
+        header.receipts_root,
+        "the last node is not the block's receipts root -- is the order root-first?"
+    );
+
+    // The receipt is a *long value*: the leaf carries its hash, not its bytes,
+    // so the nodes alone cannot yield it. That is precisely why these two
+    // methods are a pair — `getNodes` gives the path, `getRawTransactionReceipt`
+    // gives the value, and only together do they prove anything.
+    TrieStore::put(
+        &proof_store,
+        B256::from_slice(&Keccak256::digest(&raw)).as_slice(),
+        &raw,
+    );
+
+    let root = TrieNode::from_message(&root_message, &proof_store);
+
+    // 2. Walking it with only the proof's nodes reaches the receipt.
+    let key = TrieKeySlice::from_key(&receipt_trie_key(target as u32));
+    assert_eq!(
+        root.get(&key, &proof_store),
+        Some(receipts[target].rlp_encode()),
+        "the proof does not actually prove the receipt"
+    );
+}
+
+/// Ordering is leaf-first, root-last — rskj's `findNodes` appends each level
+/// *after* recursing. A consumer that assumes root-first silently fails to
+/// verify, so it is pinned rather than left implicit.
+#[tokio::test]
+async fn test_receipt_proof_nodes_are_leaf_first_root_last() {
+    let (state, block_hash, tx_hashes, _receipts, _tmp) = setup_state_with_receipts(8);
+    let resp = dispatch_for_test(
+        &state,
+        make_request(
+            "rsk_getTransactionReceiptNodesByHash",
+            json!([format!("0x{}", hex::encode(block_hash)), format!("0x{}", hex::encode(tx_hashes[3]))]),
+        ),
+    )
+    .await;
+    let nodes: Vec<String> = serde_json::from_value(resp.result.unwrap()).unwrap();
+
+    use sha3::{Digest, Keccak256};
+    let header = state.store.header(block_hash).unwrap().unwrap();
+    let last = B256::from_slice(&Keccak256::digest(unhex(nodes.last().unwrap())));
+    let first = B256::from_slice(&Keccak256::digest(unhex(&nodes[0])));
+
+    assert_eq!(last, header.receipts_root, "the ROOT must be last");
+    assert_ne!(first, header.receipts_root, "the root must not be first");
+}
+
+#[tokio::test]
+async fn test_receipt_proof_unknown_inputs_return_null() {
+    let (state, block_hash, tx_hashes, _r, _tmp) = setup_state_with_receipts(3);
+    let bogus = format!("0x{}", hex::encode(B256::repeat_byte(0xEE)));
+
+    // A known transaction against the wrong block.
+    let wrong_block = dispatch_for_test(
+        &state,
+        make_request("rsk_getTransactionReceiptNodesByHash", json!([bogus, format!("0x{}", hex::encode(tx_hashes[0]))])),
+    )
+    .await;
+    assert!(wrong_block.result.unwrap().is_null(), "a transaction not in that block must be null");
+
+    // An unknown transaction in a real block.
+    let unknown_tx = dispatch_for_test(
+        &state,
+        make_request("rsk_getTransactionReceiptNodesByHash", json!([format!("0x{}", hex::encode(block_hash)), bogus])),
+    )
+    .await;
+    assert!(unknown_tx.result.unwrap().is_null());
+
+    // An unknown transaction hash for the raw receipt.
+    let unknown_raw = dispatch_for_test(&state, make_request("rsk_getRawTransactionReceiptByHash", json!([bogus]))).await;
+    assert!(unknown_raw.result.unwrap().is_null());
+}
+
+#[tokio::test]
+async fn test_receipt_proof_rejects_malformed_input() {
+    let (state, _b, _t, _r, _tmp) = setup_state_with_receipts(1);
+    for params in [json!(["not-a-hash"]), json!([])] {
+        let resp = dispatch_for_test(&state, make_request("rsk_getRawTransactionReceiptByHash", params)).await;
+        assert!(resp.error.is_some(), "malformed input should be refused, not answered null");
+    }
+}
+
