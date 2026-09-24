@@ -65,6 +65,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
+        scoring: None,
     };
     (state, tmp)
 }
@@ -607,6 +608,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
+        scoring: None,
     };
 
     let req = make_request("eth_sendRawTransaction", json!(["0xdeadbeef"]));
@@ -654,6 +656,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
+        scoring: None,
     };
 
     let req = make_request("eth_sendRawTransaction", json!(["0xZZZZ"]));
@@ -734,6 +737,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
+        scoring: None,
     };
     (state, tmp)
 }
@@ -866,6 +870,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
+        scoring: None,
     };
     (state, tmp, tx_hash)
 }
@@ -963,6 +968,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
+        scoring: None,
     };
 
     // Ask the node for the block, take the hash it reports...
@@ -1135,6 +1141,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
+        scoring: None,
     };
     (state, tmp)
 }
@@ -1361,6 +1368,7 @@ async fn test_receipt_dto_failed_status() {
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
+        scoring: None,
     };
 
     let hash_str = format!("{:#x}", tx_hash);
@@ -2210,6 +2218,7 @@ fn setup_state_with_receipts(
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
+        scoring: None,
     };
     (state, block_hash, tx_hashes, receipts, tmp)
 }
@@ -2476,6 +2485,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
+        scoring: None,
     };
 
     let resp = dispatch_for_test(&state, make_request("eth_bridgeState", json!([]))).await;
@@ -3419,6 +3429,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         gc_burial: 4000,
         prune_keep_depth: 100_000,
         prune_max_batch: 1_000,
+        scoring: None,
     };
     (state, tmp, tx_hash, sender, caller, callee)
 }
@@ -3593,4 +3604,185 @@ async fn trace_transaction_unknown_is_null() {
     .await;
     assert!(resp.error.is_none(), "{:?}", resp.error);
     assert_eq!(resp.result.unwrap(), Value::Null);
+}
+
+// ========== sco_* namespace ==========
+
+fn setup_state_with_scoring() -> (RpcState, tempfile::TempDir, tempfile::TempDir) {
+    let (mut state, tmp) = setup_state();
+    let scoring_dir = tempfile::tempdir().unwrap();
+    state.scoring = Some(Arc::new(
+        rustock_networking::scoring::ScoringService::open(
+            scoring_dir.path(),
+            &[],
+            rustock_networking::scoring::DEFAULT_NODE_CAPACITY,
+            true,
+        ),
+    ));
+    (state, tmp, scoring_dir)
+}
+
+/// Banning, listing and unbanning, including a CIDR block.
+#[tokio::test]
+async fn sco_ban_and_unban_an_address_or_a_block() {
+    let (state, _tmp, _dir) = setup_state_with_scoring();
+
+    let ok = dispatch_for_test(&state, make_request("sco_banAddress", json!(["203.0.113.7"]))).await;
+    assert!(ok.error.is_none(), "{:?}", ok.error);
+
+    let ok = dispatch_for_test(
+        &state,
+        make_request("sco_banAddress", json!(["198.51.100.0/24"])),
+    )
+    .await;
+    assert!(ok.error.is_none(), "{:?}", ok.error);
+
+    let list = dispatch_for_test(&state, make_request("sco_bannedAddresses", json!([]))).await;
+    let list = list.result.unwrap();
+    let entries: Vec<String> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(entries.contains(&"203.0.113.7".to_string()), "{entries:?}");
+    assert!(entries.contains(&"198.51.100.0/24".to_string()), "{entries:?}");
+
+    // The block really covers its range.
+    let inside =
+        dispatch_for_test(&state, make_request("sco_isWelcome", json!(["198.51.100.99"]))).await;
+    let inside = inside.result.unwrap();
+    assert_eq!(inside["banned"], json!(true));
+    assert_eq!(inside["welcome"], json!(false));
+
+    let outside =
+        dispatch_for_test(&state, make_request("sco_isWelcome", json!(["198.51.101.99"]))).await;
+    assert_eq!(outside.result.unwrap()["banned"], json!(false));
+
+    let ok = dispatch_for_test(
+        &state,
+        make_request("sco_unbanAddress", json!(["198.51.100.0/24"])),
+    )
+    .await;
+    assert!(ok.error.is_none());
+    let after =
+        dispatch_for_test(&state, make_request("sco_isWelcome", json!(["198.51.100.99"]))).await;
+    assert_eq!(after.result.unwrap()["banned"], json!(false));
+}
+
+/// rskj refuses to ban a loopback address, and so does this.
+#[tokio::test]
+async fn sco_ban_refuses_a_local_address() {
+    let (state, _tmp, _dir) = setup_state_with_scoring();
+    let resp =
+        dispatch_for_test(&state, make_request("sco_banAddress", json!(["127.0.0.1"]))).await;
+    let err = resp.error.expect("banning loopback must fail");
+    assert!(err.message.contains("local address"), "{}", err.message);
+
+    let resp =
+        dispatch_for_test(&state, make_request("sco_banAddress", json!(["10.0.0.1/99"]))).await;
+    assert!(resp.error.unwrap().message.contains("Invalid mask"));
+}
+
+/// The peer list and the summary reflect recorded events, and clearing a peer
+/// empties them.
+#[tokio::test]
+async fn sco_peer_list_and_summary_report_what_was_recorded() {
+    let (state, _tmp, _dir) = setup_state_with_scoring();
+    let scoring = state.scoring.clone().unwrap();
+    let address: std::net::IpAddr = "203.0.113.50".parse().unwrap();
+
+    scoring.record(
+        None,
+        Some(address),
+        rustock_networking::scoring::EventType::InvalidBlock,
+    );
+    scoring.record(
+        None,
+        Some(address),
+        rustock_networking::scoring::EventType::FailedHandshake,
+    );
+
+    let list = dispatch_for_test(&state, make_request("sco_peerList", json!([]))).await;
+    let list = list.result.unwrap();
+    let entries = list.as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{entries:#?}");
+    let entry = &entries[0];
+    assert_eq!(entry["id"], "203.0.113.50");
+    assert_eq!(entry["type"], "address");
+    assert_eq!(entry["invalidBlocks"], json!(1));
+    assert_eq!(entry["failedHandshakes"], json!(1));
+    // An invalid block costs reputation; a failed handshake does not move the
+    // score at all, which is rskj's rule.
+    assert_eq!(entry["score"], json!(-1));
+    assert_eq!(entry["goodReputation"], json!(false));
+    assert_eq!(entry["punishments"], json!(1));
+    assert!(entry["punishedUntil"].as_u64().unwrap() > 0);
+    assert!(entry["score"].is_number(), "counters are JSON numbers, not hex");
+
+    let summary = dispatch_for_test(&state, make_request("sco_reputationSummary", json!([]))).await;
+    let summary = summary.result.unwrap();
+    assert_eq!(summary["invalidBlocks"], json!(1));
+    assert_eq!(summary["failedHandshakes"], json!(1));
+    assert_eq!(summary["badReputationCount"], json!(1));
+    assert_eq!(summary["goodReputationCount"], json!(0));
+    assert_eq!(summary["peersTotalCount"], json!(1));
+
+    let cleared = dispatch_for_test(
+        &state,
+        make_request("sco_clearPeerScoring", json!(["203.0.113.50"])),
+    )
+    .await;
+    assert!(cleared.result.unwrap().as_array().unwrap().is_empty(), "the entry is gone");
+}
+
+/// `sco_clearPeerScoring` takes a node id when the argument is not an address.
+#[tokio::test]
+async fn sco_clear_peer_scoring_accepts_a_node_id() {
+    let (state, _tmp, _dir) = setup_state_with_scoring();
+    let scoring = state.scoring.clone().unwrap();
+    let id = alloy_primitives::B512::repeat_byte(0xAB);
+    scoring.record(
+        Some(id),
+        None,
+        rustock_networking::scoring::EventType::InvalidHeader,
+    );
+    assert_eq!(
+        dispatch_for_test(&state, make_request("sco_peerList", json!([])))
+            .await
+            .result
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let hex_id = format!("0x{}", hex::encode(id.as_slice()));
+    let cleared =
+        dispatch_for_test(&state, make_request("sco_clearPeerScoring", json!([hex_id]))).await;
+    assert!(cleared.result.unwrap().as_array().unwrap().is_empty());
+
+    // Neither an address nor a node id is a parameter error, not a silent
+    // no-op.
+    let bad =
+        dispatch_for_test(&state, make_request("sco_clearPeerScoring", json!(["nonsense"]))).await;
+    assert!(bad.error.is_some());
+}
+
+/// Without scoring the namespace says so, rather than answering from an empty
+/// table as if every peer were spotless.
+#[tokio::test]
+async fn sco_reports_itself_unavailable_when_scoring_is_off() {
+    let (state, _tmp) = setup_state();
+    for method in [
+        "sco_bannedAddresses",
+        "sco_peerList",
+        "sco_reputationSummary",
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+        let err = resp.error.unwrap_or_else(|| panic!("{method} should report unavailable"));
+        assert_eq!(err.code, METHOD_NOT_FOUND);
+        assert!(err.message.contains("not enabled"), "{}", err.message);
+    }
 }

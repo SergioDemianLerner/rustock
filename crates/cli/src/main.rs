@@ -134,6 +134,22 @@ struct Args {
     #[arg(short, long, default_value = "./data")]
     data_dir: String,
 
+    /// Addresses or CIDR blocks refused at connection time, as rskj's
+    /// `peer.bannedPeerIPs`. Repeatable.
+    ///
+    /// Bans added later through `sco_banAddress` are persisted separately, in
+    /// `banned-peers.txt` inside the data directory, and reloaded at start-up.
+    #[arg(long, value_name = "ADDRESS_OR_CIDR")]
+    banned_peers: Vec<String>,
+
+    /// Record peer scoring but never act on it.
+    ///
+    /// rskj's `scoring.punishmentEnabled = false`. Events are still counted
+    /// and `sco_peerList` still reports them, so an operator can see what
+    /// would have been punished before letting it punish.
+    #[arg(long, default_value_t = false)]
+    no_peer_punishment: bool,
+
     /// Network ID (30 for mainnet, 33 for regtest)
     #[arg(long, default_value = "30")]
     network_id: u64,
@@ -645,6 +661,19 @@ fn apply_file_config(
         &mut a.max_inbound_per_cidr);
     apply(matches, "inbound_cidr_prefix", f.peers.inbound_cidr_prefix.as_ref(),
         &mut a.inbound_cidr_prefix);
+    // A list, so `apply`'s "the CLI wins" rule does not fit: the two sources
+    // are *combined*. An operator keeping a standing ban list in the config
+    // file should still be able to add one on the command line without
+    // retyping the rest.
+    if let Some(banned) = &f.peers.banned_peers {
+        for entry in banned {
+            if !a.banned_peers.contains(entry) {
+                a.banned_peers.push(entry.clone());
+            }
+        }
+    }
+    apply(matches, "no_peer_punishment", f.peers.no_peer_punishment.as_ref(),
+        &mut a.no_peer_punishment);
 
     apply(matches, "trie_backend", f.trie.backend.as_ref(), &mut a.trie_backend);
     apply(
@@ -1311,10 +1340,23 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Peer scoring: one service shared by the node (which refuses banned
+    // addresses before the handshake), the sync service and the transaction
+    // relay (which feed it events), and the RPC layer (which reports and
+    // overrides it). Bans live in the data directory so they survive a
+    // restart -- rskj's do not.
+    let scoring = Arc::new(rustock_networking::scoring::ScoringService::open(
+        std::path::Path::new(&args.data_dir),
+        &args.banned_peers,
+        rustock_networking::scoring::DEFAULT_NODE_CAPACITY,
+        !args.no_peer_punishment,
+    ));
+
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_tx_pool(pool.clone())
         .with_block_processor(block_processor, trie_store_for_exec, initial_state_root)
-        .with_gas_price_tracker(gas_price_tracker.clone());
+        .with_gas_price_tracker(gas_price_tracker.clone())
+        .with_scoring(Some(scoring.clone()));
 
     // Taken before the service is moved into its task: the RPC layer reads the
     // same gauge the sync loop publishes, so `debug_wireProtocolQueueSize`
@@ -1396,9 +1438,13 @@ async fn main() -> Result<()> {
         });
     }
 
-    let tx_relay = Arc::new(TxRelay::with_pool(peer_store.clone(), pool.clone()));
+    let tx_relay = Arc::new(
+        TxRelay::with_pool(peer_store.clone(), pool.clone())
+            .with_scoring(Some(scoring.clone())),
+    );
 
-    let mut node = Node::with_peer_store(node_config, peer_store.clone());
+    let mut node =
+        Node::with_peer_store(node_config, peer_store.clone()).with_scoring(scoring.clone());
     node.add_handler(sync_handler);
     node.add_handler(tx_relay.clone());
 
@@ -1525,6 +1571,7 @@ async fn main() -> Result<()> {
             gc_burial: args.gc_burial,
             prune_keep_depth: args.prune_keep_depth,
             prune_max_batch: args.prune_max_batch,
+            scoring: Some(scoring.clone()),
         };
         let rpc_host = args.rpc_host.clone();
         let rpc_port = args.rpc_port;

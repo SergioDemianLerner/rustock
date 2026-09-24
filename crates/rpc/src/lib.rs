@@ -8,6 +8,7 @@ pub mod mnr;
 pub mod admin;
 pub mod net;
 pub mod rsk;
+pub mod sco;
 pub mod server;
 pub mod state;
 pub mod tx;

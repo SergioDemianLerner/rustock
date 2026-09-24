@@ -201,7 +201,15 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
   not cosmetic, and precompile calls (the Bridge included) never appear. See
   [docs/trace-namespace.md](docs/trace-namespace.md).
 
-**Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), and the `personal_*`, `evm_*`, `db_*`, `sco_*` namespaces.
+**Peer scoring:**
+
+- `sco_banAddress`, `sco_unbanAddress`, `sco_bannedAddresses`, `sco_peerList`,
+  `sco_clearPeerScoring`, `sco_reputationSummary`, plus `sco_isWelcome`
+
+  A port of rskj's `co.rsk.scoring`. Bans persist across restarts, which
+  rskj's do not. See [docs/peer-scoring.md](docs/peer-scoring.md).
+
+**Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), and the `personal_*`, `evm_*`, `db_*` namespaces.
 
 ## Project Structure
 
@@ -228,9 +236,11 @@ Rustock executes blocks and maintains full state, but it is not yet feature-comp
   transaction's block from its parent's state, so they answer only within the
   GC burial depth (4,000 blocks by default) and return an error past it.
   `trace_filter` recomputes rather than reading an index, as rskj does.
-- **No peer scoring or banning.** A misbehaving peer is sidelined for seconds
-  and then welcomed back; there is no ban list, no CIDR exclusion and no
-  `sco_*` namespace.
+- **Peer scoring does not yet see block validity.** Handshakes,
+  disconnections, timeouts, invalid headers and transaction-pool rejections
+  all feed the scoring table; `VALID_BLOCK` and `INVALID_BLOCK` do not,
+  because rustock does not carry the supplying peer through to where blocks
+  are validated. See [docs/peer-scoring.md](docs/peer-scoring.md).
 - **No wallet / account management.** `eth_sendTransaction`, `eth_sign`, and the `personal_*` namespace are intentionally not supported — sign transactions externally and submit them via `eth_sendRawTransaction`.
 
 ## License

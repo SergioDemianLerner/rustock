@@ -8,6 +8,7 @@ pub mod handshake;
 pub mod outbound;
 pub mod peer_exchange;
 pub mod peers;
+pub mod scoring;
 pub mod utils;
 pub mod rlpx;
 

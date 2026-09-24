@@ -18,7 +18,7 @@ use tracing::info;
 
 use crate::txpool;
 use crate::types::*;
-use crate::{admin, call, debug, eth, logs, mnr, net, rsk, state, trace, tx, web3};
+use crate::{admin, call, debug, eth, logs, mnr, net, rsk, sco, state, trace, tx, web3};
 
 /// Trait for submitting raw transactions, allowing the RPC layer to use
 /// the P2P relay without depending on the sync crate directly.
@@ -88,6 +88,9 @@ pub struct RpcState {
     pub prune_keep_depth: u64,
     /// Most blocks one prune sweep may remove.
     pub prune_max_batch: u64,
+    /// Peer scoring and banning. Absent, the `sco_*` namespace reports itself
+    /// as unavailable rather than answering from an empty table.
+    pub scoring: Option<Arc<rustock_networking::scoring::ScoringService>>,
 }
 
 /// Starts the JSON-RPC HTTP server on the given host and port.
@@ -291,6 +294,14 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "debug_traceBlockByNumber" => debug::debug_trace_block_by_number(id, params, state),
         "debug_accountTransactionQuota" => debug::debug_account_transaction_quota(id, params, state),
 
+        "sco_banAddress" => sco::sco_ban_address(id, params, state),
+        "sco_unbanAddress" => sco::sco_unban_address(id, params, state),
+        "sco_bannedAddresses" => sco::sco_banned_addresses(id, state),
+        "sco_peerList" => sco::sco_peer_list(id, state),
+        "sco_clearPeerScoring" => sco::sco_clear_peer_scoring(id, params, state),
+        "sco_reputationSummary" => sco::sco_reputation_summary(id, state),
+        "sco_isWelcome" => sco::sco_is_welcome(id, params, state),
+
         "trace_transaction" => trace::trace_transaction(id, params, state),
         "trace_block" => trace::trace_block(id, params, state),
         "trace_get" => trace::trace_get(id, params, state),
@@ -305,8 +316,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
             || m.starts_with("personal_")
             || m.starts_with("evm_")
             || m.starts_with("txpool_")
-            || m.starts_with("db_")
-            || m.starts_with("sco_") => {
+            || m.starts_with("db_") => {
             execution_not_available(id, m)
         }
 

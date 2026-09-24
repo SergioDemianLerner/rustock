@@ -26,3 +26,8 @@ aes = "0.8.4"
 ctr = "0.9.2"
 hmac = "0.12.1"
 sha2 = { workspace = true }
+
+[dev-dependencies]
+# The ban list is persisted to the data directory, so its tests need a real
+# one.
+tempfile = { workspace = true }

@@ -11,6 +11,14 @@ pub struct PeerMetadata {
     pub best_hash: B256,
     pub total_difficulty: U256,
     pub client_id: String,
+    /// The peer's remote IP, when the connection path knew one.
+    ///
+    /// Peer scoring records every event against the node id **and** the
+    /// address (rskj's `recordEvent(id, address, ...)`), because a peer that
+    /// reconnects with a freshly generated node id keeps its address. The
+    /// sync layer only ever holds a node id, so the address has to be
+    /// reachable from here.
+    pub address: Option<std::net::IpAddr>,
 }
 
 struct PeerState {
@@ -53,11 +61,27 @@ impl PeerStore {
     }
 
     /// Updates the metadata for a peer.
-    pub async fn update_metadata(&self, id: &B512, metadata: PeerMetadata) {
+    ///
+    /// The **address is preserved** when the incoming metadata has none. Only
+    /// the connection path knows a peer's address; the callers that update
+    /// chain-tip metadata (a new `Status`, a `NewBlockHashes`) build a fresh
+    /// `PeerMetadata` and would otherwise erase it on the first message after
+    /// the handshake -- which would silently reduce peer scoring to node ids
+    /// only.
+    pub async fn update_metadata(&self, id: &B512, mut metadata: PeerMetadata) {
         let mut peers = self.connected_peers.lock().await;
         if let Some(state) = peers.get_mut(id) {
+            if metadata.address.is_none() {
+                metadata.address = state.metadata.address;
+            }
             state.metadata = metadata;
         }
+    }
+
+    /// The peer's remote address, if the connection path recorded one.
+    pub async fn address(&self, id: &B512) -> Option<std::net::IpAddr> {
+        let peers = self.connected_peers.lock().await;
+        peers.get(id).and_then(|s| s.metadata.address)
     }
 
     /// Returns the metadata for a specific peer.
@@ -184,6 +208,7 @@ mod tests {
             best_hash: B256::repeat_byte(0x11),
             total_difficulty: U256::from(999),
             client_id: "test".to_string(),
+            address: Some("203.0.113.1".parse().unwrap()),
         };
         store.update_metadata(&peer_id, metadata.clone()).await;
 
