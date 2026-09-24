@@ -2281,6 +2281,48 @@ fn fast_forward_needs_the_receipts_and_the_state() {
         "executed locally and the state is still held: adopt it"
     );}
 
+/// `record_execution` has to report a refused marker, because the caller's
+/// behaviour depends on it: on `false` the executed head did not move, so the
+/// caller must not claim the block executed and must not advance its in-memory
+/// state root past a block the node is not on.
+///
+/// Mainnet produced exactly this at 14:01:15 on 2026-09-24 -- a reorg landed
+/// between executing #9,267,779 and recording it, the store refused the
+/// marker, and the node logged `Executed block #9267779` on the next line
+/// anyway. The coherence check then had to reload the committed root five
+/// seconds later.
+#[test]
+fn record_execution_reports_whether_the_marker_moved() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let canonical = dummy_header(1, genesis.hash(), U256::from(2));
+    store.update_head(&canonical, U256::from(3)).unwrap();
+
+    // A sibling at the same height: stored, but not the canonical block there.
+    let mut sibling = dummy_header(1, genesis.hash(), U256::from(2));
+    sibling.extra_data = vec![0xEE].into();
+    let sibling_hash = sibling.hash();
+    store.put_header(&sibling).unwrap();
+    assert_eq!(store.canonical_hash(1).unwrap(), Some(canonical.hash()));
+
+    assert!(
+        crate::service::record_execution(&store, canonical.hash(), canonical.state_root),
+        "the canonical block records"
+    );
+    assert!(
+        !crate::service::record_execution(&store, sibling_hash, sibling.state_root),
+        "a block that is not canonical at its height must report a refused marker, \
+         not a silent failure the caller reads as success"
+    );
+
+    // And the marker really did not move to the sibling.
+    let (exec, _) = store.exec_head().unwrap().unwrap();
+    assert_eq!(exec, canonical.hash(), "the executed head stays on the canonical block");
+}
+
 #[tokio::test]
 async fn test_reconcile_leaves_a_genuine_tip_alone() {
     // The same code path must not fire at the tip. Nothing is stored above our
