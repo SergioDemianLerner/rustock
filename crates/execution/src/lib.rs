@@ -32,6 +32,7 @@ pub use precompiles::{
 pub use mining::{BlockTemplate, BlockTemplateBuilder, MinerServer, MinerWork, MiningConfig};
 pub use processor::{BlockProcessor, ProcessError, ProcessedBlock};
 pub use remasc::RemascConfig;
+pub mod tracer;
 pub mod supply;
 pub use state::apply_state_changes;
 

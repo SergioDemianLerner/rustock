@@ -645,3 +645,31 @@ where
         acc.set_nonce(nonce);
     }
 }
+
+/// Inspection support, for `debug_traceTransaction` and the `trace_*` methods.
+///
+/// Every method that matters is defaulted by the trait: `inspect_run` mirrors
+/// `Handler::run` while driving the inspector's `step` / `call` / `create`
+/// hooks. So the traced execution goes through **this same handler** -- the
+/// same RSKIP125 and RSKIP150 behaviour, the same invisible-exception
+/// handling, the same precompile set -- rather than a second implementation
+/// that could drift from it.
+///
+/// That matters more than the convenience: a tracer describing a different
+/// execution from the one the chain performed is worse than no tracer.
+impl<EVM, ERROR> revm::inspector::InspectorHandler for RskHandler<EVM, ERROR, EthFrame<EthInterpreter>>
+where
+    EVM: revm::inspector::InspectorEvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
+        >,
+        Precompiles: PrecompileProvider<<EVM as EvmTr>::Context>,
+        Inspector: revm::inspector::Inspector<<EVM as EvmTr>::Context, EthInterpreter>,
+    >,
+    ERROR: EvmTrError<EVM>,
+{
+    type IT = EthInterpreter;
+}
