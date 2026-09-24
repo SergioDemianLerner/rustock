@@ -90,6 +90,29 @@ const FOLLOW_BACKLOG_TOLERANCE: u64 = 2;
 /// qualifies.
 ///
 /// Bounded: a damaged index must not turn a recovery into a full-chain sweep.
+/// A [`ChainView`](crate::rollback::ChainView) over this node's stores.
+///
+/// `trie` is optional because two of the three decisions in `rollback` never
+/// ask about state: `fork_point` and `ancestor_at_depth` walk headers only.
+/// Only `choose_resume_point` needs the trie, and it is the only caller that
+/// passes one.
+pub(crate) struct StoreView<'a> {
+    pub store: &'a BlockStore,
+    pub trie: Option<&'a dyn TrieStore>,
+}
+
+impl crate::rollback::ChainView for StoreView<'_> {
+    fn header(&self, hash: B256) -> Option<Header> {
+        self.store.header(hash).ok().flatten()
+    }
+    fn canonical_hash(&self, number: u64) -> Option<B256> {
+        self.store.canonical_hash(number).ok().flatten()
+    }
+    fn has_state(&self, root: B256) -> bool {
+        self.trie.is_some_and(|t| t.get(root.as_slice()).is_some())
+    }
+}
+
 pub(crate) fn canonical_top_held(store: &BlockStore, from: u64) -> Option<B256> {
     const MAX_WALK_UP: u64 = 4_096;
 
@@ -160,6 +183,32 @@ const TICK_INTERVAL: Duration = Duration::from_secs(5);
 /// sync; smaller gaps are handled by fetching individual headers.
 /// Matches RSKj's `longSyncLimit` (default 24).
 const LONG_SYNC_LIMIT: u64 = 24;
+
+/// How far below an orphaned head to retreat when the fork point cannot be
+/// computed, because the branch that replaced us was never downloaded.
+///
+/// **One past `LONG_SYNC_LIMIT`, and that is the whole derivation.** This is
+/// not a guess at how deep reorgs go; no constant could be. It is the depth at
+/// which `check_follow_gap` stops trying to bridge the gap by chasing
+/// individual missing parents and switches to skeleton sync, which requests
+/// **by height range**. A range request is the only mechanism that re-fetches
+/// a height whose block the node already holds -- and holding the wrong block
+/// at a contested height is exactly the situation a blind retreat is in.
+///
+/// Retreating one block instead is what stalled mainnet for twelve minutes on
+/// 2026-09-24. It left the node "1 block behind", holding that one block (the
+/// losing one), so follow mode had nothing to chase and sat idle while the
+/// network moved on. It escaped only when the network's own progress carried
+/// it past this same threshold, 12 minutes later, and skeleton sync fixed it
+/// in 20 seconds.
+///
+/// The cost is re-executing up to 25 blocks -- a few seconds -- on a reorg
+/// whose replacement branch is not held. That is most of them: a one-block
+/// reorg at the tip takes this path too, because the block that replaced us is
+/// equally not in the store. Robustness is worth more here than those seconds;
+/// three stalls in three days (3 hours, 3 days, 12 minutes) all lived in this
+/// decision.
+pub(crate) const BLIND_RETREAT_DEPTH: u64 = LONG_SYNC_LIMIT + 1;
 
 fn create_block_hash_request(height: u64) -> P2pMessage {
     let req = BlockHashRequest {
@@ -750,9 +799,12 @@ impl SyncService {
                 // If blocks are stored at N+1 and *none* of them builds on our
                 // executed head, then nothing extends us and we are on a branch
                 // the network left behind. Adopting the stored lineage gives
-                // N+1 a canonical pointer, and the ordinary orphan path above
-                // then rolls execution back one block per round until it
-                // reaches the fork point.
+                // N+1 a canonical pointer; when it cannot be adopted the
+                // retreat goes straight to the fork point rather than one
+                // block per round (see `orphan_retreat_target` -- one block per
+                // round does not converge, because after the first step a
+                // stored child of the losing head satisfies `extends_us` and
+                // the condition stops being detected at all).
                 let stored_next = store.hashes_at_height(header.number + 1).unwrap_or_default();
                 if stored_next.is_empty() {
                     return; // genuinely at the tip: nothing to reconcile
@@ -818,11 +870,11 @@ impl SyncService {
                         // the later round used to perform happens now.
                         warn!(
                             target: "rustock::sync",
-                            "Orphan recovery: cannot adopt {:?} ({}); retreating to #{} so the \
-                             height is downloaded again",
-                            successor, broken, header.number.saturating_sub(1)
+                            "Orphan recovery: cannot adopt {:?} ({}); retreating below the fork \
+                             so the range is downloaded again",
+                            successor, broken
                         );
-                        self.retreat_below_orphaned_head(&header);
+                        self.retreat_below_orphaned_head(&header, successor);
                     }
                 }
                 return;
@@ -870,11 +922,15 @@ impl SyncService {
             Err(broken) => {
                 warn!(
                     target: "rustock::sync",
-                    "Reorg: canonical block {:?} at #{} cannot be proved ({}); retreating to #{} \
-                     so the height is downloaded again",
-                    child.parent_hash, header.number, broken, header.number - 1
+                    "Reorg: canonical block {:?} at #{} cannot be proved ({}); retreating below \
+                     the fork so the range is downloaded again",
+                    child.parent_hash, header.number, broken
                 );
-                match Validated::prove(store, header.parent_hash) {
+                // The fork point, not our parent -- same rule, and same
+                // reason, as the other orphan path. See
+                // `orphan_retreat_target`.
+                let target = self.orphan_retreat_target(&header, child_hash);
+                match Validated::prove(store, target.hash) {
                     Ok(to) => {
                         if let Err(e) = store.apply(&Transition::Retreat { to }) {
                             warn!(target: "rustock::sync", "Reorg: retreat failed: {:?}", e);
@@ -882,8 +938,8 @@ impl SyncService {
                     }
                     Err(b) => warn!(
                         target: "rustock::sync",
-                        "Reorg: cannot retreat to {:?} either ({}); the chain below is broken",
-                        header.parent_hash, b
+                        "Reorg: cannot retreat to {} either ({}); the chain below is broken",
+                        target, b
                     ),
                 }
             }
@@ -1339,24 +1395,11 @@ impl SyncService {
     pub(crate) fn roll_execution_back(&mut self, from: rustock_storage::BlockRef) -> bool {
         let Some(trie_store) = self.trie_store.clone() else { return false };
 
-        struct View<'a> {
-            store: &'a BlockStore,
-            trie: &'a dyn TrieStore,
-        }
-        impl crate::rollback::ChainView for View<'_> {
-            fn header(&self, hash: B256) -> Option<Header> {
-                self.store.header(hash).ok().flatten()
-            }
-            fn canonical_hash(&self, number: u64) -> Option<B256> {
-                self.store.canonical_hash(number).ok().flatten()
-            }
-            fn has_state(&self, root: B256) -> bool {
-                self.trie.get(root.as_slice()).is_some()
-            }
-        }
-
         let target = {
-            let view = View { store: &self.manager.store, trie: trie_store.as_ref() };
+            let view = StoreView {
+                store: &self.manager.store,
+                trie: Some(trie_store.as_ref()),
+            };
             match crate::rollback::choose_resume_point(&view, from) {
                 Ok(t) => t,
                 Err(why) => {
@@ -1406,6 +1449,85 @@ impl SyncService {
         true
     }
 
+    /// Where to retreat to when our head has been orphaned by `replaced_by`:
+    /// **below the fork, not one block down.**
+    ///
+    /// Retreating to the orphaned head's own parent is correct only when the
+    /// reorg is exactly one block deep. Any deeper and that parent is on the
+    /// abandoned branch too, so the retreat re-canonicalises a losing block
+    /// and the node then waits for a child no peer will ever produce. Mainnet
+    /// sat in exactly that state for twelve minutes on 2026-09-24
+    /// (#9,266,649-#9,266,652, a three-deep reorg), and escaped only when the
+    /// network's own progress carried it 25 blocks ahead -- which switched it
+    /// to skeleton sync, whose bulk path noticed in one round.
+    ///
+    /// It would be better to retreat to the fork point exactly. That is not
+    /// available here, and the reason is worth stating because it is not
+    /// obvious: we only reach this function when `Validated::prove` on the
+    /// replacement failed, and it fails for one reason only -- a header
+    /// missing while walking that branch down. Locating the fork means walking
+    /// the same segment, from the same tip toward the same meeting point, so
+    /// it runs into the same gap. The two succeed and fail together. When the
+    /// replacement branch *is* held, `prove` succeeds and the caller adopts it
+    /// rather than retreating at all.
+    ///
+    /// So the retreat covers distance rather than locating the fork, and the
+    /// distance is [`BLIND_RETREAT_DEPTH`] -- chosen to cross the follow /
+    /// skeleton boundary, because a height-range request is the only mechanism
+    /// that re-fetches a height whose block the node already holds.
+    ///
+    /// The exact fork point is then reached one round later, for free: the
+    /// re-download puts the replacement branch in the store, `prove` succeeds,
+    /// adoption un-canonicalises our losing blocks, and `choose_resume_point`
+    /// walks execution back to precisely the last block both chains share.
+    fn orphan_retreat_target(
+        &self,
+        header: &Header,
+        replaced_by: B256,
+    ) -> rustock_storage::BlockRef {
+        let store = &self.manager.store;
+        let view = StoreView { store, trie: self.trie_store.as_deref() };
+        let ours = header.hash();
+        let parent = rustock_storage::BlockRef::new(
+            header.number.saturating_sub(1),
+            header.parent_hash,
+        );
+
+        let _ = replaced_by;
+        // Blind, and it has to be: the fork point is NOT computable here.
+        //
+        // We only reach this function because `Validated::prove` on the
+        // replacement failed, and it fails for exactly one reason -- a header
+        // missing while walking that branch down. A fork-point search walks
+        // the *same* segment, from the same tip toward the same meeting point,
+        // so it hits the same gap and fails whenever `prove` does. The two are
+        // not independent: when the replacement branch is held, `prove`
+        // succeeds and we adopt it instead of ever coming here.
+        // `rollback::fork_point` states that relationship and the property
+        // test `a_blind_retreat_never_stops_above_the_fork` checks this
+        // function against it.
+        //
+        // So the retreat goes below the fork by covering distance instead of
+        // by locating it, and the exact fork point is reached one round later,
+        // for free: once the range is re-downloaded the replacement branch is
+        // in the store, `prove` succeeds, adoption un-canonicalises our losing
+        // blocks, and `choose_resume_point` walks execution back to precisely
+        // the last block both chains share.
+        let blind = crate::rollback::deepest_resumable_within(
+            &view,
+            ours,
+            BLIND_RETREAT_DEPTH,
+        )
+        .unwrap_or(parent);
+        warn!(
+            target: "rustock::sync",
+            "Orphan recovery: retreating {} block(s) to {}, below the orphaned head #{}, \
+             so the range is downloaded again",
+            header.number.saturating_sub(blind.number), blind, header.number
+        );
+        blind
+    }
+
     /// Retreat the head below an orphaned executed head, and roll execution
     /// back with it.
     ///
@@ -1416,17 +1538,17 @@ impl SyncService {
     /// Execution comes back with the head. Retreating one without the other is
     /// how I4 gets broken by the act of recovering -- which is what the
     /// watchdog's first deployment did to mainnet within fifteen seconds.
-    fn retreat_below_orphaned_head(&mut self, header: &Header) {
+    fn retreat_below_orphaned_head(&mut self, header: &Header, replaced_by: B256) {
+        let target = self.orphan_retreat_target(header, replaced_by);
         let store = &self.manager.store;
-        let parent_hash = header.parent_hash;
 
-        let to = match Validated::prove(store, parent_hash) {
+        let to = match Validated::prove(store, target.hash) {
             Ok(v) => v,
             Err(broken) => {
                 warn!(
                     target: "rustock::sync",
-                    "Orphan recovery: cannot retreat to {:?} ({}); the chain below is broken",
-                    parent_hash, broken
+                    "Orphan recovery: cannot retreat to {} ({}); the chain below is broken",
+                    target, broken
                 );
                 return;
             }

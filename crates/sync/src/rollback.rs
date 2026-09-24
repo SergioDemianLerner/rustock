@@ -110,6 +110,140 @@ pub fn choose_resume_point<V: ChainView>(
     Err(NoResumePoint::TooDeep { searched: MAX_ROLLBACK })
 }
 
+/// Why the fork point could not be computed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoForkPoint {
+    /// One of the two branches runs into a header the node does not hold
+    /// before the walks meet.
+    ///
+    /// This is the *ordinary* outcome when a reorg replaces blocks the node
+    /// never downloaded: the replacement branch is exactly what is missing.
+    /// Callers must have an answer for it, not treat it as an error.
+    ChainBroken { missing: B256 },
+    /// Neither walk found a shared block within [`MAX_ROLLBACK`].
+    TooDeep,
+    /// A starting hash has no header.
+    HeaderMissing { hash: B256 },
+}
+
+/// The deepest block that is on both branches: where they forked.
+///
+/// `ours` is the head being abandoned, `theirs` the block that replaced it.
+///
+/// **This is the specification of a correct retreat, not a step in one.** The
+/// node cannot call it at the moment it retreats, and the reason is worth
+/// stating: the retreat happens only when `Validated::prove` on the
+/// replacement failed, and it fails for one reason -- a header missing while
+/// walking that branch down. This walks the same segment, from the same tip
+/// toward the same meeting point, so it meets the same gap. The two succeed
+/// and fail together, and when they succeed the caller adopts the replacement
+/// instead of retreating.
+///
+/// What it is for is checking that the blind retreat which *is* used never
+/// stops above the fork -- see `a_blind_retreat_never_stops_above_the_fork`.
+/// Here the whole of both branches is known; on the node, half of it is
+/// missing by definition.
+///
+/// Both walks are bounded: a "fork" deeper than [`MAX_ROLLBACK`] is a broken
+/// store, not a reorg.
+pub fn fork_point<V: ChainView>(
+    view: &V,
+    ours: B256,
+    theirs: B256,
+) -> Result<BlockRef, NoForkPoint> {
+    use std::collections::HashMap;
+
+    if ours == theirs {
+        let header = view.header(ours).ok_or(NoForkPoint::HeaderMissing { hash: ours })?;
+        return Ok(BlockRef::new(header.number, ours));
+    }
+
+    // Our own ancestry first: it is the one we are sure we hold, because we
+    // executed it.
+    let mut mine: HashMap<B256, u64> = HashMap::new();
+    let mut hash = ours;
+    let mut header = view.header(hash).ok_or(NoForkPoint::HeaderMissing { hash: ours })?;
+    for _ in 0..=MAX_ROLLBACK {
+        mine.insert(hash, header.number);
+        if header.number == 0 {
+            break;
+        }
+        let parent = header.parent_hash;
+        // A gap on our own side just limits how deep the answer can be; it is
+        // not fatal, because the meeting point may be above the gap.
+        let Some(parent_header) = view.header(parent) else { break };
+        hash = parent;
+        header = parent_header;
+    }
+
+    // Then walk theirs down until it lands on something of ours.
+    let mut hash = theirs;
+    let mut header = view.header(hash).ok_or(NoForkPoint::HeaderMissing { hash: theirs })?;
+    for _ in 0..=MAX_ROLLBACK {
+        if let Some(number) = mine.get(&hash) {
+            return Ok(BlockRef::new(*number, hash));
+        }
+        if header.number == 0 {
+            return Err(NoForkPoint::TooDeep);
+        }
+        let parent = header.parent_hash;
+        let Some(parent_header) = view.header(parent) else {
+            return Err(NoForkPoint::ChainBroken { missing: parent });
+        };
+        hash = parent;
+        header = parent_header;
+    }
+
+    Err(NoForkPoint::TooDeep)
+}
+
+/// The deepest ancestor within `depth` blocks of `from` whose state the node
+/// still holds.
+///
+/// Used only when [`fork_point`] cannot answer, to pick a blind retreat
+/// target. Two bounds, and both matter:
+///
+/// * **`depth`**, because a blind retreat is a guess and should not be
+///   unbounded.
+/// * **state**, because the head is about to retreat here and execution has to
+///   resume here. Retreating below the last state the node holds strands
+///   execution with nowhere to resume -- `choose_resume_point` would then walk
+///   back up looking for a canonical block with state and find none, because
+///   the retreat has just un-canonicalised everything above.
+///
+/// Falls back to the shallowest ancestor walked if none of them has state,
+/// which leaves the caller no worse off than the single-step retreat this
+/// replaces. Returns `None` only when `from` itself has no header.
+pub fn deepest_resumable_within<V: ChainView>(
+    view: &V,
+    from: B256,
+    depth: u64,
+) -> Option<BlockRef> {
+    let mut hash = from;
+    let mut header = view.header(hash)?;
+    let mut fallback: Option<BlockRef> = None;
+    let mut best: Option<BlockRef> = None;
+
+    for step in 0..=depth {
+        // `from` itself is not a candidate: the whole point is to get below it.
+        if step > 0 {
+            let here = BlockRef::new(header.number, hash);
+            fallback.get_or_insert(here);
+            if view.has_state(header.state_root) {
+                best = Some(here);
+            }
+        }
+        if header.number == 0 {
+            break;
+        }
+        let Some(parent_header) = view.header(header.parent_hash) else { break };
+        hash = header.parent_hash;
+        header = parent_header;
+    }
+
+    best.or(fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,4 +566,223 @@ mod tests {
             }
         }
     }
+
+    /// A common chain up to `fork_height`, then two branches of `depth` blocks
+    /// diverging from it. Returns (fork block, our tip, their tip).
+    fn two_branches(w: &mut World, fork_height: u64, depth: u64) -> (B256, B256, B256) {
+        let mut parent = B256::ZERO;
+        for n in 0..fork_height {
+            let h = header(n, parent, 0);
+            parent = w.add(&h);
+            w.canonicalise(&h);
+            w.with_state(&h);
+        }
+        let fork_block = header(fork_height, parent, 0);
+        let fork = w.add(&fork_block);
+        w.canonicalise(&fork_block);
+        w.with_state(&fork_block);
+
+        let mut build = |w: &mut World, salt: u64| {
+            let mut parent = fork;
+            for n in fork_height + 1..=fork_height + depth {
+                let h = header(n, parent, salt);
+                parent = w.add(&h);
+                w.with_state(&h);
+            }
+            parent
+        };
+        let ours = build(w, 1);
+        let theirs = build(w, 2);
+        (fork, ours, theirs)
+    }
+
+    impl World {
+        /// Drop a header, as a node that never downloaded it would have it.
+        fn forget(&mut self, hash: B256) {
+            self.headers.remove(&hash);
+        }
+    }
+
+    mod fork {
+        use super::*;
+
+        /// The property the blind retreat must satisfy: **never stop above the
+        /// fork.** Stopping above it re-seats the head on a block the network
+        /// abandoned, which is the 2026-09-24 stall.
+        ///
+        /// `fork_point` is the oracle, computed here with both branches fully
+        /// known -- which is exactly the knowledge the node does not have when
+        /// it retreats.
+        #[test]
+        fn a_blind_retreat_never_stops_above_the_fork() {
+            let limit = crate::service::BLIND_RETREAT_DEPTH;
+            for depth in 1..=limit {
+                let mut w = World::default();
+                let (_, tip_ours, tip_theirs) = two_branches(&mut w, 100, depth);
+
+                let fork = fork_point(&w, tip_ours, tip_theirs).unwrap();
+                let target = deepest_resumable_within(&w, tip_ours, limit).unwrap();
+
+                assert!(
+                    target.number <= fork.number,
+                    "a {depth}-deep reorg retreated to #{} but the branches fork at #{}; \
+                     the head would be re-seated on a block the network abandoned",
+                    target.number, fork.number
+                );
+            }
+        }
+
+        /// The same property, against the rule this replaces. It fails for
+        /// every reorg deeper than one block -- which is the bug, stated as a
+        /// test rather than as a paragraph.
+        #[test]
+        fn retreating_to_the_parent_stops_above_the_fork_whenever_it_is_deeper() {
+            for depth in 1..=6u64 {
+                let mut w = World::default();
+                let (_, tip_ours, tip_theirs) = two_branches(&mut w, 100, depth);
+
+                let fork = fork_point(&w, tip_ours, tip_theirs).unwrap();
+                let parent = w.header(tip_ours).unwrap().parent_hash;
+                let parent_number = w.header(parent).unwrap().number;
+
+                if depth == 1 {
+                    assert_eq!(parent_number, fork.number, "one block deep: the old rule holds");
+                } else {
+                    assert!(
+                        parent_number > fork.number,
+                        "a {depth}-deep reorg: the parent (#{parent_number}) is still above \
+                         the fork (#{}), i.e. still on the abandoned branch",
+                        fork.number
+                    );
+                }
+            }
+        }
+
+        /// The shape that stalled mainnet on 2026-09-24: the branches forked three
+        /// blocks below the orphaned head. Retreating to the head's own parent --
+        /// what this replaces -- lands on a block that is itself on the losing
+        /// branch.
+        #[test]
+        fn fork_point_finds_a_three_deep_divergence() {
+            let mut w = World::default();
+            let (common, tip_ours, tip_theirs) = two_branches(&mut w, 649, 3);
+
+            let fork = fork_point(&w, tip_ours, tip_theirs).unwrap();
+            assert_eq!(fork.number, 649, "the fork is at the last shared block");
+            assert_eq!(fork.hash, common);
+
+            // The parent of the orphaned head is NOT the fork point -- it is two
+            // blocks above it, on the branch being abandoned.
+            let ours_parent = w.header(tip_ours).unwrap().parent_hash;
+            assert_ne!(ours_parent, fork.hash, "this is the bug being fixed");
+        }
+
+        #[test]
+        fn fork_point_of_a_one_deep_reorg_is_the_parent() {
+            let mut w = World::default();
+            let (common, tip_ours, tip_theirs) = two_branches(&mut w, 100, 1);
+            let fork = fork_point(&w, tip_ours, tip_theirs).unwrap();
+            assert_eq!(fork.hash, common);
+            assert_eq!(fork.hash, w.header(tip_ours).unwrap().parent_hash,
+                "for a one-block reorg the old rule and the new one agree");
+        }
+
+        #[test]
+        fn fork_point_of_a_block_with_itself_is_that_block() {
+            let (w, chain) = straight(5);
+            let hash = chain[3].hash();
+            assert_eq!(fork_point(&w, hash, hash).unwrap().number, 3);
+        }
+
+        /// The ordinary case at the tip: the replacement branch was never
+        /// downloaded, so there is nothing to walk. The caller must have an answer
+        /// for this -- it is not an error condition.
+        #[test]
+        fn fork_point_reports_a_break_when_the_other_branch_is_not_held() {
+            let mut w = World::default();
+            let (_, tip_ours, tip_theirs) = two_branches(&mut w, 100, 3);
+
+            // Forget the replacement branch below its tip, as a node that never
+            // downloaded it would have it.
+            let theirs_parent = w.header(tip_theirs).unwrap().parent_hash;
+            w.forget(theirs_parent);
+
+            assert_eq!(
+                fork_point(&w, tip_ours, tip_theirs),
+                Err(NoForkPoint::ChainBroken { missing: theirs_parent })
+            );
+        }
+
+        #[test]
+        fn fork_point_needs_both_headers() {
+            let (w, chain) = straight(3);
+            let absent = B256::repeat_byte(0xAB);
+            assert_eq!(
+                fork_point(&w, absent, chain[1].hash()),
+                Err(NoForkPoint::HeaderMissing { hash: absent })
+            );
+            assert_eq!(
+                fork_point(&w, chain[1].hash(), absent),
+                Err(NoForkPoint::HeaderMissing { hash: absent })
+            );
+        }
+
+        /// Two chains that share no ancestor at all are not a reorg.
+        #[test]
+        fn fork_point_refuses_unrelated_chains() {
+            let mut w = World::default();
+            let mut a_parent = B256::ZERO;
+            let mut b_parent = B256::repeat_byte(0x99);
+            let (mut a, mut b) = (B256::ZERO, B256::ZERO);
+            for n in 0..4 {
+                let ha = header(n, a_parent, 1);
+                let hb = header(n, b_parent, 2);
+                a = w.add(&ha);
+                b = w.add(&hb);
+                a_parent = a;
+                b_parent = b;
+            }
+            assert_eq!(fork_point(&w, a, b), Err(NoForkPoint::TooDeep));
+        }
+
+        // ---------------------------------------------------- blind retreat --
+
+        #[test]
+        fn blind_retreat_goes_the_full_depth_when_state_is_there() {
+            let (w, chain) = straight(40);
+            let from = chain[40].hash();
+            let target = deepest_resumable_within(&w, from, 25).unwrap();
+            assert_eq!(target.number, 15, "40 - 25");
+        }
+
+        /// The bound that matters: the head is about to retreat here and execution
+        /// has to resume here, so the walk must not outrun the state.
+        #[test]
+        fn blind_retreat_stops_at_the_last_block_with_state() {
+            let mut w = World::default();
+            let mut chain = Vec::new();
+            let mut parent = B256::ZERO;
+            for n in 0..=40 {
+                let h = header(n, parent, 0);
+                parent = w.add(&h);
+                w.canonicalise(&h);
+                // State only for the newest ten blocks, as a pruned node has it.
+                if n >= 31 {
+                    w.with_state(&h);
+                }
+                chain.push(h);
+            }
+            let target = deepest_resumable_within(&w, chain[40].hash(), 25).unwrap();
+            assert_eq!(target.number, 31, "must not retreat past the oldest state held");
+        }
+
+        #[test]
+        fn blind_retreat_never_returns_the_block_it_started_from() {
+            let (w, chain) = straight(10);
+            let target = deepest_resumable_within(&w, chain[10].hash(), 25).unwrap();
+            assert!(target.number < 10, "the point is to get below the orphan");
+            assert_eq!(target.number, 0, "a short chain bottoms out at genesis");
+        }
+    }
+
 }
