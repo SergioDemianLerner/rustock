@@ -87,6 +87,38 @@ pub fn eth_accounts(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(id, json!([]))
 }
 
+/// Pending transactions **belonging to this node's own accounts** — always
+/// empty here, because this node has no wallet.
+///
+/// The name misleads, and the misreading is worth spelling out because it is
+/// the obvious one. This is not "the mempool". rskj filters the pool down to
+/// senders the node's own wallet manages
+/// (`EthModuleWalletEnabled.ethPendingTransactions`):
+///
+/// ```java
+/// List<Transaction> pendingTxs = transactionPool.getPendingTransactions();
+/// List<String> managedAccounts = Arrays.asList(accounts());
+/// return pendingTxs.stream()
+///         .filter(tx -> managedAccounts.contains(tx.getSender(...).toJsonString()))
+///         .collect(Collectors.toList());
+/// ```
+///
+/// and with the wallet off it returns `Collections.emptyList()` unconditionally
+/// (`EthModuleWalletDisabled`). rustock is that case: `eth_accounts` is empty,
+/// `personal_*` is unsupported and `eth_sendTransaction` refuses. So `[]` is
+/// the faithful answer, not a stub.
+///
+/// Returning the whole pending pool instead would be worse than useless. Under
+/// rskj's contract these are *the caller's own* transactions, so a wallet or
+/// frontend would present every transaction in the public mempool as the
+/// user's — wrong in a way the caller cannot detect.
+///
+/// **What you probably want is `txpool_content`** (issue #83), which reports
+/// the pool without claiming the transactions belong to anyone in particular.
+pub fn eth_pending_transactions(id: Value) -> JsonRpcResponse {
+    JsonRpcResponse::success(id, json!([]))
+}
+
 /// The address block rewards are paid to.
 ///
 /// With mining off there is no such address and the zero address is the
