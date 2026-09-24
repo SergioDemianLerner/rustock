@@ -443,13 +443,42 @@ async fn test_unsupported_eth_method() {
 }
 
 #[tokio::test]
-async fn test_unsupported_debug_method() {
+async fn test_debug_trace_transaction_rejects_a_malformed_hash() {
     let (state, _tmp) = setup_state();
     let req = make_request("debug_traceTransaction", json!(["0x1234"]));
     let resp = dispatch_for_test(&state, req).await;
-    assert!(resp.error.is_some());
-    let err = resp.error.unwrap();
-    assert!(err.message.contains("execution engine"));
+    assert!(resp.error.is_some(), "not a 32-byte hash");
+}
+
+/// A transaction the node has never seen is `null`, not an error: the caller
+/// asked a reasonable question and the answer is "not here".
+#[tokio::test]
+async fn test_debug_trace_transaction_unknown_is_null() {
+    let (state, _tmp) = setup_state();
+    let req = make_request(
+        "debug_traceTransaction",
+        json!([format!("{:#x}", B256::repeat_byte(0xab))]),
+    );
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), Value::Null);
+}
+
+/// A block with no body cannot be replayed, and replay is the only way to
+/// reconstruct a transaction's pre-state.
+#[tokio::test]
+async fn test_debug_trace_block_without_a_body_is_null() {
+    let (state, _tmp) = setup_state();
+    let header = test_header(91);
+    let hash = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_canonical_hash(91, hash).unwrap();
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("debug_traceBlockByHash", json!([format!("{:#x}", hash)])),
+    )
+    .await;
+    assert_eq!(resp.result.unwrap(), Value::Null);
 }
 
 #[tokio::test]

@@ -363,7 +363,6 @@ impl RskExecutor {
 
         let exec_out = {
             use revm::context::ContextSetters;
-            use revm::handler::Handler;
             evm.ctx.set_tx(tx_env);
             let mut handler = crate::rsk_handler::RskHandler::with_rskip125(
                 !self.hardfork_cfg.has_rskip453(header.number),
@@ -450,6 +449,75 @@ impl RskExecutor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<BlockExecutionResult, ExecutionError> {
+        // A tracer with a zero cap, and `trace_index: None` so `run` is used
+        // for every transaction -- the inspector is never invoked.
+        self.execute_block_with(
+            header,
+            transactions,
+            state_root,
+            trie_store,
+            crate::tracer::RskTracer::new(0),
+            None,
+        )
+        .map(|(result, _)| result)
+    }
+
+    /// Execute a block with a tracer attached to one transaction.
+    ///
+    /// Tracing a historical transaction needs its **pre-state**, and there is
+    /// no such thing stored: the state before transaction *i* of block *N* is
+    /// the state after *N-1* plus transactions 0..*i*, and only per-block roots
+    /// are kept. So the whole block is re-executed and the tracer is switched
+    /// on for one index.
+    ///
+    /// Returns the trace when `trace_index` names a transaction the block has,
+    /// and `None` when it does not.
+    pub fn execute_block_traced(
+        &self,
+        header: &Header,
+        transactions: &[(rustock_core::Transaction, Address)],
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        trace_index: usize,
+        max_struct_logs: usize,
+    ) -> Result<(BlockExecutionResult, Option<crate::tracer::ProgramTrace>), ExecutionError> {
+        self.execute_block_with(
+            header,
+            transactions,
+            state_root,
+            trie_store,
+            crate::tracer::RskTracer::new(max_struct_logs),
+            Some(trace_index),
+        )
+    }
+
+    /// The block executor, with a tracer carried as a field.
+    ///
+    /// **`execute_block` passes a tracer too, and that is not a behavioural
+    /// change.** revm's `build_mainnet` and `build_mainnet_with_inspector`
+    /// construct the same `Evm` from the same spec -- identical `instruction`,
+    /// `precompiles` and `frame_stack`, differing only in the `inspector`
+    /// field, which is `()` in the first (revm-handler 17,
+    /// `mainnet_builder.rs`). `impl<CTX, INSP, I, P> EvmTr for Evm<...>` is
+    /// generic over that field, so `Handler::run` on an inspector-carrying EVM
+    /// runs the same code as on one without. The inspector is consulted only
+    /// by `inspect_run`, called here for exactly one transaction index and
+    /// never on the consensus path.
+    ///
+    /// Sharing the body this way rather than copying it is deliberate. The
+    /// alternative was a second 484-line block executor, and two copies of the
+    /// consensus block loop would drift -- which is the failure this codebase
+    /// has already had twice, in the two orphan-recovery paths that were meant
+    /// to stay identical and did not.
+    fn execute_block_with(
+        &self,
+        header: &Header,
+        transactions: &[(rustock_core::Transaction, Address)],
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        inspector: crate::tracer::RskTracer,
+        trace_index: Option<usize>,
+    ) -> Result<(BlockExecutionResult, Option<crate::tracer::ProgramTrace>), ExecutionError> {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
         let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
@@ -494,7 +562,9 @@ impl RskExecutor {
             } else {
                 Vec::new()
             };
-        let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
+        let mut evm = ctx
+            .build_mainnet_with_inspector(inspector)
+            .with_precompiles(precompile_provider);
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
@@ -512,6 +582,10 @@ impl RskExecutor {
         let mut total_gas = 0u64;
         let mut total_fees = U256::ZERO;
         let mut tx_results = Vec::with_capacity(transactions.len());
+        // The four `DetailedProgramTrace` fields that come from the execution
+        // result rather than from the opcode stream. They have to be taken
+        // inside the loop, before `result` is consumed by `into_logs`.
+        let mut traced_outcome: Option<TracedOutcome> = None;
         let mut markers = crate::state::ContractMarkers::default();
 
         // rskj BlockExecutor.maintainPrecompiledContractStorageRoots, run
@@ -823,16 +897,27 @@ impl RskExecutor {
                 active_precompiles.clone(),
                 self.hardfork_cfg.has_rskip171(header.number),
             );
-                handler
-                    .run(&mut evm)
-                    .map_err(|e: revm::context::result::EVMError<_>| {
-                        ExecutionError::Evm(format!("{e:?}"))
-                    })?
+                // `inspect_run` for the one transaction being traced, `run`
+                // for every other -- and `run` is the same code path an EVM
+                // built without an inspector takes, because revm carries the
+                // inspector as a field that only `inspect_run` consults.
+                let out = if trace_index == Some(i) {
+                    use revm::inspector::InspectorHandler;
+                    handler.inspect_run(&mut evm)
+                } else {
+                    handler.run(&mut evm)
+                };
+                out.map_err(|e: revm::context::result::EVMError<_>| {
+                    ExecutionError::Evm(format!("{e:?}"))
+                })?
             };
 
             let success = result.is_success();
             let gas_used = result.gas_used();
             let output = result.output().map(|o| o.to_vec()).unwrap_or_default();
+            if trace_index == Some(i) {
+                traced_outcome = Some(TracedOutcome::of(tx, *sender, &result, &output));
+            }
             let logs = result.into_logs();
             let created_address = Self::extract_created_address(tx, *sender, &success);
 
@@ -919,13 +1004,37 @@ impl RskExecutor {
         }
         let state = evm.finalize();
 
-        Ok(BlockExecutionResult {
-            tx_results,
-            gas_used: total_gas,
-            paid_fees: total_fees,
-            state_changes: state,
-            markers,
-        })
+        // The trace, if one transaction was traced. `finish` consumes the
+        // tracer, so it is taken after the block is done rather than per
+        // transaction.
+        let trace = trace_index.map(|_| {
+            let (struct_logs, current_storage, truncated) = evm.inspector.finish();
+            let mut trace = crate::tracer::ProgramTrace {
+                storage_size: current_storage.len(),
+                struct_logs,
+                current_storage,
+                truncated,
+                ..Default::default()
+            };
+            if let Some(outcome) = traced_outcome {
+                trace.contract_address = outcome.contract_address;
+                trace.result = outcome.result;
+                trace.error = outcome.error;
+                trace.reverted = outcome.reverted;
+            }
+            trace
+        });
+
+        Ok((
+            BlockExecutionResult {
+                tx_results,
+                gas_used: total_gas,
+                paid_fees: total_fees,
+                state_changes: state,
+                markers,
+            },
+            trace,
+        ))
     }
 
     /// rskj BridgeUtils.isFreeBridgeTx: before areBridgeTxsPaid activates,
@@ -965,6 +1074,62 @@ impl RskExecutor {
         // doesn't include the created address in the receipt RLP, so this is
         // only needed for the empty-data-CREATE skip_created bookkeeping.
         Some(sender.create(tx.nonce))
+    }
+}
+
+/// The four `DetailedProgramTrace` fields that come from the transaction's
+/// result rather than from the opcode stream.
+///
+/// rskj fills them in `Program`/`TransactionExecutor`, not in the trace
+/// listener, so they are gathered here for the same reason.
+struct TracedOutcome {
+    contract_address: String,
+    result: String,
+    error: String,
+    reverted: bool,
+}
+
+impl TracedOutcome {
+    fn of(
+        tx: &rustock_core::Transaction,
+        sender: Address,
+        result: &revm::context::result::ExecutionResult,
+        output: &[u8],
+    ) -> Self {
+        use revm::context::result::ExecutionResult;
+
+        // rskj: `contractAddress = toHexString(programInvoke.getOwnerAddress()
+        // .getLast20Bytes())` -- the account whose code ran, bare hex with no
+        // `0x`. For a CREATE that is the new contract, computed here from
+        // sender and nonce whether or not the deployment succeeded, because
+        // rskj traces the program that ran either way.
+        let owner = if tx.to.is_empty() {
+            sender.create(tx.nonce)
+        } else {
+            Address::from_slice(&tx.to)
+        };
+
+        // rskj: `toHexStringOrEmpty(result)` -- bare hex, empty string for no
+        // return data.
+        let result_hex = hex::encode(output);
+
+        // rskj renders this as `format("%s: %s", error.getClass(),
+        // error.getMessage())`, e.g.
+        // `class org.ethereum.vm.program.Program$OutOfGasException: ...`.
+        // A Java class name is not reproducible here and imitating one would
+        // be worse than not: the halt reason is reported instead, and
+        // `docs/debug-namespace.md` records the difference.
+        let error = match result {
+            ExecutionResult::Halt { reason, .. } => format!("{reason:?}"),
+            _ => String::new(),
+        };
+
+        Self {
+            contract_address: hex::encode(owner.as_slice()),
+            result: result_hex,
+            error,
+            reverted: matches!(result, ExecutionResult::Revert { .. }),
+        }
     }
 }
 

@@ -345,6 +345,49 @@ impl BlockProcessor {
         root == header.receipts_root
     }
 
+    /// Trace one transaction of a block, by re-executing the block.
+    ///
+    /// `state_root` must be the state **after the parent block** -- the
+    /// transaction's own pre-state does not exist anywhere, so the block is
+    /// replayed from its parent and the tracer switched on at `index`.
+    ///
+    /// Returns `None` when the block has no transaction at that index.
+    pub fn trace_transaction(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        index: usize,
+        max_struct_logs: usize,
+    ) -> Result<Option<crate::tracer::ProgramTrace>, ProcessError> {
+        if index >= block.transactions.len() {
+            return Ok(None);
+        }
+        let senders = self.recover_senders(&block.transactions, self.hardfork_cfg.chain_id)?;
+        let transactions: Vec<(Transaction, Address)> = block
+            .transactions
+            .iter()
+            .cloned()
+            .zip(senders.iter().copied())
+            .collect();
+
+        let (_, trace) = self.executor.execute_block_traced(
+            &block.header,
+            &transactions,
+            state_root,
+            trie_store,
+            index,
+            max_struct_logs,
+        )?;
+
+        // `result`, `error`, `reverted` and `contractAddress` are filled by
+        // the executor, which is where the transaction's own `ExecutionResult`
+        // is in scope. Doing it here instead would have to infer them from
+        // `tx_results`, and that loses the distinction rskj keeps between a
+        // REVERT and a halt.
+        Ok(trace)
+    }
+
     /// The consensus rules that need the block body, run before execution.
     ///
     /// rskj composes these in `RskContext.getBlockValidationRule`. They all
@@ -888,6 +931,193 @@ mod tests {
             }
             e => panic!("unexpected error: {e}"),
         }
+    }
+
+    /// Tracing through a block replay: the trace records the transaction's
+    /// opcodes, and the block executes to exactly what it does untraced.
+    ///
+    /// The second half is the one that matters. `execute_block` and
+    /// `execute_block_traced` share one body precisely so they cannot drift,
+    /// and this asserts the sharing actually holds -- gas, fees and per-
+    /// transaction results identical with the inspector attached.
+    #[test]
+    fn tracing_a_block_records_the_transaction_and_changes_nothing() {
+        let trie = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone());
+
+        // A funded sender and a contract that writes storage, so the trace has
+        // something to show.
+        let key = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let sender = sender_address(&key);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), trie.as_ref(), &sender, 0, one_rbtc);
+        // PUSH1 07 PUSH1 00 SSTORE STOP
+        let code = vec![0x60, 0x07, 0x60, 0x00, 0x55, 0x00];
+        let contract = Address::repeat_byte(0xC0);
+        let root = {
+            let root = put_account(&root, trie.as_ref(), &contract, 1, U256::ZERO);
+            let code_key = rustock_trie::code_key(&contract);
+            root.put(&TrieKeySlice::from_key(&code_key), &code, trie.as_ref())
+        };
+
+        let mut tx = Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(200_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::default(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign_tx(&mut tx, &key, 33);
+
+        let header = dummy_header(6_000_000);
+        let senders = vec![(tx.clone(), sender)];
+
+        let plain = processor
+            .executor
+            .execute_block(&header, &senders, &root, trie.clone())
+            .expect("untraced block executes");
+        let (traced, trace) = processor
+            .executor
+            .execute_block_traced(
+                &header,
+                &senders,
+                &root,
+                trie.clone(),
+                0,
+                crate::tracer::DEFAULT_MAX_STRUCT_LOGS,
+            )
+            .expect("traced block executes");
+
+        assert_eq!(
+            plain.gas_used, traced.gas_used,
+            "tracing must not change block gas"
+        );
+        assert_eq!(plain.paid_fees, traced.paid_fees);
+        assert_eq!(plain.tx_results.len(), traced.tx_results.len());
+        for (a, b) in plain.tx_results.iter().zip(traced.tx_results.iter()) {
+            assert_eq!(a.gas_used, b.gas_used);
+            assert_eq!(a.success, b.success);
+            assert_eq!(a.output, b.output);
+        }
+
+        let trace = trace.expect("index 0 exists, so there is a trace");
+        assert!(
+            !trace.struct_logs.is_empty(),
+            "the tracer recorded no steps"
+        );
+        assert!(
+            trace.struct_logs.iter().any(|l| l.op == "SSTORE"),
+            "the contract's SSTORE should appear: {:?}",
+            trace.struct_logs.iter().map(|l| &l.op).collect::<Vec<_>>()
+        );
+        // rskj's storage view is built one opcode late, so the written slot
+        // shows up after the SSTORE rather than on it.
+        assert!(
+            trace.current_storage.values().any(|v| v.ends_with("07")),
+            "the written value should be in the accumulated storage view"
+        );
+    }
+
+    /// The four fields rskj takes from the transaction's result rather than
+    /// from the opcode stream, and the distinction between them.
+    ///
+    /// rskj keeps `reverted` for an actual REVERT and puts a halt in `error`.
+    /// Collapsing both into "the transaction failed" -- which is all
+    /// `tx_results[i].success` can say -- would make an out-of-gas look like a
+    /// contract that chose to revert, and those call for different fixes.
+    #[test]
+    fn a_trace_reports_revert_and_halt_differently() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let run = |code: Vec<u8>, gas_limit: u64| {
+            let trie = Arc::new(MemoryTrieStore::new());
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+
+            let key = SigningKey::from_slice(&[11u8; 32]).unwrap();
+            let sender = sender_address(&key);
+            let contract = Address::repeat_byte(0xC1);
+            let root = put_account(&TrieNode::empty(), trie.as_ref(), &sender, 0, one_rbtc);
+            let root = put_account(&root, trie.as_ref(), &contract, 1, U256::ZERO);
+            let code_key = rustock_trie::code_key(&contract);
+            let root = root.put(&TrieKeySlice::from_key(&code_key), &code, trie.as_ref());
+
+            let mut tx = Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(gas_limit),
+                to: Bytes::copy_from_slice(contract.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::default(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            sign_tx(&mut tx, &key, 33);
+            let block = Block {
+                header: dummy_header(6_000_000),
+                transactions: vec![tx],
+                ommers: vec![],
+            };
+            let trace = processor
+                .trace_transaction(&block, &root, trie, 0, crate::tracer::DEFAULT_MAX_STRUCT_LOGS)
+                .expect("replay succeeds")
+                .expect("index 0 exists");
+            (trace, contract)
+        };
+
+        // PUSH1 20 PUSH1 00 MSTORE PUSH1 20 PUSH1 00 REVERT -- reverts with
+        // 32 bytes of return data.
+        let (reverted, contract) = run(
+            vec![0x60, 0x20, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xfd],
+            200_000,
+        );
+        assert!(reverted.reverted, "a REVERT must set `reverted`");
+        assert_eq!(reverted.error, "", "a REVERT is not an error in rskj");
+        assert!(
+            reverted.result.ends_with("20"),
+            "the revert's return data belongs in `result`: {:?}",
+            reverted.result
+        );
+        // rskj renders the address bare, no `0x`, lower case.
+        assert_eq!(reverted.contract_address, hex::encode(contract.as_slice()));
+        assert!(!reverted.contract_address.starts_with("0x"));
+
+        // JUMPDEST PUSH1 00 JUMP -- an infinite loop, so it halts on gas.
+        let (halted, _) = run(vec![0x5b, 0x60, 0x00, 0x56], 60_000);
+        assert!(
+            !halted.reverted,
+            "running out of gas is not a REVERT, and rskj does not report it as one"
+        );
+        assert!(
+            halted.error.contains("OutOfGas"),
+            "the halt reason belongs in `error`: {:?}",
+            halted.error
+        );
+    }
+
+    /// An index the block does not have is `None`, not an error.
+    #[test]
+    fn tracing_an_index_the_block_does_not_have_is_none() {
+        let trie = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+        let block = Block {
+            header: dummy_header(6_000_000),
+            transactions: vec![],
+            ommers: vec![],
+        };
+        let traced = processor
+            .trace_transaction(&block, &TrieNode::empty(), trie, 0, 1_000)
+            .expect("no transactions is not a failure");
+        assert!(traced.is_none());
     }
 
     // ---------------------------------------------- was_executed_locally --

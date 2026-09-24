@@ -186,11 +186,13 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
 **Debug:**
 
 - `debug_wireProtocolQueueSize`, `debug_accountTransactionQuota`
+- `debug_traceTransaction`, `debug_traceBlockByHash`, `debug_traceBlockByNumber`
+  (within the state-retention window)
 
   rskj's `debug_*`, not go-ethereum's — the two namespaces barely overlap. See
   [docs/debug-namespace.md](docs/debug-namespace.md).
 
-**Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), the tracing methods (`debug_traceTransaction` and friends), and the `trace_*`, `personal_*`, `evm_*`, `mnr_*`, `db_*`, `sco_*` namespaces.
+**Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), and the `trace_*`, `personal_*`, `evm_*`, `db_*`, `sco_*` namespaces.
 
 ## Project Structure
 

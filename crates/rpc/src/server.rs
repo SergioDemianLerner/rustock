@@ -286,6 +286,9 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         }
 
         "debug_wireProtocolQueueSize" => debug::debug_wire_protocol_queue_size(id, state),
+        "debug_traceTransaction" => debug::debug_trace_transaction(id, params, state),
+        "debug_traceBlockByHash" => debug::debug_trace_block_by_hash(id, params, state),
+        "debug_traceBlockByNumber" => debug::debug_trace_block_by_number(id, params, state),
         "debug_accountTransactionQuota" => debug::debug_account_transaction_quota(id, params, state),
 
         "txpool_content" => txpool::txpool_content(id, state),
