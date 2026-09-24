@@ -53,6 +53,9 @@ use revm::context::ContextTr;
 use revm::context_interface::JournalTr;
 use revm::inspector::{inspectors::GasInspector, Inspector};
 use revm::interpreter::{
+    CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, CreateScheme,
+};
+use revm::interpreter::{
     interpreter_types::{InputsTr, Jumps, MemoryTr, StackTr},
     Interpreter, InterpreterTypes,
 };
@@ -101,6 +104,109 @@ pub struct ProgramTrace {
     /// True when the step cap cut the trace short, so a consumer can tell a
     /// truncated trace from a short one.
     pub truncated: bool,
+    /// Gas handed to the transaction's own frame -- rskj's
+    /// `invoke.getGas()`, which is the transaction gas limit less the
+    /// intrinsic cost, and what the top-level trace reports as `action.gas`.
+    pub root_gas: u64,
+    /// The transaction's call tree: rskj's `SummarizedProgramTrace.subtraces`.
+    ///
+    /// The transaction's own frame is **not** here. rskj renders the top-level
+    /// trace from the receipt rather than from a subtrace, so what this holds
+    /// is that frame's children -- the internal transactions.
+    pub subtraces: Vec<Subtrace>,
+}
+
+/// What an entry of the call tree is, mirroring rskj's `TraceType`.
+///
+/// rskj also has `REWARD`, which it never emits from the VM -- nothing calls
+/// `newRewardSubtrace` -- so it has no counterpart here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtraceKind {
+    Call,
+    Create,
+    Suicide,
+}
+
+/// How a call frame was entered, mirroring rskj's `CallType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    Call,
+    CallCode,
+    DelegateCall,
+    StaticCall,
+}
+
+impl CallKind {
+    /// rskj renders this as `callType.name().toLowerCase()`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CallKind::Call => "call",
+            CallKind::CallCode => "callcode",
+            CallKind::DelegateCall => "delegatecall",
+            CallKind::StaticCall => "staticcall",
+        }
+    }
+}
+
+/// One node of the call tree -- rskj's `ProgramSubtrace` plus the pieces of
+/// its `InvokeData` and `ProgramResult` that the renderer needs.
+///
+/// The raw addresses are kept here and rskj's rendering conventions applied in
+/// the RPC layer, so that the swap `toAction` makes for a DELEGATECALL (`from`
+/// becomes the owner, `to` becomes the code address) lives next to the JSON it
+/// explains rather than inside the tracer.
+#[derive(Debug, Clone)]
+pub struct Subtrace {
+    pub kind: SubtraceKind,
+    /// `None` for a CREATE or a SUICIDE, which rskj gives `CallType.NONE` and
+    /// then omits from the JSON.
+    pub call_kind: Option<CallKind>,
+    /// `true` when the CREATE was a CREATE2, which rskj reports as
+    /// `creationMethod`.
+    pub is_create2: bool,
+    /// rskj `invoke.getCallerAddress()`. For a SUICIDE this is the dying
+    /// contract.
+    pub caller: Address,
+    /// rskj `invoke.getOwnerAddress()` -- the account whose storage the frame
+    /// can write. For a CREATE that is the new contract; for a SUICIDE it is
+    /// the beneficiary.
+    pub owner: Address,
+    /// rskj `msg.getCodeAddress()`, only meaningful for a DELEGATECALL.
+    pub code_address: Option<Address>,
+    /// Gas given to the frame (rskj `invoke.getGas()`).
+    pub gas: u64,
+    /// Gas the frame spent (rskj `programResult.getGasUsed()`).
+    pub gas_used: u64,
+    /// Call value, or the transferred balance for a SUICIDE.
+    pub value: U256,
+    /// Call data, or the init code for a CREATE.
+    pub input: Vec<u8>,
+    /// Return data, or the deployed code for a CREATE.
+    pub output: Vec<u8>,
+    /// Set only for a CREATE.
+    pub created_address: Option<Address>,
+    /// The halt reason, if the frame halted. rskj puts
+    /// `programResult.getException().toString()` here; see
+    /// `docs/trace-namespace.md` for why this string differs.
+    pub error: Option<String>,
+    /// rskj reports a REVERT as the literal string `"Reverted"`, which this
+    /// matches exactly.
+    pub reverted: bool,
+    pub subtraces: Vec<Subtrace>,
+}
+
+/// A frame the tracer has entered and not yet left.
+struct OpenFrame {
+    kind: SubtraceKind,
+    call_kind: Option<CallKind>,
+    is_create2: bool,
+    caller: Address,
+    owner: Address,
+    code_address: Option<Address>,
+    gas: u64,
+    value: U256,
+    input: Vec<u8>,
+    children: Vec<Subtrace>,
 }
 
 /// Records every opcode of an execution in rskj's shape.
@@ -114,6 +220,21 @@ pub struct RskTracer {
     pending_storage: Option<(Address, U256)>,
     max_logs: usize,
     truncated: bool,
+    /// False for `trace_*`, which wants the call tree and would be made
+    /// enormous by the opcode stream. Distinct from `max_logs == 0`, which
+    /// means "record steps but the budget is spent" and sets `truncated`.
+    record_steps: bool,
+    /// Frames entered and not yet left, innermost last. The first is the
+    /// transaction's own frame, whose children are the subtraces rskj
+    /// reports.
+    open_frames: Vec<OpenFrame>,
+    /// Completed top-level subtraces of the transaction.
+    subtraces: Vec<Subtrace>,
+    /// Gas given to the transaction's own frame.
+    root_gas: u64,
+    /// True once an interpreter has been built for the transaction's own
+    /// frame -- rskj's `program != null`.
+    root_has_program: bool,
 }
 
 impl Default for RskTracer {
@@ -131,7 +252,22 @@ impl RskTracer {
             pending_storage: None,
             max_logs,
             truncated: false,
+            record_steps: true,
+            open_frames: Vec::new(),
+            subtraces: Vec::new(),
+            root_gas: 0,
+            root_has_program: false,
         }
+    }
+
+    /// A tracer for `trace_*`: the call tree, and no opcode stream.
+    ///
+    /// The `trace_*` namespace renders internal transactions and never reads
+    /// `structLogs`. Recording them anyway would cost tens of megabytes per
+    /// block for output nobody looks at, which matters because `trace_block`
+    /// traces every transaction in one pass.
+    pub fn call_tree_only() -> Self {
+        Self { record_steps: false, ..Self::new(0) }
     }
 
     /// The recorded steps and the storage view they ended with.
@@ -141,6 +277,134 @@ impl RskTracer {
 
     pub fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// Take everything recorded for one transaction and reset for the next.
+    ///
+    /// `trace_block` runs one block pass and harvests per transaction, the way
+    /// rskj's `ProgramTraceProcessor` collects a trace per transaction hash
+    /// from a single `traceBlock` call. Re-executing the block once per
+    /// transaction instead would be quadratic in the block's transaction
+    /// count.
+    ///
+    /// `contract_address`, `result`, `error` and `reverted` are left empty:
+    /// they come from the transaction's `ExecutionResult`, which the executor
+    /// fills in.
+    pub fn take_trace(&mut self) -> ProgramTrace {
+        // A frame left open means the interpreter never returned from it,
+        // which should not happen -- but dropping it silently would splice
+        // its children into the wrong parent on the *next* transaction.
+        self.open_frames.clear();
+        let current_storage = std::mem::take(&mut self.current_storage);
+        let trace = ProgramTrace {
+            storage_size: current_storage.len(),
+            struct_logs: std::mem::take(&mut self.logs),
+            current_storage,
+            truncated: self.truncated,
+            subtraces: std::mem::take(&mut self.subtraces),
+            // rskj `TransactionExecutor.extractTrace`: when no `Program` was
+            // built -- a plain transfer, or a call straight to a precompile --
+            // the trace is a `SummarizedProgramTrace(TransferInvoke(..., 0L,
+            // ...))` whose gas is the literal zero, not the transaction's.
+            // So `action.gas` on a plain rBTC transfer is `0x0` in rskj, and
+            // reporting the real figure here would disagree with every rskj
+            // node.
+            root_gas: if self.root_has_program { self.root_gas } else { 0 },
+            ..Default::default()
+        };
+        self.pending_storage = None;
+        self.truncated = false;
+        self.root_gas = 0;
+        self.root_has_program = false;
+        self.gas_inspector = GasInspector::new();
+        trace
+    }
+
+    /// Push a frame the interpreter is about to enter.
+    fn enter(&mut self, frame: OpenFrame) {
+        self.open_frames.push(frame);
+    }
+
+    /// Pop the innermost frame and file it under its parent.
+    ///
+    /// The outermost frame is the transaction itself, which rskj renders from
+    /// the receipt rather than as a subtrace, so its children -- not the frame
+    /// -- become `subtraces`.
+    fn leave(&mut self, outcome: FrameOutcome) {
+        let Some(frame) = self.open_frames.pop() else { return };
+
+        if self.open_frames.is_empty() {
+            // The transaction's own frame: keep its children and its gas,
+            // drop the frame itself. rskj renders the top-level trace from
+            // the receipt, not from a subtrace.
+            self.subtraces = frame.children;
+            self.root_gas = frame.gas;
+            return;
+        }
+
+        let subtrace = Subtrace {
+            kind: frame.kind,
+            call_kind: frame.call_kind,
+            is_create2: frame.is_create2,
+            caller: frame.caller,
+            owner: outcome.created_address.unwrap_or(frame.owner),
+            code_address: frame.code_address,
+            gas: frame.gas,
+            gas_used: outcome.gas_used,
+            value: frame.value,
+            input: frame.input,
+            output: outcome.output,
+            created_address: outcome.created_address,
+            error: outcome.error,
+            reverted: outcome.reverted,
+            subtraces: frame.children,
+        };
+
+        // rskj drops a CREATE that failed: `addCreateSubtrace` is guarded by
+        // `programResult.getException() == null && !programResult.isRevert()`,
+        // so a reverted or halted inner CREATE leaves no trace at all -- and
+        // neither do the frames it opened. Reproduced here, and recorded in
+        // `docs/trace-namespace.md`, because it is a real difference from
+        // geth and not one a reader would guess.
+        if subtrace.kind == SubtraceKind::Create
+            && (subtrace.reverted || subtrace.error.is_some())
+        {
+            return;
+        }
+
+        if let Some(parent) = self.open_frames.last_mut() {
+            parent.children.push(subtrace);
+        }
+    }
+}
+
+/// What a frame returned, in the pieces `leave` needs.
+struct FrameOutcome {
+    gas_used: u64,
+    output: Vec<u8>,
+    created_address: Option<Address>,
+    error: Option<String>,
+    reverted: bool,
+}
+
+impl FrameOutcome {
+    fn of(result: &revm::interpreter::InterpreterResult, created: Option<Address>) -> Self {
+        use revm::interpreter::InstructionResult;
+        let reverted = result.result == InstructionResult::Revert;
+        // rskj: `programResult.getException().toString()` for a halt, and the
+        // literal `"Reverted"` for a revert (set by the renderer, not here).
+        let error = if result.result.is_ok() || reverted {
+            None
+        } else {
+            Some(format!("{:?}", result.result))
+        };
+        Self {
+            gas_used: result.gas.spent(),
+            output: result.output.to_vec(),
+            created_address: created,
+            error,
+            reverted,
+        }
     }
 }
 
@@ -155,6 +419,14 @@ where
     CTX: ContextTr,
     INTR: InterpreterTypes,
 {
+    fn initialize_interp(&mut self, _interp: &mut Interpreter<INTR>, _context: &mut CTX) {
+        // Fires exactly when revm builds an interpreter for a frame, which is
+        // rskj's `program != null`. See `take_trace` for why that matters.
+        if self.open_frames.len() == 1 {
+            self.root_has_program = true;
+        }
+    }
+
     fn step(&mut self, interp: &mut Interpreter<INTR>, context: &mut CTX) {
         self.gas_inspector.step(&interp.gas);
 
@@ -179,6 +451,12 @@ where
             }
         }
 
+        if !self.record_steps {
+            // `trace_*` wants the call tree only. Note this returns *before*
+            // the SSTORE/SLOAD bookkeeping below, so `current_storage` stays
+            // empty too -- which is right: nothing renders it.
+            return;
+        }
         if self.logs.len() >= self.max_logs {
             self.truncated = true;
             return;
@@ -224,6 +502,96 @@ where
         self.gas_inspector.step_end(&interp.gas);
         if let Some(last) = self.logs.last_mut() {
             last.gas_cost = self.gas_inspector.last_gas_cost();
+        }
+    }
+
+    fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        // rskj's `toAction` reads `invoke.getCallerAddress()` and
+        // `invoke.getOwnerAddress()`; for a DELEGATECALL the owner is the
+        // calling contract, which is exactly revm's `target_address`.
+        self.enter(OpenFrame {
+            kind: SubtraceKind::Call,
+            call_kind: Some(match inputs.scheme {
+                CallScheme::Call => CallKind::Call,
+                CallScheme::CallCode => CallKind::CallCode,
+                CallScheme::DelegateCall => CallKind::DelegateCall,
+                CallScheme::StaticCall => CallKind::StaticCall,
+            }),
+            is_create2: false,
+            caller: inputs.caller,
+            owner: inputs.target_address,
+            code_address: Some(inputs.bytecode_address),
+            gas: inputs.gas_limit,
+            value: inputs.value.get(),
+            input: inputs.input.bytes(_context).to_vec(),
+            children: Vec::new(),
+        });
+        None
+    }
+
+    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+        // rskj emits no subtrace for a precompile: `callToPrecompiledAddress`
+        // never calls `addSubTrace`, so the Bridge and every other precompile
+        // are invisible in a call tree. revm reports the frame either way, so
+        // it is dropped here. See `docs/trace-namespace.md`.
+        if outcome.was_precompile_called && self.open_frames.len() > 1 {
+            self.open_frames.pop();
+            return;
+        }
+        self.leave(FrameOutcome::of(&outcome.result, None));
+    }
+
+    fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+        self.enter(OpenFrame {
+            kind: SubtraceKind::Create,
+            call_kind: None,
+            is_create2: matches!(inputs.scheme(), CreateScheme::Create2 { .. }),
+            caller: inputs.caller(),
+            // Filled in from the outcome, which is where revm reports the
+            // created address.
+            owner: Address::ZERO,
+            code_address: None,
+            gas: inputs.gas_limit(),
+            value: inputs.value(),
+            input: inputs.init_code().to_vec(),
+            children: Vec::new(),
+        });
+        None
+    }
+
+    fn create_end(
+        &mut self,
+        _context: &mut CTX,
+        _inputs: &CreateInputs,
+        outcome: &mut CreateOutcome,
+    ) {
+        self.leave(FrameOutcome::of(&outcome.result, outcome.address));
+    }
+
+    fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
+        // rskj builds this from `SuicideInvoke(caller = the dying contract,
+        // owner = the beneficiary, value = the balance moved)`, and emits it
+        // even when the balance is zero. It has no result and no gas: rskj's
+        // `toTrace` skips both for `TraceType.SUICIDE`.
+        let subtrace = Subtrace {
+            kind: SubtraceKind::Suicide,
+            call_kind: None,
+            is_create2: false,
+            caller: contract,
+            owner: target,
+            code_address: None,
+            gas: 0,
+            gas_used: 0,
+            value,
+            input: Vec::new(),
+            output: Vec::new(),
+            created_address: None,
+            error: None,
+            reverted: false,
+            subtraces: Vec::new(),
+        };
+        if let Some(parent) = self.open_frames.last_mut() {
+            parent.children.push(subtrace);
         }
     }
 }

@@ -18,7 +18,7 @@ use tracing::info;
 
 use crate::txpool;
 use crate::types::*;
-use crate::{admin, call, debug, eth, logs, mnr, net, rsk, state, tx, web3};
+use crate::{admin, call, debug, eth, logs, mnr, net, rsk, state, trace, tx, web3};
 
 /// Trait for submitting raw transactions, allowing the RPC layer to use
 /// the P2P relay without depending on the sync crate directly.
@@ -290,6 +290,11 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "debug_traceBlockByHash" => debug::debug_trace_block_by_hash(id, params, state),
         "debug_traceBlockByNumber" => debug::debug_trace_block_by_number(id, params, state),
         "debug_accountTransactionQuota" => debug::debug_account_transaction_quota(id, params, state),
+
+        "trace_transaction" => trace::trace_transaction(id, params, state),
+        "trace_block" => trace::trace_block(id, params, state),
+        "trace_get" => trace::trace_get(id, params, state),
+        "trace_filter" => trace::trace_filter(id, params, state),
 
         "txpool_content" => txpool::txpool_content(id, state),
         "txpool_inspect" => txpool::txpool_inspect(id, state),

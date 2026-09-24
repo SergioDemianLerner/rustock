@@ -192,7 +192,16 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
   rskj's `debug_*`, not go-ethereum's — the two namespaces barely overlap. See
   [docs/debug-namespace.md](docs/debug-namespace.md).
 
-**Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), and the `trace_*`, `personal_*`, `evm_*`, `db_*`, `sco_*` namespaces.
+**Trace:**
+
+- `trace_transaction`, `trace_block`, `trace_get`, `trace_filter`
+  (within the state-retention window)
+
+  Call trees, in rskj's shape rather than OpenEthereum's — the differences are
+  not cosmetic, and precompile calls (the Bridge included) never appear. See
+  [docs/trace-namespace.md](docs/trace-namespace.md).
+
+**Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), and the `personal_*`, `evm_*`, `db_*`, `sco_*` namespaces.
 
 ## Project Structure
 
@@ -215,7 +224,13 @@ Rustock executes blocks and maintains full state, but it is not yet feature-comp
 - **Mining is single-node only.** Rustock builds blocks, serves the `mnr_*` merged-mining namespace and imports solutions (`--mine`, see [docs/merged-mining.md](docs/merged-mining.md)), but it has no outbound block announcement, so a mined block reaches peers only when they ask for it.
 - **No archive mode.** The trie store keeps every node it writes (so historical state is queryable as long as the underlying nodes have not been pruned), but there is no explicit archive-vs-pruning policy and no snap/state-sync support — initial sync executes every block from genesis.
 - **Local-only Bridge methods are partial.** The 32 transaction-callable Bridge methods are implemented for consensus; many of the 37 local-only getters used by `eth_call` against the Bridge precompile are still being filled in.
-- **No tracing or debug RPCs.** `debug_*` and `trace_*` are not implemented.
+- **Tracing needs recent state.** `debug_trace*` and `trace_*` re-execute a
+  transaction's block from its parent's state, so they answer only within the
+  GC burial depth (4,000 blocks by default) and return an error past it.
+  `trace_filter` recomputes rather than reading an index, as rskj does.
+- **No peer scoring or banning.** A misbehaving peer is sidelined for seconds
+  and then welcomed back; there is no ban list, no CIDR exclusion and no
+  `sco_*` namespace.
 - **No wallet / account management.** `eth_sendTransaction`, `eth_sign`, and the `personal_*` namespace are intentionally not supported — sign transactions externally and submit them via `eth_sendRawTransaction`.
 
 ## License

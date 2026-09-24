@@ -3298,3 +3298,299 @@ async fn test_eth_gas_price_falls_back_to_the_block_minimum() {
     let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
     assert_eq!(r.result.unwrap(), json!("0x387ee40"), "59,240,000");
 }
+
+// ========== trace_* namespace ==========
+
+/// A parent block holding a funded sender and two contracts, and a child
+/// block whose single transaction calls one contract which calls the other.
+///
+/// The replay needs the **parent's** state in the trie, which is what makes
+/// this fixture bigger than the others: `trace_*` re-executes the block, so a
+/// fixture that only stores a state root proves nothing.
+fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Address, Address) {
+    use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use rustock_trie::{account_key, code_key, MemoryTrieStore, TrieKeySlice, TrieNode};
+    use sha3::{Digest, Keccak256};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let trie_store = Arc::new(MemoryTrieStore::new());
+
+    let key = SigningKey::from_slice(&[31u8; 32]).unwrap();
+    let sender = {
+        let point = key.verifying_key().to_encoded_point(false);
+        Address::from_slice(&Keccak256::digest(&point.as_bytes()[1..])[12..])
+    };
+
+    // callee: PUSH1 2a PUSH1 00 MSTORE PUSH1 20 PUSH1 00 RETURN
+    let callee_code = vec![0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+    let callee = Address::repeat_byte(0xCE);
+    // caller: CALL(gas, callee, 0, 0, 0, 0, 0) then STOP
+    let mut caller_code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00];
+    caller_code.push(0x73);
+    caller_code.extend_from_slice(callee.as_slice());
+    caller_code.extend_from_slice(&[0x5a, 0xf1, 0x00]);
+    let caller = Address::repeat_byte(0xCA);
+
+    let mut root = TrieNode::empty();
+    let one_rbtc = U256::from(10u64).pow(U256::from(18));
+    let acct = rustock_trie::AccountState::new(U256::ZERO, one_rbtc);
+    root = root.put(&TrieKeySlice::from_key(&account_key(&sender)), &acct.encode(), &*trie_store);
+    for (addr, code) in [(caller, &caller_code), (callee, &callee_code)] {
+        let acct = rustock_trie::AccountState::new(U256::from(1), U256::ZERO);
+        root = root.put(&TrieKeySlice::from_key(&account_key(&addr)), &acct.encode(), &*trie_store);
+        root = root.put(&TrieKeySlice::from_key(&code_key(&addr)), code, &*trie_store);
+    }
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+    rustock_trie::TrieStore::put(
+        &*trie_store,
+        state_root.as_slice(),
+        &root.to_message(&*trie_store),
+    );
+
+    let parent = Header { state_root, ..test_header(41) };
+    let parent_hash = parent.hash();
+    store.put_header(&parent).unwrap();
+    store.put_canonical_hash(41, parent_hash).unwrap();
+
+    let mut tx = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::ZERO,
+        gas_limit: U256::from(500_000),
+        to: Bytes::copy_from_slice(caller.as_slice()),
+        value: U256::ZERO,
+        input: Bytes::default(),
+        v: 0,
+        r: U256::ZERO,
+        s: U256::ZERO,
+        cached_rlp: None,
+    };
+    let chain_id = rustock_execution::RskHardforkConfig::mainnet().chain_id;
+    let signing_hash = tx.signing_hash_eip155(chain_id);
+    let (sig, recid): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
+        key.sign_prehash(signing_hash.as_slice()).unwrap();
+    let sig_bytes = sig.to_bytes();
+    tx.r = U256::from_be_slice(&sig_bytes[..32]);
+    tx.s = U256::from_be_slice(&sig_bytes[32..]);
+    tx.v = chain_id * 2 + 35 + recid.to_byte() as u64;
+    let tx_hash = tx.tx_hash();
+
+    // `test_header`'s minimum gas price is non-zero, and a transaction below
+    // it is not valid in the block -- the replay rejects it exactly as
+    // consensus would. Zeroing the floor keeps the fixture about tracing.
+    let header = Header { parent_hash, minimum_gas_price: U256::ZERO, ..test_header(42) };
+    let block_hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(42, block_hash).unwrap();
+    store.set_head(block_hash).unwrap();
+    store.put_total_difficulty(block_hash, U256::from(42_000)).unwrap();
+    store.put_body(block_hash, std::slice::from_ref(&tx), &[]).unwrap();
+    store.put_tx_index(tx_hash, block_hash, 0).unwrap();
+    store
+        .put_receipts(
+            block_hash,
+            &[rustock_core::Receipt {
+                post_tx_state: vec![0x01],
+                cumulative_gas_used: 40_000,
+                gas_used: 40_000,
+                logs_bloom: Bloom::ZERO,
+                logs: vec![],
+                status: true,
+            }],
+        )
+        .unwrap();
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: None,
+        trie_store: Some(trie_store),
+        hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
+        wire_queue_depth: None,
+        gas_price: None,
+        epoch_store: None,
+        miner: None,
+        admin_enabled: false,
+        gc_burial: 4000,
+        prune_keep_depth: 100_000,
+        prune_max_batch: 1_000,
+    };
+    (state, tmp, tx_hash, sender, caller, callee)
+}
+
+/// `trace_transaction` returns the transaction's own trace followed by the
+/// internal call, in rskj's flattened shape.
+#[tokio::test]
+async fn trace_transaction_renders_the_call_tree() {
+    let (state, _tmp, tx_hash, sender, caller, callee) = setup_state_for_tracing();
+    let resp = dispatch_for_test(
+        &state,
+        make_request("trace_transaction", json!([format!("{:#x}", tx_hash)])),
+    )
+    .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let traces = resp.result.unwrap();
+    let traces = traces.as_array().expect("an array of traces");
+    assert_eq!(traces.len(), 2, "the transaction plus its one internal call: {traces:#?}");
+
+    let top = &traces[0];
+    assert_eq!(top["type"], "call");
+    assert_eq!(top["subtraces"], json!(1));
+    // rskj's `traceAddress` for the top-level trace is the empty array.
+    assert_eq!(top["traceAddress"], json!([]));
+    assert_eq!(top["action"]["callType"], "call");
+    assert_eq!(top["action"]["from"], format!("0x{}", hex::encode(sender.as_slice())));
+    assert_eq!(top["action"]["to"], format!("0x{}", hex::encode(caller.as_slice())));
+    // The receipt's gas, not the frame's: rskj builds the top-level result
+    // from `txInfo.getReceipt().getGasUsed()`.
+    assert_eq!(top["result"]["gasUsed"], "0x9c40");
+    // A JSON number, because rskj's `blockNumber` is a Java `long`.
+    assert_eq!(top["blockNumber"], json!(42));
+    assert!(top["blockNumber"].is_number(), "blockNumber must not be a hex string");
+    assert!(top.get("error").is_none(), "a successful trace carries no error key");
+
+    let inner = &traces[1];
+    assert_eq!(inner["type"], "call");
+    assert_eq!(inner["traceAddress"], json!([0]));
+    assert_eq!(inner["subtraces"], json!(0));
+    assert_eq!(inner["action"]["from"], format!("0x{}", hex::encode(caller.as_slice())));
+    assert_eq!(inner["action"]["to"], format!("0x{}", hex::encode(callee.as_slice())));
+    assert_eq!(
+        inner["result"]["output"].as_str().unwrap(),
+        "0x000000000000000000000000000000000000000000000000000000000000002a"
+    );
+}
+
+/// `trace_block` accepts a hash or a block id, and returns the same traces.
+#[tokio::test]
+async fn trace_block_accepts_a_number_or_a_hash() {
+    let (state, _tmp, _tx, _sender, _caller, _callee) = setup_state_for_tracing();
+    let by_number = dispatch_for_test(&state, make_request("trace_block", json!(["0x2a"]))).await;
+    assert!(by_number.error.is_none(), "{:?}", by_number.error);
+    let by_number = by_number.result.unwrap();
+
+    let hash = state.store.canonical_hash(42).unwrap().unwrap();
+    let by_hash =
+        dispatch_for_test(&state, make_request("trace_block", json!([format!("{:#x}", hash)])))
+            .await;
+    assert!(by_hash.error.is_none(), "{:?}", by_hash.error);
+    assert_eq!(by_number, by_hash.result.unwrap());
+    assert_eq!(by_number.as_array().unwrap().len(), 2);
+}
+
+/// rskj's `trace_get` takes exactly one position and indexes the **block's**
+/// flattened trace list, not a path down the transaction's call tree.
+#[tokio::test]
+async fn trace_get_takes_one_position_and_indexes_the_block() {
+    let (state, _tmp, tx_hash, _sender, caller, callee) = setup_state_for_tracing();
+    let tx = format!("{:#x}", tx_hash);
+
+    let second =
+        dispatch_for_test(&state, make_request("trace_get", json!([tx, ["0x1"]]))).await;
+    let second = second.result.unwrap();
+    assert_eq!(second["action"]["from"], format!("0x{}", hex::encode(caller.as_slice())));
+    assert_eq!(second["action"]["to"], format!("0x{}", hex::encode(callee.as_slice())));
+
+    // Past the end is null, not an error.
+    let far = dispatch_for_test(&state, make_request("trace_get", json!([tx, ["0x9"]]))).await;
+    assert_eq!(far.result.unwrap(), Value::Null);
+
+    // rskj rejects a multi-element path by name rather than walking it.
+    let two =
+        dispatch_for_test(&state, make_request("trace_get", json!([tx, ["0x0", "0x0"]]))).await;
+    assert!(two.error.unwrap().message.contains("only one index"));
+
+    let none = dispatch_for_test(&state, make_request("trace_get", json!([tx, []]))).await;
+    assert!(none.error.unwrap().message.contains("cannot be null or empty"));
+}
+
+/// `trace_filter` over the range, and its rskj-shaped guards.
+#[tokio::test]
+async fn trace_filter_returns_the_range_and_enforces_its_limits() {
+    let (state, _tmp, _tx, sender, _caller, _callee) = setup_state_for_tracing();
+
+    let all = dispatch_for_test(
+        &state,
+        make_request("trace_filter", json!([{"fromBlock": "0x2a", "toBlock": "0x2a"}])),
+    )
+    .await;
+    assert!(all.error.is_none(), "{:?}", all.error);
+    assert_eq!(all.result.unwrap().as_array().unwrap().len(), 2);
+
+    // `after` skips, `count` limits -- and rskj applies both across the whole
+    // range, so one block of two traces with `after: 1` leaves one.
+    let windowed = dispatch_for_test(
+        &state,
+        make_request(
+            "trace_filter",
+            json!([{"fromBlock": "0x2a", "toBlock": "0x2a", "after": 1, "count": 1}]),
+        ),
+    )
+    .await;
+    assert_eq!(windowed.result.unwrap().as_array().unwrap().len(), 1);
+
+    // The address filter selects whole transactions by their *own* sender, so
+    // matching the sender yields the internal call as well.
+    let by_sender = dispatch_for_test(
+        &state,
+        make_request(
+            "trace_filter",
+            json!([{
+                "fromBlock": "0x2a", "toBlock": "0x2a",
+                "fromAddress": [format!("0x{}", hex::encode(sender.as_slice()))]
+            }]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        by_sender.result.unwrap().as_array().unwrap().len(),
+        2,
+        "rskj filters transactions, not traces, so the internal call comes along"
+    );
+
+    let other = dispatch_for_test(
+        &state,
+        make_request(
+            "trace_filter",
+            json!([{
+                "fromBlock": "0x2a", "toBlock": "0x2a",
+                "fromAddress": [format!("0x{}", hex::encode(Address::repeat_byte(0x99).as_slice()))]
+            }]),
+        ),
+    )
+    .await;
+    assert!(other.result.unwrap().as_array().unwrap().is_empty());
+
+    let backwards = dispatch_for_test(
+        &state,
+        make_request("trace_filter", json!([{"fromBlock": "0x2a", "toBlock": "0x1"}])),
+    )
+    .await;
+    assert!(backwards.error.unwrap().message.contains("cannot be greater than"));
+
+    let too_many = dispatch_for_test(
+        &state,
+        make_request("trace_filter", json!([{"count": 10_001}])),
+    )
+    .await;
+    assert!(too_many.error.unwrap().message.contains("Count value too big"));
+}
+
+/// An unknown transaction is `null`, and the `trace_*` methods no longer
+/// answer "execution engine not available".
+#[tokio::test]
+async fn trace_transaction_unknown_is_null() {
+    let (state, _tmp) = setup_state();
+    let resp = dispatch_for_test(
+        &state,
+        make_request("trace_transaction", json!([format!("{:#x}", B256::repeat_byte(0xcd))])),
+    )
+    .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    assert_eq!(resp.result.unwrap(), Value::Null);
+}

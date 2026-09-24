@@ -388,6 +388,42 @@ impl BlockProcessor {
         Ok(trace)
     }
 
+    /// The call tree of every transaction in a block, in one replay.
+    ///
+    /// `state_root` must be the state after the parent block, as for
+    /// `trace_transaction`. The returned vector is index-aligned with
+    /// `block.transactions`.
+    ///
+    /// This is what `trace_block` and `trace_transaction` (the `trace_`
+    /// namespace, not `debug_`) are built on. rskj does the same thing --
+    /// `TraceModuleImpl.buildBlockTraces` calls `blockExecutor.traceBlock`
+    /// once per block, never once per transaction.
+    pub fn trace_block_calls(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+    ) -> Result<Vec<crate::tracer::ProgramTrace>, ProcessError> {
+        if block.transactions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let senders = self.recover_senders(&block.transactions, self.hardfork_cfg.chain_id)?;
+        let transactions: Vec<(Transaction, Address)> = block
+            .transactions
+            .iter()
+            .cloned()
+            .zip(senders.iter().copied())
+            .collect();
+
+        let (_, traces) = self.executor.execute_block_call_traced(
+            &block.header,
+            &transactions,
+            state_root,
+            trie_store,
+        )?;
+        Ok(traces)
+    }
+
     /// The consensus rules that need the block body, run before execution.
     ///
     /// rskj composes these in `RskContext.getBlockValidationRule`. They all
@@ -1100,6 +1136,237 @@ mod tests {
             halted.error.contains("OutOfGas"),
             "the halt reason belongs in `error`: {:?}",
             halted.error
+        );
+    }
+
+    /// The call tree: an inner CALL becomes a subtrace of the transaction,
+    /// with its own caller, target, value and return data.
+    #[test]
+    fn a_call_tree_records_the_inner_call() {
+        let trie = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+
+        let key = SigningKey::from_slice(&[21u8; 32]).unwrap();
+        let sender = sender_address(&key);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        // The callee returns one 32-byte word (0x2a):
+        //   PUSH1 2a PUSH1 00 MSTORE PUSH1 20 PUSH1 00 RETURN
+        let callee_code = vec![0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let callee = Address::repeat_byte(0xCE);
+
+        // The caller CALLs it with no value and no data, forwarding all gas:
+        //   PUSH1 00 x4, PUSH20 <callee>, GAS, CALL, STOP
+        let mut caller_code = vec![
+            0x60, 0x00, // retSize
+            0x60, 0x00, // retOffset
+            0x60, 0x00, // argsSize
+            0x60, 0x00, // argsOffset
+            0x60, 0x00, // value
+        ];
+        caller_code.push(0x73); // PUSH20
+        caller_code.extend_from_slice(callee.as_slice());
+        caller_code.push(0x5a); // GAS
+        caller_code.push(0xf1); // CALL
+        caller_code.push(0x00); // STOP
+        let caller = Address::repeat_byte(0xCA);
+
+        let mut root = put_account(&TrieNode::empty(), trie.as_ref(), &sender, 0, one_rbtc);
+        for (addr, code) in [(caller, &caller_code), (callee, &callee_code)] {
+            root = put_account(&root, trie.as_ref(), &addr, 1, U256::ZERO);
+            let code_key = rustock_trie::code_key(&addr);
+            root = root.put(&TrieKeySlice::from_key(&code_key), code, trie.as_ref());
+        }
+
+        let mut tx = Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(500_000),
+            to: Bytes::copy_from_slice(caller.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::default(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign_tx(&mut tx, &key, 33);
+        let block = Block {
+            header: dummy_header(6_000_000),
+            transactions: vec![tx],
+            ommers: vec![],
+        };
+
+        let traces = processor
+            .trace_block_calls(&block, &root, trie)
+            .expect("replay succeeds");
+        assert_eq!(traces.len(), 1, "one transaction, one trace");
+        let trace = &traces[0];
+
+        // The transaction's own frame is not a subtrace -- rskj renders it
+        // from the receipt -- so the inner CALL is the only entry.
+        assert_eq!(
+            trace.subtraces.len(),
+            1,
+            "expected exactly the inner CALL: {:?}",
+            trace.subtraces.iter().map(|s| s.kind).collect::<Vec<_>>()
+        );
+        let inner = &trace.subtraces[0];
+        assert_eq!(inner.kind, crate::tracer::SubtraceKind::Call);
+        assert_eq!(inner.call_kind.map(|k| k.as_str()), Some("call"));
+        assert_eq!(inner.caller, caller);
+        assert_eq!(inner.owner, callee);
+        assert!(!inner.reverted);
+        assert_eq!(inner.error, None);
+        assert_eq!(
+            inner.output.last(),
+            Some(&0x2a),
+            "the callee's return data should be on the subtrace: {:?}",
+            inner.output
+        );
+        assert!(inner.gas_used > 0, "the inner call spent gas");
+
+        // `call_tree_only` does not pay for the opcode stream.
+        assert!(
+            trace.struct_logs.is_empty(),
+            "trace_* does not render structLogs and must not record them"
+        );
+    }
+
+    /// A plain value transfer reports `gas: 0`, and REMASC gets a trace at
+    /// all -- both because rskj does.
+    ///
+    /// rskj's `TransactionExecutor.extractTrace` has two branches. With a
+    /// `Program` it reports the real invoke. Without one -- a transfer to a
+    /// codeless account, or a call straight to a precompile -- it builds
+    /// `new TransferInvoke(sender, receiver, 0L, value, data)`, and that
+    /// hard-coded `0L` is what `action.gas` reports. Every RSK block ends with
+    /// the REMASC transaction, which takes that branch, so a `trace_block`
+    /// that omitted it would be one entry short on every block.
+    #[test]
+    fn a_plain_transfer_and_remasc_trace_the_way_rskj_does() {
+        let trie = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+
+        let key = SigningKey::from_slice(&[23u8; 32]).unwrap();
+        let sender = sender_address(&key);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), trie.as_ref(), &sender, 0, one_rbtc);
+
+        let mut transfer = Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(Address::repeat_byte(0xEE).as_slice()),
+            value: U256::from(1_000u64),
+            input: Bytes::default(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign_tx(&mut transfer, &key, 33);
+
+        let remasc = Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::ZERO,
+            to: Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::default(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        assert!(BlockProcessor::is_remasc_tx(&remasc), "the fixture must look like REMASC");
+
+        let block = Block {
+            // Below REMASC's 4,000-block maturity, so the distribution has no
+            // processing block to look up and returns early. The point here
+            // is that the *trace* exists, not what REMASC paid.
+            header: dummy_header(100),
+            transactions: vec![transfer, remasc],
+            ommers: vec![],
+        };
+
+        let traces = processor
+            .trace_block_calls(&block, &root, trie)
+            .expect("replay succeeds");
+        assert_eq!(traces.len(), 2, "REMASC gets a trace too, as it does in rskj");
+        assert_eq!(
+            traces[0].root_gas, 0,
+            "no Program means rskj's TransferInvoke hard-codes gas to 0"
+        );
+        assert!(traces[0].subtraces.is_empty());
+        assert_eq!(traces[1].root_gas, 0, "REMASC likewise");
+    }
+
+    /// rskj drops a failed CREATE from the call tree entirely, and this
+    /// reproduces that rather than improving on it.
+    ///
+    /// `Program.createContract` guards `addCreateSubtrace` with
+    /// `programResult.getException() == null && !programResult.isRevert()`, so
+    /// a reverted inner CREATE is invisible. A client written against rskj
+    /// expects the gap; one that saw the frame here and not there would
+    /// disagree with every other RSK node.
+    #[test]
+    fn a_failed_create_leaves_no_subtrace_as_in_rskj() {
+        let trie = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+
+        let key = SigningKey::from_slice(&[22u8; 32]).unwrap();
+        let sender = sender_address(&key);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        // Init code that reverts: PUSH1 00 PUSH1 00 REVERT  (0x6000 6000 fd)
+        // Deployer: store that init code in memory and CREATE it.
+        //   PUSH5 <initcode> PUSH1 00 MSTORE   (right-aligned in the word)
+        //   PUSH1 05 PUSH1 1b PUSH1 00 CREATE  (size 5, offset 32-5=27)
+        //   STOP
+        let mut deployer = vec![0x64]; // PUSH5
+        deployer.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]);
+        deployer.extend_from_slice(&[0x60, 0x00, 0x52]); // PUSH1 00 MSTORE
+        deployer.extend_from_slice(&[0x60, 0x05, 0x60, 0x1b, 0x60, 0x00]); // size, offset, value
+        deployer.push(0xf0); // CREATE
+        deployer.push(0x00); // STOP
+        let deployer_addr = Address::repeat_byte(0xDE);
+
+        let root = put_account(&TrieNode::empty(), trie.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, trie.as_ref(), &deployer_addr, 1, U256::ZERO);
+        let code_key = rustock_trie::code_key(&deployer_addr);
+        let root = root.put(&TrieKeySlice::from_key(&code_key), &deployer, trie.as_ref());
+
+        let mut tx = Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(500_000),
+            to: Bytes::copy_from_slice(deployer_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::default(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign_tx(&mut tx, &key, 33);
+        let block = Block {
+            header: dummy_header(6_000_000),
+            transactions: vec![tx],
+            ommers: vec![],
+        };
+
+        let traces = processor
+            .trace_block_calls(&block, &root, trie)
+            .expect("replay succeeds");
+        assert_eq!(traces.len(), 1);
+        assert!(
+            traces[0].subtraces.is_empty(),
+            "rskj emits no subtrace for a reverted CREATE, so neither may this: {:?}",
+            traces[0].subtraces.iter().map(|s| s.kind).collect::<Vec<_>>()
         );
     }
 
