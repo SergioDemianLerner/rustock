@@ -390,25 +390,16 @@ impl RskExecutor {
         let success = exec.is_success();
         let gas_used = exec.gas_used();
         let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
+        let outcome = TracedOutcome::of(tx, sender, &exec, &output);
         let logs = exec.into_logs();
 
         let created_address = Self::extract_created_address(tx, sender, &success);
 
-        let (struct_logs, current_storage, truncated) = evm.inspector.finish();
-        let trace = crate::tracer::ProgramTrace {
-            contract_address: hex::encode(
-                tx.to.as_ref().first().map(|_| tx.to.as_ref()).unwrap_or(&[]),
-            ),
-            storage_size: current_storage.len(),
-            struct_logs,
-            // rskj puts the return data in `result` and leaves it empty on a
-            // failure; `error`/`reverted` carry the rest.
-            result: if success { hex::encode(&output) } else { String::new() },
-            error: if success { String::new() } else { "Reverted".to_string() },
-            reverted: !success,
-            current_storage,
-            truncated,
-        };
+        // The same `take_trace` + `TracedOutcome` pair the block path uses,
+        // so the two tracing entry points cannot disagree about what a
+        // reverted transaction looks like.
+        let mut trace = evm.inspector.take_trace();
+        outcome.apply_to(&mut trace);
 
         Ok((
             TxExecutionResult { gas_used, success, output, logs, created_address },
@@ -457,9 +448,36 @@ impl RskExecutor {
             state_root,
             trie_store,
             crate::tracer::RskTracer::new(0),
-            None,
+            TracedTxs::None,
         )
         .map(|(result, _)| result)
+    }
+
+    /// Execute a block, recording the call tree of **every** transaction.
+    ///
+    /// This is what the `trace_*` namespace needs, and it is one block pass:
+    /// rskj's `TraceModuleImpl` likewise calls `blockExecutor.traceBlock` once
+    /// and pulls a trace per transaction hash out of the
+    /// `ProgramTraceProcessor`. Calling `execute_block_traced` once per index
+    /// instead would be quadratic in the block's transaction count.
+    ///
+    /// The opcode stream is not recorded -- `trace_*` never renders it.
+    pub fn execute_block_call_traced(
+        &self,
+        header: &Header,
+        transactions: &[(rustock_core::Transaction, Address)],
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+    ) -> Result<(BlockExecutionResult, Vec<crate::tracer::ProgramTrace>), ExecutionError> {
+        let (result, traces) = self.execute_block_with(
+            header,
+            transactions,
+            state_root,
+            trie_store,
+            crate::tracer::RskTracer::call_tree_only(),
+            TracedTxs::All,
+        )?;
+        Ok((result, traces.into_values().collect()))
     }
 
     /// Execute a block with a tracer attached to one transaction.
@@ -481,14 +499,15 @@ impl RskExecutor {
         trace_index: usize,
         max_struct_logs: usize,
     ) -> Result<(BlockExecutionResult, Option<crate::tracer::ProgramTrace>), ExecutionError> {
-        self.execute_block_with(
+        let (result, mut traces) = self.execute_block_with(
             header,
             transactions,
             state_root,
             trie_store,
             crate::tracer::RskTracer::new(max_struct_logs),
-            Some(trace_index),
-        )
+            TracedTxs::One(trace_index),
+        )?;
+        Ok((result, traces.remove(&trace_index)))
     }
 
     /// The block executor, with a tracer carried as a field.
@@ -516,8 +535,11 @@ impl RskExecutor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
         inspector: crate::tracer::RskTracer,
-        trace_index: Option<usize>,
-    ) -> Result<(BlockExecutionResult, Option<crate::tracer::ProgramTrace>), ExecutionError> {
+        traced: TracedTxs,
+    ) -> Result<
+        (BlockExecutionResult, std::collections::BTreeMap<usize, crate::tracer::ProgramTrace>),
+        ExecutionError,
+    > {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
         let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
@@ -582,10 +604,10 @@ impl RskExecutor {
         let mut total_gas = 0u64;
         let mut total_fees = U256::ZERO;
         let mut tx_results = Vec::with_capacity(transactions.len());
-        // The four `DetailedProgramTrace` fields that come from the execution
-        // result rather than from the opcode stream. They have to be taken
-        // inside the loop, before `result` is consumed by `into_logs`.
-        let mut traced_outcome: Option<TracedOutcome> = None;
+        // Harvested per transaction rather than once at the end, so that
+        // `trace_block` can trace every transaction in a single block pass.
+        let mut traces: std::collections::BTreeMap<usize, crate::tracer::ProgramTrace> =
+            std::collections::BTreeMap::new();
         let mut markers = crate::state::ContractMarkers::default();
 
         // rskj BlockExecutor.maintainPrecompiledContractStorageRoots, run
@@ -637,6 +659,15 @@ impl RskExecutor {
             }
             if Self::is_remasc_tx(tx) {
                 debug!(tx_index = i, "executing REMASC system call");
+                if traced.includes(i) {
+                    // REMASC never enters the EVM here, so the tracer records
+                    // nothing -- but rskj still produces a trace for it
+                    // (`TransactionExecutor.extractTrace`'s `program == null`
+                    // branch), and `trace_block` would otherwise be short one
+                    // entry per block. An empty trace renders as the
+                    // zero-gas, no-subtrace `call` rskj emits.
+                    traces.insert(i, crate::tracer::ProgramTrace::default());
+                }
                 // Warm the REMASC account: outside revm's transact flow the
                 // journal rejects storage ops on accounts it has not loaded.
                 // Touch it too: rskj transfers the (zero) endowment to the
@@ -901,7 +932,7 @@ impl RskExecutor {
                 // for every other -- and `run` is the same code path an EVM
                 // built without an inspector takes, because revm carries the
                 // inspector as a field that only `inspect_run` consults.
-                let out = if trace_index == Some(i) {
+                let out = if traced.includes(i) {
                     use revm::inspector::InspectorHandler;
                     handler.inspect_run(&mut evm)
                 } else {
@@ -915,8 +946,13 @@ impl RskExecutor {
             let success = result.is_success();
             let gas_used = result.gas_used();
             let output = result.output().map(|o| o.to_vec()).unwrap_or_default();
-            if trace_index == Some(i) {
-                traced_outcome = Some(TracedOutcome::of(tx, *sender, &result, &output));
+            if traced.includes(i) {
+                // Taken here, not after the block: `take_trace` resets the
+                // tracer so the next transaction starts with an empty tree,
+                // and `result` is about to be consumed by `into_logs`.
+                let mut trace = evm.inspector.take_trace();
+                TracedOutcome::of(tx, *sender, &result, &output).apply_to(&mut trace);
+                traces.insert(i, trace);
             }
             let logs = result.into_logs();
             let created_address = Self::extract_created_address(tx, *sender, &success);
@@ -1004,27 +1040,6 @@ impl RskExecutor {
         }
         let state = evm.finalize();
 
-        // The trace, if one transaction was traced. `finish` consumes the
-        // tracer, so it is taken after the block is done rather than per
-        // transaction.
-        let trace = trace_index.map(|_| {
-            let (struct_logs, current_storage, truncated) = evm.inspector.finish();
-            let mut trace = crate::tracer::ProgramTrace {
-                storage_size: current_storage.len(),
-                struct_logs,
-                current_storage,
-                truncated,
-                ..Default::default()
-            };
-            if let Some(outcome) = traced_outcome {
-                trace.contract_address = outcome.contract_address;
-                trace.result = outcome.result;
-                trace.error = outcome.error;
-                trace.reverted = outcome.reverted;
-            }
-            trace
-        });
-
         Ok((
             BlockExecutionResult {
                 tx_results,
@@ -1033,7 +1048,7 @@ impl RskExecutor {
                 state_changes: state,
                 markers,
             },
-            trace,
+            traces,
         ))
     }
 
@@ -1074,6 +1089,28 @@ impl RskExecutor {
         // doesn't include the created address in the receipt RLP, so this is
         // only needed for the empty-data-CREATE skip_created bookkeeping.
         Some(sender.create(tx.nonce))
+    }
+}
+
+/// Which transactions of a block the inspector should be switched on for.
+///
+/// `debug_traceTransaction` wants one; `trace_block` wants all of them in a
+/// single pass; consensus wants none, and takes `Handler::run` for every
+/// transaction as a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TracedTxs {
+    None,
+    One(usize),
+    All,
+}
+
+impl TracedTxs {
+    fn includes(self, index: usize) -> bool {
+        match self {
+            TracedTxs::None => false,
+            TracedTxs::One(i) => i == index,
+            TracedTxs::All => true,
+        }
     }
 }
 
@@ -1130,6 +1167,13 @@ impl TracedOutcome {
             error,
             reverted: matches!(result, ExecutionResult::Revert { .. }),
         }
+    }
+
+    fn apply_to(self, trace: &mut crate::tracer::ProgramTrace) {
+        trace.contract_address = self.contract_address;
+        trace.result = self.result;
+        trace.error = self.error;
+        trace.reverted = self.reverted;
     }
 }
 

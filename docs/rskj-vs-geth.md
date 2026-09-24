@@ -258,6 +258,77 @@ Against geth's `"%s: %v wei + %v gas × %v wei"`: a plain ASCII `x` rather than
 last. The address is bare hex, so a contract creation's summary begins with
 `": "`. Consumers parse this string, so the difference is not cosmetic.
 
+### `trace_get` takes an index, not a path
+
+Parity's `trace_get(txHash, positions)` walks `positions` down the call tree.
+rskj rejects more than one:
+
+```java
+if (tracePositions.size() > 1) {
+    throw invalidParamError("'positions' accepts only one index");
+}
+...
+List<TransactionTrace> traces = buildBlockTraces(block);   // every tx in the block
+TransactionTrace transactionTrace = traces.get(positions.get(0));
+```
+
+and then indexes the **whole block's** flattened trace list. The transaction
+hash selects the *block*, not the traces. `trace_get(tx, ["0x0"])` on the
+second transaction of a block therefore returns a trace belonging to the
+first — silently, with a plausible-looking result. Full detail in
+`docs/trace-namespace.md`.
+
+### `trace_filter` addresses match transactions, not traces
+
+```java
+txStream = txStream.filter(tx -> addresses.contains(tx.getSender(signatureCache)));
+```
+
+Parity matches each individual trace. rskj filters whole transactions by their
+own sender and receive address, then emits every trace of the survivors. So an
+internal call *to* the address you asked about is invisible unless the
+top-level transaction also matched — usually the opposite of the question.
+
+### Precompile calls are absent from `trace_*`
+
+`Program.callToPrecompiledAddress` never calls `addSubTrace`. On RSK that
+means **the Bridge does not appear in any call tree**: peg-ins, peg-out
+requests and federation calls are invisible to an indexer reading internal
+transactions. Bridge events are the only route.
+
+### A failed CREATE is absent too
+
+```java
+if (programResult.getException() == null && !programResult.isRevert()) {
+    getTrace().addSubTrace(ProgramSubtrace.newCreateSubtrace(...));
+}
+```
+
+A reverted or halted inner CREATE leaves nothing — no entry, no error, and
+none of the frames it opened. Parity shows it with its error. A deployment
+that reverted looks exactly like one that never happened. A failed **CALL**
+is reported normally; only CREATE is dropped.
+
+### `trace_*` mixes JSON numbers with hex strings
+
+`blockNumber`, `transactionPosition` and `subtraces` come out as JSON numbers
+(`42`), because they are Java `long`/`int` fields. Everything else in the
+object — `gas`, `value`, `gasUsed`, `input`, `output` — is a `0x` string. A
+client that assumes hex everywhere reads `blockNumber` as zero.
+
+### `RskAddress.toJsonString()` returns `null` for the zero address
+
+```java
+public String toJsonString() {
+    if (NULL_ADDRESS.equals(this)) { return null; }
+    return HexUtils.toUnformattedJsonHex(this.getBytes());
+}
+```
+
+`TraceAction` is `@JsonInclude(NON_NULL)`, so the key vanishes rather than
+carrying `"0x0000…0000"`. A consumer indexing by `action.to` must treat an
+absent key as the zero address, not as malformed input.
+
 ---
 
 ## How to add an entry
