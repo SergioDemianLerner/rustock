@@ -156,3 +156,123 @@ fn parse_storage_key(s: &str) -> Option<alloy_primitives::B256> {
     let bytes = hex::decode(padded).ok()?;
     Some(alloy_primitives::B256::from_slice(&bytes))
 }
+
+/// `rsk_getRawTransactionReceiptByHash` — the receipt's raw RLP.
+///
+/// `eth_getTransactionReceipt` returns a decoded receipt you have to *trust*.
+/// This returns the bytes that actually went into the receipts trie, so a
+/// caller who already trusts the block's `receiptsRoot` can *check* it —
+/// together with [`rsk_get_transaction_receipt_nodes_by_hash`], which supplies
+/// the path.
+///
+/// Main chain only, matching rskj's `receiptStore.getInMainChain`: a receipt
+/// from a block that lost a reorg proves nothing against the canonical root.
+/// `null` when the transaction is unknown.
+pub fn rsk_get_raw_transaction_receipt_by_hash(
+    id: Value,
+    params: &Value,
+    store: &BlockStore,
+) -> JsonRpcResponse {
+    let Some(tx_hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid transaction hash");
+    };
+
+    let Ok(Some((block_hash, index))) = store.tx_location(tx_hash) else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+
+    // `tx_location` indexes the canonical chain, which is rskj's
+    // `getInMainChain`; re-checking the canonical pointer keeps that true if
+    // the index is ever widened to cover forks.
+    let on_main_chain = store
+        .header(block_hash)
+        .ok()
+        .flatten()
+        .and_then(|h| store.canonical_hash(h.number).ok().flatten())
+        .is_some_and(|canonical| canonical == block_hash);
+    if !on_main_chain {
+        return JsonRpcResponse::success(id, Value::Null);
+    }
+
+    let Ok(Some(receipts)) = store.receipts(block_hash) else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+    let Some(receipt) = receipts.get(index as usize) else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+
+    JsonRpcResponse::success(id, json!(to_hex_bytes(&receipt.rlp_encode())))
+}
+
+/// `rsk_getTransactionReceiptNodesByHash` — the trie nodes proving a receipt.
+///
+/// Given these plus the receipt's RLP, a light client or a bridge on another
+/// chain can verify the receipt against a `receiptsRoot` it already trusts,
+/// without the block, without the state, and without trusting the node that
+/// served it.
+///
+/// # Ordering: leaf first, root last
+///
+/// Not the obvious order, and worth stating because a consumer that assumes
+/// root-first silently fails to verify. rskj's `Trie.findNodes` appends each
+/// level *after* recursing into its child:
+///
+/// ```text
+///   List<Trie> subnodes = node.findNodes(...);
+///   subnodes.add(this);          // <- this node goes AFTER its child's list
+/// ```
+///
+/// so the deepest node comes back first and the root last. `nodes_on_path`
+/// mirrors that.
+///
+/// The trie is rebuilt from the block's receipts on demand, exactly as rskj
+/// does — the nodes are not stored.
+pub fn rsk_get_transaction_receipt_nodes_by_hash(
+    id: Value,
+    params: &Value,
+    store: &BlockStore,
+) -> JsonRpcResponse {
+    use rustock_core::types::receipt::{build_receipts_trie, receipt_trie_key};
+    use rustock_trie::{MemoryTrieStore, TrieKeySlice, TrieStore};
+
+    let Some(block_hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
+    };
+    let Some(tx_hash) = params.get(1).and_then(|v| v.as_str()).and_then(parse_b256) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid transaction hash");
+    };
+
+    let Ok(Some((transactions, _ommers))) = store.body(block_hash) else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+
+    // The transaction has to be in *this* block. rskj returns null when the
+    // index search never matches, and a proof against another block's root
+    // would be meaningless.
+    let Some(index) = transactions.iter().position(|tx| tx.tx_hash() == tx_hash) else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+
+    let Ok(Some(receipts)) = store.receipts(block_hash) else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+    if receipts.len() != transactions.len() {
+        // A partial receipt set would build a different trie and produce a
+        // proof that cannot verify. Refuse rather than answer wrongly.
+        return JsonRpcResponse::success(id, Value::Null);
+    }
+
+    let mem = MemoryTrieStore::new();
+    let root = build_receipts_trie(&receipts, &mem);
+    let key = TrieKeySlice::from_key(&receipt_trie_key(index as u32));
+
+    let Some(nodes) = root.nodes_on_path(&key, &mem) else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+
+    let encoded: Vec<Value> = nodes
+        .iter()
+        .map(|n| json!(to_hex_bytes(&n.to_message(&mem as &dyn TrieStore))))
+        .collect();
+    JsonRpcResponse::success(id, Value::Array(encoded))
+}
