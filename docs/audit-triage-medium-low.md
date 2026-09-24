@@ -327,13 +327,11 @@ bytes. `LocalOnly` means they are reachable only through `eth_call`, never from
 a transaction, so they cannot affect consensus — they give wrong RPC answers.
 Worth finishing; not urgent.
 
-**MOSTLY CLOSED (2026-09-24, issue #64).** Eighteen of the twenty-two
-undispatched methods are implemented, the catch-all is gone, and
+**CLOSED (2026-09-24, issues #64 and #97).** All twenty-two undispatched
+methods are implemented, the catch-all is gone, and
 `bridge_method_table_is_fully_dispatched` fails if a table row is ever added
-without an arm. Four remain deliberately unimplemented and now return an
-explicit error rather than empty bytes: `getBtcBlockchainBlockLocator` (removed
-at RSKIP89/orchid, needs the pre-checkpoint chain walk) and the three
-`getStateFor*` federator-client serializations.
+without an arm. The last four -- `getBtcBlockchainBlockLocator` and the three `getStateFor*`
+federator-client serializations -- landed under #97.
 
 Reading the Java also turned up four *dispatched* getters that were answering
 wrongly, all fixed in the same pass:

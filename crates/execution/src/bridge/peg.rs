@@ -4283,7 +4283,7 @@ pub fn serialize_pegouts_waiting_for_confirmations(
 /// rskj `BridgeStorageProvider.getReleaseTransactionSet`: one in-memory set
 /// loaded from the legacy cell (pair entries, no hash), merged post-RSKIP146
 /// with the with-txhash cell (triple entries).
-pub fn load_pegout_confirmation_set<CTX: crate::RskContextTr>(
+pub(crate) fn load_pegout_confirmation_set<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     use_tx_hash: bool,
 ) -> Vec<PegoutWaitingForConfirmations> {
@@ -5057,7 +5057,7 @@ fn save_release_request_queue<CTX: crate::RskContextTr>(
 /// `releaseRequestQueue` entries FIRST, then — once RSKIP146 is active — the
 /// `releaseRequestQueueWithTxHash` entries appended. Both lists, concatenated,
 /// not one or the other.
-fn load_release_request_queue<CTX: crate::RskContextTr>(
+pub(crate) fn load_release_request_queue<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     rskip146: bool,
 ) -> Vec<ReleaseRequest> {

@@ -993,13 +993,10 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getBtcBlockchainInitialBlockHeight" => btc_chain::get_initial_block_height(gas_cost, config),
         "getBtcBlockchainBlockHashAtDepth" => btc_chain::get_block_hash_at_depth(ctx, args, gas_cost, config, hardfork_cfg),
 
-        // Registered in the method table, deliberately not implemented
-        // (issue #97). See `unimplemented_method` for why this is an error
-        // rather than empty bytes.
-        "getBtcBlockchainBlockLocator"
-        | "getStateForBtcReleaseClient"
-        | "getStateForSvpClient"
-        | "getStateForDebugging" => unimplemented_method(method_name),
+        "getBtcBlockchainBlockLocator" => btc_chain::get_block_locator(ctx, gas_cost, config, hardfork_cfg),
+        "getStateForBtcReleaseClient" => getters::get_state_for_btc_release_client(ctx, gas_cost),
+        "getStateForSvpClient" => getters::get_state_for_svp_client(ctx, gas_cost),
+        "getStateForDebugging" => getters::get_state_for_debugging(ctx, gas_cost, hardfork_cfg),
 
         // Every method in `bridge_method_table` must appear above. A name that
         // reaches here is a table entry with no implementation, which is a bug
@@ -1062,18 +1059,10 @@ mod tests {
             + start;
         let dispatch = &SOURCE[start..end];
 
-        /// Registered, reachable only through `eth_call`, and not implemented
-        /// -- tracked in issue #97. `getBtcBlockchainBlockLocator` was removed
-        /// at RSKIP89 (orchid) and needs the checkpoints file; the three
-        /// `getStateFor*` methods are large serializations of federator-client
-        /// state. All four return an explicit error rather than a plausible
-        /// empty value.
-        const DELIBERATELY_UNIMPLEMENTED: [&str; 4] = [
-            "getBtcBlockchainBlockLocator",
-            "getStateForBtcReleaseClient",
-            "getStateForSvpClient",
-            "getStateForDebugging",
-        ];
+        /// Every method in the table is implemented as of issue #97. The list
+        /// stays as the place to name one that is not, so that "unimplemented"
+        /// has to be written down rather than left as a silent gap.
+        const DELIBERATELY_UNIMPLEMENTED: [&str; 0] = [];
 
         let mut missing = Vec::new();
         for m in BRIDGE_METHODS.iter() {

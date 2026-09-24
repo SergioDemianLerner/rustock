@@ -545,6 +545,76 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
 // ---------------------------------------------------------------------------
 
 /// `getBtcBlockchainBestChainHeight()` → int256
+/// `getBtcBlockchainBlockLocator()` → string[], a bitcoin-style block locator
+/// over the Bridge's BTC header chain.
+///
+/// The head, then the blocks at `best - 2^i` for i = 0, 1, 2 …, stopping at
+/// the lowest block the store holds and capped at 100 hashes -- the classic
+/// exponentially-widening locator, so a peer can find the fork point in a
+/// bounded number of steps.
+///
+/// **Removed at RSKIP89**, and the method table already knows: it is
+/// `Until(Orchid)`, so on mainnet today the selector does not resolve at all
+/// and this is reachable only by `eth_call` against a pre-orchid block.
+/// `getBtcBlockchainBlockHashAtDepth` replaced it.
+///
+/// Hashes are rendered by `Sha256Hash.toString()`, which is display order and
+/// carries no `0x`.
+pub fn get_block_locator<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> Result<PrecompileOutput, PrecompileError> {
+    /// rskj `maxHashesToInform`.
+    const MAX_HASHES: usize = 100;
+
+    let Some(head) = load_chain_head(ctx) else {
+        return Err(PrecompileError::other("getBtcBlockchainBlockLocator: no BTC chain head"));
+    };
+    let lowest = lowest_stored_height(config).unwrap_or(0);
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+
+    let mut hashes: Vec<String> =
+        vec![hex::encode(bitcoin_hash_to_b256(&head.header.block_hash()))];
+
+    if head.height > lowest {
+        let mut i = 0u32;
+        loop {
+            if hashes.len() > MAX_HASHES {
+                break;
+            }
+            let step = 2u64.saturating_pow(i);
+            let height = (head.height as u64).saturating_sub(step);
+            if height <= lowest as u64 {
+                if let Some(block) = stored_block_at_main_chain_height(ctx, lowest, rskip199) {
+                    hashes.push(hex::encode(bitcoin_hash_to_b256(&block.header.block_hash())));
+                }
+                break;
+            }
+            match stored_block_at_main_chain_height(ctx, height as u32, rskip199) {
+                Some(block) => {
+                    hashes.push(hex::encode(bitcoin_hash_to_b256(&block.header.block_hash())))
+                }
+                // rskj panics and rethrows here; refusing is the same outcome
+                // without the panic processor.
+                None => {
+                    return Err(PrecompileError::other(
+                        "getBtcBlockchainBlockLocator: cannot walk the BTC chain",
+                    ))
+                }
+            }
+            i += 1;
+        }
+    }
+
+    Ok(PrecompileOutput::new(
+        gas_cost,
+        super::getters::abi_encode_string_array_pub(&hashes).into(),
+    ))
+}
+
 /// `getBtcBlockchainInitialBlockHeight()` → int256, the height of the lowest
 /// block this node's Bridge BTC store holds.
 ///
