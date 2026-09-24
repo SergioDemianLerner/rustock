@@ -15,7 +15,7 @@ Source of truth: `co/rsk/rpc/Web3DebugModule.java`,
 |---|---|---|
 | `debug_wireProtocolQueueSize` | **yes** | |
 | `debug_accountTransactionQuota` | **yes** | |
-| `debug_traceTransaction` | not yet | needs a VM tracer (issue #81) |
+| `debug_traceTransaction` | not yet | tracer built; needs block replay (issue #81) |
 | `debug_traceBlockByHash` | not yet | ditto |
 | `debug_traceBlockByNumber` | not yet | ditto |
 
@@ -88,11 +88,54 @@ quota's lifetime, which is minutes at most, and it avoids carrying a second
 timestamp that could disagree with the first. A consumer cannot tell the
 difference; a reader of the code should know it is derived rather than stored.
 
-## The tracer methods
+## The tracer
 
-`debug_traceTransaction` and the two block variants need a VM tracer, tracked
-in issue #81. Two things are settled in advance and recorded here because they
-constrain the design:
+`crates/execution/src/tracer.rs` implements rskj's structure, and
+`RskExecutor::execute_tx_traced` runs a transaction through it. Three details
+inside `structLogs` are rskj's and are the ones a geth-shaped implementation
+gets wrong:
+
+* **`gas` is measured before the opcode runs, `gasCost` after.** rskj calls
+  `addOp` with the remaining gas and then `saveGasCost` on the entry it just
+  added. Reporting post-execution gas shifts every row by one opcode.
+* **Stack and memory are bare hex, not `0x`-prefixed**, and the stack is
+  **bottom first** -- `stack[0]` is the deepest item. Memory is split into
+  32-byte chunks, the last one short when the size is not a multiple of 32.
+* **`storage` lags one opcode, deliberately.** rskj notes the key when it sees
+  SSTORE or SLOAD (`storageKey = stack.peek()`) and reads its value on the
+  *next* `addOp`, once that opcode has run. A step's `storage` therefore shows
+  the effect of the step before it, and the map accumulates the keys touched
+  so far rather than describing the contract's whole storage.
+
+### Tracing does not change execution
+
+The traced path is separate from block processing, and the storage read uses
+`sload_skip_cold_load` so the tracer does not warm the slot.
+
+That second point is **defensive, not load-bearing**, and the difference is
+worth knowing. On Ethereum a tracer calling plain `sload` would warm the slot
+and change EIP-2929 gas for everything after it. RSK has no EIP-2929 --
+`make_cfg_env` zeroes `cold_storage_cost`, `warm_storage_read_cost` and the
+rest, pinned by `test_cfg_env_no_eip2929_cold_access_cost` -- so here that
+mistake would cost nothing. Verified by flipping the skip off: the equivalence
+test still passes. The skip stays because not depending on that is free.
+
+So `tracing_does_not_change_execution` does not prove side-effect freedom; it
+proves the traced and untraced paths agree on gas, output, success and logs,
+which is what catches them drifting apart. That is the real risk, because
+`execute_tx_traced` duplicates the untraced setup rather than refactoring it.
+
+### What is not built yet
+
+`debug_traceTransaction` and the block variants need to replay a transaction
+in its block's context: the state before transaction *i* of block *N* is the
+state after block *N-1* plus transactions 0..*i*, and no intermediate root is
+stored. That means re-executing the block with the tracer attached at one
+index, and `RskExecutor::execute_block` is 484 lines of consensus path --
+parameterising it over an inspector is its own change, with its own replay
+validation, not a tail-end addition to this one.
+
+Two constraints on those methods are already settled:
 
 * **The output shape is rskj's `DetailedProgramTrace`** — `contractAddress`,
   `initStorage`, `structLogs`, `result`, `error`, `reverted`, `storageSize`,

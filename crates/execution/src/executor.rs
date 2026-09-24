@@ -273,6 +273,151 @@ impl RskExecutor {
         })
     }
 
+    /// The same execution as `execute_tx_inner`, with a tracer attached.
+    ///
+    /// **Deliberately a copy of the setup above, not a refactor of it.** The
+    /// two differ in exactly two lines -- `build_mainnet_with_inspector`
+    /// instead of `build_mainnet`, and `inspect_run` instead of `run` -- and
+    /// everything else has to stay identical, because a trace of a different
+    /// execution than the chain performed is worse than no trace.
+    ///
+    /// Restructuring the consensus path to share this would put tracing inside
+    /// it; duplicating puts tracing beside it. The cost of duplication is
+    /// drift, and `tracing_does_not_change_execution` is the guard against
+    /// that: it runs the same transaction both ways and requires the same gas,
+    /// the same output, the same success and the same logs.
+    pub fn execute_tx_traced(
+        &self,
+        header: &Header,
+        tx: &rustock_core::Transaction,
+        sender: Address,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        local_call: bool,
+        max_struct_logs: usize,
+    ) -> Result<(TxExecutionResult, crate::tracer::ProgramTrace), ExecutionError> {
+        let spec_id = self.hardfork_cfg.spec_id(header.number);
+        let block_env = block_env_from_header(header, &self.hardfork_cfg);
+        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg);
+        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
+
+        let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
+
+        let mut chain_ext = crate::raw_storage::RskChainExt::default();
+        chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
+        chain_ext.btc_block_cache = self.btc_block_cache.clone();
+        let ctx = revm::Context::mainnet()
+            .with_db(WrapDatabaseRef(db))
+            .with_block(block_env)
+            .with_cfg(cfg)
+            .with_chain(chain_ext);
+
+        let precompile_provider = RskPrecompileProvider::new(
+            rsk_precompiles(&self.hardfork_cfg, header.number),
+            &self.hardfork_cfg,
+            Some(self.block_store.clone()),
+            self.remasc_config.clone(),
+        )
+        .with_bridge_config(self.bridge_constants.clone());
+        // rskj sets this on the transaction itself; the Bridge reads it out of
+        // the per-transaction context, so that is where it goes here.
+        if local_call {
+            if let Ok(mut guard) = precompile_provider.bridge_tx_context_slot().lock() {
+                guard.local_call = true;
+            }
+        }
+        let invisible_flag = precompile_provider.invisible_exception_flag();
+        let active_precompiles: Vec<Address> =
+            rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
+        let extcodesize_max_precompiles: Vec<Address> = if self.hardfork_cfg.has_rskip90(header.number) {
+            active_precompiles.clone()
+        } else {
+            Vec::new()
+        };
+        let pre_rskip150_precompiles = (!self.hardfork_cfg.has_rskip150(header.number))
+            .then(|| active_precompiles.clone());
+        // rskj `VM.doEXTCODEHASH` reports `keccak256("")` for any active
+        // precompile; EXTCODEHASH activates at RSKIP140 (papyrus).
+        let extcodehash_precompiles: Vec<Address> =
+            if self.hardfork_cfg.has_rskip140(header.number) {
+                active_precompiles.clone()
+            } else {
+                Vec::new()
+            };
+        let mut evm = ctx
+            .build_mainnet_with_inspector(crate::tracer::RskTracer::new(max_struct_logs))
+            .with_precompiles(precompile_provider);
+        crate::rsk_instructions::install(
+            &mut evm.instruction,
+            self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_chainid(header.number),
+            self.hardfork_cfg.has_push0(header.number),
+            self.hardfork_cfg.has_basefee(header.number),
+            self.hardfork_cfg.has_rskip91(header.number),
+            self.hardfork_cfg.has_rskip446(header.number),
+            self.hardfork_cfg.has_rskip445(header.number),
+            &extcodesize_max_precompiles,
+            &extcodehash_precompiles,
+            header.beneficiary,
+        );
+
+        let exec_out = {
+            use revm::context::ContextSetters;
+            use revm::handler::Handler;
+            evm.ctx.set_tx(tx_env);
+            let mut handler = crate::rsk_handler::RskHandler::with_rskip125(
+                !self.hardfork_cfg.has_rskip453(header.number),
+                self.hardfork_cfg.has_rskip125(header.number),
+                invisible_flag,
+                pre_rskip150_precompiles,
+                active_precompiles,
+                self.hardfork_cfg.has_rskip171(header.number),
+            );
+            use revm::inspector::InspectorHandler;
+            let out = handler
+                .inspect_run(&mut evm)
+                .map_err(|e: revm::context::result::EVMError<_>| {
+                    ExecutionError::Evm(format!("{e:?}"))
+                })?;
+            out
+        };
+        let state = {
+            use revm::context_interface::{ContextTr, JournalTr};
+            evm.ctx.journal_mut().finalize()
+        };
+        let result = revm::context::result::ExecResultAndState::new(exec_out, state);
+
+        let exec = result.result;
+        let success = exec.is_success();
+        let gas_used = exec.gas_used();
+        let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
+        let logs = exec.into_logs();
+
+        let created_address = Self::extract_created_address(tx, sender, &success);
+
+        let (struct_logs, current_storage, truncated) = evm.inspector.finish();
+        let trace = crate::tracer::ProgramTrace {
+            contract_address: hex::encode(
+                tx.to.as_ref().first().map(|_| tx.to.as_ref()).unwrap_or(&[]),
+            ),
+            storage_size: current_storage.len(),
+            struct_logs,
+            // rskj puts the return data in `result` and leaves it empty on a
+            // failure; `error`/`reverted` carry the rest.
+            result: if success { hex::encode(&output) } else { String::new() },
+            error: if success { String::new() } else { "Reverted".to_string() },
+            reverted: !success,
+            current_storage,
+            truncated,
+        };
+
+        Ok((
+            TxExecutionResult { gas_used, success, output, logs, created_address },
+            trace,
+        ))
+    }
+
+
     /// Execute all transactions in a block.
     /// Account for one transaction's balance changes, rejecting the block if it
     /// created rBTC.
@@ -957,6 +1102,20 @@ mod tests {
         root.put(&key, &acct.encode(), store)
     }
 
+    /// An account with code, for tests that need a contract to run.
+    fn put_account_with_code(
+        root: &TrieNode,
+        store: &dyn TrieStore,
+        addr: &Address,
+        nonce: u64,
+        balance: U256,
+        code: &[u8],
+    ) -> TrieNode {
+        let root = put_account(root, store, addr, nonce, balance);
+        let code_key_bytes = rustock_trie::code_key(addr);
+        root.put(&TrieKeySlice::from_key(&code_key_bytes), code, store)
+    }
+
     /// rskj `Bridge.validateLocalCall` (Bridge.java:431) lets a LOCAL-ONLY
     /// getter run for `eth_call`/`estimateGas` and throws for anything on-chain.
     /// rustock had the throw but no way to say "this is a local call", so the
@@ -1030,6 +1189,129 @@ mod tests {
     /// cheaper. The contract performs CALL(gas=0, eoa, value=1) and stops:
     ///   21,000 intrinsic + 21 (7 pushes) + 700 CALL + 9,000 VT = 30,721
     /// (the charged stipend returns as the EOA child's unused gas).
+    /// A tracer that alters the execution it observes is a consensus hazard
+    /// dressed as a debugging tool, so the traced and untraced paths must
+    /// agree on gas, output, success and logs.
+    ///
+    /// **What this does not prove.** It cannot detect the tracer warming a
+    /// storage slot, because RSK has no EIP-2929 -- every cold/warm gas
+    /// parameter is zero (`test_cfg_env_no_eip2929_cold_access_cost`), so
+    /// warmth is invisible in gas here. Verified by flipping
+    /// `sload_skip_cold_load`'s skip off: this test still passes. The skip
+    /// stays because not depending on that is free, not because this catches
+    /// it.
+    ///
+    /// What it does catch is the likelier failure: `execute_tx_traced`
+    /// duplicates the untraced setup rather than refactoring it, and this is
+    /// the guard against the two drifting apart.
+    #[test]
+    fn tracing_does_not_change_execution() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let root = put_account(
+            &TrieNode::empty(), store.as_ref(), &sender, 0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+
+        // A contract that writes storage twice and reads it back, so the
+        // tracer's storage handling is exercised -- that is the part that
+        // touches the journal and so the part that could perturb gas.
+        //   PUSH1 01 PUSH1 00 SSTORE   (store 1 at slot 0)
+        //   PUSH1 00 SLOAD            (read it back)
+        //   PUSH1 02 PUSH1 00 SSTORE  (store 2 at slot 0)
+        //   STOP
+        let code = vec![
+            0x60, 0x01, 0x60, 0x00, 0x55,
+            0x60, 0x00, 0x54,
+            0x60, 0x02, 0x60, 0x00, 0x55,
+            0x00,
+        ];
+        let contract = Address::repeat_byte(0xCC);
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 1, U256::ZERO, &code);
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(6_000_000);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(600_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::default(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        let plain = executor
+            .execute_tx(&header, &tx, sender, &root, store.clone())
+            .expect("untraced execution completes");
+        let (traced, trace) = executor
+            .execute_tx_traced(
+                &header, &tx, sender, &root, store, false,
+                crate::tracer::DEFAULT_MAX_STRUCT_LOGS,
+            )
+            .expect("traced execution completes");
+
+        assert_eq!(plain.gas_used, traced.gas_used, "tracing must not change gas");
+        assert_eq!(plain.success, traced.success);
+        assert_eq!(plain.output, traced.output);
+        assert_eq!(plain.logs.len(), traced.logs.len());
+        assert_eq!(plain.created_address, traced.created_address);
+
+        // And the trace actually recorded something, so the assertions above
+        // are not comparing two untraced runs.
+        assert!(!trace.struct_logs.is_empty(), "the tracer recorded no steps");
+        assert!(
+            trace.struct_logs.iter().any(|l| l.op == "SSTORE"),
+            "the contract's SSTOREs should appear in the trace"
+        );
+    }
+
+    /// The step cap exists so that tracing a large transaction cannot exhaust
+    /// memory -- which is most likely on exactly the transaction someone wants
+    /// to look at. A truncated trace says so rather than looking short.
+    #[test]
+    fn a_trace_stops_at_the_step_cap() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let root = put_account(
+            &TrieNode::empty(), store.as_ref(), &sender, 0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        // JUMPDEST; PUSH1 00; JUMP -- an infinite loop, stopped by out-of-gas.
+        let code = vec![0x5b, 0x60, 0x00, 0x56];
+        let contract = Address::repeat_byte(0xCC);
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 1, U256::ZERO, &code);
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(6_000_000);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(600_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::default(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        let (_result, trace) = executor
+            .execute_tx_traced(&header, &tx, sender, &root, store, false, 50)
+            .expect("execution completes");
+
+        assert_eq!(trace.struct_logs.len(), 50, "the cap is the cap");
+        assert!(trace.truncated, "and the trace says it was cut short");
+    }
+
     #[test]
     fn test_rskj_call_stipend_is_charged_to_caller() {
         let store = Arc::new(MemoryTrieStore::new());
