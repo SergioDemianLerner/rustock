@@ -57,6 +57,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        wire_queue_depth: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -568,6 +569,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        wire_queue_depth: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -613,6 +615,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        wire_queue_depth: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -691,6 +694,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        wire_queue_depth: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -821,6 +825,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        wire_queue_depth: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -916,6 +921,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        wire_queue_depth: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -1086,6 +1092,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        wire_queue_depth: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -1310,6 +1317,7 @@ async fn test_receipt_dto_failed_status() {
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        wire_queue_depth: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -1942,6 +1950,9 @@ impl crate::server::TxPoolReader for OnePendingTx {
             queued: Vec::new(),
         }
     }
+    fn quota_report(&self, address: &alloy_primitives::Address) -> Option<(f64, u64)> {
+        (*address == self.sender).then_some((1_234.5_f64, 1_700_000_000_000_u64))
+    }
 }
 
 fn setup_state_with_pending_tx() -> (RpcState, B256, tempfile::TempDir) {
@@ -2154,6 +2165,7 @@ fn setup_state_with_receipts(
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        wire_queue_depth: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -2418,6 +2430,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
+        wire_queue_depth: None,
         epoch_store: None,
         miner: None,
         admin_enabled: false,
@@ -2752,6 +2765,9 @@ impl crate::server::TxPoolReader for PoolDouble {
             pending: self.pending.clone(),
             queued: self.queued.clone(),
         }
+    }
+    fn quota_report(&self, _address: &alloy_primitives::Address) -> Option<(f64, u64)> {
+        None
     }
 }
 
@@ -3125,4 +3141,87 @@ async fn test_an_uncle_is_still_synthesised_from_its_header() {
     assert_ne!(result, Value::Null, "an uncle we lack the block for is still rendered");
     assert_eq!(result["transactions"], json!([]), "synthesised from the header, as rskj does");
     assert_eq!(result["hash"], json!(format!("{:#x}", uncle.hash())));
+}
+
+// ========== debug_* ==========
+//
+// Shapes are rskj's `Web3DebugModule` / `DebugModuleImpl`. go-ethereum has
+// neither method, so there is nothing to be compatible with in that direction.
+
+/// rskj: `HexUtils.toQuantityJsonHex(messageHandler.getMessageQueueSize())` --
+/// a hex quantity **string**, not a number. `txpool_status` in the same server
+/// answers with JSON numbers; that inconsistency is rskj's and both are
+/// reproduced rather than harmonised.
+#[tokio::test]
+async fn test_debug_wire_protocol_queue_size_is_a_hex_string() {
+    let (mut state, _tmp) = setup_state();
+    let depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    state.wire_queue_depth = Some(depth.clone());
+
+    let r = dispatch_for_test(&state, make_request("debug_wireProtocolQueueSize", json!([]))).await;
+    assert_eq!(r.result.unwrap(), json!("0x0"));
+
+    depth.store(26, std::sync::atomic::Ordering::Relaxed);
+    let r = dispatch_for_test(&state, make_request("debug_wireProtocolQueueSize", json!([]))).await;
+    assert_eq!(r.result.unwrap(), json!("0x1a"), "a quantity, so no leading zeros");
+}
+
+/// Without a sync loop attached there is no queue to report, and zero is the
+/// truthful answer rather than an error: nothing is waiting.
+#[tokio::test]
+async fn test_debug_wire_protocol_queue_size_without_a_sync_loop() {
+    let (state, _tmp) = setup_state();
+    let r = dispatch_for_test(&state, make_request("debug_wireProtocolQueueSize", json!([]))).await;
+    assert_eq!(r.result.unwrap(), json!("0x0"));
+}
+
+/// rskj's `TxQuota` serialises exactly two `@JsonProperty` fields, and
+/// `availableVirtualGas` is a **double**. The fractional part is not noise:
+/// the virtual-gas cost of a transaction is a product of six fractional
+/// factors, so rounding it would merge quotas that the limiter distinguishes.
+#[tokio::test]
+async fn test_debug_account_transaction_quota_shape() {
+    let (state, _hash, _tmp) = setup_state_with_pending_tx();
+    let tracked = format!("{:#x}", alloy_primitives::Address::repeat_byte(0x11));
+
+    let result = dispatch_for_test(
+        &state,
+        make_request("debug_accountTransactionQuota", json!([tracked])),
+    )
+    .await
+    .result
+    .unwrap();
+
+    assert_eq!(result["availableVirtualGas"], json!(1_234.5_f64), "a double, not rounded");
+    assert_eq!(result["timestamp"], json!(1_700_000_000_000_u64));
+    let keys: Vec<&String> = result.as_object().unwrap().keys().collect();
+    assert_eq!(keys.len(), 2, "rskj's TxQuota has exactly two JSON fields: {keys:?}");
+}
+
+/// An address the limiter has never admitted a transaction for has no entry,
+/// and rskj's `accountQuotas.get(address)` returns null for it. That is the
+/// common case, not an error.
+#[tokio::test]
+async fn test_debug_account_transaction_quota_untracked_is_null() {
+    let (state, _hash, _tmp) = setup_state_with_pending_tx();
+    let stranger = format!("{:#x}", alloy_primitives::Address::repeat_byte(0x77));
+
+    let r = dispatch_for_test(
+        &state,
+        make_request("debug_accountTransactionQuota", json!([stranger])),
+    )
+    .await;
+    assert_eq!(r.result.unwrap(), Value::Null);
+    assert!(r.error.is_none(), "not tracked is an answer, not a failure");
+}
+
+#[tokio::test]
+async fn test_debug_account_transaction_quota_rejects_a_bad_address() {
+    let (state, _hash, _tmp) = setup_state_with_pending_tx();
+    let r = dispatch_for_test(
+        &state,
+        make_request("debug_accountTransactionQuota", json!(["not-an-address"])),
+    )
+    .await;
+    assert!(r.error.is_some());
 }

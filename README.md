@@ -181,7 +181,14 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
   transactions, and `txpool_status` counts are JSON numbers rather than hex
   strings. See [docs/rskj-vs-geth.md](docs/rskj-vs-geth.md).
 
-**Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), and the `debug_*`, `trace_*`, `personal_*`, `evm_*`, `mnr_*`, `db_*`, `sco_*` namespaces.
+**Debug:**
+
+- `debug_wireProtocolQueueSize`, `debug_accountTransactionQuota`
+
+  rskj's `debug_*`, not go-ethereum's — the two namespaces barely overlap. See
+  [docs/debug-namespace.md](docs/debug-namespace.md).
+
+**Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), the tracing methods (`debug_traceTransaction` and friends), and the `trace_*`, `personal_*`, `evm_*`, `mnr_*`, `db_*`, `sco_*` namespaces.
 
 ## Project Structure
 

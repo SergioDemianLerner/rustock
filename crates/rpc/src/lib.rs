@@ -1,4 +1,5 @@
 pub mod call;
+pub mod debug;
 pub mod dto;
 pub mod eth;
 pub mod helpers;

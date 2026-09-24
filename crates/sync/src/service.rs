@@ -368,6 +368,12 @@ pub struct SyncService {
     chain_activity: Arc<crate::chain_activity::ChainActivity>,
     peer_store: Arc<rustock_networking::peers::PeerStore>,
     event_rx: mpsc::UnboundedReceiver<SyncEvent>,
+    /// Inbound wire messages waiting to be handled, published for
+    /// `debug_wireProtocolQueueSize`.
+    ///
+    /// Refreshed every time the loop takes an event, so a reader sees the live
+    /// backlog rather than a sample taken on some other schedule.
+    wire_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) state: SyncState,
     pub(crate) last_progress: Instant,
     /// Per-peer body-request timeout strikes: incremented when a request to a
@@ -472,6 +478,7 @@ impl SyncService {
             chain_activity: Arc::new(crate::chain_activity::ChainActivity::new()),
             peer_store,
             event_rx,
+            wire_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             state: SyncState::Idle,
             last_progress: Instant::now(),
             body_peer_strikes: HashMap::new(),
@@ -523,6 +530,18 @@ impl SyncService {
     pub fn with_tx_pool(mut self, pool: Arc<crate::TransactionPool>) -> Self {
         self.tx_pool = Some(pool);
         self
+    }
+
+    /// A live view of the inbound wire-message backlog, for
+    /// `debug_wireProtocolQueueSize`.
+    ///
+    /// rskj answers that method with `messageHandler.getMessageQueueSize()` --
+    /// messages received from peers and not yet handled. This is the same
+    /// quantity for this node: the `SyncEvent` channel is where inbound wire
+    /// work waits, and its depth is what "the peer loop is falling behind"
+    /// looks like here.
+    pub fn wire_queue_depth(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.wire_queue_depth.clone()
     }
 
     /// Attach a block processor for full block validation and execution.
@@ -639,6 +658,8 @@ impl SyncService {
                     self.on_tick().await;
                 }
                 event = self.event_rx.recv() => {
+                    self.wire_queue_depth
+                        .store(self.event_rx.len(), std::sync::atomic::Ordering::Relaxed);
                     match event {
                         Some(e) => {
                             let is_progress = matches!(

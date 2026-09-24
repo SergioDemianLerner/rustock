@@ -18,7 +18,7 @@ use tracing::info;
 
 use crate::txpool;
 use crate::types::*;
-use crate::{admin, call, eth, logs, mnr, net, rsk, state, tx, web3};
+use crate::{admin, call, debug, eth, logs, mnr, net, rsk, state, tx, web3};
 
 /// Trait for submitting raw transactions, allowing the RPC layer to use
 /// the P2P relay without depending on the sync crate directly.
@@ -34,6 +34,10 @@ pub trait TxPoolReader: Send + Sync {
     fn pool_status(&self) -> (usize, usize);
     /// The whole pool, grouped the way `txpool_content` reports it.
     fn pool_content(&self) -> PoolContent;
+    /// An address's rate-limiter quota: available virtual gas, and when it was
+    /// last refreshed in epoch milliseconds. `None` when the limiter is not
+    /// tracking the address, which is what rskj's map lookup returns.
+    fn quota_report(&self, address: &alloy_primitives::Address) -> Option<(f64, u64)>;
 }
 
 /// The pool's contents, sender-major and nonce-ordered within each sender --
@@ -60,6 +64,9 @@ pub struct RpcState {
     pub hardfork_cfg: Option<RskHardforkConfig>,
     pub filter_store: Arc<logs::FilterStore>,
     pub tx_pool: Option<Arc<dyn TxPoolReader>>,
+    /// Live depth of the inbound wire-message queue, for
+    /// `debug_wireProtocolQueueSize`.
+    pub wire_queue_depth: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Present only when the node runs the epoch trie backend.
     pub epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>>,
     /// The miner, present only when the node was started with mining enabled.
@@ -269,6 +276,9 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         | "eth_signTransaction" => {
             execution_not_available(id, &req.method)
         }
+
+        "debug_wireProtocolQueueSize" => debug::debug_wire_protocol_queue_size(id, state),
+        "debug_accountTransactionQuota" => debug::debug_account_transaction_quota(id, params, state),
 
         "txpool_content" => txpool::txpool_content(id, state),
         "txpool_inspect" => txpool::txpool_inspect(id, state),
