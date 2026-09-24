@@ -651,6 +651,15 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
     let skey = storage_key(&addr, &slot);
     root = root.put(&TrieKeySlice::from_key(&skey), &[42], &*trie_store);
 
+    // Slot 0x02: a 70-byte value, longer than one word. This is the shape
+    // `rsk_getStorageBytesAt` exists for and `eth_getStorageAt` cannot return.
+    let mut long_slot_bytes = [0u8; 32];
+    long_slot_bytes[31] = 2;
+    let long_slot = B256::from(long_slot_bytes);
+    let long_value: Vec<u8> = (0u8..70).collect();
+    let lkey = storage_key(&addr, &long_slot);
+    root = root.put(&TrieKeySlice::from_key(&lkey), &long_value, &*trie_store);
+
     root.save(&*trie_store, true);
     let state_root = root.compute_hash(&*trie_store);
 
@@ -1959,4 +1968,110 @@ async fn test_compiler_methods_are_refused() {
         assert!(resp.result.is_none(), "{method} must not answer");
         assert_eq!(resp.error.unwrap().code, -32601);
     }
+}
+
+// ========== rsk_getStorageBytesAt ==========
+
+/// The reason the method exists: a value longer than one word comes back
+/// whole. `eth_getStorageAt` truncates it to 32 bytes and pads, which is
+/// silently wrong for Bridge state.
+#[tokio::test]
+async fn test_rsk_get_storage_bytes_at_returns_a_multi_word_value_whole() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("rsk_getStorageBytesAt", json!([addr, "0x2", "latest"])),
+    )
+    .await;
+
+    let expected: String = format!("0x{}", hex::encode((0u8..70).collect::<Vec<u8>>()));
+    assert_eq!(resp.result.unwrap().as_str().unwrap(), expected, "the 70-byte value was not returned whole");
+}
+
+/// And the contrast that makes the point: the same key through
+/// `eth_getStorageAt` comes back truncated to one word.
+#[tokio::test]
+async fn test_eth_get_storage_at_truncates_what_rsk_get_storage_bytes_at_returns_whole() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+    let slot = "0x0000000000000000000000000000000000000000000000000000000000000002";
+
+    let word = dispatch_for_test(&state, make_request("eth_getStorageAt", json!([addr, slot, "latest"]))).await;
+    let bytes = dispatch_for_test(&state, make_request("rsk_getStorageBytesAt", json!([addr, slot, "latest"]))).await;
+
+    let word_s = word.result.unwrap().as_str().unwrap().to_string();
+    let bytes_s = bytes.result.unwrap().as_str().unwrap().to_string();
+    assert_eq!(word_s.len(), 66, "eth_getStorageAt must answer with exactly one word");
+    assert!(bytes_s.len() > word_s.len(), "rsk_getStorageBytesAt must return more than one word");
+}
+
+/// An absent key answers `0x0`, which is rskj's
+/// `Optional.ofNullable(...).orElse("0x0")` -- **not** null and not `0x`.
+///
+/// `0x` and `0x0` look alike and are different facts: the first is a key
+/// holding a zero-length value, the second a key that is not there. For Bridge
+/// state that is "the queue is empty" against "there is no queue".
+#[tokio::test]
+async fn test_rsk_get_storage_bytes_at_absent_key_is_0x0_not_null() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("rsk_getStorageBytesAt", json!([addr, "0xdead", "latest"])),
+    )
+    .await;
+    let v = resp.result.unwrap();
+    assert!(!v.is_null(), "an absent key must not answer null");
+    assert_eq!(v.as_str().unwrap(), "0x0");
+}
+
+/// rskj takes the key through `strHexOrStrNumberToByteArray`, which accepts a
+/// short hex string and left-pads it. A caller who writes `0x1` should get the
+/// same answer as one who writes the full word.
+#[tokio::test]
+async fn test_rsk_get_storage_bytes_at_accepts_a_short_key() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+    let short = dispatch_for_test(&state, make_request("rsk_getStorageBytesAt", json!([addr, "0x2", "latest"]))).await;
+    let full = dispatch_for_test(
+        &state,
+        make_request("rsk_getStorageBytesAt", json!([addr, "0x0000000000000000000000000000000000000000000000000000000000000002", "latest"])),
+    )
+    .await;
+    assert_eq!(short.result.unwrap(), full.result.unwrap(), "a short key must resolve like the padded one");
+}
+
+#[tokio::test]
+async fn test_rsk_get_storage_bytes_at_rejects_bad_input() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+
+    for (params, what) in [
+        (json!(["not-an-address", "0x1", "latest"]), "address"),
+        (json!([addr, "0xZZ", "latest"]), "non-hex key"),
+        (json!([addr]), "missing key"),
+    ] {
+        let resp = dispatch_for_test(&state, make_request("rsk_getStorageBytesAt", params)).await;
+        assert!(resp.error.is_some(), "{what} should be rejected, not answered");
+    }
+}
+
+/// Reading at a historical block reads that block's state, not the head's.
+/// Bridge state you can only ask about at the tip is much less useful for
+/// investigating something that already happened.
+#[tokio::test]
+async fn test_rsk_get_storage_bytes_at_reads_the_requested_block() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+
+    let by_number = dispatch_for_test(&state, make_request("rsk_getStorageBytesAt", json!([addr, "0x2", "0x2a"]))).await;
+    let latest = dispatch_for_test(&state, make_request("rsk_getStorageBytesAt", json!([addr, "0x2", "latest"]))).await;
+    assert_eq!(
+        by_number.result.unwrap(),
+        latest.result.unwrap(),
+        "block #42 is the head in this fixture, so the two must agree"
+    );
 }

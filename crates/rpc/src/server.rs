@@ -205,6 +205,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
             id, &req.params, &state.store, state.prune_keep_depth, state.prune_max_batch,
         ),
         "rsk_storageStatus" => admin::rsk_storage_status(id, &state.store, &state.epoch_store),
+        "rsk_getStorageBytesAt" => rsk::rsk_get_storage_bytes_at(id, params, &state),
         "rsk_getRawBlockHeaderByHash" => rsk::rsk_get_raw_block_header_by_hash(id, params, &state.store),
         "rsk_getRawBlockHeaderByNumber" => rsk::rsk_get_raw_block_header_by_number(id, params, &state.store),
 
