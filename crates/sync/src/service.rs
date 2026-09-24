@@ -747,6 +747,7 @@ impl SyncService {
                 if before != after {
                     self.state = SyncState::Idle;
                 } else {
+                    self.fill_follow_body_gap().await;
                     self.check_follow_gap().await;
                     self.leave_follow_if_backlog().await;
                 }
@@ -1061,6 +1062,84 @@ impl SyncService {
                  the blocks will be re-requested"
             );
         }
+    }
+
+    /// Request bodies for canonical blocks above the executed head that we
+    /// hold a header for and no body.
+    ///
+    /// **The hole this fills.** Follow mode is reactive: `request_follow_bodies`
+    /// asks only for the bodies of headers that just arrived. If one of those
+    /// requests is never answered, `expire_stale_follow_bodies` drops it and
+    /// nothing re-issues it -- the comment there says "the next tip will
+    /// re-request the body", but the next tip brings *its own* header, not the
+    /// one that was lost. The block stays header-only for good.
+    ///
+    /// Every other guard measures a difference that is **zero** in that state:
+    ///
+    /// * `leave_follow_if_backlog` compares the downloaded head to the
+    ///   executed head. Both sat at #9,267,974 on 2026-09-24 while the missing
+    ///   blocks were *above* the head, so it returned on its first check.
+    /// * `check_execution_progress` watches execution stop while blocks wait.
+    ///   None were waiting by its measure.
+    /// * `check_follow_gap` is the only check that compares against peers, and
+    ///   it is gated at `LONG_SYNC_LIMIT`.
+    ///
+    /// So the node idled 13m40s, 12 to 22 blocks behind, with nothing in
+    /// flight -- and escaped only when the network's own progress carried it
+    /// past 25 and skeleton sync took over, which then fetched all 25 bodies in
+    /// 385 ms. The Φ watchdog saw it and escalated four times; each escalation
+    /// restarted the round, `try_start_sync` found the gap under the limit, and
+    /// put the node straight back into follow mode. Escalation and "Near tip
+    /// (N blocks behind), entering follow mode" share a timestamp in the log,
+    /// every time.
+    ///
+    /// **Why the condition is safe to run every tick.** A canonical block with
+    /// no body is the ordinary state for the moment between a header arriving
+    /// and its body answering -- but during that moment the request is in
+    /// `pending_follow_bodies`. Requiring that to be empty makes the pair
+    /// "canonical, body-less, and nothing outstanding" mean the request was
+    /// lost rather than merely young.
+    pub(crate) async fn fill_follow_body_gap(&mut self) {
+        if !self.pending_follow_bodies.is_empty() {
+            return; // a request is already outstanding; do not pile on
+        }
+        let Some(executed) = self
+            .manager
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(h, _)| self.manager.store.header(h).ok().flatten())
+            .map(|h| h.number)
+        else {
+            return;
+        };
+
+        // Bounded by the follow/skeleton boundary: past that `check_follow_gap`
+        // switches to the pipeline, which is the better tool for a long range.
+        let mut missing: Vec<Header> = Vec::new();
+        for number in executed + 1..=executed + LONG_SYNC_LIMIT {
+            let Ok(Some(hash)) = self.manager.store.canonical_hash(number) else {
+                break; // the canonical chain we hold ends here
+            };
+            let Ok(Some(header)) = self.manager.store.header(hash) else {
+                break;
+            };
+            if self.manager.store.body(hash).ok().flatten().is_none() {
+                missing.push(header);
+            }
+        }
+
+        if missing.is_empty() {
+            return;
+        }
+        warn!(
+            target: "rustock::sync",
+            "Follow mode holds {} canonical block(s) above #{} with no body and nothing \
+             in flight; re-requesting them",
+            missing.len(), executed
+        );
+        self.request_follow_bodies(&missing).await;
     }
 
     /// Leave follow mode when a backlog has built up behind the tip.

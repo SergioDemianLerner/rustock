@@ -4511,3 +4511,136 @@ async fn a_matching_state_root_is_left_alone() {
 
     assert_eq!(service.follow_buffer.len(), 1, "cleared the buffer when nothing was wrong");
 }
+
+/// The 2026-09-24 15:41 stall: follow mode holding canonical headers above the
+/// executed head with no bodies, and nothing in flight.
+///
+/// A body request that is never answered is expired by
+/// `expire_stale_follow_bodies` and then re-issued by nobody -- the next tip
+/// brings its own header, not the lost one. Every other guard measures a
+/// difference that is zero here (the downloaded head *equals* the executed
+/// head; the missing blocks are above both), so the node idled 13m40s and
+/// escaped only when the network carried it past `LONG_SYNC_LIMIT`.
+#[tokio::test]
+async fn test_follow_mode_re_requests_bodies_it_is_missing() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    // A canonical chain of five blocks, with bodies only for the first.
+    let mut parent = genesis.hash();
+    let mut headers = Vec::new();
+    for n in 1..=5u64 {
+        let h = dummy_header(n, parent, U256::from(1));
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        if n == 1 {
+            store.put_body(h.hash(), &[], &[]).unwrap();
+        }
+        parent = h.hash();
+        headers.push(h);
+    }
+
+    // Executed up to #1; #2..#5 are canonical, header-only, no body.
+    store.set_exec_head(headers[0].hash(), headers[0].state_root).unwrap();
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let peer = B512::repeat_byte(0x01);
+    let (tx, mut rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    peer_store.add_peer(peer, tx).await;
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    assert!(
+        service.pending_follow_bodies.is_empty(),
+        "nothing in flight is the precondition"
+    );
+
+    service.fill_follow_body_gap().await;
+
+    assert_eq!(
+        service.pending_follow_bodies.len(),
+        4,
+        "the four canonical blocks above the executed head with no body must be requested"
+    );
+    // And the requests really went to the wire.
+    let mut sent = 0;
+    while rx.try_recv().is_ok() {
+        sent += 1;
+    }
+    assert_eq!(sent, 4, "one body request per missing block");
+}
+
+/// The guard that keeps this from fighting normal operation: a canonical block
+/// with no body is the ordinary state between a header arriving and its body
+/// answering, and during that moment the request is outstanding.
+#[tokio::test]
+async fn test_follow_mode_does_not_pile_on_outstanding_requests() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.update_head(&b1, U256::from(2)).unwrap();
+    store.set_exec_head(genesis.hash(), genesis.state_root).unwrap();
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let peer = B512::repeat_byte(0x01);
+    let (tx, mut rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    peer_store.add_peer(peer, tx).await;
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    // A request for #1 is already outstanding.
+    service
+        .pending_follow_bodies
+        .insert(1, (b1.hash(), b1.clone(), Instant::now()));
+
+    service.fill_follow_body_gap().await;
+
+    assert_eq!(service.pending_follow_bodies.len(), 1, "no second request");
+    assert!(rx.try_recv().is_err(), "nothing sent while one is in flight");
+}
+
+/// Nothing to do when the node holds every body it has a canonical entry for,
+/// which is the normal case and must stay silent.
+#[tokio::test]
+async fn test_follow_mode_gap_fill_is_a_no_op_when_bodies_are_present() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut parent = genesis.hash();
+    for n in 1..=3u64 {
+        let h = dummy_header(n, parent, U256::from(1));
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        store.put_body(h.hash(), &[], &[]).unwrap();
+        parent = h.hash();
+    }
+    store.set_exec_head(genesis.hash(), genesis.state_root).unwrap();
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let peer = B512::repeat_byte(0x01);
+    let (tx, mut rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    peer_store.add_peer(peer, tx).await;
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    service.fill_follow_body_gap().await;
+
+    assert!(service.pending_follow_bodies.is_empty());
+    assert!(rx.try_recv().is_err(), "a healthy follow mode must stay quiet");
+}
