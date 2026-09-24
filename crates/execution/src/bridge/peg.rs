@@ -2208,16 +2208,14 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     };
 
     if should_process_requests {
-        // Load pending requests from the correct queue key
-        let (pending, queue_key) = if use_tx_hash {
-            let key = bridge_storage_key(RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY);
-            let data = bridge_load_bytes(ctx, key);
-            (deserialize_release_queue_with_hash(&data), key)
-        } else {
-            let key = bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY);
-            let data = bridge_load_bytes(ctx, key);
-            (deserialize_release_queue_legacy(&data), key)
-        };
+        // rskj `getReleaseRequestQueue` concatenates the legacy queue with the
+        // with-txhash one; it does not pick whichever is populated. Reading
+        // only one was correct on mainnet by circumstance -- the legacy queue
+        // was drained before RSKIP146 activated at iris300 (#3,614,800) and
+        // every request since carries a tx hash -- but it is not correct by
+        // construction, and an entry that ever landed in the legacy queue
+        // afterwards would have been silently stranded there forever.
+        let pending = load_release_request_queue(ctx, use_tx_hash);
 
         // RSKIP271: rskj processPegoutsInBatch sets nextPegoutHeight whenever
         // the queue ends up empty — including the case where it was empty to
@@ -2392,12 +2390,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         }
                     }
                     kept.extend(to_retry);
-                    let updated_queue = if use_tx_hash {
-                        serialize_release_queue_with_hash(&kept)
-                    } else {
-                        serialize_release_queue_legacy(&kept)
-                    };
-                    bridge_store_bytes(ctx, queue_key, &updated_queue);
+                    save_release_request_queue(ctx, &kept, use_tx_hash);
                 } else {
                     // RSKIP271+ (processPegoutsInBatch): one batched BTC tx
                     // for the whole queue, keyed by this updateCollections
@@ -2465,7 +2458,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         // is now empty (rskj removeEntries(pegoutEntries)).
                         // rskj re-serializes the emptied queue, so the cell
                         // holds RLP.encodeList([]) = [0xc0], NOT empty bytes.
-                        bridge_store_bytes(ctx, queue_key, &serialize_release_queue_with_hash(&[]));
+                        save_release_request_queue(ctx, &[], use_tx_hash);
                         queue_emptied = true;
                     }
                 }
@@ -3555,6 +3548,48 @@ fn store_utxos_at<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str, utxos: &[B
 /// federation's STORED format version (rskj `getActiveFederation().getRedeemScript()`).
 /// During the activation window the active federation is still the OLD one, so its
 /// format cell (and keys) must be used.
+/// The ACTIVE federation, as the local-only getters need it: members with all
+/// three key types, plus creation time and block.
+///
+/// Same new/old selection as `active_federation_keys_and_redeem` -- during a
+/// new federation's activation window the **old** one is still active -- and
+/// the same genesis fallback when nothing is stored. Reading
+/// `newFederation` directly, which several of these getters used to do, is
+/// wrong in both cases.
+///
+/// The genesis federation's creation time is rskj's
+/// `ZonedDateTime.parse("1970-01-18T12:49:08.400Z")`: an Instant built from
+/// what was meant to be a seconds value, so `toEpochMilli()` is 1514948400.
+/// `genesis_federation_creation_time_millis` carries that number verbatim.
+pub(crate) fn active_federation<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> super::federation::StoredFederation {
+    let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
+    let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
+    let age = super::governance::federation_activation_age(config, hardfork_cfg, block_number);
+    match (new, old) {
+        (Some(n), Some(o)) => {
+            if block_number >= n.creation_block + age {
+                n
+            } else {
+                o
+            }
+        }
+        (Some(n), None) => n,
+        (None, _) => super::federation::StoredFederation {
+            members: genesis_federation_keys(config)
+                .into_iter()
+                .map(super::federation::StoredMember::from_btc)
+                .collect(),
+            creation_time_millis: config.genesis_federation_creation_time_millis,
+            creation_block: 1,
+        },
+    }
+}
+
 pub(crate) fn active_federation_keys_and_redeem<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
@@ -3641,14 +3676,40 @@ pub(crate) fn retiring_federation_keys<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
 ) -> Option<Vec<[u8; 33]>> {
+    retiring_federation(ctx, config, hardfork_cfg, block_number).map(|fed| fed.btc_keys())
+}
+
+/// The retiring federation itself, or `None`.
+///
+/// rskj `FederationSupportImpl.getRetiringFederationReference`: **both** the
+/// old and the new federation must be stored, *and* the new one must have
+/// reached its activation age. A stored old federation alone is not a
+/// retiring federation -- during the activation window there is none, and
+/// every getter that asks reports `FEDERATION_NON_EXISTENT` rather than
+/// describing the federation sitting in storage.
+pub(crate) fn retiring_federation<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> Option<super::federation::StoredFederation> {
     let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY)?;
     let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY)?;
     let age = super::governance::federation_activation_age(config, hardfork_cfg, block_number);
     if block_number >= new.creation_block + age {
-        Some(old.btc_keys())
+        Some(old)
     } else {
         None
     }
+}
+
+/// `federation_redeem_for_format`, for callers outside this module.
+pub(crate) fn federation_redeem_for_format_pub(
+    keys: &[[u8; 33]],
+    format_version: u64,
+    config: &BridgeConstants,
+) -> Vec<u8> {
+    federation_redeem_for_format(keys, format_version, config)
 }
 
 /// rskj `BridgeUtils.isFromFederateMember(rskTx, federation)`: true when the
@@ -4943,21 +5004,53 @@ pub fn get_queued_pegouts_count<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // Try the post-RSKIP146 queue first
-    let with_hash_key = bridge_storage_key(RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY);
-    let with_hash_data = bridge_load_bytes(ctx, with_hash_key);
-    if !with_hash_data.is_empty() {
-        let entries = deserialize_release_queue_with_hash(&with_hash_data);
-        let count = U256::from(entries.len());
-        return Ok(PrecompileOutput::new(gas_cost, count.to_be_bytes::<32>().to_vec().into()));
-    }
-
-    // Fall back to legacy queue
-    let legacy_key = bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY);
-    let legacy_data = bridge_load_bytes(ctx, legacy_key);
-    let entries = deserialize_release_queue_legacy(&legacy_data);
+    // Both queues, as rskj's `getReleaseRequestQueue().getEntries().size()`
+    // counts them -- not whichever one happens to be populated. The method
+    // only exists from RSKIP271 (hop400), which is well past RSKIP146, so the
+    // with-txhash half is always in scope here.
+    let entries = load_release_request_queue(ctx, true);
     let count = U256::from(entries.len());
     Ok(PrecompileOutput::new(gas_cost, count.to_be_bytes::<32>().to_vec().into()))
+}
+
+/// rskj `BridgeStorageProvider.saveReleaseRequestQueue` (l.197-207): the queue
+/// is written back **split by whether an entry carries its creating RSK tx
+/// hash** -- `serializeReleaseRequestQueue` takes `getEntriesWithoutHash()`
+/// and `serializeReleaseRequestQueueWithTxHash` takes `getEntriesWithHash()`.
+///
+/// Both cells are written once RSKIP146 is active. That matters for the case
+/// this fixes: after processing a concatenated queue, the legacy half has to
+/// be rewritten with what is left of it, or entries that were just paid out
+/// would still be sitting there. On mainnet the legacy half is empty and this
+/// rewrites `[0xc0]` over `[0xc0]`, which is the value `updateCollections`
+/// already materializes on its first call.
+fn save_release_request_queue<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    entries: &[ReleaseRequest],
+    rskip146: bool,
+) {
+    let without_hash: Vec<ReleaseRequest> = entries
+        .iter()
+        .filter(|e| e.rsk_tx_hash.is_none())
+        .cloned()
+        .collect();
+    bridge_store_bytes(
+        ctx,
+        bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY),
+        &serialize_release_queue_legacy(&without_hash),
+    );
+    if rskip146 {
+        let with_hash: Vec<ReleaseRequest> = entries
+            .iter()
+            .filter(|e| e.rsk_tx_hash.is_some())
+            .cloned()
+            .collect();
+        bridge_store_bytes(
+            ctx,
+            bridge_storage_key(RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY),
+            &serialize_release_queue_with_hash(&with_hash),
+        );
+    }
 }
 
 /// rskj `BridgeStorageProvider.getReleaseRequestQueue` (l.168-193): the legacy
@@ -5218,6 +5311,121 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writable Bridge context with nothing in it but the raw-storage
+    /// overlay -- enough for the release-queue reads and writes.
+    fn queue_ctx() -> impl crate::RskContextTr {
+        use revm::MainContext;
+        revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default())
+    }
+
+    fn legacy_entry(tag: u8, amount: u64) -> ReleaseRequest {
+        ReleaseRequest { btc_dest_hash160: [tag; 20], amount_satoshis: amount, rsk_tx_hash: None }
+    }
+
+    fn hashed_entry(tag: u8, amount: u64) -> ReleaseRequest {
+        ReleaseRequest {
+            btc_dest_hash160: [tag; 20],
+            amount_satoshis: amount,
+            rsk_tx_hash: Some([tag; 32]),
+        }
+    }
+
+    /// rskj `getReleaseRequestQueue` concatenates, legacy first. Reading one
+    /// queue or the other -- which is what `updateCollections` and
+    /// `getQueuedPegoutsCount` used to do -- loses entries whenever both are
+    /// populated. Mainnet never reaches that state, because the legacy queue
+    /// was drained before RSKIP146 activated at iris300 (#3,614,800), so this
+    /// is a divergence that only a test can reach.
+    #[test]
+    fn release_request_queue_concatenates_legacy_then_with_tx_hash() {
+        let mut ctx = queue_ctx();
+        let legacy = vec![legacy_entry(0x11, 1_000), legacy_entry(0x22, 2_000)];
+        let hashed = vec![hashed_entry(0x33, 3_000)];
+        bridge_store_bytes(
+            &mut ctx,
+            bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY),
+            &serialize_release_queue_legacy(&legacy),
+        );
+        bridge_store_bytes(
+            &mut ctx,
+            bridge_storage_key(RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY),
+            &serialize_release_queue_with_hash(&hashed),
+        );
+
+        let all = load_release_request_queue(&mut ctx, true);
+        assert_eq!(
+            all.iter().map(|e| e.amount_satoshis).collect::<Vec<_>>(),
+            vec![1_000, 2_000, 3_000],
+            "legacy entries come first, in queue order, then the hashed ones"
+        );
+
+        // Before RSKIP146 the with-txhash queue is not in scope at all.
+        let pre = load_release_request_queue(&mut ctx, false);
+        assert_eq!(pre.len(), 2);
+    }
+
+    #[test]
+    fn queued_pegouts_count_sums_both_queues() {
+        let mut ctx = queue_ctx();
+        bridge_store_bytes(
+            &mut ctx,
+            bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY),
+            &serialize_release_queue_legacy(&[legacy_entry(0x11, 1_000)]),
+        );
+        bridge_store_bytes(
+            &mut ctx,
+            bridge_storage_key(RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY),
+            &serialize_release_queue_with_hash(&[
+                hashed_entry(0x22, 2_000),
+                hashed_entry(0x33, 3_000),
+            ]),
+        );
+
+        let out = get_queued_pegouts_count(&mut ctx, 0).unwrap();
+        assert_eq!(
+            U256::from_be_slice(out.bytes.as_ref()),
+            U256::from(3),
+            "the count is both queues, not whichever one is populated"
+        );
+    }
+
+    /// rskj `saveReleaseRequestQueue` writes the queue back split by whether
+    /// an entry carries its creating RSK tx hash, and writes **both** cells
+    /// once RSKIP146 is active -- so a legacy half that was just drained is
+    /// rewritten empty rather than left holding entries that were already
+    /// paid out.
+    #[test]
+    fn saving_a_mixed_queue_splits_it_by_tx_hash() {
+        let mut ctx = queue_ctx();
+        let mixed = vec![legacy_entry(0x11, 1_000), hashed_entry(0x22, 2_000)];
+        save_release_request_queue(&mut ctx, &mixed, true);
+
+        let legacy_cell =
+            bridge_load_bytes(&mut ctx, bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY));
+        let hashed_cell = bridge_load_bytes(
+            &mut ctx,
+            bridge_storage_key(RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY),
+        );
+        assert_eq!(deserialize_release_queue_legacy(&legacy_cell).len(), 1);
+        assert_eq!(deserialize_release_queue_with_hash(&hashed_cell).len(), 1);
+
+        // Round-trip: what comes back out is what went in, in the same order.
+        let reloaded = load_release_request_queue(&mut ctx, true);
+        let shape = |q: &[ReleaseRequest]| -> Vec<(u8, u64, bool)> {
+            q.iter()
+                .map(|e| (e.btc_dest_hash160[0], e.amount_satoshis, e.rsk_tx_hash.is_some()))
+                .collect()
+        };
+        assert_eq!(shape(&reloaded), shape(&mixed));
+
+        // Draining the legacy half rewrites its cell as RLP.encodeList([]).
+        save_release_request_queue(&mut ctx, &[hashed_entry(0x22, 2_000)], true);
+        let legacy_cell =
+            bridge_load_bytes(&mut ctx, bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY));
+        assert_eq!(legacy_cell, vec![0xc0], "emptied, not left stale");
+        assert_eq!(load_release_request_queue(&mut ctx, true).len(), 1);
+    }
 
     /// Ground truth from mainnet #8,113,398 (the segwit SVP spend tx for the
     /// first reed800 P2SH-P2WSH proposed federation): a format-4000 spend with

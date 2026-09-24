@@ -301,6 +301,18 @@ by construction. The new fee estimator follows rskj and concatenates, because
 it is a read-only path where matching rskj costs nothing; changing the live
 peg-out processing path was not worth the risk for a case mainnet cannot reach.
 
+**CLOSED (2026-09-24, issue #64).** All three paths now go through
+`load_release_request_queue` (legacy entries first, then with-txhash) and
+`save_release_request_queue`, which writes the queue back split by whether an
+entry carries its creating RSK tx hash — rskj
+`BridgeStorageProvider.saveReleaseRequestQueue`. The stored bytes on mainnet
+are unchanged, because the legacy half is empty and is rewritten with the same
+`[0xc0]` that `updateCollections` already materializes on its first call.
+Tests: `release_request_queue_concatenates_legacy_then_with_tx_hash`,
+`queued_pegouts_count_sums_both_queues`,
+`saving_a_mixed_queue_splits_it_by_tx_hash` — each seeds *both* queues, which
+is the state mainnet cannot reach.
+
 ## No consensus effect — local-only getters and prototype gaps
 
 FRCR-74 (RSKIP-89 getters), FRCR-878 (`getLockWhitelistEntryByAddress`),
@@ -314,6 +326,36 @@ and `LocalOnly` permission, but have no dispatch arm, so they fall through to
 bytes. `LocalOnly` means they are reachable only through `eth_call`, never from
 a transaction, so they cannot affect consensus — they give wrong RPC answers.
 Worth finishing; not urgent.
+
+**MOSTLY CLOSED (2026-09-24, issue #64).** Eighteen of the twenty-two
+undispatched methods are implemented, the catch-all is gone, and
+`bridge_method_table_is_fully_dispatched` fails if a table row is ever added
+without an arm. Four remain deliberately unimplemented and now return an
+explicit error rather than empty bytes: `getBtcBlockchainBlockLocator` (removed
+at RSKIP89/orchid, needs the pre-checkpoint chain walk) and the three
+`getStateFor*` federator-client serializations.
+
+Reading the Java also turned up four *dispatched* getters that were answering
+wrongly, all fixed in the same pass:
+
+- `getFederatorPublicKeyOfType` returned the BTC key for every key type, so
+  `"rsk"` gave the wrong federator identity.
+- `getFederationSize`/`Threshold`/`CreationTime`/`CreationBlockNumber` and
+  `getFederatorPublicKey` read `newFederation` directly rather than whichever
+  federation is *active* — wrong during an activation window, and wrong (0)
+  when nothing is stored and the genesis federation applies.
+- `getFederationCreationTime` returned milliseconds at every height; RSKIP419
+  switched the unit to seconds.
+- `getRetiringFederation*` treated "oldFederation is stored" as "there is a
+  retiring federation"; rskj also requires the new federation to have reached
+  its activation age.
+
+Two are approximations, documented at their definitions:
+`getBtcBlockchainInitialBlockHeight` and the depth bound of
+`getBtcBlockchainBlockHashAtDepth` use the store's own lowest block, where rskj
+recomputes `getCheckpointBefore(activeFederation.creationTime)` from bitcoinj's
+checkpoints file — a file rustock does not carry, and a number that moves with
+every federation change.
 
 ---
 

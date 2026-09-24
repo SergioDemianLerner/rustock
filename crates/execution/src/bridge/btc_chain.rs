@@ -545,6 +545,93 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
 // ---------------------------------------------------------------------------
 
 /// `getBtcBlockchainBestChainHeight()` → int256
+/// `getBtcBlockchainInitialBlockHeight()` → int256, the height of the lowest
+/// block this node's Bridge BTC store holds.
+///
+/// **This can disagree with rskj, by design.** rskj recomputes the answer on
+/// every call: `getLowestBlock()` opens bitcoinj's checkpoints file and picks
+/// `getCheckpointBefore(activeFederation.creationTime)`, so the number moves
+/// forward every time the federation changes, even though the store's actual
+/// lowest block never does. rustock does not carry the checkpoints file; it
+/// carries the single checkpoint its store was seeded from, and answers with
+/// that -- which is the truthful description of what the node has.
+///
+/// The two coincide for as long as the active federation is the one the store
+/// was seeded against, and diverge after a powpeg change. Reporting a height
+/// for a block the node does not have would be worse than reporting the one it
+/// does.
+pub fn get_initial_block_height(
+    gas_cost: u64,
+    config: &BridgeConstants,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let height = lowest_stored_height(config).ok_or_else(|| {
+        PrecompileError::other("getBtcBlockchainInitialBlockHeight: no BTC checkpoint configured")
+    })?;
+    Ok(encode_int_result(gas_cost, height as i64))
+}
+
+/// `getBtcBlockchainBlockHashAtDepth(int256 depth)` → bytes32, the hash of the
+/// main-chain block `depth` blocks below the head.
+///
+/// rskj bounds `depth` by `head.getHeight() - getLowestBlock().getHeight()`
+/// and throws `IndexOutOfBoundsException` outside it -- which the Bridge turns
+/// into a revert. The bound here uses the store's own lowest block rather than
+/// the checkpoints file (see `get_initial_block_height`), so for depths
+/// between the two bounds this returns a real block hash where rskj refuses.
+/// Every hash it does return is the one rskj would return.
+pub fn get_block_hash_at_depth<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> Result<PrecompileOutput, PrecompileError> {
+    if args.len() < 32 {
+        return Err(PrecompileError::other(
+            "getBtcBlockchainBlockHashAtDepth: args too short",
+        ));
+    }
+    // rskj reads the argument as `((BigInteger) args[0]).intValue()`, so a
+    // value that does not fit an int wraps rather than failing -- but any
+    // wrapped value then fails the `depth < 0` check below.
+    let depth_word = alloy_primitives::U256::from_be_slice(&args[..32]);
+    let depth: i64 = depth_word.try_into().unwrap_or(i64::MAX);
+
+    let head = load_chain_head(ctx).ok_or_else(|| {
+        PrecompileError::other("getBtcBlockchainBlockHashAtDepth: no BTC chain head")
+    })?;
+    let lowest = lowest_stored_height(config).unwrap_or(0);
+    let max_depth = head.height as i64 - lowest as i64;
+    if depth < 0 || depth > max_depth {
+        return Err(PrecompileError::Other(
+            format!("Depth must be between 0 and {max_depth}").into(),
+        ));
+    }
+
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+    let height = head.height - depth as u32;
+    let block = stored_block_at_main_chain_height(ctx, height, rskip199).ok_or_else(|| {
+        PrecompileError::other("getBtcBlockchainBlockHashAtDepth: block not in store")
+    })?;
+
+    // The ABI return type is `bytes`, not `bytes32` -- so the 32 bytes come
+    // back offset-and-length prefixed, 96 bytes in all.
+    //
+    // rskj answers with `blockHash.getBytes()`, and a bitcoinj `Sha256Hash`
+    // for a block hash holds its bytes in DISPLAY order (`Block.getHash()`
+    // wraps the double-SHA256 reversed). rust-bitcoin keeps the raw internal
+    // order, so it has to be reversed to match.
+    let hash = bitcoin_hash_to_b256(&block.header.block_hash());
+    Ok(PrecompileOutput::new(gas_cost, encode_abi_bytes(hash.as_slice()).into()))
+}
+
+/// The height of the lowest block the Bridge BTC store can hold: the
+/// checkpoint the chain was seeded from.
+fn lowest_stored_height(config: &BridgeConstants) -> Option<u32> {
+    config.btc_checkpoint.map(|(_, height, _)| height)
+}
+
 pub fn get_best_chain_height<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
