@@ -27,6 +27,12 @@ pub trait TxSubmitter: Send + Sync {
     async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> Result<alloy_primitives::B256, String>;
 }
 
+/// What `eth_gasPrice` needs, without the RPC crate depending on sync.
+pub trait GasPriceSource: Send + Sync {
+    /// rskj `GasPriceTracker.getGasPrice()`.
+    fn gas_price(&self) -> alloy_primitives::U256;
+}
+
 /// Trait for reading from the transaction pool without depending on the sync crate.
 pub trait TxPoolReader: Send + Sync {
     fn get_pending_tx(&self, hash: &alloy_primitives::B256) -> Option<(rustock_core::Transaction, alloy_primitives::Address, alloy_primitives::B256)>;
@@ -67,6 +73,8 @@ pub struct RpcState {
     /// Live depth of the inbound wire-message queue, for
     /// `debug_wireProtocolQueueSize`.
     pub wire_queue_depth: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Supplies `eth_gasPrice`. `None` falls back to the head block's minimum.
+    pub gas_price: Option<Arc<dyn GasPriceSource>>,
     /// Present only when the node runs the epoch trie backend.
     pub epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>>,
     /// The miner, present only when the node was started with mining enabled.
@@ -166,7 +174,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_syncing" => eth::eth_syncing(id, &state.store, &state.peer_store).await,
         "eth_chainId" => eth::eth_chain_id(id, &state.config),
         "eth_blockNumber" => eth::eth_block_number(id, &state.store),
-        "eth_gasPrice" => eth::eth_gas_price(id, &state.store),
+        "eth_gasPrice" => eth::eth_gas_price(id, state),
         "eth_mining" => eth::eth_mining(id),
         "eth_hashrate" => eth::eth_hashrate(id),
         "eth_accounts" => eth::eth_accounts(id),

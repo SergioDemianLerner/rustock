@@ -166,6 +166,9 @@ pub struct TransactionPool {
     /// because every line in the transaction path logs at `debug` and the node
     /// runs at `info`, so the pool is otherwise entirely unobservable.
     stats: RwLock<PoolStats>,
+    /// Supplies the fee-market average for the low-gas-price factor. `None`
+    /// keeps rskj's skip branch.
+    gas_price: Option<Arc<crate::gas_price::GasPriceTracker>>,
 }
 
 /// What passed through the pool since the last time anyone asked.
@@ -230,7 +233,21 @@ impl TransactionPool {
             trie_store,
             quota: RwLock::new(quota),
             stats: RwLock::new(PoolStats::default()),
+            gas_price: None,
         }
+    }
+
+    /// Attach the gas-price tracker, which enables the rate limiter's
+    /// low-gas-price factor whenever the fee market is working.
+    ///
+    /// Without it the limiter takes rskj's own `createSkippingGasPriceFactor`
+    /// branch, which pins that factor to 1 -- so a transaction priced at the
+    /// block minimum costs four times less virtual gas than it should, and
+    /// pricing at the floor is precisely the optimal play for the flooding
+    /// this limiter exists to stop.
+    pub fn with_gas_price_tracker(mut self, tracker: Arc<crate::gas_price::GasPriceTracker>) -> Self {
+        self.gas_price = Some(tracker);
+        self
     }
 
     /// Activity since the previous call, clearing the counters.
@@ -407,12 +424,15 @@ impl TransactionPool {
                     .minimum_gas_price
                     .try_into()
                     .unwrap_or(u64::MAX),
-                // rustock has no fee-market average yet, so this takes rskj's
-                // own `createSkippingGasPriceFactor` branch -- the one it uses
-                // whenever `GasPriceTracker.isFeeMarketWorking()` is false.
-                // Supplying `Some(avg)` here enables the low-gas-price factor
-                // with no other change.
-                avg_gas_price: None,
+                // rskj supplies the average only when the fee market is
+                // working -- `isFeeMarketWorking()` false takes its
+                // `createSkippingGasPriceFactor` branch, which pins the
+                // low-gas-price factor to 1. On a chain with spare capacity
+                // that is the usual path on rskj too; the difference is that
+                // it recovers when blocks fill up, which this now does.
+                avg_gas_price: self.gas_price.as_ref().and_then(|t| {
+                    t.is_fee_market_working().then(|| t.gas_price().try_into().unwrap_or(u64::MAX))
+                }),
             };
             let receiver = (tx.to.len() == 20).then(|| Address::from_slice(tx.to.as_ref()));
             let accepted = self.quota.write().unwrap().accept_tx(

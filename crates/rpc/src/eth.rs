@@ -68,8 +68,23 @@ pub async fn eth_syncing(
     }
 }
 
-pub fn eth_gas_price(id: Value, store: &BlockStore) -> JsonRpcResponse {
-    let price = head_header(store)
+/// `eth_gasPrice` — what a transaction should pay to be **mined**.
+///
+/// This used to answer with the head block's `minimumGasPrice`, which is a
+/// different question: that is the floor a transaction must clear to be
+/// *valid*. During congestion the two diverge, and a wallet trusting the floor
+/// underpays and waits.
+///
+/// rskj answers with `GasPriceTracker.getGasPrice()`: the 25th percentile of
+/// the last 512 transactions' gas prices, floored at the best block's minimum
+/// times 1.1. Until the node has seen 512 transactions the tracker has no
+/// percentile and falls back to the last block's minimum -- the old answer,
+/// now as a documented fallback rather than the whole implementation.
+pub fn eth_gas_price(id: Value, state: &crate::server::RpcState) -> JsonRpcResponse {
+    if let Some(tracker) = &state.gas_price {
+        return JsonRpcResponse::success(id, json!(to_hex_u256(&alloy_primitives::U256::from(tracker.gas_price()))));
+    }
+    let price = head_header(&state.store)
         .map(|h| to_hex_u256(&h.minimum_gas_price))
         .unwrap_or_else(|| "0x0".to_string());
     JsonRpcResponse::success(id, json!(price))

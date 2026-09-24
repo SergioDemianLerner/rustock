@@ -55,6 +55,15 @@ impl rustock_rpc::server::TxSubmitter for TxRelaySubmitter {
 
 struct PoolAdapter(Arc<rustock_sync::TransactionPool>);
 
+/// The gas-price tracker, as `eth_gasPrice` needs it.
+struct GasPriceAdapter(Arc<rustock_sync::gas_price::GasPriceTracker>);
+
+impl rustock_rpc::server::GasPriceSource for GasPriceAdapter {
+    fn gas_price(&self) -> alloy_primitives::U256 {
+        self.0.gas_price()
+    }
+}
+
 impl rustock_rpc::server::TxPoolReader for PoolAdapter {
     fn get_pending_tx(
         &self,
@@ -1122,12 +1131,23 @@ async fn main() -> Result<()> {
         },
         ..Default::default()
     };
-    let pool = Arc::new(rustock_sync::TransactionPool::new(
-        pool_config,
-        config.chain_id.into(),
-        store.clone(),
-        trie_store_for_pool.clone(),
-    ));
+    // One tracker, shared: the rate limiter's low-gas-price factor and
+    // `eth_gasPrice` must not disagree about what the market is doing.
+    // rskj primes both its windows from the block store at start-up, so a
+    // restart does not leave the node answering with the block minimum until
+    // 512 fresh transactions have gone by.
+    let gas_price_tracker = Arc::new(rustock_sync::gas_price::GasPriceTracker::default());
+    gas_price_tracker.initialize_from_store(&store);
+
+    let pool = Arc::new(
+        rustock_sync::TransactionPool::new(
+            pool_config,
+            config.chain_id.into(),
+            store.clone(),
+            trie_store_for_pool.clone(),
+        )
+        .with_gas_price_tracker(gas_price_tracker.clone()),
+    );
 
     // Every line in the transaction path logs at `debug` or `trace` and this
     // node runs at `info`, so the pool is otherwise entirely unobservable: an
@@ -1293,12 +1313,14 @@ async fn main() -> Result<()> {
 
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_tx_pool(pool.clone())
-        .with_block_processor(block_processor, trie_store_for_exec, initial_state_root);
+        .with_block_processor(block_processor, trie_store_for_exec, initial_state_root)
+        .with_gas_price_tracker(gas_price_tracker.clone());
 
     // Taken before the service is moved into its task: the RPC layer reads the
     // same gauge the sync loop publishes, so `debug_wireProtocolQueueSize`
     // answers with the live backlog.
     let wire_queue_depth = sync_service.wire_queue_depth();
+
     if let Some(path) = &args.import_blocks_db {
         let source = RskjBlockSource::open(path)?;
         info!("Sourcing block bodies from rskj LevelDB at {path} (peers only for what it lacks)");
@@ -1488,6 +1510,7 @@ async fn main() -> Result<()> {
         let rpc_state = rustock_rpc::server::RpcState {
             store: store.clone(),
             wire_queue_depth: Some(wire_queue_depth.clone()),
+            gas_price: Some(Arc::new(GasPriceAdapter(gas_price_tracker.clone()))),
             peer_store: peer_store.clone(),
             config: config.clone(),
             tx_submitter: Some(Arc::new(TxRelaySubmitter(tx_relay.clone()))),
