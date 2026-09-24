@@ -15,9 +15,9 @@ Source of truth: `co/rsk/rpc/Web3DebugModule.java`,
 |---|---|---|
 | `debug_wireProtocolQueueSize` | **yes** | |
 | `debug_accountTransactionQuota` | **yes** | |
-| `debug_traceTransaction` | not yet | tracer built; needs block replay (issue #81) |
-| `debug_traceBlockByHash` | not yet | ditto |
-| `debug_traceBlockByNumber` | not yet | ditto |
+| `debug_traceTransaction` | **yes** | only within the state-retention window |
+| `debug_traceBlockByHash` | **yes** | ditto |
+| `debug_traceBlockByNumber` | **yes** | ditto |
 
 go-ethereum's `debug_` namespace has dozens of other methods
 (`debug_storageRangeAt`, `debug_getModifiedAccountsByNumber`, `debug_dumpBlock`
@@ -125,24 +125,79 @@ proves the traced and untraced paths agree on gas, output, success and logs,
 which is what catches them drifting apart. That is the real risk, because
 `execute_tx_traced` duplicates the untraced setup rather than refactoring it.
 
-### What is not built yet
+### How a historical transaction is traced
 
-`debug_traceTransaction` and the block variants need to replay a transaction
-in its block's context: the state before transaction *i* of block *N* is the
-state after block *N-1* plus transactions 0..*i*, and no intermediate root is
-stored. That means re-executing the block with the tracer attached at one
-index, and `RskExecutor::execute_block` is 484 lines of consensus path --
-parameterising it over an inspector is its own change, with its own replay
-validation, not a tail-end addition to this one.
+A trace needs the state **before** the transaction, and no such thing is
+stored: the state before transaction *i* of block *N* is the state after *N-1*
+plus transactions 0..*i*, and only per-block roots are kept. So the whole block
+is re-executed from its parent's state with the tracer switched on at one
+index.
 
-Two constraints on those methods are already settled:
+`RskExecutor::execute_block_with` takes the inspector as a parameter and
+`execute_block` passes a tracer with a zero cap and `trace_index: None`.
+**That is not a behavioural change**, and the reason is worth stating rather
+than asserting. In revm-handler 17's `mainnet_builder.rs`, `build_mainnet` and
+`build_mainnet_with_inspector` construct the same `Evm` from the same spec --
+identical `instruction`, `precompiles` and `frame_stack` -- differing only in
+the `inspector` field, which the first sets to `()`. And
+`impl<CTX, INSP, I, P> EvmTr for Evm<…>` is generic over that field, so
+`Handler::run` on an inspector-carrying EVM runs the same code as on one
+without. The inspector is consulted only by `inspect_run`, which is called for
+exactly one transaction index and never on the consensus path.
+
+Sharing one body rather than copying it was deliberate. The alternative was a
+second 484-line block executor, and two copies of the consensus block loop
+would drift -- the failure this codebase has already had, in the two
+orphan-recovery paths that were meant to stay identical and did not.
+`tracing_a_block_records_the_transaction_and_changes_nothing` asserts the
+traced and untraced runs agree on gas, fees and every per-transaction result.
+
+### Only recent blocks can be traced
+
+The parent's state has to still be in the trie, which for this node means
+roughly the GC burial depth (4,000 blocks by default). Past that,
+`debug_traceTransaction` returns an error naming the block it could not reach,
+rather than an answer computed from a state that is not the right one.
+
+One further note:
 
 * **The output shape is rskj's `DetailedProgramTrace`** — `contractAddress`,
   `initStorage`, `structLogs`, `result`, `error`, `reverted`, `storageSize`,
   `currentStorage` — not go-ethereum's `{gas, failed, returnValue,
   structLogs}`. Consumers are written against rskj.
-* **Only recent blocks can be traced.** Tracing re-executes a transaction
-  against the state at its parent block, and this node keeps state for roughly
-  the GC burial depth (4,000 blocks by default). Older transactions are not
-  traceable without re-deriving state, and the method should say so rather than
-  answer from the wrong state.
+* `truncated` is **not an rskj field**. rskj has no step cap and so never has
+  to say it hit one; a consumer here must be able to tell a truncated trace
+  from a short one, so the flag is added rather than the cap hidden.
+
+### Three places the output is knowingly not rskj's
+
+These are differences, not oversights, and a consumer comparing two nodes will
+see them.
+
+**`error` is not a Java class name.** rskj builds it as
+`format("%s: %s", error.getClass(), error.getMessage())`, so a real trace says
+`class org.ethereum.vm.program.Program$OutOfGasException: ...`. There is no
+such class here and printing one would be a lie about what ran; the revm halt
+reason is reported instead. A consumer that *parses* this string will not work
+against both nodes -- but one that only shows it to a human reads the same
+fact.
+
+**`reverted` and `error` stay distinct.** rskj sets `reverted` for an actual
+REVERT and leaves `error` empty; a halt (out of gas, invalid opcode, stack
+underflow) goes in `error` with `reverted` false. That distinction is kept
+here, which is why the executor fills these fields from the transaction's own
+`ExecutionResult` rather than from `tx_results[i].success` -- `success` is a
+single boolean and cannot tell the two apart.
+`a_trace_reports_revert_and_halt_differently` pins both directions.
+
+**`initStorage` is not produced, and `storageSize` counts what the trace
+touched.** rskj reads the contract's *entire* storage before the program runs
+-- `getStorageKeysCount`, then every key up to `vmTraceInitStorageLimit` --
+and reports the count as `storageSize` and the contents as `initStorage`. That
+needs an enumeration of the account's storage in the unitrie at the moment the
+transaction starts, which is mid-block state the inspector has no route to:
+revm's journal holds the dirty overlay, the trie holds the parent block, and
+neither alone is the pre-transaction storage. `storageSize` here is therefore
+the size of `currentStorage` -- the keys the trace observed -- and
+`initStorage` is absent. Filed as a follow-up rather than approximated
+silently.
