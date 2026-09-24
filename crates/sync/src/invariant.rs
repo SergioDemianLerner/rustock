@@ -20,6 +20,22 @@
 //! | 5 -- canonical pointer to a block we never downloaded | I2, I3 |
 //! | 6 -- canonical entry stranded above the head | **I6** |
 //! | 7 -- head naming a block that is not canonical | **I8** |
+//! | 8 -- execution on the losing side of a tip sibling fork | **I5** |
+//!
+//! # Four of these are now repaired, not only reported
+//!
+//! `SyncService::verify_coherence` acts on I5, I6, I7 and I8. That was not
+//! the original intent -- "it makes it loud" was -- and stall 8 is why it
+//! changed. On 2026-09-24 a one-block sibling fork at the tip left execution
+//! on the losing side; I5 named it correctly every thirty-five seconds for
+//! twelve minutes and nothing consumed the report, because every other guard
+//! in the sync service compares block *numbers* and all those differences are
+//! zero in that state.
+//!
+//! An invariant that is only ever printed is a diagnostic. Once a violation
+//! has a repair that is safe and well defined, leaving it to a human -- or to
+//! the watchdog, which is a liveness net for the failures nothing else
+//! understands -- is choosing to stall.
 //!
 //! Stall 6 is the one this was written after: `ensure_canonical_lineage`
 //! wrote a canonical entry at #9,262,402 while `KEY_HEAD` stayed at
