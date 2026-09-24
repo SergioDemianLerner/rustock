@@ -165,18 +165,33 @@ pub(crate) fn fast_forward_state(
     Some(TrieNode::from_message(&data, trie_store.as_ref()))
 }
 
-pub(crate) fn record_execution(store: &BlockStore, hash: B256, state_root: B256) {
+/// Advance the executed-head marker, reporting whether it actually moved.
+///
+/// **The return value is not decoration.** `Transition::Executed` refuses a
+/// block that is not canonical at its height, which happens whenever a reorg
+/// lands between executing a block and recording it. A caller that ignores the
+/// refusal goes on to claim the block executed and to advance its in-memory
+/// state root to a block the node is not on -- which is how #9,267,779 came to
+/// be logged as `Executed block` one line after the store refused it, on
+/// 2026-09-24 at 14:01:15, and why the coherence check then had to reload the
+/// committed root five seconds later.
+pub(crate) fn record_execution(store: &BlockStore, hash: B256, state_root: B256) -> bool {
     match Validated::prove(store, hash) {
-        Ok(at) => {
-            if let Err(e) = store.apply(&Transition::Executed { at, state_root }) {
+        Ok(at) => match store.apply(&Transition::Executed { at, state_root }) {
+            Ok(_) => true,
+            Err(e) => {
                 error!(target: "rustock::sync", "Recording execution of {:?} failed: {:?}", hash, e);
+                false
             }
+        },
+        Err(broken) => {
+            error!(
+                target: "rustock::sync",
+                "Executed {:?} but its lineage does not hold ({}); not recording it",
+                hash, broken
+            );
+            false
         }
-        Err(broken) => error!(
-            target: "rustock::sync",
-            "Executed {:?} but its lineage does not hold ({}); not recording it",
-            hash, broken
-        ),
     }
 }
 
@@ -3065,7 +3080,21 @@ impl SyncService {
                     wall_start.elapsed(),
                 );
                 trie_store.flush();
-                record_execution(&self.manager.store, hash, result.state_root_hash);
+                if !record_execution(&self.manager.store, hash, result.state_root_hash) {
+                    // The work is done and the state is in the trie, but the
+                    // marker did not move -- so neither does the in-memory
+                    // root, which must keep matching the committed one. This
+                    // method's contract is "true means the executed head
+                    // advanced"; it did not.
+                    warn!(
+                        target: "rustock::sync",
+                        "Executed #{} ({:?}) but could not record it; the executed head \
+                         stays at its previous block and this one will be re-executed \
+                         once the canonical chain settles",
+                        header.number, hash
+                    );
+                    return false;
+                }
                 info!(
                     target: "rustock::sync",
                     "Executed block #{}, state root: {:?}",
@@ -3244,7 +3273,12 @@ fn process_downloaded_blocks(
                 if blocks_since_flush >= 100 {
                     trie_store.flush();
                     blocks_since_flush = 0;
-                    record_execution(store, *hash, result.state_root_hash);
+                    if !record_execution(store, *hash, result.state_root_hash) {
+                        // Not canonical any more: executing further blocks on
+                        // top of it would build on a branch the node is not on.
+                        all_ok = false;
+                        break;
+                    }
                 }
                 if processed.is_multiple_of(100) {
                     debug!(
@@ -3277,7 +3311,13 @@ fn process_downloaded_blocks(
         trie_store.flush();
         blocks_since_flush = 0;
         if let Some((hash, root_hash)) = last_executed {
-            record_execution(store, hash, root_hash);
+            if !record_execution(store, hash, root_hash) {
+                // `halt_after_exec_failure` then reconciles the head, which is
+                // the only thing that can make this block canonical or replace
+                // it. Reporting the batch as clean would leave the executed
+                // head behind the blocks just written, with nothing to notice.
+                all_ok = false;
+            }
         }
         if fast_forwarded > 0 {
             info!(
