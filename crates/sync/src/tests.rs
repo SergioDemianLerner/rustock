@@ -1,6 +1,7 @@
 use super::*;
 use alloy_primitives::{Address, B256, U256, Bytes, B512};
 use tempfile::tempdir;
+use crate::service::EXECUTION_OFF_CHAIN_GRACE;
 
 fn dummy_header(number: u64, parent: B256, difficulty: U256) -> Header {
     Header {
@@ -4035,33 +4036,66 @@ async fn head_reverification_reseats_a_head_that_is_not_canonical_then_walks_up(
     assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
 }
 
-/// Retreating below the executed head breaks I4 by construction — which the
-/// first deployment did within fifteen seconds of its first escalation.
+/// A retreat below the executed head takes execution with it, and the store
+/// is coherent at every point an observer can read it.
+///
+/// **These two tests used to assert the opposite**, and that is the history
+/// worth keeping. The original rule was "never retreat below the executed
+/// head", written after the first deployment broke I4 — head under execution
+/// — within fifteen seconds of its first escalation. The rule was a
+/// workaround for a real hazard, and it was expressed as
+/// `floor = head.number.min(executed.number)`, which is `head.number`
+/// whenever the node is caught up. So the watchdog's first escalation did
+/// nothing at all for a caught-up node, which is precisely the node that gets
+/// stuck in follow mode. Mainnet 2026-09-24 19:00:48: `escalation 1 ->
+/// RetreatAndReverify { blocks: 1 }` against head == executed == #9,268,363,
+/// and nothing moved (issue #112).
+///
+/// The hazard it guarded against is real but is not this function's to solve:
+/// `Transition::Retreat` stages the new head and the pulled-down execution in
+/// **one batch** through `stage_execution_after_reorg`, so there is no moment
+/// at which the head sits under execution. What these now pin is that
+/// property, rather than the refusal that stood in for it.
 #[tokio::test]
-async fn head_reverification_never_retreats_below_the_executed_head() {
+async fn head_reverification_retreat_takes_execution_with_it() {
     let (store, _dir, headers) = linked_chain(10);
     let top = headers.last().unwrap();
-    // Executed and head both at #10: there is nowhere to retreat to.
+    // Executed and head both at #10 — the caught-up shape the old floor made
+    // into a no-op.
     store.set_exec_head(top.hash(), top.state_root).unwrap();
 
     let mut service = service_over(store.clone());
     service.reverify_head_lineage(5);
 
-    assert_eq!(store.head().unwrap(), Some(top.hash()), "retreated below execution");
-    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
+    let cursor = store.cursor().unwrap().unwrap();
+    assert_eq!(cursor.validated_head.number, 5, "the retreat must actually happen");
+    assert_eq!(
+        cursor.executed.number, 5,
+        "execution must come down with the head, not be left above it"
+    );
+    assert_eq!(
+        crate::invariant::check(&store, None, crate::Scope::Full),
+        Ok(()),
+        "I4 -- executed above head -- is what the old rule was protecting; it must still hold"
+    );
 }
 
-/// With execution further back, a retreat is allowed but stops at it.
+/// The same when execution started further back: a retreat that passes it
+/// still brings it down to the new head.
 #[tokio::test]
-async fn head_reverification_retreats_only_as_far_as_the_executed_head() {
+async fn head_reverification_retreat_past_execution_brings_it_down() {
     let (store, _dir, headers) = linked_chain(10);
     store.set_exec_head(headers[8].hash(), headers[8].state_root).unwrap();
 
     let mut service = service_over(store.clone());
     service.reverify_head_lineage(5);
 
-    let head = store.header(store.head().unwrap().unwrap()).unwrap().unwrap();
-    assert_eq!(head.number, 8, "should have stopped at the executed head");
+    let cursor = store.cursor().unwrap().unwrap();
+    assert_eq!(cursor.validated_head.number, 5, "retreated the full five blocks");
+    assert_eq!(
+        cursor.executed.number, 5,
+        "execution was above the new head, so it came down to it"
+    );
     assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
 }
 
@@ -4670,4 +4704,255 @@ async fn test_follow_mode_gap_fill_is_a_no_op_when_bodies_are_present() {
 
     assert!(service.pending_follow_bodies.is_empty());
     assert!(rx.try_recv().is_err(), "a healthy follow mode must stay quiet");
+}
+
+// ===========================================================================
+// Stall 8: a same-height sibling reorg leaves execution on the losing fork
+// (issue #112, mainnet 2026-09-24 18:57 UTC)
+// ===========================================================================
+
+/// A service with a trie store that holds the state of every `dummy_header`.
+///
+/// Every `dummy_header` carries `state_root: B256::ZERO`, so putting the empty
+/// node under that one key makes `has_state` true for all of them — which is
+/// what `choose_resume_point` needs in order to pick a resume point at all.
+fn service_with_state(store: Arc<BlockStore>) -> SyncService {
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(B256::ZERO.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store,
+    );
+    SyncService::new(manager, peer_store, event_rx).with_block_processor(processor, trie, empty)
+}
+
+/// Two siblings at the tip, one canonical and one executed — the exact shape
+/// of the 2026-09-24 18:57 stall. Returns `(store, dir, shared parent, loser,
+/// winner)`.
+fn tip_sibling_fork(len: u64) -> (Arc<BlockStore>, tempfile::TempDir, Header, Header, Header) {
+    let (store, dir, headers) = linked_chain(len);
+    let parent = headers.last().unwrap().clone();
+
+    // Same parent, same height, distinguished only by `extra_data` — as the
+    // mainnet pair were, down to sharing a timestamp and difficulty.
+    let mut loser = dummy_header(len + 1, parent.hash(), U256::from(1));
+    loser.extra_data = vec![0xAA].into();
+    let mut winner = dummy_header(len + 1, parent.hash(), U256::from(1));
+    winner.extra_data = vec![0xBB].into();
+
+    store.put_header(&loser).unwrap();
+    store.put_header(&winner).unwrap();
+    store.put_body(loser.hash(), &[], &[]).unwrap();
+    store.put_body(winner.hash(), &[], &[]).unwrap();
+
+    // The canonical index and the head point at the winner; execution is on
+    // the loser. Nothing about the *heights* says anything is wrong.
+    store.put_canonical_hash(len + 1, winner.hash()).unwrap();
+    store.set_head(winner.hash()).unwrap();
+    store.set_exec_head(loser.hash(), loser.state_root).unwrap();
+
+    (store, dir, parent, loser, winner)
+}
+
+/// Backdate the outstanding violation's clock so the grace period has passed.
+fn age_violation(service: &mut SyncService, by: Duration) {
+    if let Some((_, first_seen)) = service.violation_since.as_mut() {
+        *first_seen -= by;
+    }
+}
+
+/// I5 is now an actuator, not only a report.
+///
+/// On mainnet this state stood for twelve minutes while I5 named it correctly
+/// every thirty-five seconds. Every other guard in the service compares block
+/// *numbers* — downloaded head against executed head, our height against our
+/// peers' — and all of those differences are zero when the fork is one block
+/// deep at the tip.
+#[tokio::test]
+async fn a_tip_sibling_reorg_pulls_execution_back_onto_the_canonical_chain() {
+    let (store, _dir, parent, loser, winner) = tip_sibling_fork(9);
+    let mut service = service_with_state(store.clone());
+
+    // The state that wedged the node: every height agrees, and the executed
+    // head is on the wrong chain.
+    let cursor = store.cursor().unwrap().unwrap();
+    assert_eq!(cursor.validated_head.number, cursor.executed.number, "same height");
+    assert_eq!(cursor.executed.hash, loser.hash());
+    assert_eq!(store.canonical_hash(10).unwrap(), Some(winner.hash()));
+
+    let violation = crate::invariant::check(&store, None, crate::Scope::Full).unwrap_err();
+    assert_eq!(violation.relation(), "I5", "precondition: {violation}");
+
+    // First tick: the violation is seen, the clock starts, nothing moves.
+    service.verify_coherence();
+    assert_eq!(
+        store.exec_head().unwrap().map(|(h, _)| h),
+        Some(loser.hash()),
+        "execution must not be moved on the first sighting — a sibling can still flip back"
+    );
+
+    // Once it has held past the grace, execution comes back to the shared
+    // parent, which is the deepest block both chains agree on.
+    age_violation(&mut service, EXECUTION_OFF_CHAIN_GRACE + Duration::from_secs(1));
+    service.verify_coherence();
+
+    assert_eq!(
+        store.exec_head().unwrap().map(|(h, _)| h),
+        Some(parent.hash()),
+        "execution should have rolled back to the shared parent"
+    );
+    assert_eq!(
+        crate::invariant::check(&store, None, crate::Scope::Full),
+        Ok(()),
+        "I5 should be cleared by the repair"
+    );
+    // And the node is set up to move forward again rather than sit still.
+    assert_eq!(service.last_body_height, parent.number);
+
+    // The next tick sees a coherent store and forgets the violation, which is
+    // what puts `Coherence restored` in the log.
+    service.verify_coherence();
+    assert!(
+        service.violation_since.is_none(),
+        "the violation clock should be cleared once the store is coherent again"
+    );
+}
+
+/// The thrash guard, from the other side: a sibling that wins the fork back
+/// before the grace elapses costs nothing.
+#[tokio::test]
+async fn a_sibling_that_flips_back_within_the_grace_does_not_move_execution() {
+    let (store, _dir, _parent, loser, winner) = tip_sibling_fork(9);
+    let mut service = service_with_state(store.clone());
+
+    service.verify_coherence();
+    assert!(service.violation_since.is_some(), "the clock is running");
+
+    // The network changes its mind: our executed block is canonical again.
+    store.put_canonical_hash(10, loser.hash()).unwrap();
+    store.set_head(loser.hash()).unwrap();
+
+    // Even well past the grace, there is nothing to repair.
+    age_violation(&mut service, EXECUTION_OFF_CHAIN_GRACE * 10);
+    service.verify_coherence();
+
+    assert_eq!(
+        store.exec_head().unwrap().map(|(h, _)| h),
+        Some(loser.hash()),
+        "execution must not move for a fork that resolved in our favour"
+    );
+    assert!(
+        service.violation_since.is_none(),
+        "a coherent store clears the violation clock"
+    );
+    let _ = winner;
+}
+
+/// A three-deep reorg resolves to the fork point, not to one block down.
+///
+/// `choose_resume_point` walks the executed head's *own* ancestry, so it
+/// cannot stop on a losing block the way a fixed-depth retreat can — the bug
+/// #99 was filed for.
+#[tokio::test]
+async fn a_three_deep_reorg_rolls_execution_to_the_fork_point() {
+    let (store, _dir, headers) = linked_chain(9);
+    let fork = headers.last().unwrap().clone();
+    let mut service = service_with_state(store.clone());
+
+    // Our branch: three blocks, all executed, none of them canonical any more.
+    let mut prev = fork.hash();
+    let mut ours = Vec::new();
+    for n in 10..=12u64 {
+        let mut h = dummy_header(n, prev, U256::from(1));
+        h.extra_data = vec![0xAA, n as u8].into();
+        store.put_header(&h).unwrap();
+        prev = h.hash();
+        ours.push(h);
+    }
+
+    // The network's branch, which won and is canonical from the fork up.
+    let mut prev = fork.hash();
+    let mut theirs = Vec::new();
+    for n in 10..=12u64 {
+        let mut h = dummy_header(n, prev, U256::from(2));
+        h.extra_data = vec![0xBB, n as u8].into();
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(n, h.hash()).unwrap();
+        prev = h.hash();
+        theirs.push(h);
+    }
+    store.set_head(theirs.last().unwrap().hash()).unwrap();
+    let top_of_ours = ours.last().unwrap();
+    store.set_exec_head(top_of_ours.hash(), top_of_ours.state_root).unwrap();
+
+    service.verify_coherence();
+    age_violation(&mut service, EXECUTION_OFF_CHAIN_GRACE + Duration::from_secs(1));
+    service.verify_coherence();
+
+    assert_eq!(
+        store.exec_head().unwrap().map(|(h, _)| h),
+        Some(fork.hash()),
+        "execution should land on #9, the deepest block both branches share — \
+         not on #11, our own parent, which is on the branch being abandoned"
+    );
+    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
+}
+
+/// The `RetreatAndReverify` bug: the watchdog's first escalation was a no-op
+/// for a caught-up node.
+///
+/// The floor was `head.number.min(executed.number)`, which is `head.number`
+/// whenever the node is caught up — so the depth came out zero and nothing
+/// moved. A caught-up node in follow mode is precisely the one that gets
+/// stuck, so the first rung of the ladder never did anything in the shape it
+/// was most needed for. Mainnet logged `escalation 1 -> RetreatAndReverify
+/// { blocks: 1 }` against head == executed == #9,268,363 and moved nothing.
+#[tokio::test]
+async fn the_watchdog_retreat_moves_a_node_that_is_caught_up() {
+    let (store, _dir, headers) = linked_chain(10);
+    let mut service = service_with_state(store.clone());
+
+    let before = store.cursor().unwrap().unwrap();
+    assert_eq!(
+        before.validated_head.number, before.executed.number,
+        "precondition: caught up, which is what made the old code a no-op"
+    );
+
+    service.reverify_head_lineage(1);
+
+    let after = store.cursor().unwrap().unwrap();
+    assert_eq!(after.validated_head.number, 9, "the head must actually retreat");
+    assert_eq!(
+        after.executed.number, 9,
+        "and execution must come with it, or the store is left incoherent"
+    );
+    assert_eq!(after.validated_head.hash, headers[9].hash());
+    assert_eq!(
+        crate::invariant::check(&store, None, crate::Scope::Full),
+        Ok(()),
+        "retreating below execution must not leave the head under it"
+    );
+    assert!(
+        service.last_body_height <= 9,
+        "the body cursor must follow the retreat, or the range is never re-fetched"
+    );
+}
+
+/// The retreat still stops at genesis rather than walking off the bottom.
+#[tokio::test]
+async fn the_watchdog_retreat_stops_at_genesis() {
+    let (store, _dir, _headers) = linked_chain(2);
+    let mut service = service_with_state(store.clone());
+
+    service.reverify_head_lineage(50);
+
+    let after = store.cursor().unwrap().unwrap();
+    assert_eq!(after.validated_head.number, 0, "clamped to genesis");
+    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
 }

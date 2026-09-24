@@ -33,6 +33,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// and far shorter than any stall the node has ever suffered.
 const VIOLATION_GRACE: Duration = Duration::from_secs(45);
 
+/// How long I5 must hold before execution is rolled back onto the canonical
+/// chain.
+///
+/// I5 -- the executed head is not the canonical block at its own height --
+/// holds for a moment on every ordinary reorg, between the canonical index
+/// switching and the replacement block executing. Acting on the first tick
+/// would retreat execution for a sibling that is about to win anyway, and two
+/// siblings alternating would make the node thrash.
+///
+/// Shorter than `VIOLATION_GRACE` because this is a repair, not a report: the
+/// 2026-09-24 19:00 stall stood for twelve minutes, and the ordinary case it
+/// must not disturb resolves inside a second.
+pub(crate) const EXECUTION_OFF_CHAIN_GRACE: Duration = Duration::from_secs(10);
+
 /// Faster reclaim for body requests: a body not back within this window is
 /// re-sent to another peer. Shorter than REQUEST_TIMEOUT because idempotent
 /// application makes a duplicate harmless, so reclaiming a slot stuck on a
@@ -1390,6 +1404,36 @@ impl SyncService {
                     Violation::CanonicalAboveHead { .. } | Violation::HeadNotCanonical { .. } => {
                         self.reverify_head_lineage(0);
                     }
+                    // I5: the executed head is not the canonical block at
+                    // its own height, so this node has executed the losing
+                    // side of a fork. Every *other* guard in the service
+                    // measures a difference of block numbers -- downloaded
+                    // head versus executed head, our height versus peers' --
+                    // and that difference is **zero** when the fork is one
+                    // block deep at the tip. So nothing moved.
+                    //
+                    // Mainnet 2026-09-24 18:57: two siblings at #9,268,363
+                    // with the same parent; the canonical index switched to
+                    // one, execution stayed on the other, and the node stood
+                    // still for twelve minutes. I5 reported it correctly every
+                    // thirty-five seconds and nothing consumed the report --
+                    // the invariant checker was a reporter, not an actuator.
+                    //
+                    // `choose_resume_point` walks the executed head's own
+                    // ancestry to the first block that is both canonical and
+                    // still has state, which for a one-deep sibling fork is
+                    // the shared parent: one block re-executed.
+                    Violation::ExecutedOffChain { at, hash, canonical } => {
+                        if self.violation_held_for(&v, EXECUTION_OFF_CHAIN_GRACE) {
+                            warn!(
+                                target: "rustock::sync",
+                                "Executed head #{at} ({hash}) is not canonical at its height \
+                                 ({canonical:?}); rolling execution back onto the canonical \
+                                 chain"
+                            );
+                            self.roll_execution_back(cursor.executed);
+                        }
+                    }
                     // I7: the executed head names a state root the trie store
                     // does not have, so the node cannot execute another block
                     // from it -- and nothing else notices, because the executed
@@ -1428,7 +1472,7 @@ impl SyncService {
     /// hours. Only the second kind is worth a line in the log.
     fn report_violation(&mut self, v: &Violation) {
         let now = Instant::now();
-        let identity = format!("{}@{:?}", v.relation(), v.at());
+        let identity = Self::violation_identity(v);
 
         let first_seen = match &self.violation_since {
             Some((seen, at)) if *seen == identity => *at,
@@ -1459,6 +1503,26 @@ impl SyncService {
             now.saturating_duration_since(first_seen).as_secs(),
             v
         );
+    }
+
+    /// How a violation is identified across ticks: the relation and the
+    /// height it was found at. Two different heights are two different
+    /// violations, each with its own clock.
+    fn violation_identity(v: &Violation) -> String {
+        format!("{}@{:?}", v.relation(), v.at())
+    }
+
+    /// Has *this* violation been held continuously for at least `grace`?
+    ///
+    /// The identity is checked rather than assumed. `report_violation` runs
+    /// first and would have reset the clock for a different relation, but a
+    /// repair that fires on the strength of some other relation's age would be
+    /// a subtle and rare bug, and checking costs a string compare.
+    fn violation_held_for(&self, v: &Violation, grace: Duration) -> bool {
+        let identity = Self::violation_identity(v);
+        self.violation_since.as_ref().is_some_and(|(seen, first_seen)| {
+            *seen == identity && Instant::now().saturating_duration_since(*first_seen) >= grace
+        })
     }
 
     /// The store is coherent again: forget whatever was outstanding.
@@ -1782,8 +1846,12 @@ impl SyncService {
     ///    so the range is downloaded again.
     ///
     /// Both go through `Transition`, so neither can leave the three position
-    /// keys disagreeing. Retreat never goes below the executed head: a head
-    /// under execution is not a recovery, it is a second incoherence.
+    /// keys disagreeing.
+    ///
+    /// The retreat **may** go below the executed head, and takes execution
+    /// with it when it does. Refusing to was the bug: head and executed are
+    /// equal on a caught-up node, so a floor at the executed height made the
+    /// whole step a no-op for precisely the node that needs it.
     pub(crate) fn reverify_head_lineage(&mut self, retreat: u64) {
         let store = &self.manager.store;
         let Ok(Some(cursor)) = store.cursor() else { return };
@@ -1823,9 +1891,31 @@ impl SyncService {
             return;
         }
 
-        // 2. Nothing above: retreat, but never below execution.
-        let floor = head.number.min(cursor.executed.number);
-        let depth = retreat.min(head.number.saturating_sub(floor));
+        // 2. Nothing above: retreat, and take execution down with us.
+        //
+        // **This used to floor the retreat at the executed head's number**:
+        //
+        // ```
+        // let floor = head.number.min(cursor.executed.number);
+        // let depth = retreat.min(head.number.saturating_sub(floor));
+        // ```
+        //
+        // which is zero whenever the node is caught up -- and a caught-up node
+        // in follow mode is exactly the one that gets stuck. So the watchdog's
+        // first escalation was a no-op in the commonest stall shape. Mainnet
+        // 2026-09-24 19:00:48 logged `escalation 1 -> RetreatAndReverify
+        // { blocks: 1 }` against head == executed == #9,268,363 and moved
+        // nothing; three minutes later escalation 2 did the same.
+        //
+        // The old comment defended the floor as "a head under execution is not
+        // a recovery, it is a second incoherence". That is right about the end
+        // state and wrong about the method: `Transition::Retreat` pulls
+        // execution down with the head through `stage_execution_after_reorg`
+        // whenever the retreat orphans it, and `roll_execution_back` below
+        // settles execution onto a height whose state we still hold. The pair
+        // is what the orphan-recovery path already does; there is no moment at
+        // which the head sits under execution.
+        let depth = retreat.min(head.number);
         if depth == 0 {
             debug!(
                 target: "rustock::sync",
@@ -1858,6 +1948,15 @@ impl SyncService {
                              downloaded again", head, dest
                         );
                         self.last_body_height = self.last_body_height.min(dest.number);
+                        // Execution follows the head, exactly as it does in
+                        // orphan recovery. Reading the cursor again rather
+                        // than reusing `cursor.executed` matters: the retreat
+                        // may already have moved execution, and rolling back
+                        // from a stale reference would walk the ancestry of a
+                        // block that is no longer the executed head.
+                        if let Ok(Some(after)) = self.manager.store.cursor() {
+                            self.roll_execution_back(after.executed);
+                        }
                     }
                     Err(e) => warn!(target: "rustock::sync", "Head re-verification: retreat failed: {:?}", e),
                 }
