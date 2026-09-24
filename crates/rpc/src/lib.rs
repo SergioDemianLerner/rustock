@@ -10,6 +10,7 @@ pub mod rsk;
 pub mod server;
 pub mod state;
 pub mod tx;
+pub mod txpool;
 pub mod types;
 pub mod web3;
 

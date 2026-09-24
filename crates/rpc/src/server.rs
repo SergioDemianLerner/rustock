@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
+use crate::txpool;
 use crate::types::*;
 use crate::{admin, call, eth, logs, mnr, net, rsk, state, tx, web3};
 
@@ -31,6 +32,21 @@ pub trait TxPoolReader: Send + Sync {
     fn get_pending_tx(&self, hash: &alloy_primitives::B256) -> Option<(rustock_core::Transaction, alloy_primitives::Address, alloy_primitives::B256)>;
     fn pending_nonce(&self, addr: &alloy_primitives::Address) -> Option<u64>;
     fn pool_status(&self) -> (usize, usize);
+    /// The whole pool, grouped the way `txpool_content` reports it.
+    fn pool_content(&self) -> PoolContent;
+}
+
+/// The pool's contents, sender-major and nonce-ordered within each sender --
+/// rskj's `groupTransactions` shape, produced once and rendered twice, by
+/// `txpool_content` and `txpool_inspect`.
+///
+/// `pending` is what can execute now; `queued` is what waits on a nonce gap.
+/// Keeping them apart is the informative part of the answer: a flat list
+/// cannot say whether a transaction is stuck or merely unmined.
+#[derive(Default)]
+pub struct PoolContent {
+    pub pending: Vec<(alloy_primitives::Address, Vec<(u64, rustock_core::Transaction)>)>,
+    pub queued: Vec<(alloy_primitives::Address, Vec<(u64, rustock_core::Transaction)>)>,
 }
 
 /// Shared application state available to every RPC handler.
@@ -254,17 +270,9 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
             execution_not_available(id, &req.method)
         }
 
-        "txpool_status" => {
-            if let Some(pool) = &state.tx_pool {
-                let (pending, queued) = pool.pool_status();
-                JsonRpcResponse::success(id, json!({
-                    "pending": format!("0x{:x}", pending),
-                    "queued": format!("0x{:x}", queued),
-                }))
-            } else {
-                execution_not_available(id, "txpool_status")
-            }
-        }
+        "txpool_content" => txpool::txpool_content(id, state),
+        "txpool_inspect" => txpool::txpool_inspect(id, state),
+        "txpool_status" => txpool::txpool_status(id, state),
 
         m if m.starts_with("debug_")
             || m.starts_with("trace_")
@@ -290,7 +298,7 @@ fn mining_not_enabled(id: Value, method: &str) -> JsonRpcResponse {
     )
 }
 
-fn execution_not_available(id: Value, method: &str) -> JsonRpcResponse {
+pub(crate) fn execution_not_available(id: Value, method: &str) -> JsonRpcResponse {
     JsonRpcResponse::error(
         id,
         METHOD_NOT_FOUND,

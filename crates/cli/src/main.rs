@@ -71,6 +71,11 @@ impl rustock_rpc::server::TxPoolReader for PoolAdapter {
     fn pool_status(&self) -> (usize, usize) {
         self.0.status()
     }
+
+    fn pool_content(&self) -> rustock_rpc::server::PoolContent {
+        let (pending, queued) = self.0.content();
+        rustock_rpc::server::PoolContent { pending, queued }
+    }
 }
 
 /// The transaction pool, as the block builder needs it. The pool recovers

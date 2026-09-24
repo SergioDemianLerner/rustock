@@ -131,6 +131,9 @@ pub struct PooledTx {
     pub encoded_size: usize,
 }
 
+/// Transactions grouped by sender, each sender's ordered by nonce.
+pub type PoolGroups = Vec<(Address, Vec<(u64, Transaction)>)>;
+
 struct PoolInner {
     pending: HashMap<Address, BTreeMap<u64, PooledTx>>,
     queued: HashMap<Address, BTreeMap<u64, PooledTx>>,
@@ -645,6 +648,36 @@ impl TransactionPool {
             b.tx.gas_price.cmp(&a.tx.gas_price).then(a.tx.nonce.cmp(&b.tx.nonce))
         });
         result
+    }
+
+    /// The whole pool, grouped by sender and ordered by nonce within each
+    /// sender -- the shape `txpool_content` and `txpool_inspect` report.
+    ///
+    /// Taken under one read lock so the two halves cannot disagree: a
+    /// transaction promoted from queued to pending between two separate reads
+    /// would otherwise appear twice, or vanish.
+    #[allow(clippy::type_complexity)]
+    pub fn content(&self) -> (PoolGroups, PoolGroups) {
+        let inner = self.inner.read().unwrap();
+        let collect = |side: &HashMap<Address, BTreeMap<u64, PooledTx>>| -> PoolGroups {
+            let mut out: Vec<(Address, Vec<(u64, Transaction)>)> = side
+                .iter()
+                .map(|(addr, by_nonce)| {
+                    (
+                        *addr,
+                        by_nonce
+                            .iter()
+                            .map(|(nonce, ptx)| (*nonce, ptx.tx.clone()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            // The senders come out of a HashMap, so without this the same pool
+            // renders in a different order on every call.
+            out.sort_by_key(|(addr, _)| *addr);
+            out
+        };
+        (collect(&inner.pending), collect(&inner.queued))
     }
 
     /// Return counts of pending and queued transactions.
@@ -1292,6 +1325,53 @@ mod tests {
         let (pending, queued) = pool.status();
         assert_eq!(pending, 3);
         assert_eq!(queued, 0);
+    }
+
+    /// `content()` must report the same split `status()` counts, and must
+    /// order each sender's transactions by nonce -- that ordering is what
+    /// `txpool_content` presents, and the pool's senders live in a HashMap.
+    #[test]
+    fn test_content_splits_pending_from_queued_and_orders_by_nonce() {
+        let (pool, key, addr) = setup_pool_with_account(U256::from(10u64.pow(18)), 0);
+
+        // Out of nonce order on purpose: 2 and 1 queue behind the gap at 0.
+        for nonce in [2u64, 1] {
+            let mut tx = make_tx(nonce, 59_240_000);
+            sign_tx(&mut tx, &key, 33);
+            pool.add_transaction(&encode_tx(&tx)).unwrap();
+        }
+
+        let (pending, queued) = pool.content();
+        assert!(pending.is_empty(), "nothing can execute behind a nonce gap");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, addr);
+        assert_eq!(
+            queued[0].1.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![1, 2],
+            "nonce order, not insertion order"
+        );
+
+        // Filling the gap promotes both.
+        let mut tx0 = make_tx(0, 59_240_000);
+        sign_tx(&mut tx0, &key, 33);
+        pool.add_transaction(&encode_tx(&tx0)).unwrap();
+
+        let (pending, queued) = pool.content();
+        assert!(queued.is_empty(), "the gap is filled");
+        assert_eq!(
+            pending[0].1.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let (p, q) = pool.status();
+        assert_eq!(
+            (p, q),
+            (
+                pending.iter().map(|(_, txs)| txs.len()).sum::<usize>(),
+                queued.iter().map(|(_, txs)| txs.len()).sum::<usize>()
+            ),
+            "status and content must not disagree about the same pool"
+        );
     }
 
     // ========== rskj: addTwiceAndGetPendingTransaction ==========
