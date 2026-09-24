@@ -278,6 +278,11 @@ impl TransactionPool {
         self.quota.read().unwrap().quota_of(address)
     }
 
+    /// An address's quota as `debug_accountTransactionQuota` reports it.
+    pub fn quota_report_of(&self, address: &Address) -> Option<(f64, u64)> {
+        self.quota.read().unwrap().quota_report_of(address, Instant::now())
+    }
+
     /// Add a raw RLP-encoded transaction to the pool.
     /// Add a raw RLP-encoded transaction to the pool, recording the outcome.
     pub fn add_transaction(&self, raw: &[u8]) -> Result<B256, PoolError> {

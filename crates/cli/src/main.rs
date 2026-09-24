@@ -76,6 +76,10 @@ impl rustock_rpc::server::TxPoolReader for PoolAdapter {
         let (pending, queued) = self.0.content();
         rustock_rpc::server::PoolContent { pending, queued }
     }
+
+    fn quota_report(&self, address: &alloy_primitives::Address) -> Option<(f64, u64)> {
+        self.0.quota_report_of(address)
+    }
 }
 
 /// The transaction pool, as the block builder needs it. The pool recovers
@@ -1290,6 +1294,11 @@ async fn main() -> Result<()> {
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_tx_pool(pool.clone())
         .with_block_processor(block_processor, trie_store_for_exec, initial_state_root);
+
+    // Taken before the service is moved into its task: the RPC layer reads the
+    // same gauge the sync loop publishes, so `debug_wireProtocolQueueSize`
+    // answers with the live backlog.
+    let wire_queue_depth = sync_service.wire_queue_depth();
     if let Some(path) = &args.import_blocks_db {
         let source = RskjBlockSource::open(path)?;
         info!("Sourcing block bodies from rskj LevelDB at {path} (peers only for what it lacks)");
@@ -1478,6 +1487,7 @@ async fn main() -> Result<()> {
 
         let rpc_state = rustock_rpc::server::RpcState {
             store: store.clone(),
+            wire_queue_depth: Some(wire_queue_depth.clone()),
             peer_store: peer_store.clone(),
             config: config.clone(),
             tx_submitter: Some(Arc::new(TxRelaySubmitter(tx_relay.clone()))),

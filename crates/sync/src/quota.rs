@@ -391,6 +391,27 @@ impl QuotaChecker {
         self.quotas.get(address).map(|q| q.available_virtual_gas)
     }
 
+    /// An address's quota as `debug_accountTransactionQuota` reports it:
+    /// the available virtual gas and when it was last refreshed, in
+    /// milliseconds since the epoch.
+    ///
+    /// rskj stores that timestamp directly (`TxQuota.timestamp`, set from its
+    /// `TimeProvider`). Here `last_refresh` is an `Instant`, which is
+    /// monotonic and deliberately has no epoch, so the wall-clock moment is
+    /// reconstructed by subtracting its age from now. That is accurate to the
+    /// clock's own drift over the quota's lifetime -- at most a few minutes
+    /// here -- and avoids carrying a second timestamp that could disagree with
+    /// the first.
+    pub fn quota_report_of(&self, address: &Address, now: Instant) -> Option<(f64, u64)> {
+        let quota = self.quotas.get(address)?;
+        let epoch_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let age = now.saturating_duration_since(quota.last_refresh).as_millis() as u64;
+        Some((quota.available_virtual_gas, epoch_now.saturating_sub(age)))
+    }
+
     pub fn tracked_accounts(&self) -> usize {
         self.quotas.len()
     }
