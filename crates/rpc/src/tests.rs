@@ -2424,3 +2424,284 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
     assert!(!s.starts_with("0x"), "rskj emits bare hex here, not 0x-prefixed: got {s}");
     assert_eq!(s, hex::encode(tx_hash));
 }
+
+// ========== eth_getUncleBy*AndIndex ==========
+//
+// Checked against rskj's `Web3Impl.getUncleResultDTO` at the revision pinned in
+// docs/rskj-reference.md. Two of its behaviours are easy to get wrong and are
+// each pinned by a test below: an out-of-range index is `null` rather than an
+// error, and the uncle is rendered with its *own* transactions when the node
+// has that block stored.
+
+/// Builds a block at `number` with `uncles` ommers, stores header, body,
+/// canonical index and total difficulty, and returns its hash.
+fn store_block_with_uncles(
+    store: &BlockStore,
+    number: u64,
+    uncles: &[Header],
+) -> B256 {
+    let mut header = test_header(number);
+    header.uncle_count = uncles.len() as u64;
+    let hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_body(hash, &[], uncles).unwrap();
+    store.put_canonical_hash(number, hash).unwrap();
+    store.put_total_difficulty(hash, U256::from(1_000 * number)).unwrap();
+    hash
+}
+
+/// A header distinguishable from every other in these tests by its timestamp,
+/// so the hashes differ.
+fn uncle_header(number: u64, tag: u64) -> Header {
+    let mut h = test_header(number);
+    h.timestamp += tag * 1_000;
+    h.cached_hash = None;
+    h
+}
+
+#[tokio::test]
+async fn test_eth_get_uncle_by_block_hash_and_index() {
+    let (state, _tmp) = setup_state();
+    let u0 = uncle_header(100, 1);
+    let u1 = uncle_header(100, 2);
+    let block = store_block_with_uncles(&state.store, 101, &[u0.clone(), u1.clone()]);
+
+    for (idx, uncle) in [(0u32, &u0), (1u32, &u1)] {
+        let req = make_request(
+            "eth_getUncleByBlockHashAndIndex",
+            json!([format!("{:#x}", block), format!("{:#x}", idx)]),
+        );
+        let resp = dispatch_for_test(&state, req).await;
+        let result = resp.result.unwrap();
+        assert_eq!(result["hash"], json!(format!("{:#x}", uncle.hash())), "index {idx}");
+        assert_eq!(result["number"], json!("0x64"));
+        assert_eq!(result["parentHash"], json!(format!("{:#x}", uncle.parent_hash)));
+    }
+}
+
+#[tokio::test]
+async fn test_eth_get_uncle_by_block_number_and_index_agrees_with_by_hash() {
+    let (state, _tmp) = setup_state();
+    let u0 = uncle_header(200, 7);
+    let block = store_block_with_uncles(&state.store, 201, &[u0]);
+
+    let by_hash = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getUncleByBlockHashAndIndex",
+            json!([format!("{:#x}", block), "0x0"]),
+        ),
+    )
+    .await
+    .result
+    .unwrap();
+    let by_number = dispatch_for_test(
+        &state,
+        make_request("eth_getUncleByBlockNumberAndIndex", json!(["0xc9", "0x0"])),
+    )
+    .await
+    .result
+    .unwrap();
+
+    assert_ne!(by_hash, json!(null));
+    assert_eq!(by_hash, by_number, "the two lookups must render the same uncle");
+}
+
+#[tokio::test]
+async fn test_eth_get_uncle_out_of_range_index_is_null_not_an_error() {
+    // rskj: `if (uncleIdx >= block.getUncleList().size()) return null;` -- a
+    // caller walking indices until null must not get an error instead.
+    let (state, _tmp) = setup_state();
+    let block = store_block_with_uncles(&state.store, 301, &[uncle_header(300, 3)]);
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getUncleByBlockHashAndIndex",
+            json!([format!("{:#x}", block), "0x1"]),
+        ),
+    )
+    .await;
+    assert!(resp.error.is_none(), "out of range must not be an error");
+    assert_eq!(resp.result.unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn test_eth_get_uncle_of_uncleless_block_is_null() {
+    let (state, _tmp) = setup_state();
+    let block = store_block_with_uncles(&state.store, 401, &[]);
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getUncleByBlockHashAndIndex",
+            json!([format!("{:#x}", block), "0x0"]),
+        ),
+    )
+    .await;
+    assert_eq!(resp.result.unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn test_eth_get_uncle_of_unknown_block_is_null() {
+    let (state, _tmp) = setup_state();
+    let resp = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getUncleByBlockHashAndIndex",
+            json!([format!("{:#x}", B256::repeat_byte(0xab)), "0x0"]),
+        ),
+    )
+    .await;
+    assert_eq!(resp.result.unwrap(), Value::Null);
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getUncleByBlockNumberAndIndex", json!(["0xfffff", "0x0"])),
+    )
+    .await;
+    assert_eq!(resp.result.unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn test_eth_get_uncle_malformed_index_is_an_error() {
+    // rskj rejects this in `HexIndexParam`, during parameter deserialisation,
+    // so it is an error even though an out-of-range index is not.
+    let (state, _tmp) = setup_state();
+    let block = store_block_with_uncles(&state.store, 501, &[uncle_header(500, 5)]);
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getUncleByBlockHashAndIndex",
+            json!([format!("{:#x}", block), "zz"]),
+        ),
+    )
+    .await;
+    assert!(resp.error.is_some(), "a malformed index is an invalid parameter");
+}
+
+#[tokio::test]
+async fn test_eth_get_uncle_unstored_uncle_renders_as_an_empty_block() {
+    // The common case: the node never downloaded the competing branch, so it
+    // has the uncle's header (from the including block's body) and nothing
+    // else. rskj synthesises `Block.createBlockFromHeader` -- empty lists --
+    // and `getTotalDifficultyForHash` returns ZERO for a hash it lacks.
+    let (state, _tmp) = setup_state();
+    let block = store_block_with_uncles(&state.store, 601, &[uncle_header(600, 6)]);
+
+    let result = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getUncleByBlockHashAndIndex",
+            json!([format!("{:#x}", block), "0x0"]),
+        ),
+    )
+    .await
+    .result
+    .unwrap();
+
+    assert_eq!(result["transactions"], json!([]));
+    assert_eq!(result["uncles"], json!([]));
+    assert_eq!(result["totalDifficulty"], json!("0x0"));
+}
+
+#[tokio::test]
+async fn test_eth_get_uncle_stored_uncle_renders_its_own_transactions() {
+    // rskj looks the uncle up as a block first and only falls back to the
+    // header. So when the node *does* have that block -- it downloaded the
+    // competing branch during a reorg -- the answer carries the uncle's
+    // transaction hashes and its real total difficulty.
+    //
+    // go-ethereum always answers with an empty block here. Returning `[]`
+    // unconditionally would look right and be wrong; this test is what stops
+    // that. See docs/rskj-vs-geth.md.
+    let (state, _tmp) = setup_state();
+
+    let uncle = uncle_header(700, 8);
+    let uncle_hash = uncle.hash();
+    let tx = rustock_core::Transaction {
+        nonce: 3,
+        gas_price: U256::from(20_000_000_000u64),
+        gas_limit: U256::from(21_000),
+        to: alloy_primitives::Bytes::from(vec![0x34; 20]),
+        value: U256::from(7),
+        input: alloy_primitives::Bytes::default(),
+        v: 27,
+        r: U256::from(11),
+        s: U256::from(22),
+        cached_rlp: None,
+    };
+    state.store.put_header(&uncle).unwrap();
+    state.store.put_body(uncle_hash, std::slice::from_ref(&tx), &[]).unwrap();
+    state.store.put_total_difficulty(uncle_hash, U256::from(4242)).unwrap();
+
+    let block = store_block_with_uncles(&state.store, 701, &[uncle]);
+
+    let result = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getUncleByBlockHashAndIndex",
+            json!([format!("{:#x}", block), "0x0"]),
+        ),
+    )
+    .await
+    .result
+    .unwrap();
+
+    assert_eq!(
+        result["transactions"],
+        json!([format!("{:#x}", tx.tx_hash())]),
+        "a stored uncle is rendered with its own transactions, as hashes"
+    );
+    assert_eq!(result["totalDifficulty"], json!("0x1092"));
+}
+
+#[tokio::test]
+async fn test_block_size_counts_the_whole_block_not_just_the_header() {
+    // rskj reports `block.getEncoded().length`: the RLP list
+    // [header, transactions, uncles]. Measuring the header alone made `size`
+    // independent of the transactions, which is the one thing callers use it
+    // for.
+    let (state, _tmp) = setup_state();
+
+    let tx = rustock_core::Transaction {
+        nonce: 1,
+        gas_price: U256::from(1),
+        gas_limit: U256::from(21_000),
+        to: alloy_primitives::Bytes::from(vec![0x56; 20]),
+        value: U256::from(1),
+        input: alloy_primitives::Bytes::from(vec![0xab; 500]),
+        v: 27,
+        r: U256::from(1),
+        s: U256::from(2),
+        cached_rlp: None,
+    };
+    let header = test_header(900);
+    let hash = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_body(hash, std::slice::from_ref(&tx), &[]).unwrap();
+    state.store.put_canonical_hash(900, hash).unwrap();
+
+    let result = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockByHash", json!([format!("{:#x}", hash), false])),
+    )
+    .await
+    .result
+    .unwrap();
+
+    let size = u64::from_str_radix(
+        result["size"].as_str().unwrap().trim_start_matches("0x"),
+        16,
+    )
+    .unwrap();
+
+    let mut header_rlp = Vec::new();
+    alloy_rlp::Encodable::encode(&header, &mut header_rlp);
+    assert!(
+        size > header_rlp.len() as u64 + 500,
+        "size {size} must include the 500-byte payload on top of the {}-byte header",
+        header_rlp.len()
+    );
+}

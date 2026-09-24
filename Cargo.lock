@@ -3218,6 +3218,7 @@ dependencies = [
  "rustock-sync",
  "rustock-trie",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",

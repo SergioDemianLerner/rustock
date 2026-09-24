@@ -156,6 +156,8 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_getBlockTransactionCountByNumber" => eth::eth_get_block_transaction_count_by_number(id, params, &state.store),
         "eth_getUncleCountByBlockHash" => eth::eth_get_uncle_count_by_block_hash(id, params, &state.store),
         "eth_getUncleCountByBlockNumber" => eth::eth_get_uncle_count_by_block_number(id, params, &state.store),
+        "eth_getUncleByBlockHashAndIndex" => eth::eth_get_uncle_by_block_hash_and_index(id, params, &state.store),
+        "eth_getUncleByBlockNumberAndIndex" => eth::eth_get_uncle_by_block_number_and_index(id, params, &state.store),
 
         // -- rpc --
         "rpc_modules" => {

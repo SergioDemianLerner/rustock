@@ -1,5 +1,5 @@
 use crate::helpers::{
-    parse_b256, parse_block_number, to_hex_u256, to_hex_u64, BlockResultDto,
+    parse_b256, parse_block_number, parse_hex_u32, to_hex_u256, to_hex_u64, BlockResultDto,
 };
 use crate::server::TxSubmitter;
 use crate::types::*;
@@ -238,7 +238,97 @@ pub fn eth_get_uncle_count_by_block_number(id: Value, params: &Value, store: &Bl
     }
 }
 
+pub fn eth_get_uncle_by_block_hash_and_index(id: Value, params: &Value, store: &BlockStore) -> JsonRpcResponse {
+    let Some(hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
+    };
+    let Some(index) = params.get(1).and_then(|v| v.as_str()).and_then(parse_hex_u32) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid index");
+    };
+
+    match uncle_dto(store, hash, index) {
+        Some(dto) => JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap()),
+        None => JsonRpcResponse::success(id, Value::Null),
+    }
+}
+
+pub fn eth_get_uncle_by_block_number_and_index(id: Value, params: &Value, store: &BlockStore) -> JsonRpcResponse {
+    let Some(bn_str) = params.get(0).and_then(|v| v.as_str()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block number");
+    };
+    let head_num = head_number(store).unwrap_or(0);
+    let Some(number) = parse_block_number(bn_str, head_num) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block number");
+    };
+    // The index is validated before the block is looked up, so a malformed
+    // index is an error even when the block is unknown -- rskj rejects it in
+    // parameter deserialisation, before the method body runs.
+    let Some(index) = params.get(1).and_then(|v| v.as_str()).and_then(parse_hex_u32) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid index");
+    };
+
+    let hash = match store.canonical_hash(number) {
+        Ok(Some(h)) => h,
+        _ => return JsonRpcResponse::success(id, Value::Null),
+    };
+
+    match uncle_dto(store, hash, index) {
+        Some(dto) => JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap()),
+        None => JsonRpcResponse::success(id, Value::Null),
+    }
+}
+
 // -- internal helpers --------------------------------------------------------
+
+/// One uncle of `block_hash`, rendered as a block. `None` means JSON `null`.
+///
+/// This mirrors rskj's `Web3Impl.getUncleResultDTO`, which has two behaviours
+/// that are not the obvious ones:
+///
+/// 1. **An out-of-range index is `null`, not an error.** So is an unknown
+///    parent block. Only a malformed index is an error, and that is rejected
+///    earlier, during parameter parsing.
+///
+/// 2. **The uncle is rendered with its own body when the node happens to have
+///    that block.** rskj calls `blockchain.getBlockByHash(uncleHeader.getHash())`
+///    first and only falls back to `Block.createBlockFromHeader` -- an empty
+///    block synthesised from the header -- when the lookup misses. An uncle
+///    was a real block on a competing branch, so if this node downloaded that
+///    branch it has the transactions, and rskj returns them.
+///
+///    go-ethereum does not do this: it always builds `NewBlockWithHeader(uncle)`
+///    and so always answers with empty `transactions` and `uncles`. The
+///    consequence is that on RSK the same call against two honest nodes can
+///    return different `transactions` and `size` for the same uncle, depending
+///    on what each node stored. See `docs/rskj-vs-geth.md`.
+///
+/// `totalDifficulty` gets the same treatment by accident of rskj's storage
+/// layer: `getTotalDifficultyForHash` returns ZERO for a hash it does not
+/// have, which is what an unstored uncle hits, and `unwrap_or_default()` here
+/// gives the same `0x0`.
+fn uncle_dto(
+    store: &BlockStore,
+    block_hash: alloy_primitives::B256,
+    index: u32,
+) -> Option<BlockResultDto> {
+    // The uncle *headers* live in the parent's body. No body means the node
+    // has at most a bare header for this block, which cannot name its uncles.
+    let (_, ommers) = store.body(block_hash).ok().flatten()?;
+    let uncle_header = ommers.get(index as usize)?;
+    let uncle_hash = uncle_header.hash();
+
+    let uncle_body = store.body(uncle_hash).ok().flatten();
+    let td = store.total_difficulty(uncle_hash).ok().flatten().unwrap_or_default();
+
+    Some(BlockResultDto::from_header_with_body(
+        uncle_header,
+        uncle_hash,
+        td,
+        uncle_body.as_ref(),
+        false,
+    ))
+}
+
 
 fn head_number(store: &BlockStore) -> Option<u64> {
     store.head().ok()?

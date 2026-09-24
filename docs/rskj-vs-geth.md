@@ -137,6 +137,55 @@ Two further details:
 
 ---
 
+## `eth_getUncleBy*AndIndex` may return the uncle's transactions
+
+| | |
+|---|---|
+| **go-ethereum** | always `types.NewBlockWithHeader(uncle)` — empty `transactions`, empty `uncles`, every time |
+| **rskj** | the uncle's *stored block* when the node has one, with its real transaction hashes; an empty block synthesised from the header only as a fallback |
+| **source** | `org/ethereum/rpc/Web3Impl.java`, `getUncleResultDTO` |
+
+```java
+BlockHeader uncleHeader = block.getUncleList().get(uncleIdx);
+Block uncle = blockchain.getBlockByHash(uncleHeader.getHash().getBytes());
+
+if (uncle == null) {                     // <- only then is it header-only
+    boolean isRskip126Enabled = config.getActivationConfig()
+            .isActive(ConsensusRule.RSKIP126, uncleHeader.getNumber());
+    uncle = Block.createBlockFromHeader(uncleHeader, isRskip126Enabled);
+}
+
+return getBlockResult(uncle, false);
+```
+
+An uncle is a real block that lost a race on a competing branch. A node that
+downloaded that branch has its body, and rskj hands it back.
+
+**The consequence is that this method is not deterministic across nodes.** Two
+honest, fully synced rskj nodes can answer the same call with different
+`transactions`, different `size` and a different `totalDifficulty` — zero on
+the node that lacks the block, the real cumulative difficulty on the node that
+has it — purely because of what each happened to store. Nothing in the response
+says which branch produced it.
+
+**Cost of getting it wrong.** Hard-coding `transactions: []` looks correct and
+passes against any node that never saw the competing branch — which, measured
+on this node, is *every* uncle: 3,818 uncles across 1,971 blocks below
+#5,000,000, none of them stored as a block. The divergence would then appear
+only against a node that had reorged, i.e. exactly when someone is
+investigating a reorg.
+
+Two smaller notes on the same method:
+
+* **An out-of-range index is `null`, not an error** (`if (uncleIdx >=
+  block.getUncleList().size()) return null;`), and so is an unknown block. Only
+  a *malformed* index is an error, rejected earlier by `HexIndexParam`.
+* **`totalDifficulty` is `0x0` for an unstored uncle** rather than absent:
+  `IndexedBlockStore.getTotalDifficultyForHash` returns `ZERO` for a hash it
+  does not have.
+
+---
+
 ## How to add an entry
 
 When implementing anything against rskj, if the Java does not match what the

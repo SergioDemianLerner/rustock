@@ -146,6 +146,7 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
 - `eth_getBlockByHash`, `eth_getBlockByNumber`
 - `eth_getBlockTransactionCountByHash`, `eth_getBlockTransactionCountByNumber`
 - `eth_getUncleCountByBlockHash`, `eth_getUncleCountByBlockNumber`
+- `eth_getUncleByBlockHashAndIndex`, `eth_getUncleByBlockNumberAndIndex`
 - `net_version`, `net_peerCount`, `net_listening`, `net_peerList`
 - `web3_clientVersion`, `web3_sha3`
 - `rpc_modules`
