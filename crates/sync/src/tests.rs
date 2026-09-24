@@ -2090,10 +2090,21 @@ async fn test_reconcile_when_the_forks_parent_was_never_downloaded() {
         service.reconcile_exec_head_with_canonical().await;
     }
 
+    // At or below b1 -- the network's chain builds on b1 and on everything
+    // under it, so any of them lets sync re-request #2 and receive x2.
+    //
+    // This used to assert exactly b1, i.e. a one-block retreat, and that
+    // assertion was the 2026-09-24 stall written down as a requirement. The
+    // node cannot know the fork is only one block deep: x2 is missing, which
+    // is precisely why `fork_point` cannot answer here. It now retreats
+    // `BLIND_RETREAT_DEPTH` blocks instead, which on this three-block fixture
+    // reaches genesis.
     let (head, _) = store.exec_head().unwrap().unwrap();
-    assert_eq!(head, b1_hash,
-        "execution must retreat to b1, the last block the network's chain also \
-         builds on, so sync can re-request #2 and receive x2; got {head:?}");
+    let exec_number = store.header(head).unwrap().unwrap().number;
+    assert!(exec_number <= 1,
+        "execution must retreat to at least b1 (#1), the deepest block the \
+         network's chain also builds on, so sync can re-request #2 and receive \
+         x2; stopped at #{exec_number} ({head:?})");
 
     // Rolling execution back is only half of it, and asserting only that is why
     // this wedge survived a test written for its own shape. `our_head_number()`
@@ -2102,12 +2113,121 @@ async fn test_reconcile_when_the_forks_parent_was_never_downloaded() {
     // asks peers for headers after a block their chain abandoned, stores the
     // dangling children again, and completes without advancing. Mainnet
     // #9,258,222 looped there for 15 minutes with peers answering in 1s.
-    assert_eq!(store.head().unwrap(), Some(b1_hash),
-        "the head pointer must retreat too, or the next skeleton is requested \
-         from the orphan and the node re-downloads the same dangling headers");
+    let head_number = store
+        .head()
+        .unwrap()
+        .and_then(|h| store.header(h).unwrap())
+        .map(|h| h.number);
+    assert_eq!(head_number, Some(exec_number),
+        "the head pointer must retreat with execution, or the next skeleton is \
+         requested from the orphan and the node re-downloads the same dangling \
+         headers");
     assert_ne!(store.canonical_hash(2).unwrap(), Some(a2_hash),
         "the canonical pointer must stop naming the orphan at #2, so the height \
          is downloaded again");
+}
+
+/// The mainnet stall of 2026-09-24, at the service level.
+///
+/// A **three-deep** reorg whose replacement branch was never downloaded:
+///
+/// ```text
+///   #30  f30                      the fork point (canonical, executed)
+///   #31  a31 ours       x31 the network's -- NOT IN STORE
+///   #32  a32 ours       x32                -- NOT IN STORE
+///   #33  a33 ours, executed head  x33      -- NOT IN STORE
+///   #34                           c34 stored, parent = x33
+/// ```
+///
+/// Retreating to the orphaned head's parent lands on a32 (#32), which is
+/// itself on the abandoned branch. The live node then sat there: a32 is
+/// stored and builds on a31, so the orphan check saw a successor extending
+/// the head and reported everything fine, while no peer would ever extend it.
+/// Twelve minutes, until the network moved 25 blocks ahead and skeleton sync
+/// took over.
+///
+/// The retreat must end up at or below the fork.
+#[tokio::test]
+async fn test_reconcile_retreats_below_a_three_deep_fork() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    // A common chain up to the fork point.
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut parent = genesis.hash();
+    let mut fork_hash = parent;
+    for n in 1..=30u64 {
+        let h = dummy_header(n, parent, U256::from(1));
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        parent = h.hash();
+        fork_hash = parent;
+    }
+
+    // Our branch: three blocks above the fork, all executed.
+    let mut ours = fork_hash;
+    let mut our_tip = None;
+    for n in 31..=33u64 {
+        let mut h = dummy_header(n, ours, U256::from(1));
+        h.extra_data = vec![0xAA].into();
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        ours = h.hash();
+        our_tip = Some(h);
+    }
+    let our_tip = our_tip.unwrap();
+    let our_tip_hash = our_tip.hash();
+
+    // The network's branch: three blocks the node never downloaded, and one
+    // child of the last of them that it did.
+    let mut theirs = fork_hash;
+    for n in 31..=33u64 {
+        let mut h = dummy_header(n, theirs, U256::from(9));
+        h.extra_data = vec![0xCC].into();
+        theirs = h.hash(); // deliberately NOT stored
+    }
+    let c34 = dummy_header(34, theirs, U256::from(9));
+    store.put_header(&c34).unwrap();
+    assert!(store.header(theirs).unwrap().is_none(), "their #33 is absent");
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(our_tip.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    store.set_exec_head(our_tip_hash, our_tip.state_root).unwrap();
+
+    service.reconcile_exec_head_with_canonical().await;
+
+    let (exec, _) = store.exec_head().unwrap().unwrap();
+    let exec_number = store.header(exec).unwrap().unwrap().number;
+    assert!(
+        exec_number <= 30,
+        "the retreat must end at or below the fork (#30); it stopped at #{exec_number}, \
+         which is still on the branch the network abandoned"
+    );
+    assert!(
+        exec_number < 32,
+        "#32 is the orphaned head's own parent -- retreating there is the 2026-09-24 bug"
+    );
+
+    let head_number = store
+        .head()
+        .unwrap()
+        .and_then(|h| store.header(h).unwrap())
+        .map(|h| h.number);
+    assert_eq!(head_number, Some(exec_number),
+        "the head must retreat with execution, or the next skeleton is requested from \
+         a block the network abandoned");
+    assert_ne!(store.canonical_hash(33).unwrap(), Some(our_tip_hash),
+        "the canonical index must stop naming the orphan");
 }
 
 #[tokio::test]
