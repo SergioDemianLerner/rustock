@@ -822,6 +822,164 @@ fn abi_decode_string(args: &[u8], slot: usize) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Federator-client state
+// ---------------------------------------------------------------------------
+//
+// Three methods that hand a federator's signing client the Bridge state it
+// needs. All three return an RLP blob inside an ABI `bytes`, and all three are
+// `LocalOnly`.
+
+/// `getStateForBtcReleaseClient()` → bytes.
+///
+/// rskj: `new StateForFederator(provider.getPegoutsWaitingForSignatures()).encodeToRlp()`,
+/// which is `RLP.encodeList(serializeRskTxsWaitingForSignatures(map))` -- the
+/// serialized map, itself an RLP list, wrapped in a one-element outer list.
+/// The double wrapping is not redundant: `StateForFederator`'s decoder reads
+/// `rlpList.get(0)`, so a client parsing this expects the extra level.
+///
+/// This is the map the signing client polls: every peg-out awaiting federator
+/// signatures, keyed by the RSK transaction that created it.
+pub fn get_state_for_btc_release_client<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let data = bridge_load_bytes_named(ctx, PEGOUTS_WAITING_FOR_SIGNATURES_KEY);
+    let waiting = super::peg::deserialize_rsk_txs_waiting_for_signatures(&data);
+    let serialized = super::peg::serialize_rsk_txs_waiting_for_signatures(&waiting);
+    let encoded = serialization::rlp_encode_list(&[serialized]);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&encoded).into()))
+}
+
+/// `getStateForSvpClient()` → bytes.
+///
+/// rskj returns `RLP.encodeList(serializeRskTxWaitingForSignatures(entry))`
+/// for the single SVP spend transaction awaiting signatures, and
+/// `RLP.encodeList(RLP.encodedEmptyList())` when there is none -- an empty
+/// list inside a list, not an empty blob, so the client's decoder finds the
+/// element it indexes and sees it empty.
+///
+/// The SVP (RSKIP419) is the protocol that proves a proposed federation can
+/// sign before it takes over. Outside a federation change this is the empty
+/// case.
+pub fn get_state_for_svp_client<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let stored = bridge_load_bytes_named(ctx, SVP_SPEND_TX_WAITING_FOR_SIGNATURES_KEY);
+    // Stored as RLP[rskTxHash, btcTx]; rskj serializes the entry the same way.
+    let inner = if stored.is_empty() {
+        serialization::rlp_encode_list(&[])
+    } else {
+        stored
+    };
+    let encoded = serialization::rlp_encode_list(&[inner]);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&encoded).into()))
+}
+
+/// `getStateForDebugging()` → bytes: the whole Bridge state in one call.
+///
+/// rskj `BridgeState.getEncoded()`, a six-element RLP list:
+///
+/// ```text
+/// [ btcBlockchainBestChainHeight   (RLP.encodeBigInteger, not an element)
+/// , activeFederationBtcUTXOs       (element of serializeUTXOList)
+/// , rskTxsWaitingForSignatures     (element)
+/// , releaseRequestQueue            (element; with-txhash form from RSKIP146)
+/// , pegoutsWaitingForConfirmations (element; with-txhash form from RSKIP146)
+/// , nextPegoutCreationBlockNumber  (element of serializeLong) ]
+/// ```
+///
+/// The first field is the odd one: `encodeBigInteger` rather than
+/// `encodeElement`, so the height is a minimal-length integer while the other
+/// five are byte strings. Encoding it like its neighbours produces a blob a
+/// client decodes as the wrong type.
+///
+/// **The UTXOs are the *new* federation's**, read from
+/// `newFederationBtcUTXOs` directly -- `getNewFederationBtcUTXOs()`, not the
+/// active-federation selection that switches to the old key during an
+/// activation window. `eth_bridgeState` exposes none of this; this method is
+/// the only one that returns the whole thing, which is why it is priced at
+/// 3,000,000 gas.
+pub fn get_state_for_debugging<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    gas_cost: u64,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    // rskj `BridgeState.shouldUsePapyrusEncoding` == RSKIP146.
+    let papyrus = hardfork_cfg.has_rskip146(block_number);
+
+    let height = super::btc_store::load_chain_head(ctx).map_or(0u32, |h| h.height);
+    let utxos = load_federation_utxos(ctx);
+    let waiting_for_signatures = super::peg::serialize_rsk_txs_waiting_for_signatures(
+        &super::peg::deserialize_rsk_txs_waiting_for_signatures(&bridge_load_bytes_named(
+            ctx,
+            PEGOUTS_WAITING_FOR_SIGNATURES_KEY,
+        )),
+    );
+    let queue = super::peg::load_release_request_queue(ctx, papyrus);
+    let queue_bytes = if papyrus {
+        super::peg::serialize_release_queue_with_hash(&queue)
+    } else {
+        super::peg::serialize_release_queue_legacy(&queue)
+    };
+    let confirmations = super::peg::load_pegout_confirmation_set(ctx, papyrus);
+    let confirmations_bytes =
+        super::peg::serialize_pegouts_waiting_for_confirmations(&confirmations, papyrus);
+    let next_pegout = bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY).to::<u64>();
+
+    let encoded = serialization::rlp_encode_list(&[
+        // encodeBigInteger, not encodeElement: a minimal-length integer.
+        serialization::rlp_encode_u64(u64::from(height)),
+        serialization::rlp_encode_element(&serialize_utxo_list(&utxos)),
+        serialization::rlp_encode_element(&waiting_for_signatures),
+        serialization::rlp_encode_element(&queue_bytes),
+        serialization::rlp_encode_element(&confirmations_bytes),
+        serialization::rlp_encode_element(&serialization::serialize_long(next_pegout)),
+    ]);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&encoded).into()))
+}
+
+/// ABI-encode a `string[]`.
+///
+/// A dynamic array of dynamic values: an offset to the array, its length, then
+/// one offset per element relative to the start of the element section, then
+/// each element as a length word plus its bytes padded to 32.
+pub(crate) fn abi_encode_string_array_pub(items: &[String]) -> Vec<u8> {
+    abi_encode_string_array(items)
+}
+
+fn abi_encode_string_array(items: &[String]) -> Vec<u8> {
+    let mut head = Vec::new();
+    let mut body = Vec::new();
+
+    // Offsets are measured from the first word after the length.
+    let mut offset = items.len() * 32;
+    for item in items {
+        head.extend_from_slice(&word(offset as u64));
+        let bytes = item.as_bytes();
+        body.extend_from_slice(&word(bytes.len() as u64));
+        let mut padded = bytes.to_vec();
+        padded.resize(bytes.len().div_ceil(32) * 32, 0);
+        body.extend_from_slice(&padded);
+        offset += 32 + bytes.len().div_ceil(32) * 32;
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&word(32)); // offset to the array
+    out.extend_from_slice(&word(items.len() as u64));
+    out.extend_from_slice(&head);
+    out.extend_from_slice(&body);
+    out
+}
+
+fn word(v: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..32].copy_from_slice(&v.to_be_bytes());
+    w
+}
+
+// ---------------------------------------------------------------------------
 // ABI encoding helpers
 // ---------------------------------------------------------------------------
 
@@ -1290,6 +1448,67 @@ mod tests {
             1_700_000_000
         );
         assert_eq!(as_int(&get_proposed_federation_size(&mut ctx, 0).unwrap()), 1);
+    }
+
+    // ---- federator-client state ----
+
+    /// rskj wraps the serialized map in an outer one-element list
+    /// (`StateForFederator.encodeToRlp`), and its decoder reads
+    /// `rlpList.get(0)` -- so the extra level is load-bearing, not redundant.
+    #[test]
+    fn state_for_btc_release_client_is_double_wrapped() {
+        let mut ctx = ctx_at(6_500_000);
+        let out = get_state_for_btc_release_client(&mut ctx, 0).unwrap();
+        let rlp = as_bytes(&out);
+
+        let outer = crate::bridge::serialization::rlp_decode_list(&rlp)
+            .expect("the answer is an RLP list");
+        assert_eq!(outer.len(), 1, "one element: the serialized map");
+        assert!(
+            crate::bridge::serialization::rlp_decode_list(&outer[0]).is_some(),
+            "and that element is itself a list -- the map"
+        );
+    }
+
+    /// With nothing awaiting signatures rskj still returns the shape, not an
+    /// empty blob: a client indexes into it either way.
+    #[test]
+    fn state_for_svp_client_is_an_empty_list_when_there_is_nothing() {
+        let mut ctx = ctx_at(7_400_000);
+        let out = get_state_for_svp_client(&mut ctx, 0).unwrap();
+        let rlp = as_bytes(&out);
+
+        let outer = crate::bridge::serialization::rlp_decode_list(&rlp).unwrap();
+        assert_eq!(outer.len(), 1);
+        let inner = crate::bridge::serialization::rlp_decode_list(&outer[0]).unwrap();
+        assert!(inner.is_empty(), "an empty list inside a list");
+    }
+
+    /// `BridgeState.getEncoded` is six fields, and the first is encoded as a
+    /// **big integer** while the other five are byte strings. Encoding the
+    /// height like its neighbours produces a blob that decodes as the wrong
+    /// type.
+    #[test]
+    fn state_for_debugging_has_six_fields_with_the_height_as_an_integer() {
+        let mut ctx = ctx_at(6_500_000);
+        let forks = hardforks();
+        let out = get_state_for_debugging(&mut ctx, 0, &forks).unwrap();
+        let rlp = as_bytes(&out);
+
+        let fields = crate::bridge::serialization::rlp_decode_list(&rlp)
+            .expect("BridgeState is an RLP list");
+        assert_eq!(fields.len(), 6, "btcHeight, utxos, waitingFS, queue, pegouts, nextHeight");
+
+        // An empty store gives height 0, which `encodeBigInteger` renders as
+        // the empty byte string rather than a zero byte.
+        assert!(fields[0].is_empty() || fields[0] == vec![0u8], "height as an integer");
+        // The middle four are byte strings holding their own RLP lists.
+        for (i, field) in fields.iter().enumerate().take(5).skip(1) {
+            assert!(
+                crate::bridge::serialization::rlp_decode_list(field).is_some(),
+                "field {i} should carry a serialized collection"
+            );
+        }
     }
 
     // ---- BTC tx index ----
