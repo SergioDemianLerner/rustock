@@ -303,3 +303,62 @@ pub async fn eth_send_raw_transaction(
         Err(e) => JsonRpcResponse::error(id, INVALID_PARAMS, e),
     }
 }
+
+/// `eth_bridgeState` — two fields, not the whole Bridge.
+///
+/// The name and the `BridgeState` class both suggest a full dump. They are
+/// misleading: `BridgeState` *holds* the UTXO set, the federation, the release
+/// request queue and the pegouts waiting for confirmations, but
+/// `stateToMap()` — which is what the RPC returns — exposes only two of them:
+///
+/// ```java
+/// public Map<String, Object> stateToMap() {
+///     Map<String, Object> result = new HashMap<>();
+///     result.put("rskTxsWaitingForSignatures", this.toStringList(rskTxsWaitingForSignatures.keySet()));
+///     result.put("btcBlockchainBestChainHeight", this.btcBlockchainBestChainHeight);
+///     return result;
+/// }
+/// ```
+///
+/// The rest is only in `getEncoded()`, which the RPC never calls.
+///
+/// Two further details that are easy to get wrong:
+///
+/// * **No block parameter.** rskj reads `blockchain.getBestBlock()`
+///   unconditionally (`EthModule.bridgeState`). A caller cannot ask about a
+///   historical block, so neither does this.
+/// * **The hashes carry no `0x` prefix.** `Keccak256.toHexString()` is
+///   `Hex.toHexString(bytes)`, which is bare hex — unusual for JSON-RPC, where
+///   almost everything else is prefixed, and the sort of difference a consumer
+///   discovers by failing to parse.
+pub fn eth_bridge_state(id: Value, state: &crate::server::RpcState) -> JsonRpcResponse {
+    use rustock_execution::bridge::{btc_store, peg, storage as bridge_storage};
+
+    let Some((root, _header)) = crate::state::resolve_state_root("latest", state) else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve the best block");
+    };
+    let Some(trie_store) = state.trie_store.clone() else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "No state available");
+    };
+
+    let mut ctx = rustock_execution::bridge_read_context(trie_store, root, None);
+
+    let height = btc_store::load_chain_head(&mut ctx).map(|h| h.height).unwrap_or(0);
+
+    // Keys only: rskj maps `rskTxsWaitingForSignatures.keySet()`, discarding the
+    // Bitcoin transactions themselves.
+    let key = bridge_storage::bridge_storage_key(
+        bridge_storage::PEGOUTS_WAITING_FOR_SIGNATURES_KEY,
+    );
+    let raw = bridge_storage::bridge_load_raw(&mut ctx, key).unwrap_or_default();
+    let waiting = peg::deserialize_rsk_txs_waiting_for_signatures(&raw);
+    let hashes: Vec<Value> = waiting.keys().map(|h| json!(hex::encode(h))).collect();
+
+    JsonRpcResponse::success(
+        id,
+        json!({
+            "rskTxsWaitingForSignatures": hashes,
+            "btcBlockchainBestChainHeight": height,
+        }),
+    )
+}

@@ -2297,3 +2297,130 @@ async fn test_receipt_proof_rejects_malformed_input() {
     }
 }
 
+
+// ========== eth_bridgeState (#86) ==========
+
+/// The shape is two fields, and only two.
+///
+/// `BridgeState` holds the UTXO set, the federation, the release request queue
+/// and the pegouts waiting for confirmations — and `stateToMap()`, which is
+/// what the RPC returns, exposes none of them. A caller expecting a full dump
+/// is expecting something rskj never gave.
+#[tokio::test]
+async fn test_eth_bridge_state_returns_exactly_rskjs_two_fields() {
+    let (state, _tmp) = setup_state_with_trie();
+    let resp = dispatch_for_test(&state, make_request("eth_bridgeState", json!([]))).await;
+
+    let v = resp.result.expect("should answer");
+    let obj = v.as_object().expect("an object");
+
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["btcBlockchainBestChainHeight", "rskTxsWaitingForSignatures"],
+        "rskj's stateToMap() returns these two and nothing else"
+    );
+    assert!(obj["btcBlockchainBestChainHeight"].is_number());
+    assert!(obj["rskTxsWaitingForSignatures"].is_array());
+}
+
+/// It takes no block parameter: rskj reads `blockchain.getBestBlock()`
+/// unconditionally. A caller passing one must not be able to steer the answer
+/// into believing it got a historical read.
+#[tokio::test]
+async fn test_eth_bridge_state_ignores_any_block_parameter() {
+    let (state, _tmp) = setup_state_with_trie();
+    let bare = dispatch_for_test(&state, make_request("eth_bridgeState", json!([]))).await;
+    let with_block = dispatch_for_test(&state, make_request("eth_bridgeState", json!(["0x1"]))).await;
+    assert_eq!(
+        bare.result.unwrap(),
+        with_block.result.unwrap(),
+        "a block parameter must not change the answer -- rskj has none"
+    );
+}
+
+/// An empty Bridge answers with an empty list, not null: the list is always
+/// present even when there is nothing waiting.
+#[tokio::test]
+async fn test_eth_bridge_state_with_nothing_waiting_is_an_empty_list() {
+    let (state, _tmp) = setup_state_with_trie();
+    let resp = dispatch_for_test(&state, make_request("eth_bridgeState", json!([]))).await;
+    let v = resp.result.unwrap();
+    assert_eq!(v["rskTxsWaitingForSignatures"], json!([]));
+    assert_eq!(v["btcBlockchainBestChainHeight"], json!(0), "no BTC chain head seeded in this fixture");
+}
+
+/// The hashes carry **no `0x` prefix**.
+///
+/// `Keccak256.toHexString()` is `Hex.toHexString(bytes)` — bare hex. Almost
+/// everything else in JSON-RPC is `0x`-prefixed, so this is the kind of
+/// difference a consumer finds by failing to parse, and it is worth a test
+/// rather than a comment.
+#[tokio::test]
+async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
+    use rustock_trie::{MemoryTrieStore, TrieKeySlice, TrieNode, storage_key};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let trie_store: Arc<dyn rustock_trie::TrieStore> = Arc::new(MemoryTrieStore::new());
+
+    // rskTxsWaitingFS is an RLP list of (32-byte rsk tx hash, btc tx) pairs.
+    let tx_hash = [0xABu8; 32];
+    let mut payload = Vec::new();
+    {
+        use alloy_rlp::Encodable;
+        let items: Vec<alloy_primitives::Bytes> = vec![
+            alloy_primitives::Bytes::from(tx_hash.to_vec()),
+            alloy_primitives::Bytes::from(vec![0x01u8, 0x02, 0x03]),
+        ];
+        items.encode(&mut payload);
+    }
+
+    let bridge_key = rustock_execution::bridge::storage::bridge_storage_key(
+        rustock_execution::bridge::storage::PEGOUTS_WAITING_FOR_SIGNATURES_KEY,
+    );
+    let trie_key = storage_key(
+        &rustock_execution::precompiles::BRIDGE_ADDR,
+        &B256::from(bridge_key),
+    );
+
+    let mut root = TrieNode::empty();
+    root = root.put(&TrieKeySlice::from_key(&trie_key), &payload, &*trie_store);
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+    rustock_trie::TrieStore::put(&*trie_store, state_root.as_slice(), &root.to_message(&*trie_store));
+
+    let header = Header { state_root, ..test_header(42) };
+    let hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(42, hash).unwrap();
+    store.set_head(hash).unwrap();
+    store.put_total_difficulty(hash, U256::from(42_000)).unwrap();
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: None,
+        trie_store: Some(trie_store),
+        hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
+        epoch_store: None,
+        miner: None,
+        admin_enabled: false,
+        gc_burial: 4000,
+        prune_keep_depth: 100_000,
+        prune_max_batch: 50_000,
+    };
+
+    let resp = dispatch_for_test(&state, make_request("eth_bridgeState", json!([]))).await;
+    let v = resp.result.unwrap();
+    let list = v["rskTxsWaitingForSignatures"].as_array().expect("a list");
+    assert_eq!(list.len(), 1, "the seeded waiting transaction should appear");
+
+    let s = list[0].as_str().unwrap();
+    assert!(!s.starts_with("0x"), "rskj emits bare hex here, not 0x-prefixed: got {s}");
+    assert_eq!(s, hex::encode(tx_hash));
+}
