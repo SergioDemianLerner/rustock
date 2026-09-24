@@ -105,7 +105,7 @@ pub fn rsk_get_storage_bytes_at(
     params: &Value,
     state: &crate::server::RpcState,
 ) -> JsonRpcResponse {
-    use alloy_primitives::{Address, B256};
+    use alloy_primitives::Address;
     use rustock_trie::{storage_key, TrieKeySlice};
 
     let Some(addr) = params

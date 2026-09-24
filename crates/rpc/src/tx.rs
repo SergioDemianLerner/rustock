@@ -1,5 +1,5 @@
 use crate::dto::{ReceiptDto, TransactionDto};
-use crate::helpers::{parse_b256, parse_block_number};
+use crate::helpers::{parse_b256, parse_block_number, parse_hex_u32};
 use crate::server::RpcState;
 use crate::types::*;
 use alloy_primitives::{Address, B256};
@@ -152,7 +152,3 @@ fn recover_sender_or_zero(tx: &rustock_core::Transaction) -> Address {
     tx.recover_sender(30).unwrap_or(Address::ZERO)
 }
 
-fn parse_hex_u32(s: &str) -> Option<u32> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    u32::from_str_radix(s, 16).ok()
-}

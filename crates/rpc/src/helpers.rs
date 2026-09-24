@@ -44,6 +44,14 @@ pub fn parse_block_number(s: &str, head_number: u64) -> Option<u64> {
     }
 }
 
+/// Parses a 0x-prefixed hex index. Returns None on anything malformed, which
+/// callers report as an invalid parameter -- rskj's `HexIndexParam` throws
+/// `invalidParamError` for the same inputs, before the method body runs.
+pub fn parse_hex_u32(s: &str) -> Option<u32> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u32::from_str_radix(s, 16).ok()
+}
+
 /// Block result DTO matching rskj's `BlockResultDTO` JSON format.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,8 +90,7 @@ impl BlockResultDto {
         body: Option<&(Vec<rustock_core::Transaction>, Vec<Header>)>,
         full_txs: bool,
     ) -> Self {
-        let mut rlp_buf = Vec::new();
-        alloy_rlp::Encodable::encode(header, &mut rlp_buf);
+        let size = encoded_block_len(header, body);
 
         let transactions = if let Some((txs, _)) = body {
             txs.iter()
@@ -128,9 +135,53 @@ impl BlockResultDto {
             minimum_gas_price: to_hex_u256(&header.minimum_gas_price),
             transactions,
             uncles,
-            size: to_hex_u64(rlp_buf.len() as u64),
+            size: to_hex_u64(size),
         }
     }
+}
+
+/// Length of the block's RLP encoding, which is what `size` reports.
+///
+/// rskj answers with `block.getEncoded().length` -- the whole block, i.e. the
+/// RLP list `[header, transactions, uncles]`, not the header alone. Measuring
+/// only the header made `size` short by the entire transaction list, so a
+/// block carrying 40 KB of transactions reported ~600 bytes. Callers use this
+/// to budget bandwidth and to sanity-check a block they have fetched, and both
+/// uses are defeated by a number that ignores the payload.
+///
+/// A block whose body is absent (header-only, or an uncle the node never
+/// stored) encodes as `[header, [], []]`, which is what rskj also produces for
+/// that case: it synthesises a body-less block from the header.
+fn encoded_block_len(
+    header: &Header,
+    body: Option<&(Vec<rustock_core::Transaction>, Vec<Header>)>,
+) -> u64 {
+    use alloy_rlp::{Encodable, Header as RlpHeader};
+
+    let mut header_rlp = Vec::new();
+    header.encode(&mut header_rlp);
+
+    let (txs_payload, ommers_payload) = match body {
+        Some((txs, ommers)) => {
+            let txs_len: usize = txs.iter().map(|tx| tx.rlp_for_trie().len()).sum();
+            let mut ommers_len = 0usize;
+            for o in ommers {
+                let mut buf = Vec::new();
+                o.encode(&mut buf);
+                ommers_len += buf.len();
+            }
+            (txs_len, ommers_len)
+        }
+        None => (0, 0),
+    };
+
+    let payload = header_rlp.len()
+        + RlpHeader { list: true, payload_length: txs_payload }.length()
+        + txs_payload
+        + RlpHeader { list: true, payload_length: ommers_payload }.length()
+        + ommers_payload;
+
+    (RlpHeader { list: true, payload_length: payload }.length() + payload) as u64
 }
 
 /// Compute the keccak256 hash of a transaction's RLP encoding.
