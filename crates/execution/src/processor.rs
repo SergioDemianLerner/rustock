@@ -284,6 +284,67 @@ impl BlockProcessor {
         StoreAncestry { store: &self.block_store }
     }
 
+    /// Has **this node** already executed this exact block, so that its result
+    /// can be adopted instead of re-running it?
+    ///
+    /// Re-execution is not rare. Every orphan recovery retreats the head below
+    /// the fork and then climbs back, and all but the handful of blocks above
+    /// the fork are blocks this node executed minutes earlier, producing state
+    /// roots that are still in the trie. Running the EVM over them again
+    /// reproduces bytes that are already on disk.
+    ///
+    /// # Why the receipt index is the right witness
+    ///
+    /// `put_receipts` is called from exactly one place in this crate -- the end
+    /// of `process_and_commit` -- so a receipt entry keyed by a block hash is a
+    /// record that *this* node executed *that* block. It is persisted, so it
+    /// survives a restart, and the pruner deletes it in the same batch as the
+    /// block and its state, so it cannot outlive what it vouches for.
+    /// `executed_locally_is_only_written_by_execution` pins that invariant.
+    ///
+    /// # Why it does not have to be trusted
+    ///
+    /// The stored receipts are hashed and compared against the header's
+    /// `receiptsRoot`, so the answer is **verified, not believed**. That
+    /// matters: the alternative test -- "is `header.state_root` in the trie?"
+    /// -- would be a validation bypass, because a header's state root is
+    /// attacker-chosen data and every root in our own history is public. A
+    /// miner could name a stale root and have us skip execution and record an
+    /// executed head whose state is a hundred blocks old. Here a forged header
+    /// cannot pass: we only ever hold receipts we produced ourselves, and they
+    /// have to hash to the root the header claims.
+    ///
+    /// The caller must **also** confirm the state root still resolves in the
+    /// trie store. Both halves are needed and neither implies the other: this
+    /// says who validated the block, the trie says whether its state is still
+    /// there.
+    ///
+    /// One caveat worth stating: `rskj_import::import_receipts` writes the same
+    /// index during a bootstrap from rskj. For those blocks the state came from
+    /// the same import, so this changes no trust boundary -- the node accepted
+    /// that state wholesale when it imported it.
+    pub fn was_executed_locally(&self, hash: B256) -> bool {
+        let Ok(Some(header)) = self.block_store.header(hash) else {
+            return false;
+        };
+        let Ok(Some(receipts)) = self.block_store.receipts(hash) else {
+            return false;
+        };
+        // An empty list is not evidence. Every RSK block carries the REMASC
+        // synthetic transaction (see `is_remasc_tx`), so a real block always
+        // has at least one receipt; an empty entry means something other than
+        // a normal execution put it there. Refusing to skip can only cost a
+        // re-execution, so the conservative answer is the right one.
+        if receipts.is_empty() {
+            return false;
+        }
+        let root = ordered_trie_root(
+            &receipts,
+            self.hardfork_cfg.has_unitrie_state_root(header.number),
+        );
+        root == header.receipts_root
+    }
+
     /// The consensus rules that need the block body, run before execution.
     ///
     /// rskj composes these in `RskContext.getBlockValidationRule`. They all
@@ -823,6 +884,167 @@ mod tests {
             }
             e => panic!("unexpected error: {e}"),
         }
+    }
+
+    // ---------------------------------------------- was_executed_locally --
+
+    /// A block this node executed is recognised, because the receipts it wrote
+    /// hash to the header's `receiptsRoot`.
+    #[test]
+    fn a_block_this_node_executed_is_recognised() {
+        let trie = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone());
+
+        let (hash, _header) = execute_one_block(&processor, &block_store, &trie, 8_000_000);
+        assert!(processor.was_executed_locally(hash));
+    }
+
+    /// A block whose header we hold but which we never executed. This is the
+    /// common case at a tip reorg: the replacement branch's header arrives long
+    /// before anything runs it.
+    #[test]
+    fn a_block_we_only_have_the_header_for_is_not_recognised() {
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+        let header = dummy_header(8_000_000);
+        block_store.put_header(&header).unwrap();
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone());
+        assert!(!processor.was_executed_locally(header.hash()));
+    }
+
+    /// **The security property.** The receipts have to hash to the header's
+    /// `receiptsRoot`, so a header cannot claim to have been executed by
+    /// pointing at receipts that belong to some other block.
+    ///
+    /// Without this check the test below would pass, and with it a miner could
+    /// name any state root in our history and have us record an executed head
+    /// whose state is stale -- the validation bypass this whole design exists
+    /// to avoid.
+    #[test]
+    fn receipts_that_do_not_match_the_header_are_not_evidence() {
+        let trie = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone());
+
+        // Execute one block so we hold a genuine, non-empty receipt list.
+        let (executed_hash, _) = execute_one_block(&processor, &block_store, &trie, 8_000_000);
+        let real_receipts = block_store.receipts(executed_hash).unwrap().unwrap();
+        assert!(!real_receipts.is_empty(), "the fixture must produce receipts");
+
+        // A different block, with those receipts filed against it.
+        let mut forged = dummy_header(8_000_001);
+        forged.extra_data = vec![0xFF].into();
+        let forged_hash = forged.hash();
+        block_store.put_header(&forged).unwrap();
+        block_store.put_receipts(forged_hash, &real_receipts).unwrap();
+
+        assert!(
+            !processor.was_executed_locally(forged_hash),
+            "receipts belonging to another block must not vouch for this one"
+        );
+    }
+
+    #[test]
+    fn an_empty_receipt_list_is_not_evidence() {
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+        let header = dummy_header(8_000_000);
+        let hash = header.hash();
+        block_store.put_header(&header).unwrap();
+        block_store.put_receipts(hash, &[]).unwrap();
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone());
+        assert!(!processor.was_executed_locally(hash));
+    }
+
+    /// The invariant `was_executed_locally` rests on: within this crate, the
+    /// receipt index is written by execution and nothing else. If a second
+    /// writer is ever added, the receipt index stops being a witness that
+    /// *this node ran this block* and the fast-forward becomes unsound.
+    ///
+    /// (`rskj_import::import_receipts` in the storage crate is the deliberate
+    /// exception, and is documented on `was_executed_locally`.)
+    #[test]
+    fn executed_locally_is_only_written_by_execution() {
+        const SOURCE: &str = include_str!("processor.rs");
+        let production = SOURCE.split("#[cfg(test)]").next().unwrap();
+        let writes = production.matches(".put_receipts(").count();
+        assert_eq!(
+            writes, 2,
+            "put_receipts is called {writes} times in this crate's production code, not 2 \
+             (the unitrie and Orchid arms of process_and_commit). A new writer means the \
+             receipt index no longer proves this node executed the block -- see \
+             was_executed_locally."
+        );
+    }
+
+    /// Execute a minimal block and return its hash. Shared by the tests above
+    /// so they all start from a genuinely executed block rather than a
+    /// hand-built receipt list.
+    fn execute_one_block(
+        processor: &BlockProcessor,
+        block_store: &Arc<BlockStore>,
+        trie: &Arc<MemoryTrieStore>,
+        number: u64,
+    ) -> (B256, Header) {
+        let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let sender = sender_address(&key);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), trie.as_ref(), &sender, 0, one_rbtc);
+
+        let mut tx = Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(21_000),
+            to: Bytes::copy_from_slice(Address::repeat_byte(0xDD).as_slice()),
+            value: U256::from(1),
+            input: Bytes::default(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign_tx(&mut tx, &key, 33);
+
+        // Two passes, because a header has to carry the roots its own
+        // execution produces: run it once to learn them, then build the real
+        // header and commit it the way the node does.
+        let draft = Block {
+            header: dummy_header(number),
+            transactions: vec![tx.clone()],
+            ommers: vec![],
+        };
+        let learned = processor
+            .execute_and_commit(&draft, &root, trie.clone())
+            .expect("the fixture block must execute");
+
+        let mut header = dummy_header(number);
+        header.state_root = learned.state_root_hash;
+        header.receipts_root = learned.receipts_root;
+        header.transactions_root = rustock_core::ordered_tx_trie_root(
+            std::slice::from_ref(&tx),
+            test_hardfork_cfg().has_unitrie_state_root(number),
+        );
+        header.ommers_hash = crate::processor::compute_ommers_hash(&[]);
+        header.gas_used = learned.gas_used;
+        header.paid_fees = learned.paid_fees;
+        let block = Block {
+            header: header.clone(),
+            transactions: vec![tx],
+            ommers: vec![],
+        };
+        let hash = block.hash();
+        block_store.put_header(&header).unwrap();
+        processor
+            .process_and_commit(&block, &root, trie.clone())
+            .expect("the corrected fixture block must process");
+        (hash, header)
     }
 
     #[test]

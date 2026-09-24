@@ -135,6 +135,36 @@ pub(crate) fn canonical_top_held(store: &BlockStore, from: u64) -> Option<B256> 
 
 /// Record execution progress through a transition, so the executed head can
 /// never be set to a block whose lineage does not hold.
+/// Adopt a block this node has already executed, instead of executing it again.
+///
+/// Returns its state root node when the block can be fast-forwarded over, and
+/// `None` when it has to be executed.
+///
+/// **Two conditions, and neither implies the other.** `was_executed_locally`
+/// says *this node* validated this exact block -- verified by hashing the
+/// stored receipts against the header's `receiptsRoot`, not taken on trust.
+/// The trie lookup says the state it produced is *still there*. Skipping on the
+/// state root alone would be a validation bypass: a header's state root is
+/// attacker-chosen, and every root in our own history is public.
+///
+/// This is what makes a deep retreat cheap. An orphan recovery retreats below
+/// the fork and climbs back over blocks it executed minutes ago; only the
+/// handful above the fork are new work. Re-running the EVM over the rest
+/// reproduces bytes already on disk -- measured at 13-55 ms per block, so
+/// 0.3-1.4 s on every reorg.
+pub(crate) fn fast_forward_state(
+    processor: &rustock_execution::BlockProcessor,
+    trie_store: &Arc<dyn TrieStore>,
+    header: &Header,
+    hash: B256,
+) -> Option<TrieNode> {
+    if !processor.was_executed_locally(hash) {
+        return None;
+    }
+    let data = trie_store.get(header.state_root.as_slice())?;
+    Some(TrieNode::from_message(&data, trie_store.as_ref()))
+}
+
 pub(crate) fn record_execution(store: &BlockStore, hash: B256, state_root: B256) {
     match Validated::prove(store, hash) {
         Ok(at) => {
@@ -3009,6 +3039,19 @@ impl SyncService {
             return false;
         }
 
+        // Already executed by this node? Adopt the result instead of redoing it.
+        if let Some(node) = fast_forward_state(&processor, &trie_store, header, hash) {
+            record_execution(&self.manager.store, hash, header.state_root);
+            self.current_state_root = Some(node);
+            info!(
+                target: "rustock::sync",
+                "Re-adopted block #{} without re-executing it (already executed locally, \
+                 state root {:?} still held)",
+                header.number, header.state_root
+            );
+            return true;
+        }
+
         let cpu_start = crate::chain_activity::thread_cpu_time();
         let wall_start = Instant::now();
         match processor.process_and_commit(&block, &state_root, trie_store.clone()) {
@@ -3098,6 +3141,8 @@ fn process_downloaded_blocks(
 ) -> ExecOutcome {
     let mut current_root = state_root;
     let mut processed = 0u64;
+    // Of `processed`, how many were adopted without re-running the EVM.
+    let mut fast_forwarded = 0u64;
     let mut all_ok = true;
     let mut last_executed: Option<(B256, B256)> = None;
 
@@ -3168,6 +3213,15 @@ fn process_downloaded_blocks(
             break;
         }
 
+        // Already executed by this node? Adopt the result instead of redoing it.
+        if let Some(node) = fast_forward_state(&processor, &trie_store, header, *hash) {
+            current_root = node;
+            last_executed = Some((*hash, header.state_root));
+            processed += 1;
+            fast_forwarded += 1;
+            continue;
+        }
+
         // Both clocks, because the difference between them is the diagnostic:
         // CPU time rising is execution getting slower, wall time rising alone
         // is the node waiting on the trie database rather than working.
@@ -3225,11 +3279,19 @@ fn process_downloaded_blocks(
         if let Some((hash, root_hash)) = last_executed {
             record_execution(store, hash, root_hash);
         }
-        info!(
-            target: "rustock::sync",
-            "Processed {} blocks, state root: {:?}",
-            processed, current_root.compute_hash(trie_store.as_ref())
-        );
+        if fast_forwarded > 0 {
+            info!(
+                target: "rustock::sync",
+                "Processed {} blocks ({} re-adopted without re-executing), state root: {:?}",
+                processed, fast_forwarded, current_root.compute_hash(trie_store.as_ref())
+            );
+        } else {
+            info!(
+                target: "rustock::sync",
+                "Processed {} blocks, state root: {:?}",
+                processed, current_root.compute_hash(trie_store.as_ref())
+            );
+        }
     }
 
     ExecOutcome {

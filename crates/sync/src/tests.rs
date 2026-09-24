@@ -2230,6 +2230,57 @@ async fn test_reconcile_retreats_below_a_three_deep_fork() {
         "the canonical index must stop naming the orphan");
 }
 
+/// Both halves of the fast-forward rule, and neither implies the other.
+///
+/// `was_executed_locally` says this node validated the block;
+/// the trie lookup says the state it produced is still held. A block that
+/// passes the first and fails the second must still be executed -- there is
+/// no state to adopt.
+#[test]
+fn fast_forward_needs_the_receipts_and_the_state() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let receipts = vec![rustock_core::Receipt {
+        post_tx_state: vec![0x01],
+        cumulative_gas_used: 21_000,
+        gas_used: 21_000,
+        logs_bloom: alloy_primitives::Bloom::ZERO,
+        logs: vec![],
+        status: true,
+    }];
+
+    let hardfork = rustock_execution::RskHardforkConfig::mainnet();
+    let number = 9_000_000u64;
+    let mut header = dummy_header(number, B256::ZERO, U256::from(1));
+    header.state_root = B256::repeat_byte(0x5A);
+    header.receipts_root =
+        rustock_core::ordered_trie_root(&receipts, hardfork.has_unitrie_state_root(number));
+    let hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_receipts(hash, &receipts).unwrap();
+
+    let processor = rustock_execution::BlockProcessor::new(hardfork, store.clone());
+    assert!(processor.was_executed_locally(hash), "the receipts vouch for this block");
+
+    // State absent: must execute.
+    let empty_trie: Arc<dyn rustock_trie::TrieStore> =
+        Arc::new(rustock_trie::MemoryTrieStore::new());
+    assert!(
+        crate::service::fast_forward_state(&processor, &empty_trie, &header, hash).is_none(),
+        "no state to adopt, so the block has to be executed"
+    );
+
+    // State present: adopt it.
+    let with_state: Arc<dyn rustock_trie::TrieStore> =
+        Arc::new(rustock_trie::MemoryTrieStore::new());
+    let node = rustock_trie::TrieNode::empty();
+    with_state.put(header.state_root.as_slice(), &node.to_message(with_state.as_ref()));
+    assert!(
+        crate::service::fast_forward_state(&processor, &with_state, &header, hash).is_some(),
+        "executed locally and the state is still held: adopt it"
+    );}
+
 #[tokio::test]
 async fn test_reconcile_leaves_a_genuine_tip_alone() {
     // The same code path must not fire at the tip. Nothing is stored above our
