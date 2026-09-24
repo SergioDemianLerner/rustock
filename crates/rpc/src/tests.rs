@@ -1847,6 +1847,107 @@ async fn test_eth_accounts_is_empty_because_there_is_no_wallet() {
     );
 }
 
+/// `eth_pendingTransactions` is empty for the same reason `eth_accounts` is:
+/// rskj scopes it to the node's own wallet, and this node has none.
+///
+/// It is emphatically NOT "the mempool". rskj filters the pool to senders the
+/// wallet manages, and `EthModuleWalletDisabled` returns `Collections.emptyList()`
+/// unconditionally. Returning the pending pool here would present every
+/// transaction in the public mempool as the caller's own.
+#[tokio::test]
+async fn test_eth_pending_transactions_is_empty_because_there_is_no_wallet() {
+    let (state, _tmp) = setup_state();
+    let resp = dispatch_for_test(&state, make_request("eth_pendingTransactions", json!([]))).await;
+    assert_eq!(
+        resp.result.unwrap(),
+        json!([]),
+        "a node with no wallet has no transactions of its own"
+    );
+    assert!(resp.error.is_none(), "it answers, rather than refusing");
+}
+
+/// The one that would catch a future change of heart: a pool holding a real
+/// pending transaction must not leak into `eth_pendingTransactions`.
+///
+/// Without this the other test proves nothing — an empty pool and an empty
+/// answer agree for the wrong reason. If someone later decides the method
+/// should report the mempool, this is what fails, and it names why.
+#[tokio::test]
+async fn test_eth_pending_transactions_ignores_a_populated_pool() {
+    let (state, hash, _tmp) = setup_state_with_pending_tx();
+
+    // The pool is genuinely reachable through the RPC layer, so a pass below is
+    // about this method rather than about a disconnected fixture.
+    let by_hash = dispatch_for_test(
+        &state,
+        make_request("eth_getTransactionByHash", json!([format!("0x{}", hex::encode(hash))])),
+    )
+    .await;
+    assert!(
+        by_hash.result.as_ref().is_some_and(|v| !v.is_null()),
+        "precondition: the pending transaction is visible via eth_getTransactionByHash"
+    );
+
+    let resp = dispatch_for_test(&state, make_request("eth_pendingTransactions", json!([]))).await;
+    assert_eq!(
+        resp.result.unwrap(),
+        json!([]),
+        "the pool leaked into eth_pendingTransactions. These are not the caller's own \
+         transactions -- rskj scopes this method to the node's wallet. Use txpool_content (#83)."
+    );
+}
+
+/// A pool holding exactly one pending transaction.
+///
+/// A double rather than a real `TransactionPool`: the RPC crate talks to the
+/// pool through `TxPoolReader` and does not depend on the sync crate, which is
+/// the right shape and means this test needs no signing key and no funded
+/// account to populate it.
+struct OnePendingTx {
+    tx: rustock_core::Transaction,
+    hash: B256,
+    sender: alloy_primitives::Address,
+}
+
+impl crate::server::TxPoolReader for OnePendingTx {
+    fn get_pending_tx(
+        &self,
+        hash: &B256,
+    ) -> Option<(rustock_core::Transaction, alloy_primitives::Address, B256)> {
+        (*hash == self.hash).then(|| (self.tx.clone(), self.sender, self.hash))
+    }
+    fn pending_nonce(&self, _addr: &alloy_primitives::Address) -> Option<u64> {
+        Some(self.tx.nonce + 1)
+    }
+    fn pool_status(&self) -> (usize, usize) {
+        (1, 0)
+    }
+}
+
+fn setup_state_with_pending_tx() -> (RpcState, B256, tempfile::TempDir) {
+    let (mut state, tmp) = setup_state();
+
+    let tx = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::from(1_000_000_000u64),
+        gas_limit: U256::from(21_000),
+        to: alloy_primitives::Bytes::from(vec![0xBBu8; 20]),
+        value: U256::from(1_000u64),
+        input: alloy_primitives::Bytes::new(),
+        v: 27,
+        r: U256::from(1u64),
+        s: U256::from(2u64),
+        cached_rlp: None,
+    };
+    let hash = B256::repeat_byte(0xA1);
+    state.tx_pool = Some(Arc::new(OnePendingTx {
+        tx,
+        hash,
+        sender: alloy_primitives::Address::repeat_byte(0x11),
+    }));
+    (state, hash, tmp)
+}
+
 /// The Solidity compiler methods are refused rather than answered with an
 /// empty list. rskj removed these upstream; answering "no compilers" would
 /// invite a caller to treat compilation as supported-but-unavailable.
