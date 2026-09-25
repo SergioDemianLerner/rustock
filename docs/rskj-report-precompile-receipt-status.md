@@ -99,7 +99,7 @@ handles those separately and the CALL fails visibly.
 
 ```
 to        0x0000000000000000000000000000000001000006   (Bridge)
-selector  0xf10b9c59  addSignature(bytes,bytes[],bytes)
+selector  a Bridge method taking (bytes, bytes[], bytes)
 gas limit 200,000      gas price 26,065,600
 ```
 
@@ -112,8 +112,8 @@ The `bytes[]` holds one 71-byte element beginning `0x9f`:
 ```
 
 This is not a DER SEQUENCE (no `0x30` tag), so
-`BtcECKey.ECDSASignature.decodeFromDER` throws inside `Bridge.addSignature`
-(`Bridge.java:632`).
+`BtcECKey.ECDSASignature.decodeFromDER` throws inside the Bridge method that
+parses it.
 
 Observed on chain:
 
@@ -186,7 +186,8 @@ a fork.
 We raise it because it is a live source of incorrect fee reporting for anyone
 consuming rskj receipts, and because independent implementations must reproduce
 it exactly. Rustock now does, documented in its compatibility catalogue as
-"§9d — `addSignature` with a non-DER signature: success receipt, full-limit fee".
+§9d — a Bridge method given a non-DER signature: success receipt, full-limit
+fee.
 
 ## How this was found
 
