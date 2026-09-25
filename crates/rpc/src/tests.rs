@@ -66,6 +66,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
+        events: None,
     };
     (state, tmp)
 }
@@ -609,6 +610,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
+        events: None,
     };
 
     let req = make_request("eth_sendRawTransaction", json!(["0xdeadbeef"]));
@@ -657,6 +659,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
+        events: None,
     };
 
     let req = make_request("eth_sendRawTransaction", json!(["0xZZZZ"]));
@@ -738,6 +741,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
+        events: None,
     };
     (state, tmp)
 }
@@ -871,6 +875,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
+        events: None,
     };
     (state, tmp, tx_hash)
 }
@@ -969,6 +974,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
+        events: None,
     };
 
     // Ask the node for the block, take the hash it reports...
@@ -1142,6 +1148,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
+        events: None,
     };
     (state, tmp)
 }
@@ -1369,6 +1376,7 @@ async fn test_receipt_dto_failed_status() {
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
+        events: None,
     };
 
     let hash_str = format!("{:#x}", tx_hash);
@@ -2219,6 +2227,7 @@ fn setup_state_with_receipts(
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
+        events: None,
     };
     (state, block_hash, tx_hashes, receipts, tmp)
 }
@@ -2486,6 +2495,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
+        events: None,
     };
 
     let resp = dispatch_for_test(&state, make_request("eth_bridgeState", json!([]))).await;
@@ -3430,6 +3440,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         prune_keep_depth: 100_000,
         prune_max_batch: 1_000,
         scoring: None,
+        events: None,
     };
     (state, tmp, tx_hash, sender, caller, callee)
 }
@@ -3785,4 +3796,270 @@ async fn sco_reports_itself_unavailable_when_scoring_is_off() {
         assert_eq!(err.code, METHOD_NOT_FOUND);
         assert!(err.message.contains("not enabled"), "{}", err.message);
     }
+}
+
+// ========== eth_subscribe over WebSocket (#121) ==========
+
+use crate::subscribe::{notifications_for, parse_subscription, LogsParams, Subscription};
+use rustock_core::events::{BlockEvent, ChainEvent};
+
+fn block_event(number: u64, logs: Vec<rustock_core::Log>, removed: bool) -> ChainEvent {
+    let header = test_header(number);
+    ChainEvent::Block(Arc::new(BlockEvent {
+        hash: header.hash(),
+        header,
+        transactions: Vec::new(),
+        receipts: vec![rustock_core::Receipt {
+            post_tx_state: vec![0x01],
+            cumulative_gas_used: 21_000,
+            gas_used: 21_000,
+            logs_bloom: Bloom::ZERO,
+            logs,
+            status: true,
+        }],
+        removed,
+    }))
+}
+
+fn sample_log(address: Address, topic: B256) -> rustock_core::Log {
+    rustock_core::Log { address, topics: vec![topic], data: Bytes::default() }
+}
+
+#[test]
+fn subscription_types_parse_as_rskj_names_them() {
+    assert!(matches!(
+        parse_subscription(&json!(["newHeads"])).unwrap(),
+        Subscription::NewHeads
+    ));
+    assert!(matches!(
+        parse_subscription(&json!(["newPendingTransactions"])).unwrap(),
+        Subscription::NewPendingTransactions
+    ));
+    assert!(matches!(parse_subscription(&json!(["syncing"])).unwrap(), Subscription::Syncing));
+
+    let addr = Address::repeat_byte(0x11);
+    let topic = B256::repeat_byte(0xAA);
+    let sub = parse_subscription(&json!([
+        "logs",
+        {"address": format!("0x{}", hex::encode(addr.as_slice())),
+         "topics": [format!("{:#x}", topic)]}
+    ]))
+    .unwrap();
+    let Subscription::Logs(params) = sub else { panic!("expected a logs subscription") };
+    assert_eq!(params.addresses, vec![addr]);
+    assert!(params.matches(&sample_log(addr, topic)));
+    assert!(!params.matches(&sample_log(Address::repeat_byte(0x22), topic)));
+
+    assert!(parse_subscription(&json!(["nonsense"])).is_err());
+    assert!(parse_subscription(&json!([])).is_err());
+}
+
+/// **A `newHeads` subscriber must not be told about a block that left the
+/// chain.** The head notification has no `removed` field to carry the
+/// retraction in, so emitting one would say the opposite of the truth.
+#[test]
+fn new_heads_ignores_removed_blocks() {
+    let joined = notifications_for(&Subscription::NewHeads, "0x1", &block_event(7, vec![], false));
+    assert_eq!(joined.len(), 1);
+    assert_eq!(joined[0]["method"], "eth_subscription");
+    assert_eq!(joined[0]["params"]["subscription"], "0x1");
+    assert_eq!(joined[0]["params"]["result"]["number"], "0x7");
+
+    let left = notifications_for(&Subscription::NewHeads, "0x1", &block_event(7, vec![], true));
+    assert!(left.is_empty(), "a retracted block is not a new head");
+}
+
+/// The retraction a log subscriber depends on. This node sees a tip fork
+/// several times an hour, so a subscriber that never heard `removed: true`
+/// would accumulate logs from blocks that are no longer on the chain.
+#[test]
+fn a_removed_block_retracts_its_logs() {
+    let addr = Address::repeat_byte(0x11);
+    let topic = B256::repeat_byte(0xAA);
+    let subscription = Subscription::Logs(LogsParams {
+        addresses: vec![addr],
+        topics: Vec::new(),
+    });
+
+    let joined = notifications_for(
+        &subscription,
+        "0x2",
+        &block_event(9, vec![sample_log(addr, topic)], false),
+    );
+    assert_eq!(joined.len(), 1);
+    assert_eq!(joined[0]["params"]["result"]["removed"], json!(false));
+
+    let left = notifications_for(
+        &subscription,
+        "0x2",
+        &block_event(9, vec![sample_log(addr, topic)], true),
+    );
+    assert_eq!(left.len(), 1, "the same log must come back as removed");
+    assert_eq!(left[0]["params"]["result"]["removed"], json!(true));
+    assert_eq!(left[0]["params"]["result"]["blockNumber"], "0x9");
+}
+
+/// A subscription hears only about what it asked for.
+#[test]
+fn a_subscription_ignores_events_it_did_not_ask_for() {
+    let addr = Address::repeat_byte(0x11);
+    let event = block_event(3, vec![sample_log(addr, B256::repeat_byte(0xAA))], false);
+
+    assert!(notifications_for(&Subscription::NewPendingTransactions, "0x1", &event).is_empty());
+
+    let tx_event = ChainEvent::PendingTransaction(B256::repeat_byte(0xEE));
+    assert!(notifications_for(&Subscription::NewHeads, "0x1", &tx_event).is_empty());
+    let pending = notifications_for(&Subscription::NewPendingTransactions, "0x1", &tx_event);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0]["params"]["result"],
+        json!(format!("{:#x}", B256::repeat_byte(0xEE)))
+    );
+
+    // A logs subscription whose address matches nothing in the block stays
+    // quiet, rather than emitting an empty notification.
+    let unrelated = Subscription::Logs(LogsParams {
+        addresses: vec![Address::repeat_byte(0x99)],
+        topics: Vec::new(),
+    });
+    assert!(notifications_for(&unrelated, "0x1", &event).is_empty());
+}
+
+// --- over a real socket ---
+
+async fn start_test_ws(state: RpcState) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new()
+        .route("/", axum::routing::any(crate::ws::upgrade_for_test))
+        .with_state(state);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("ws://{addr}/")
+}
+
+/// The transport itself: upgrade, subscribe, receive a pushed notification,
+/// unsubscribe, and stop receiving.
+///
+/// Worth doing over a real socket rather than by calling the handler: the
+/// upgrade, the framing and the `select!` between "client said something" and
+/// "the chain moved" are the actual design, and none of them is exercised by
+/// a direct call.
+#[tokio::test]
+async fn a_websocket_client_subscribes_and_is_pushed_to() {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (mut state, _tmp) = setup_state();
+    let events = rustock_core::events::channel();
+    state.events = Some(events.clone());
+    let url = start_test_ws(state).await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // An ordinary request works on the socket too.
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::text(
+            json!({"jsonrpc":"2.0","id":1,"method":"web3_clientVersion","params":[]}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let reply = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert!(reply["result"].is_string(), "{reply}");
+
+    // Subscribe.
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::text(
+            json!({"jsonrpc":"2.0","id":2,"method":"eth_subscribe","params":["newHeads"]})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let reply = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    let sub_id = reply["result"].as_str().expect("a subscription id").to_string();
+
+    // Wait until the connection has actually registered as a receiver, or the
+    // publish below races the subscribe and is dropped with no receivers.
+    for _ in 0..100 {
+        if events.receiver_count() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    events.send(block_event(42, vec![], false)).unwrap();
+    let pushed = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let pushed: Value = serde_json::from_str(&pushed).unwrap();
+    assert_eq!(pushed["method"], "eth_subscription");
+    assert_eq!(pushed["params"]["subscription"], sub_id.as_str());
+    assert_eq!(pushed["params"]["result"]["number"], "0x2a");
+
+    // Unsubscribe, then prove nothing more arrives.
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::text(
+            json!({"jsonrpc":"2.0","id":3,"method":"eth_unsubscribe","params":[sub_id]})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let reply = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["result"], json!(true), "unsubscribe should report success");
+
+    events.send(block_event(43, vec![], false)).unwrap();
+    let quiet = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        socket.next(),
+    )
+    .await;
+    assert!(quiet.is_err(), "nothing should arrive after unsubscribing");
+}
+
+/// `eth_subscribe` on a node with no event source is accepted and simply
+/// never fires, rather than failing — which is what lets the transport be
+/// useful on a node built without one.
+#[tokio::test]
+async fn subscribing_without_an_event_source_is_accepted() {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (state, _tmp) = setup_state();
+    assert!(state.events.is_none());
+    let url = start_test_ws(state).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::text(
+            json!({"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let reply = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert!(reply["result"].is_string(), "{reply}");
+    assert!(reply.get("error").is_none());
+}
+
+/// An unknown subscription type is a parameter error, not a silent no-op that
+/// leaves the client waiting forever for notifications that never come.
+#[tokio::test]
+async fn an_unknown_subscription_type_is_rejected() {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (state, _tmp) = setup_state();
+    let url = start_test_ws(state).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::text(
+            json!({"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newBlocks"]})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let reply = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["error"]["code"], json!(INVALID_PARAMS));
 }

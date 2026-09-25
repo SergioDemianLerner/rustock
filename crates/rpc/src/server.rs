@@ -91,6 +91,11 @@ pub struct RpcState {
     /// Peer scoring and banning. Absent, the `sco_*` namespace reports itself
     /// as unavailable rather than answering from an empty table.
     pub scoring: Option<Arc<rustock_networking::scoring::ScoringService>>,
+    /// Chain events for `eth_subscribe`. Absent, a subscription is accepted
+    /// and simply never fires -- which is the right shape for a node built
+    /// without an event source, and keeps the WebSocket transport testable
+    /// without one.
+    pub events: Option<crate::subscribe::EventSender>,
 }
 
 /// Starts the JSON-RPC HTTP server on the given host and port.
@@ -340,6 +345,12 @@ pub(crate) fn execution_not_available(id: Value, method: &str) -> JsonRpcRespons
         METHOD_NOT_FOUND,
         format!("Method {} requires execution engine (not yet available)", method),
     )
+}
+
+/// Dispatch one request. Used by the WebSocket transport, which speaks the
+/// same JSON-RPC over a different socket, and by the tests.
+pub async fn dispatch_rpc(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
+    dispatch(state, req).await
 }
 
 #[cfg(test)]

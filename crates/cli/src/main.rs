@@ -134,6 +134,18 @@ struct Args {
     #[arg(short, long, default_value = "./data")]
     data_dir: String,
 
+    /// Serve JSON-RPC over WebSocket as well, on its own port.
+    ///
+    /// Off by default, as rskj's `rpc.providers.web.ws.enabled` is. This is
+    /// the only transport that carries `eth_subscribe`, so a client wanting
+    /// new heads or logs pushed to it needs this on.
+    #[arg(long, default_value_t = false)]
+    ws: bool,
+
+    /// Port for the WebSocket JSON-RPC server (rskj's default is 4445).
+    #[arg(long, default_value_t = 4445)]
+    ws_port: u16,
+
     /// Addresses or CIDR blocks refused at connection time, as rskj's
     /// `peer.bannedPeerIPs`. Repeatable.
     ///
@@ -651,6 +663,8 @@ fn apply_file_config(
     apply(matches, "rpc_port", f.rpc.port.as_ref(), &mut a.rpc_port);
     apply(matches, "rpc_admin", f.rpc.admin.as_ref(), &mut a.rpc_admin);
     apply(matches, "no_rpc", f.rpc.disabled.as_ref(), &mut a.no_rpc);
+    apply(matches, "ws", f.rpc.ws.as_ref(), &mut a.ws);
+    apply(matches, "ws_port", f.rpc.ws_port.as_ref(), &mut a.ws_port);
 
     apply(matches, "max_peers", f.peers.max_peers.as_ref(), &mut a.max_peers);
     apply(matches, "max_inbound_peers", f.peers.max_inbound_peers.as_ref(),
@@ -1340,6 +1354,11 @@ async fn main() -> Result<()> {
         });
     }
 
+    // The chain-event channel that feeds `eth_subscribe`. Created only when
+    // the WebSocket server is on: without a receiver every publish is a
+    // no-op, but not creating it at all makes that explicit.
+    let events = args.ws.then(rustock_core::events::channel);
+
     // Peer scoring: one service shared by the node (which refuses banned
     // addresses before the handshake), the sync service and the transaction
     // relay (which feed it events), and the RPC layer (which reports and
@@ -1356,7 +1375,8 @@ async fn main() -> Result<()> {
         .with_tx_pool(pool.clone())
         .with_block_processor(block_processor, trie_store_for_exec, initial_state_root)
         .with_gas_price_tracker(gas_price_tracker.clone())
-        .with_scoring(Some(scoring.clone()));
+        .with_scoring(Some(scoring.clone()))
+        .with_events(events.clone());
 
     // Taken before the service is moved into its task: the RPC layer reads the
     // same gauge the sync loop publishes, so `debug_wireProtocolQueueSize`
@@ -1440,7 +1460,8 @@ async fn main() -> Result<()> {
 
     let tx_relay = Arc::new(
         TxRelay::with_pool(peer_store.clone(), pool.clone())
-            .with_scoring(Some(scoring.clone())),
+            .with_scoring(Some(scoring.clone()))
+            .with_events(events.clone()),
     );
 
     let mut node =
@@ -1572,7 +1593,24 @@ async fn main() -> Result<()> {
             prune_keep_depth: args.prune_keep_depth,
             prune_max_batch: args.prune_max_batch,
             scoring: Some(scoring.clone()),
+            events: events.clone(),
         };
+        // The WebSocket server shares the same `RpcState`, so every method
+        // available over HTTP works over the socket too -- plus
+        // `eth_subscribe`, which only means anything on a connection that
+        // stays open.
+        if args.ws {
+            let ws_host = args.rpc_host.clone();
+            let ws_port = args.ws_port;
+            let ws_state = rpc_state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = rustock_rpc::ws::start_ws_server(&ws_host, ws_port, ws_state).await
+                {
+                    tracing::error!("RPC WebSocket server error: {}", e);
+                }
+            });
+        }
+
         let rpc_host = args.rpc_host.clone();
         let rpc_port = args.rpc_port;
         tokio::spawn(async move {

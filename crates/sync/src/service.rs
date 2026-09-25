@@ -475,6 +475,14 @@ pub struct SyncService {
     /// Peers excluded from header-chunk assignment (stalled mid-round),
     /// mapped to the instant their sideline expires.
     pub(crate) sidelined: HashMap<B512, Instant>,
+    /// Chain events for `eth_subscribe`, when the node was built with a
+    /// WebSocket server.
+    ///
+    /// Published from the **follow** path only. During bulk sync a subscriber
+    /// would receive thousands of heads it did not ask to be caught up on,
+    /// and would simply trip the lag disconnect; subscriptions are a tip
+    /// feature and the tip is where they are fed.
+    pub(crate) events: Option<rustock_core::events::EventSender>,
     /// Peer scoring, when the node was built with it.
     ///
     /// The sidelining below **feeds** this rather than being replaced by it.
@@ -527,6 +535,7 @@ impl SyncService {
             tx_pool: None,
             blocks_since_flush: 0,
             sidelined: HashMap::new(),
+            events: None,
             scoring: None,
             last_prefetch_start: None,
             block_source: None,
@@ -550,6 +559,12 @@ impl SyncService {
             Some((txs, ommers)) => self.manager.store.put_body(hash, &txs, &ommers).is_ok(),
             None => false,
         }
+    }
+
+    /// Attach the chain-event channel that feeds `eth_subscribe`.
+    pub fn with_events(mut self, events: Option<rustock_core::events::EventSender>) -> Self {
+        self.events = events;
+        self
     }
 
     /// Attach peer scoring. Without it the service behaves exactly as before.
@@ -1640,6 +1655,71 @@ impl SyncService {
             }
         }
     }
+    /// Tell subscribers a block joined or left the canonical chain.
+    ///
+    /// Receipts are read back from the store rather than carried from
+    /// execution, because a removal has no execution to carry them from and
+    /// both cases must produce the same event. One point read at the tip.
+    ///
+    /// Silent when nobody is subscribed: `broadcast::send` returns an error
+    /// with no receivers, and that is the ordinary state of a node whose
+    /// WebSocket server is off.
+    pub(crate) fn publish_block(
+        &self,
+        hash: B256,
+        header: &Header,
+        transactions: &[rustock_core::Transaction],
+        removed: bool,
+    ) {
+        let Some(events) = &self.events else { return };
+        if events.receiver_count() == 0 {
+            return;
+        }
+        let receipts = self.manager.store.receipts(hash).ok().flatten().unwrap_or_default();
+        let _ = events.send(rustock_core::events::ChainEvent::Block(std::sync::Arc::new(
+            rustock_core::events::BlockEvent {
+                hash,
+                header: header.clone(),
+                transactions: transactions.to_vec(),
+                receipts,
+                removed,
+            },
+        )));
+    }
+
+    /// Retract every block between `from` (exclusive of the resume point) and
+    /// `to`, walking the abandoned branch's own ancestry.
+    ///
+    /// This is rskj's `BlockchainBranchComparator.calculateFork` reduced to
+    /// the half rustock needs: the old branch. The new branch announces
+    /// itself as it executes.
+    fn publish_removals(&self, from: rustock_storage::BlockRef, to: rustock_storage::BlockRef) {
+        let Some(events) = &self.events else { return };
+        if events.receiver_count() == 0 {
+            return;
+        }
+        let store = &self.manager.store;
+        let mut hash = from.hash;
+        // Bounded by the rollback depth the caller already accepted.
+        for _ in 0..crate::rollback::MAX_ROLLBACK {
+            if hash == to.hash {
+                break;
+            }
+            let Ok(Some(header)) = store.header(hash) else { break };
+            if header.number <= to.number {
+                break;
+            }
+            let transactions = store
+                .body(hash)
+                .ok()
+                .flatten()
+                .map(|(txs, _)| txs)
+                .unwrap_or_default();
+            self.publish_block(hash, &header, &transactions, true);
+            hash = header.parent_hash;
+        }
+    }
+
     /// Move execution to the highest block on the executed head's own ancestry
     /// that is canonical and whose state we still hold.
     ///
@@ -1694,6 +1774,12 @@ impl SyncService {
             error!(target: "rustock::sync", "Recording the resume point {target} failed: {e:?}");
             return false;
         }
+
+        // Retract the abandoned branch before moving execution, so a
+        // subscriber sees `removed: true` for those blocks before it sees the
+        // replacements arrive. rskj's logs emitter emits the old branch first
+        // for the same reason.
+        self.publish_removals(from, target);
 
         self.current_state_root = Some(TrieNode::from_message(&data, trie_store.as_ref()));
         self.last_body_height = header.number;
@@ -3373,6 +3459,7 @@ impl SyncService {
                 );
                 self.gas_price.on_block(header, &block.transactions);
                 self.gas_price.on_best_block(header);
+                self.publish_block(hash, header, &block.transactions, false);
                 self.current_state_root = Some(result.new_state_root);
                 true
             }

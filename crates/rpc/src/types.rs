@@ -42,6 +42,16 @@ impl JsonRpcResponse {
         }
     }
 
+    /// Serialise for a transport that writes frames rather than HTTP bodies.
+    pub fn to_text(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            // A response that cannot be serialised is a bug, but dropping the
+            // connection over it would be worse than telling the caller.
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#
+                .to_string()
+        })
+    }
+
     pub fn error(id: serde_json::Value, code: i64, message: impl Into<String>) -> Self {
         Self {
             jsonrpc: "2.0",
