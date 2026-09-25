@@ -609,8 +609,8 @@ precompile that throws has its exception recorded for *fee* purposes
 (`result.setException` → summary marked failed → no refund) but not for
 *receipt* purposes (`executionError`, which only `execError()` sets). So the
 receipt reports SUCCESS while the sender is charged the full gas limit. The VM
-path calls both; the precompile path calls only one. Reported upstream to the
-rskj security team.
+path calls both; the precompile path calls only one. Reported upstream in
+[`rskj-report-precompile-receipt-status.md`](./rskj-report-precompile-receipt-status.md).
 
 The second fix also exposed a latent ordering bug in rustock: rskj validates
 height and confirmations *first* and swallows that failure, so a transaction
