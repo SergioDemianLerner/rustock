@@ -1,8 +1,8 @@
 # Major components
 
-What was built in this repository between **2026-06-05 and 2026-09-25**: 465
-commits, and the codebase grown from ~38,000 to ~103,700 lines of Rust with
-the test count going from 819 to 1,577. Components marked *extended* existed
+What was built in this repository between **2026-06-05 and 2026-09-25**: 474
+commits, and the codebase grown from ~38,000 to ~105,100 lines of Rust with
+the test count going from 819 to 1,591. Components marked *extended* existed
 in outline before that window; the rest are new.
 
 The organising constraint throughout is that rustock must agree with rskj
@@ -210,6 +210,19 @@ never appears in a call tree at all** (rskj emits no subtrace for a
 precompile), a failed CREATE vanishes with its whole subtree, `trace_get`
 indexes the block rather than walking the transaction, and `trace_filter`
 matches whole transactions rather than individual traces.
+
+## WebSocket subscriptions
+
+`eth_subscribe` over a WebSocket on its own port: `newHeads`, `logs` and
+`newPendingTransactions`, fed by one typed chain-event channel that the sync
+service publishes to as it follows the tip.
+
+Without it a client has to poll, which is slower and — for logs — lossy
+across a reorg, exactly where it most needs to be told. The care is in the
+retraction: a reorg re-sends the abandoned branch's logs with `removed: true`
+before the replacements arrive, because this node sees a tip fork several
+times an hour and a subscriber that never heard about one would accumulate
+logs from blocks no longer on the chain.
 
 ## Peer scoring, punishment and banning
 
