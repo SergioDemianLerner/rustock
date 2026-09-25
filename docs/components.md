@@ -10,6 +10,11 @@ The organising constraint throughout is that rustock must agree with rskj
 is why so many of these components are either a port of a specific rskj class
 or an instrument for proving equivalence with one.
 
+If you know rskj and want to find the file that answers to a class you already
+know, [docs/rskj-to-rustock-map.md](rskj-to-rustock-map.md) maps the two
+codebases package by package, and lists what each side has that the other does
+not.
+
 ---
 
 ## rskj database import
