@@ -238,6 +238,31 @@ crates/
   rpc/          JSON-RPC HTTP server (axum-based) with state, call, log, and filter support
 ```
 
+### Log timestamps and timezones
+
+Log timestamps are **UTC by default** and RFC 3339, so the offset travels with
+every line rather than being something a reader has to know.
+
+```
+--log-timezone utc        # default: 2026-09-25T21:13:45.947Z
+--log-timezone -03:00     #          2026-09-25T18:13:45.947-03:00
+--log-timezone local      # read from the machine, once, at start-up
+```
+
+or `timezone` under `[log]` in the config file. The offset is also stated once
+at start-up (`Log timestamps are GMT-03:00`), so a log opened later says what
+it is in words as well as in every timestamp.
+
+`local` is resolved **once**, before the runtime starts: the `time` crate will
+not determine a local offset in a multithreaded process, because another
+thread changing `TZ` concurrently is a data race. A consequence is that
+`local` does not follow a daylight-saving transition mid-run. A fixed offset
+avoids the question, and is exactly right for zones without DST.
+
+Note this is rustock's own timestamp. Under systemd, `journalctl` prints its
+own timestamp first, in the *viewer's* timezone — `TZ=America/Argentina/Buenos_Aires journalctl -u rustock`
+shifts that one, with no node configuration at all.
+
 ## Limitations and Future Work
 
 Rustock executes blocks and maintains full state, but it is not yet feature-complete relative to rskj. Notable gaps:
