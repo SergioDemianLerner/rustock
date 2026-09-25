@@ -757,21 +757,14 @@ pub fn compute_ommers_hash(ommers: &[rustock_core::Header]) -> B256 {
 }
 
 /// Accrue a single log into a bloom filter (EIP-2718 bloom algorithm).
+///
+/// Delegates to `rustock_core::bloom` rather than deriving the bits here,
+/// because `eth_getLogs` now *tests* blooms to skip blocks and a filter is
+/// only free of false negatives while the bits set on insertion are the bits
+/// checked on lookup. Two copies of that derivation would be two chances to
+/// disagree by one bit and silently drop logs.
 fn accrue_log_bloom(bloom: &mut Bloom, log: &Log) {
-    bloom_insert(bloom, log.address.as_slice());
-    for topic in &log.topics {
-        bloom_insert(bloom, topic.as_slice());
-    }
-}
-
-fn bloom_insert(bloom: &mut Bloom, data: &[u8]) {
-    use sha3::{Digest, Keccak256};
-
-    let hash = Keccak256::digest(data);
-    for i in 0..3 {
-        let bit = (((hash[2 * i] as usize) << 8) | (hash[2 * i + 1] as usize)) & 0x7FF;
-        bloom.0[255 - bit / 8] |= 1 << (bit % 8);
-    }
+    rustock_core::bloom::accrue_log(bloom, log);
 }
 
 #[cfg(test)]

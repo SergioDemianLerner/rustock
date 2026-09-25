@@ -1101,7 +1101,20 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
     let topic1 = B256::repeat_byte(0xAA);
 
     for block_num in 1u64..=3 {
-        let header = test_header(block_num);
+        // The header's bloom must be the OR of its receipts' blooms, as it is
+        // on chain -- `eth_getLogs` now skips a block whose bloom cannot
+        // match, and a fixture carrying `Bloom::ZERO` next to real logs is a
+        // block that could not exist (`ProcessError::LogsBloomMismatch`).
+        let mut logs_bloom = alloy_primitives::Bloom::ZERO;
+        rustock_core::bloom::accrue_log(
+            &mut logs_bloom,
+            &rustock_core::Log {
+                address: log_addr,
+                topics: vec![topic1],
+                data: vec![block_num as u8].into(),
+            },
+        );
+        let header = Header { logs_bloom, ..test_header(block_num) };
         let hash = header.hash();
         store.put_header(&header).unwrap();
         store.put_canonical_hash(block_num, hash).unwrap();
@@ -1113,7 +1126,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
             post_tx_state: vec![0x01],
             cumulative_gas_used: 21_000,
             gas_used: 21_000,
-            logs_bloom: alloy_primitives::Bloom::ZERO,
+            logs_bloom,
             logs: vec![
                 rustock_core::Log {
                     address: log_addr,
@@ -3798,6 +3811,256 @@ async fn sco_reports_itself_unavailable_when_scoring_is_off() {
     }
 }
 
+// ========== eth_getLogs bloom skipping (#122) ==========
+
+/// A chain where each block's logs are different, so a query naming one
+/// block's address or topic can only match that block.
+///
+/// Every header carries the OR of its receipts' blooms, as a real one does.
+fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>, Vec<B256>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+
+    let mut addresses = Vec::new();
+    let mut topics = Vec::new();
+
+    for block_num in 1u64..=8 {
+        let address = Address::repeat_byte(block_num as u8);
+        let topic_a = B256::repeat_byte(0x10 + block_num as u8);
+        let topic_b = B256::repeat_byte(0x80 + block_num as u8);
+        addresses.push(address);
+        topics.push(topic_a);
+
+        let logs = vec![rustock_core::Log {
+            address,
+            topics: vec![topic_a, topic_b],
+            data: vec![block_num as u8].into(),
+        }];
+        let mut logs_bloom = alloy_primitives::Bloom::ZERO;
+        for log in &logs {
+            rustock_core::bloom::accrue_log(&mut logs_bloom, log);
+        }
+
+        let header = Header { logs_bloom, ..test_header(block_num) };
+        let hash = header.hash();
+        store.put_header(&header).unwrap();
+        store.put_canonical_hash(block_num, hash).unwrap();
+        store.put_total_difficulty(hash, U256::from(block_num * 1000)).unwrap();
+        store.put_body(hash, &[], &[]).unwrap();
+        store
+            .put_receipts(
+                hash,
+                &[rustock_core::Receipt {
+                    post_tx_state: vec![0x01],
+                    cumulative_gas_used: 21_000,
+                    gas_used: 21_000,
+                    logs_bloom,
+                    logs,
+                    status: true,
+                }],
+            )
+            .unwrap();
+        if block_num == 8 {
+            store.set_head(hash).unwrap();
+        }
+    }
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: None,
+        trie_store: None,
+        hardfork_cfg: None,
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
+        wire_queue_depth: None,
+        gas_price: None,
+        epoch_store: None,
+        miner: None,
+        admin_enabled: false,
+        gc_burial: 4000,
+        prune_keep_depth: 100_000,
+        prune_max_batch: 50_000,
+        scoring: None,
+        events: None,
+    };
+    (state, tmp, addresses, topics)
+}
+
+/// **The property the optimisation rests on: the answer never changes.**
+///
+/// A bloom filter has no false negatives, so skipping a block whose bloom
+/// cannot match must be invisible. This runs a spread of filter shapes —
+/// address-only, topic-only, both, alternatives, unmatchable, unconstrained —
+/// and checks each against a brute-force scan of every log in range.
+///
+/// A one-bit disagreement between the bloom's build and its test would show
+/// up here as silently missing logs, which is the worst failure this RPC can
+/// have: the answer still looks like a valid answer.
+#[tokio::test]
+async fn bloom_skipping_never_changes_the_answer() {
+    let (state, _tmp, addresses, topics) = setup_state_with_varied_logs();
+
+    let hex_addr = |a: &Address| format!("0x{}", hex::encode(a.as_slice()));
+    let hex_topic = |t: &B256| format!("{:#x}", t);
+
+    let cases: Vec<(&str, Value)> = vec![
+        ("unconstrained", json!({"fromBlock": "0x1", "toBlock": "0x8"})),
+        (
+            "one address",
+            json!({"fromBlock": "0x1", "toBlock": "0x8", "address": hex_addr(&addresses[2])}),
+        ),
+        (
+            "two addresses",
+            json!({"fromBlock": "0x1", "toBlock": "0x8",
+                   "address": [hex_addr(&addresses[0]), hex_addr(&addresses[5])]}),
+        ),
+        (
+            "one topic",
+            json!({"fromBlock": "0x1", "toBlock": "0x8", "topics": [hex_topic(&topics[4])]}),
+        ),
+        (
+            "topic alternatives",
+            json!({"fromBlock": "0x1", "toBlock": "0x8",
+                   "topics": [[hex_topic(&topics[1]), hex_topic(&topics[6])]]}),
+        ),
+        (
+            "address and topic that agree",
+            json!({"fromBlock": "0x1", "toBlock": "0x8",
+                   "address": hex_addr(&addresses[3]), "topics": [hex_topic(&topics[3])]}),
+        ),
+        (
+            "address and topic that disagree",
+            json!({"fromBlock": "0x1", "toBlock": "0x8",
+                   "address": hex_addr(&addresses[3]), "topics": [hex_topic(&topics[4])]}),
+        ),
+        (
+            "null first topic, real second",
+            json!({"fromBlock": "0x1", "toBlock": "0x8",
+                   "topics": [Value::Null, format!("{:#x}", B256::repeat_byte(0x82))]}),
+        ),
+        (
+            "matches nothing",
+            json!({"fromBlock": "0x1", "toBlock": "0x8",
+                   "address": hex_addr(&Address::repeat_byte(0xEE))}),
+        ),
+    ];
+
+    for (name, filter) in cases {
+        let resp = dispatch_for_test(&state, make_request("eth_getLogs", json!([filter.clone()])))
+            .await;
+        assert!(resp.error.is_none(), "{name}: {:?}", resp.error);
+        let got = resp.result.unwrap();
+        let got = got.as_array().unwrap();
+
+        let expected = brute_force_logs(&state, 1, 8, &filter);
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "{name}: bloom skipping changed the result ({} vs {} brute force)",
+            got.len(),
+            expected.len()
+        );
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert_eq!(a["blockNumber"], b.0, "{name}: wrong block");
+            assert_eq!(a["address"], b.1, "{name}: wrong address");
+        }
+    }
+}
+
+/// Every log in range that the filter matches, found without consulting any
+/// bloom. Returns `(blockNumber, address)` pairs in order.
+fn brute_force_logs(state: &RpcState, from: u64, to: u64, filter: &Value) -> Vec<(Value, Value)> {
+    let want_addrs: Vec<Address> = match filter.get("address") {
+        Some(Value::String(s)) => vec![s.parse().unwrap()],
+        Some(Value::Array(a)) => a.iter().map(|v| v.as_str().unwrap().parse().unwrap()).collect(),
+        _ => Vec::new(),
+    };
+    let want_topics: Vec<Option<Vec<B256>>> = match filter.get("topics") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => Some(vec![s.parse().unwrap()]),
+                Value::Array(alts) => {
+                    Some(alts.iter().map(|x| x.as_str().unwrap().parse().unwrap()).collect())
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    for number in from..=to {
+        let Some(hash) = state.store.canonical_hash(number).unwrap() else { continue };
+        let Some(receipts) = state.store.receipts(hash).unwrap() else { continue };
+        for receipt in &receipts {
+            for log in &receipt.logs {
+                if !want_addrs.is_empty() && !want_addrs.contains(&log.address) {
+                    continue;
+                }
+                let mut ok = true;
+                for (i, allowed) in want_topics.iter().enumerate() {
+                    let Some(allowed) = allowed else { continue };
+                    match log.topics.get(i) {
+                        Some(t) if allowed.contains(t) => {}
+                        None if allowed.is_empty() => {}
+                        _ => ok = false,
+                    }
+                }
+                if ok {
+                    out.push((
+                        json!(format!("{:#x}", number)),
+                        json!(format!("0x{}", hex::encode(log.address.as_slice()))),
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The gate must not fire when the query constrains nothing, because it could
+/// never skip and would be a header read per block for no reason.
+#[tokio::test]
+async fn an_unconstrained_query_returns_every_log() {
+    let (state, _tmp, _addrs, _topics) = setup_state_with_varied_logs();
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getLogs", json!([{"fromBlock": "0x1", "toBlock": "0x8"}])),
+    )
+    .await;
+    assert_eq!(resp.result.unwrap().as_array().unwrap().len(), 8);
+}
+
+/// An empty alternatives list at a topic position means "the log must have no
+/// topic here" — there is nothing to look up, so the bloom must not be
+/// allowed to reject the block on its behalf.
+#[tokio::test]
+async fn an_empty_topic_alternative_list_does_not_skip_blocks() {
+    let (state, _tmp, addresses, _topics) = setup_state_with_varied_logs();
+    // Position 0 is unconstrained; position 2 must be absent, which every log
+    // here satisfies (each has exactly two topics).
+    let resp = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getLogs",
+            json!([{
+                "fromBlock": "0x1", "toBlock": "0x8",
+                "address": format!("0x{}", hex::encode(addresses[1].as_slice())),
+                "topics": [Value::Null, Value::Null, []]
+            }]),
+        ),
+    )
+    .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    assert_eq!(
+        resp.result.unwrap().as_array().unwrap().len(),
+        1,
+        "the empty list must not let the bloom skip the matching block"
+    );
+}
 // ========== eth_subscribe over WebSocket (#121) ==========
 
 use crate::subscribe::{notifications_for, parse_subscription, LogsParams, Subscription};

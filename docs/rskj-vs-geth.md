@@ -346,6 +346,20 @@ repeating here:
   resolves to at that moment. rustock parses only literal addresses and treats
   anything else as a node id.
 
+### `eth_getLogs` skips on the block bloom; rskj skips on a range bloom
+
+Both nodes answer the same logs; they reject non-matching blocks differently.
+
+rskj keeps `co.rsk.logfilter.BlocksBloomStore` — the ORed bloom of a *group*
+of blocks, written once the range is confirmed — so a wide query can discard
+a whole group with one test. rustock tests each block's own `logs_bloom` from
+its header, which is one read per block rather than one per group.
+
+Same answers, different cost curve: rustock is closer to linear in the range,
+rskj closer to linear in the number of groups. Not a compatibility difference,
+recorded here because someone comparing query latency between the two nodes
+will see it and should know why. Issue #122 tracks the grouped index.
+
 ### `newHeads` announces blocks that never became the head
 
 `BlockHeaderNotificationEmitter` listens on `onBlock`, and in
