@@ -12,7 +12,7 @@ no equivalent split — the distinction is historical, not architectural, and
 what matters is whether the behaviour is RSK's or Ethereum's, which the
 inherited packages no longer tell you.
 
-**Sizes are not comparable.** rustock is ~103,700 lines of Rust against
+**Sizes are not comparable.** rustock is ~105,100 lines of Rust against
 rskj's ~130,800 lines of Java, but rustock has no DI container, no builder
 classes, and gets the EVM interpreter from `revm` rather than implementing it.
 A component that looks smaller here usually is not.
@@ -160,7 +160,10 @@ reason it is that shape is that rskj chose it first.
 | Dispatch | `org.ethereum.rpc.Web3Impl`, `co.rsk.rpc.netty.JsonRpcWeb3ServerHandler` | `crates/rpc/src/server.rs` |
 | HTTP transport | `co.rsk.rpc.netty.Web3HttpServer` (Netty) | `crates/rpc/src/server.rs` (axum) |
 | `eth_*` | `co.rsk.rpc.modules.eth.EthModule` | `crates/rpc/src/eth.rs`, `call.rs`, `tx.rs` |
-| `eth_getLogs`, filters | `org.ethereum.rpc.Web3Impl` + `co.rsk.logfilter.*` | `crates/rpc/src/logs.rs` |
+| `eth_getLogs`, filters | `org.ethereum.rpc.Web3Impl` + `co.rsk.logfilter.*` | `crates/rpc/src/logs.rs`, `crates/core/src/bloom.rs` |
+| WebSocket transport | `co.rsk.rpc.netty.Web3WebSocketServer`, `RskWebSocketJsonRpcHandler` | `crates/rpc/src/ws.rs` |
+| `eth_subscribe` | `co.rsk.rpc.modules.eth.subscribe.*` (`EthSubscribeRequest`, `LogsNotificationEmitter`, `BlockHeaderNotificationEmitter`) | `crates/rpc/src/subscribe.rs` |
+| Chain event fan-out | `org.ethereum.listener.EthereumListener` + `CompositeEthereumListener` | `crates/core/src/events.rs` (one typed channel) |
 | `debug_*` | `co.rsk.rpc.modules.debug.DebugModuleImpl` | `crates/rpc/src/debug.rs` |
 | `trace_*` | `co.rsk.rpc.modules.trace.TraceModuleImpl`, `TraceTransformer` | `crates/rpc/src/trace.rs` |
 | `txpool_*` | `co.rsk.rpc.modules.txpool.TxPoolModuleImpl` | `crates/rpc/src/txpool.rs` |
@@ -177,11 +180,15 @@ Split by *why*, because the three kinds call for different responses.
 
 ### Genuine gaps
 
+Two entries left this table on 2026-09-25: **WebSocket RPC and
+`eth_subscribe`** (#121, closed by #123 — `crates/rpc/src/ws.rs` and
+`subscribe.rs`) and the per-block half of the **log bloom index** (#122,
+#124). What remains of the second is the grouped range index, kept below.
+
 | rskj | classes | what is missing |
 |---|---|---|
-| **WebSocket RPC + subscriptions** | `co.rsk.rpc.netty.Web3WebSocketServer`, `RskWebSocketJsonRpcHandler`, `RskWebSocketJsonParameterValidator` | rustock's RPC is HTTP-only (axum). No `eth_subscribe`/`eth_unsubscribe`, so a client wanting new heads or logs must poll. This is the gap most likely to be noticed by an application developer. |
 | **Snap sync** | `co.rsk.net.SnapshotProcessor`, `net/sync/SnapSyncState`, `SnapProcessor`, `SnapSyncRequestManager` | Joining the network without executing from genesis. Tracked as **issue #84**. rustock's substitute is the rskj database import, which needs an existing node. |
-| **Log bloom index** | `co.rsk.logfilter.BlocksBloomStore`, `BlocksBloom`, `BlocksBloomProcessor` | rskj keeps ORed blooms over groups of blocks so `eth_getLogs` can skip ranges without reading receipts. rustock reads receipts per block, which is correct but slower on wide ranges. |
+| **Grouped log bloom index** | `co.rsk.logfilter.BlocksBloomStore`, `BlocksBloom`, `BlocksBloomProcessor` | rskj keeps one ORed bloom per *group* of blocks, so a wide `eth_getLogs` can discard a whole group with one test. rustock tests each block's own header bloom (#124) — same answers, one read per block rather than per group. The grouped index needs new storage and a confirmation-depth invariant; **issue #122** stays open for it. |
 | **Metrics and profiling** | `co.rsk.metrics.profilers.*`, `co.rsk.metrics.jmx.*`, `HashRateCalculator` | No JMX, no profiler hooks, no hash-rate estimate. rustock has structured `tracing` logs and periodic summaries instead, which is not the same thing for an operator with a dashboard. |
 | **Parallel transaction execution** | `co.rsk.core.bc.ParallelizeTransactionHandler`, `ReadWrittenKeysTracker` | RSKIP144. Testnet-only today (`reed810`), so not a mainnet consensus gap — but it becomes one the day it activates. Tracked as **issue #48**. |
 | **Union Bridge** | `co.rsk.peg.union.*` (`UnionBridgeSupport`, `UnionBridgeStorageProvider`), ~10 Bridge methods | RSKIP502, also `reed810`/testnet-only. rustock's Bridge table has no union methods at all. The largest *unfiled* gap; see the note below. |
@@ -207,10 +214,14 @@ Split by *why*, because the three kinds call for different responses.
   the transitions are the part that has broken repeatedly, and an enum makes
   the whole set readable in one place.
 - **Listeners.** rskj's `EthereumListener` fan-out (`org.ethereum.listener.*`)
-  has no rustock equivalent; the two consumers that mattered
-  (`GasPriceTracker`, the peg-out watcher) are called directly from the
-  execution path instead, so "a block was executed" and "the tracker saw it"
-  cannot drift apart.
+  is an interface with a dozen methods and a dozen implementors. rustock calls
+  the two consumers that matter (`GasPriceTracker`, the peg-out watcher)
+  directly from the execution path, so "a block was executed" and "the tracker
+  saw it" cannot drift apart, and has **one typed channel**
+  (`crates/core/src/events.rs`) for the one consumer that genuinely needs
+  fan-out: `eth_subscribe`. It lives in `core` because the sync service
+  publishes and the RPC layer consumes and neither crate depends on the
+  other.
 
 ---
 
@@ -225,6 +236,7 @@ implementation and needs to prove it agrees with the first.
 | **Coherence invariants** | `crates/sync/src/invariant.rs` | Eight stated relations (I1–I8) over the node's three position markers, checked after every commit. Four are now *repaired* automatically, not only reported. rskj has no equivalent assertion layer. |
 | **Position transitions** | `crates/storage/src/position.rs` | `Transition` / `Validated`: the three position markers can only move through one type that writes them in a single batch. rskj writes its equivalents from many places. |
 | **Rollback as a pure function** | `crates/sync/src/rollback.rs` | `choose_resume_point` and `fork_point`, simulated over thousands of generated chains (`crates/storage/tests/position_simulator.rs`). |
+| **Typed chain-event channel** | `crates/core/src/events.rs` | One `broadcast` channel with two variants, replacing rskj's `EthereumListener` interface. Bounded per subscriber, and a consumer that falls behind is disconnected rather than silently skipped. |
 | **Φ progress watchdog** | `crates/sync/src/watchdog.rs` | A progress measure with an escalation ladder, for the node that believes it is syncing and is not. |
 | **Supply conservation** | `crates/execution/src/supply.rs` | Per-block and per-transaction check that execution did not create rBTC from nothing. A bug that mints rBTC would otherwise be invisible — state roots would agree with an rskj carrying the same bug. |
 | **Block pruning** | `crates/storage/src/pruner.rs` | rskj keeps all blocks. rustock can delete headers, bodies, receipts and index entries below a floor. |
@@ -249,6 +261,7 @@ implementation and needs to prove it agrees with the first.
 | how sync decides what to do next | `crates/sync/src/service.rs` — one `tick`, one `SyncState` |
 | what a peer's misbehaviour costs | `crates/networking/src/scoring.rs` |
 | a wire message | `crates/networking/src/protocol/rsk.rs` |
+| what a subscriber is pushed | `crates/rpc/src/subscribe.rs`, then `docs/websocket-subscriptions.md` |
 
 And before changing anything that touches consensus: `docs/consensus-port-log.md`
 records what was already found the hard way, and whole-chain replay is how you
