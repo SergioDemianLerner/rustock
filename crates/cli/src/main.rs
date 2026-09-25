@@ -267,9 +267,9 @@ struct Args {
     /// such as `-03:00`.
     ///
     /// Timestamps stay RFC 3339, so the offset is part of the line rather
-    /// than something a reader has to know: UTC prints `…T01:53:47.009Z`,
-    /// `-03:00` prints `…T22:53:47.009-03:00`. Nothing downstream has to
-    /// guess which one it is looking at.
+    /// than something a reader has to know: UTC prints `…T01:53:47.0+00:00`,
+    /// `-03:00` prints `…T22:53:47.0-03:00`. Nothing downstream has to guess
+    /// which one it is looking at.
     ///
     /// `local` reads the machine's offset, which is resolved once at start-up
     /// and then fixed for the life of the process -- so a node that runs
@@ -833,21 +833,39 @@ fn parse_log_timezone(
     })
 }
 
-/// The timer the subscriber formats timestamps with.
+/// The timestamp format: RFC 3339 with **one** subsecond digit.
 ///
-/// RFC 3339 throughout, so the offset travels with the timestamp -- `Z` for
-/// UTC, `-03:00` otherwise -- and a reader or a parser never has to be told
-/// separately which zone a line is in.
+/// `2026-09-25T19:02:09.1-03:00`.
+///
+/// The well-known `Rfc3339` formatter prints full nanosecond precision
+/// (`.147085805`), which is nine digits of noise on every line of a node
+/// whose interesting events are hundreds of milliseconds apart. RFC 3339
+/// allows any number of `time-secfrac` digits, so one is still conformant and
+/// still parses.
+///
+/// The offset is kept mandatory, so it travels with every timestamp -- `Z`
+/// for UTC, `-03:00` otherwise -- and neither a reader nor a parser has to be
+/// told separately which zone a line is in.
+///
+/// The cost is that two events inside the same tenth of a second are no
+/// longer ordered by their timestamps. The journal preserves arrival order
+/// regardless, and the durations that matter are logged as explicit
+/// milliseconds rather than inferred from timestamps.
+const LOG_TIMESTAMP: &[time::format_description::BorrowedFormatItem<'static>] = time::macros::format_description!(
+    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:1][offset_hour sign:mandatory]:[offset_minute]"
+);
+
+/// The timer the subscriber formats timestamps with.
 fn log_timer(
     spec: &str,
     local_offset: Option<time::UtcOffset>,
-) -> Result<tracing_subscriber::fmt::time::OffsetTime<time::format_description::well_known::Rfc3339>>
-{
+) -> Result<
+    tracing_subscriber::fmt::time::OffsetTime<
+        &'static [time::format_description::BorrowedFormatItem<'static>],
+    >,
+> {
     let offset = parse_log_timezone(spec, local_offset)?;
-    Ok(tracing_subscriber::fmt::time::OffsetTime::new(
-        offset,
-        time::format_description::well_known::Rfc3339,
-    ))
+    Ok(tracing_subscriber::fmt::time::OffsetTime::new(offset, LOG_TIMESTAMP))
 }
 
 /// The machine's UTC offset, read **before** the tokio runtime exists.
@@ -2485,6 +2503,36 @@ mod log_timezone_tests {
 
     fn offset(h: i8, m: i8) -> UtcOffset {
         UtcOffset::from_hms(h, m, 0).unwrap()
+    }
+
+    /// The timestamp format, pinned.
+    ///
+    /// Nanosecond precision was nine digits of noise on every line; one digit
+    /// is enough for a node whose interesting events are hundreds of
+    /// milliseconds apart. This test is what stops the well-known `Rfc3339`
+    /// formatter drifting back in, since it looks like the obvious choice.
+    #[test]
+    fn a_timestamp_has_one_subsecond_digit_and_a_numeric_offset() {
+        use time::macros::datetime;
+
+        let t = datetime!(2026-09-25 19:02:09.147085805 -03:00);
+        let rendered = t.format(&super::LOG_TIMESTAMP).unwrap();
+        assert_eq!(rendered, "2026-09-25T19:02:09.1-03:00");
+        assert_eq!(rendered.len(), 27, "27 characters, not 35");
+
+        // UTC renders as `+00:00`, not `Z`. Both are RFC 3339; the numeric
+        // form keeps every line the same width, which is the point of the
+        // exercise.
+        let utc = datetime!(2026-09-25 22:02:09.9 +00:00);
+        assert_eq!(utc.format(&super::LOG_TIMESTAMP).unwrap(), "2026-09-25T22:02:09.9+00:00");
+
+        // Truncation, not rounding: `.98` must not become `.10` of the next
+        // second.
+        let nearly = datetime!(2026-09-25 22:02:09.98 +00:00);
+        assert_eq!(
+            nearly.format(&super::LOG_TIMESTAMP).unwrap(),
+            "2026-09-25T22:02:09.9+00:00"
+        );
     }
 
     #[test]

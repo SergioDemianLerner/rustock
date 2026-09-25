@@ -86,7 +86,7 @@ level = "info"
 to_stdout = false                  # true when run under systemd (journald)
 # Timezone for log timestamps: "utc" (default), "local", or a fixed UTC
 # offset. Timestamps stay RFC 3339, so the offset is part of every line:
-# UTC prints ...T21:13:45.947Z, "-03:00" prints ...T18:13:45.947-03:00.
+# UTC prints ...T21:13:45.9+00:00, "-03:00" prints ...T18:13:45.9-03:00.
 # "local" is read once at start-up and then held, so it does not follow a
 # daylight-saving change; a fixed offset says so plainly, and is exactly
 # right for zones without DST (Argentina has had none since 2009).
