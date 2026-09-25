@@ -240,12 +240,13 @@ crates/
 
 ### Log timestamps and timezones
 
-Log timestamps are **UTC by default** and RFC 3339, so the offset travels with
-every line rather than being something a reader has to know.
+Log timestamps are **UTC by default** and RFC 3339 with one subsecond digit,
+so the offset travels with every line rather than being something a reader has
+to know.
 
 ```
---log-timezone utc        # default: 2026-09-25T21:13:45.947Z
---log-timezone -03:00     #          2026-09-25T18:13:45.947-03:00
+--log-timezone utc        # default: 2026-09-25T21:13:45.9+00:00
+--log-timezone -03:00     #          2026-09-25T18:13:45.9-03:00
 --log-timezone local      # read from the machine, once, at start-up
 ```
 
