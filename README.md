@@ -231,7 +231,7 @@ Rustock executes blocks and maintains full state, but it is not yet feature-comp
 
 - **Mining is single-node only.** Rustock builds blocks, serves the `mnr_*` merged-mining namespace and imports solutions (`--mine`, see [docs/merged-mining.md](docs/merged-mining.md)), but it has no outbound block announcement, so a mined block reaches peers only when they ask for it.
 - **No archive mode.** The trie store keeps every node it writes (so historical state is queryable as long as the underlying nodes have not been pruned), but there is no explicit archive-vs-pruning policy and no snap/state-sync support — initial sync executes every block from genesis.
-- **Local-only Bridge methods are partial.** The 32 transaction-callable Bridge methods are implemented for consensus; many of the 37 local-only getters used by `eth_call` against the Bridge precompile are still being filled in.
+- **Bridge methods are complete but unevenly exercised.** All 70 methods in the Bridge table are dispatched, transaction-callable and local-only alike. The transaction-callable ones are proven by whole-chain replay against mainnet; the local-only getters are proven only by unit tests, because mainnet history does not call them.
 - **Tracing needs recent state.** `debug_trace*` and `trace_*` re-execute a
   transaction's block from its parent's state, so they answer only within the
   GC burial depth (4,000 blocks by default) and return an error past it.
