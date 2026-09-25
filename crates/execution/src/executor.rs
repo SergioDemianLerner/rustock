@@ -2412,8 +2412,8 @@ mod tests {
     ///   * reports `gasUsed = requiredGas + basicTxCost`, well under the limit,
     ///   * yet charges the sender the ENTIRE gas limit, the surplus to REMASC.
     ///
-    /// That is quirks-frozen-bugs.md §50, reported to the rskj security team in
-    /// docs/rskj-report-precompile-receipt-status.md, and consensus-frozen.
+    /// That is quirks-frozen-bugs.md §50, reported to the rskj security team,
+    /// and consensus-frozen.
     ///
     /// This test exists where it does because the rskj-compat sender path now
     /// returns `Err` for inputs rskj throws on, and that error flows through
