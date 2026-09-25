@@ -263,6 +263,31 @@ struct Args {
     #[arg(long, default_value_t = false)]
     log_to_stdout: bool,
 
+    /// Timezone for log timestamps: `utc`, `local`, or a fixed UTC offset
+    /// such as `-03:00`.
+    ///
+    /// Timestamps stay RFC 3339, so the offset is part of the line rather
+    /// than something a reader has to know: UTC prints `…T01:53:47.009Z`,
+    /// `-03:00` prints `…T22:53:47.009-03:00`. Nothing downstream has to
+    /// guess which one it is looking at.
+    ///
+    /// `local` reads the machine's offset, which is resolved once at start-up
+    /// and then fixed for the life of the process -- so a node that runs
+    /// across a daylight-saving transition keeps the offset it started with.
+    /// A fixed offset avoids that entirely, and is exactly right for zones
+    /// without DST (Argentina has had none since 2009).
+    ///
+    /// `allow_hyphen_values` because a negative offset starts with `-`, and
+    /// clap otherwise reads `--log-timezone -03:00` as a missing value
+    /// followed by an unknown `-0` flag.
+    #[arg(
+        long,
+        default_value = "utc",
+        value_name = "utc|local|±HH:MM",
+        allow_hyphen_values = true
+    )]
+    log_timezone: String,
+
     /// JSON-RPC server port
     #[arg(long, default_value_t = 4444)]
     rpc_port: u16,
@@ -730,13 +755,128 @@ fn apply_file_config(
 
     apply(matches, "log_level", f.log.level.as_ref(), &mut a.log_level);
     apply(matches, "log_to_stdout", f.log.to_stdout.as_ref(), &mut a.log_to_stdout);
+    apply(matches, "log_timezone", f.log.timezone.as_ref(), &mut a.log_timezone);
 
     apply_opt(matches, "pegout_alerts_config", f.alerts.pegout_alerts_config.as_ref(),
         &mut a.pegout_alerts_config);
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Parse `--log-timezone` into a UTC offset.
+///
+/// `utc`, `local`, or a fixed `±HH:MM` / `±HHMM` / `±HH`.
+///
+/// `local` needs the offset the caller read before the runtime started; when
+/// that could not be determined this returns an error rather than quietly
+/// logging in UTC, because a timestamp in a timezone the operator did not ask
+/// for is worse than a refusal to start. They can pass the offset instead.
+fn parse_log_timezone(
+    spec: &str,
+    local_offset: Option<time::UtcOffset>,
+) -> Result<time::UtcOffset> {
+    let spec = spec.trim();
+    match spec.to_ascii_lowercase().as_str() {
+        "utc" | "z" | "" => return Ok(time::UtcOffset::UTC),
+        "local" => {
+            return local_offset.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--log-timezone local: this machine's UTC offset could not be \
+                     determined. Pass the offset instead, for example \
+                     --log-timezone -03:00"
+                )
+            })
+        }
+        _ => {}
+    }
+
+    let (sign, rest) = match spec.split_at_checked(1) {
+        Some(("+", rest)) => (1i8, rest),
+        Some(("-", rest)) => (-1i8, rest),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "--log-timezone {spec:?}: expected `utc`, `local`, or a signed offset \
+                 such as -03:00"
+            ))
+        }
+    };
+
+    // The shape is checked rather than the colons stripped. Stripping them
+    // accepts `-1:2` and reads it as `-12:00`, which is not a parse failure
+    // the operator would ever see -- every log line would simply carry the
+    // wrong offset. Two digits mean two digits.
+    let digits: Vec<char> = rest.chars().collect();
+    let two = |a: char, b: char| -> Option<i8> {
+        (a.is_ascii_digit() && b.is_ascii_digit())
+            .then(|| (a as i8 - b'0' as i8) * 10 + (b as i8 - b'0' as i8))
+    };
+    let (hours, minutes) = match digits.as_slice() {
+        [h1, h2] => (two(*h1, *h2), Some(0)),
+        [h1, h2, m1, m2] => (two(*h1, *h2), two(*m1, *m2)),
+        [h1, h2, ':', m1, m2] => (two(*h1, *h2), two(*m1, *m2)),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "--log-timezone {spec:?}: expected ±HH, ±HHMM or ±HH:MM"
+            ))
+        }
+    };
+    let (Some(hours), Some(minutes)) = (hours, minutes) else {
+        return Err(anyhow::anyhow!(
+            "--log-timezone {spec:?}: expected ±HH, ±HHMM or ±HH:MM"
+        ));
+    };
+    if !(0..=59).contains(&minutes) {
+        return Err(anyhow::anyhow!("--log-timezone {spec:?}: minutes must be 00-59"));
+    }
+
+    time::UtcOffset::from_hms(sign * hours, sign * minutes, 0).map_err(|_| {
+        // `time` caps offsets at ±25:59:59; the real world stops at ±14:00.
+        anyhow::anyhow!("--log-timezone {spec:?}: offset out of range")
+    })
+}
+
+/// The timer the subscriber formats timestamps with.
+///
+/// RFC 3339 throughout, so the offset travels with the timestamp -- `Z` for
+/// UTC, `-03:00` otherwise -- and a reader or a parser never has to be told
+/// separately which zone a line is in.
+fn log_timer(
+    spec: &str,
+    local_offset: Option<time::UtcOffset>,
+) -> Result<tracing_subscriber::fmt::time::OffsetTime<time::format_description::well_known::Rfc3339>>
+{
+    let offset = parse_log_timezone(spec, local_offset)?;
+    Ok(tracing_subscriber::fmt::time::OffsetTime::new(
+        offset,
+        time::format_description::well_known::Rfc3339,
+    ))
+}
+
+/// The machine's UTC offset, read **before** the tokio runtime exists.
+///
+/// The `time` crate refuses to determine the local offset once a process is
+/// multithreaded, and it is right to: another thread calling `setenv("TZ")`
+/// concurrently with `localtime_r` is a data race in C, and the crate will
+/// not paper over it. `tracing_subscriber`'s `LocalTime` hits exactly this
+/// and is gated behind an `--cfg unsound_local_offset` build flag as a
+/// result.
+///
+/// So the offset is read here, in the last moment this process is
+/// single-threaded, and then held fixed. That is also why
+/// `--log-timezone local` cannot follow a daylight-saving transition: the
+/// offset is decided once, at start-up. A fixed `±HH:MM` says so plainly.
+fn resolve_local_offset() -> Option<time::UtcOffset> {
+    time::UtcOffset::current_local_offset().ok()
+}
+
+fn main() -> Result<()> {
+    // Before anything spawns a thread.
+    let local_offset = resolve_local_offset();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(local_offset))
+}
+
+async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     // Parse once, keeping the matches so the merge below can ask clap which
     // values the operator actually typed -- with the derive API a flag that was
     // never passed still arrives carrying its default.
@@ -754,10 +894,13 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(&args.data_dir).context("Failed to create data directory")?;
 
+    let timer = log_timer(&args.log_timezone, local_offset)?;
+
     let _guard = if args.log_to_stdout {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
+            .with_timer(timer)
             .init();
         None
     } else {
@@ -768,6 +911,7 @@ async fn main() -> Result<()> {
             .with_env_filter(filter)
             .with_target(false)
             .with_ansi(false)
+            .with_timer(timer)
             .with_writer(non_blocking)
             .init();
 
@@ -778,6 +922,22 @@ async fn main() -> Result<()> {
 
         Some(guard)
     };
+
+    // Say the offset once, in words, even though every line already carries
+    // it. A reader skimming a log for a time they remember should not have to
+    // notice a `-03:00` suffix to realise the whole file is not in UTC.
+    let offset = parse_log_timezone(&args.log_timezone, local_offset)?;
+    let (oh, om, _) = offset.as_hms();
+    if offset.is_utc() {
+        info!("Log timestamps are UTC (GMT+00:00)");
+    } else {
+        info!(
+            "Log timestamps are GMT{}{:02}:{:02} -- every line carries the offset",
+            if oh < 0 || om < 0 { '-' } else { '+' },
+            oh.abs(),
+            om.abs(),
+        );
+    }
 
     info!("Starting Rustock on port {}...", args.port);
 
@@ -2308,4 +2468,106 @@ fn run_build_bridge_index(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod log_timezone_tests {
+    use super::parse_log_timezone;
+    use time::UtcOffset;
+
+    fn offset(h: i8, m: i8) -> UtcOffset {
+        UtcOffset::from_hms(h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn utc_is_the_default_and_its_spellings() {
+        for spec in ["utc", "UTC", "Utc", "z", "Z", ""] {
+            assert_eq!(parse_log_timezone(spec, None).unwrap(), UtcOffset::UTC, "{spec:?}");
+        }
+    }
+
+    /// Buenos Aires: UTC-3, and no daylight saving since 2009, so a fixed
+    /// offset is correct for it year-round.
+    #[test]
+    fn a_signed_offset_parses_in_every_accepted_spelling() {
+        for spec in ["-03:00", "-0300", "-03"] {
+            assert_eq!(parse_log_timezone(spec, None).unwrap(), offset(-3, 0), "{spec:?}");
+        }
+        for spec in ["+05:30", "+0530"] {
+            assert_eq!(parse_log_timezone(spec, None).unwrap(), offset(5, 30), "{spec:?}");
+        }
+        assert_eq!(parse_log_timezone("+00:00", None).unwrap(), UtcOffset::UTC);
+    }
+
+    /// The sign applies to the minutes too. `-03:30` is three and a half
+    /// hours *behind* UTC, not three hours behind and thirty minutes ahead --
+    /// which is what `from_hms(-3, 30, 0)` would mean.
+    #[test]
+    fn the_sign_carries_to_the_minutes() {
+        let parsed = parse_log_timezone("-03:30", None).unwrap();
+        assert_eq!(parsed, offset(-3, -30));
+        let (h, m, _) = parsed.as_hms();
+        assert_eq!((h, m), (-3, -30));
+    }
+
+    /// `local` without a resolved offset is an error, not a silent fallback
+    /// to UTC: a timestamp in a timezone the operator did not ask for is
+    /// worse than a refusal to start.
+    #[test]
+    fn local_without_a_resolvable_offset_is_an_error() {
+        let err = parse_log_timezone("local", None).unwrap_err().to_string();
+        assert!(err.contains("could not be determined"), "{err}");
+        assert!(err.contains("-03:00"), "the error should suggest the way out: {err}");
+
+        assert_eq!(parse_log_timezone("local", Some(offset(-3, 0))).unwrap(), offset(-3, 0));
+    }
+
+    /// clap must accept a value that begins with `-`.
+    ///
+    /// Without `allow_hyphen_values`, `--log-timezone -03:00` fails with
+    /// "unexpected argument '-0' found" -- clap reads the value as another
+    /// flag. Found by running the binary; no unit test on the parser could
+    /// have caught it, because the parser is never reached.
+    #[test]
+    fn a_negative_offset_survives_argument_parsing() {
+        use clap::Parser;
+        let args = super::Args::try_parse_from([
+            "rustock-cli",
+            "--log-timezone",
+            "-03:00",
+        ])
+        .expect("a leading-minus value must parse");
+        assert_eq!(args.log_timezone, "-03:00");
+        assert_eq!(parse_log_timezone(&args.log_timezone, None).unwrap(), offset(-3, 0));
+
+        // The `=` form has to keep working too.
+        let args =
+            super::Args::try_parse_from(["rustock-cli", "--log-timezone=-0300"]).unwrap();
+        assert_eq!(parse_log_timezone(&args.log_timezone, None).unwrap(), offset(-3, 0));
+
+        // And the default is still UTC when the flag is absent.
+        let args = super::Args::try_parse_from(["rustock-cli"]).unwrap();
+        assert_eq!(args.log_timezone, "utc");
+    }
+
+    #[test]
+    fn nonsense_is_rejected_with_a_usable_message() {
+        for spec in [
+            "America/Argentina/Buenos_Aires",
+            "-3",       // one digit
+            "03:00",    // unsigned
+            "-03:99",   // minutes out of range
+            "-0:0",     // one digit either side
+            "-1:2",     // would become -12:00 if colons were merely stripped
+            "-03:0",
+            "-3:00",
+            "abc",
+        ] {
+            let err = parse_log_timezone(spec, None).unwrap_err().to_string();
+            assert!(err.contains(spec), "the message should quote the input: {err}");
+        }
+        // An IANA name is the most likely wrong guess, so make sure it fails
+        // loudly rather than being read as some prefix.
+        assert!(parse_log_timezone("America/Argentina/Buenos_Aires", None).is_err());
+    }
 }

@@ -23,6 +23,7 @@ rustock-trie = { version = "0.1.0", path = "../trie" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+time = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 tracing-appender = "0.2.4"

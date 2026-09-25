@@ -150,6 +150,8 @@ pub struct RateLimitSection {
 pub struct LogSection {
     pub level: Option<String>,
     pub to_stdout: Option<bool>,
+    /// `utc`, `local`, or a fixed UTC offset such as `-03:00`.
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -278,6 +280,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "account_tx_rate_limit_gas_per_second_percent",
     "log_level",
     "log_to_stdout",
+    "log_timezone",
     "pegout_alerts_config",
 ];
 

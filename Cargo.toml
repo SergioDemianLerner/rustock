@@ -19,7 +19,11 @@ anyhow = "1.0.104"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "time"] }
+# `local-offset` lets the node read the machine's UTC offset. The `time` crate
+# only allows that while the process is single-threaded, which is why the
+# offset is resolved in `main` before the tokio runtime is built.
+time = { version = "0.3", features = ["local-offset", "macros", "formatting"] }
 thiserror = "2.0.18"
 rand = "0.8.6"
 tempfile = "3.25.0"
