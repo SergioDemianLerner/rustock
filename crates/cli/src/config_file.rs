@@ -78,6 +78,10 @@ pub struct RpcSection {
     pub port: Option<u16>,
     pub admin: Option<bool>,
     pub disabled: Option<bool>,
+    /// Serve JSON-RPC over WebSocket too (rskj `providers.web.ws.enabled`).
+    pub ws: Option<bool>,
+    /// WebSocket port (rskj `providers.web.ws.port`, default 4445).
+    pub ws_port: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -244,6 +248,8 @@ pub const CONFIGURABLE: &[&str] = &[
     "rpc_port",
     "rpc_admin",
     "no_rpc",
+    "ws",
+    "ws_port",
     "max_peers",
     "max_inbound_peers",
     "max_inbound_per_ip",

@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+# Only for the chain-event broadcast channel: the sync service publishes and
+# the RPC layer's subscriptions consume, and neither crate depends on the
+# other, so the type has to live where both can see it.
+tokio = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 anyhow = { workspace = true }

@@ -20,6 +20,7 @@ pub struct TxRelay {
     seen: Mutex<LruCache<B256, ()>>,
     pool: Option<Arc<TransactionPool>>,
     scoring: Option<Arc<ScoringService>>,
+    events: Option<rustock_core::events::EventSender>,
 }
 
 impl TxRelay {
@@ -31,6 +32,7 @@ impl TxRelay {
             )),
             pool: None,
             scoring: None,
+            events: None,
         }
     }
 
@@ -42,6 +44,7 @@ impl TxRelay {
             )),
             pool: Some(pool),
             scoring: None,
+            events: None,
         }
     }
 
@@ -55,6 +58,25 @@ impl TxRelay {
     pub fn with_scoring(mut self, scoring: Option<Arc<ScoringService>>) -> Self {
         self.scoring = scoring;
         self
+    }
+
+    /// Attach the chain-event channel, so `eth_subscribe("newPendingTransactions")`
+    /// hears about transactions that enter the pool.
+    pub fn with_events(mut self, events: Option<rustock_core::events::EventSender>) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Announce a transaction the pool accepted.
+    ///
+    /// Only accepted ones: a subscriber asked what is *pending*, and a
+    /// transaction the pool refused never was.
+    fn announce_pending(&self, hash: B256) {
+        let Some(events) = &self.events else { return };
+        if events.receiver_count() == 0 {
+            return;
+        }
+        let _ = events.send(rustock_core::events::ChainEvent::PendingTransaction(hash));
     }
 
     fn filter_and_validate(&self, txs: &[Bytes], from: Option<B512>) -> Vec<Bytes> {
@@ -86,7 +108,10 @@ impl TxRelay {
                     );
                 }
                 match accepted {
-                    Ok(_) => valid_txs.push(tx_bytes.clone()),
+                    Ok(_) => {
+                        self.announce_pending(hash);
+                        valid_txs.push(tx_bytes.clone())
+                    }
                     Err(e) => {
                         trace!(tx_hash = %hash, err = %e, "Rejected incoming transaction");
                     }
@@ -110,6 +135,7 @@ impl TxRelay {
             let mut seen = self.seen.lock().expect("seen cache lock poisoned");
             seen.put(hash, ());
         }
+        self.announce_pending(hash);
 
         let msg = P2pMessage::RskMessage(RskMessage::new(
             RskSubMessage::Transactions(vec![raw_tx]),

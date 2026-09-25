@@ -214,6 +214,14 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
   A port of rskj's `co.rsk.scoring`. Bans persist across restarts, which
   rskj's do not. See [docs/peer-scoring.md](docs/peer-scoring.md).
 
+**WebSocket + subscriptions:**
+
+- `eth_subscribe` / `eth_unsubscribe` over a WebSocket on its own port
+  (`--ws`, default port 4445; off by default, as rskj's is). `newHeads`,
+  `logs` (with `removed` on a reorg) and `newPendingTransactions`. Every HTTP
+  method works over the socket too. See
+  [docs/websocket-subscriptions.md](docs/websocket-subscriptions.md).
+
 **Unsupported** (returns error): mining (`eth_sendTransaction`, `eth_sign`, compilers), and the `personal_*`, `evm_*`, `db_*` namespaces.
 
 ## Project Structure
