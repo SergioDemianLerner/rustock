@@ -9,6 +9,11 @@
 
 A Rootstock (RSK) full node implementation in Rust. Rustock syncs and validates blocks from the RSK network using Bitcoin merged mining proofs, executes every transaction against an RSK-compatible Unitrie world state, follows the chain tip in real time, and exposes an rskj-compatible JSON-RPC interface with full state, call, and log support.
 
+**Coming from rskj?** [docs/rskj-to-rustock-map.md](docs/rskj-to-rustock-map.md)
+maps the two codebases package by package — the rskj class you already know on
+one side, the rustock file that answers to it on the other — and lists what
+each side has that the other does not.
+
 ## Features
 
 - **Full block sync**: Skeleton-based bulk header sync with parallel chunk downloads across multiple peers, followed by block body downloads and real-time tip following via `NewBlockHashes`.
