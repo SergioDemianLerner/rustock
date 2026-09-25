@@ -202,11 +202,31 @@ pub fn eth_uninstall_filter(id: Value, params: &Value, state: &RpcState) -> Json
 
 fn collect_logs(from: u64, to: u64, filter: &LogFilter, state: &RpcState) -> Vec<LogDto> {
     let mut result = Vec::new();
+    // Only worth reading a header to test its bloom when the query actually
+    // constrains something. An unfiltered `eth_getLogs` wants every log, so
+    // the test could never skip a block and would be a read per block for
+    // nothing.
+    let use_bloom = filter_constrains_anything(filter);
 
     for num in from..=to {
         let Some(block_hash) = state.store.canonical_hash(num).ok().flatten() else {
             continue;
         };
+
+        // The cheap rejection: one header read and three bit tests per
+        // filtered term, against a receipt list that may hold hundreds of
+        // logs. The header's `logs_bloom` is the OR of its receipts' blooms
+        // and is validated against the recomputed value when the block is
+        // executed (`ProcessError::LogsBloomMismatch`), so it can be trusted
+        // to be complete.
+        if use_bloom {
+            if let Some(header) = state.store.header(block_hash).ok().flatten() {
+                if !bloom_may_match(&header.logs_bloom, filter) {
+                    continue;
+                }
+            }
+        }
+
         let Some(receipts) = state.store.receipts(block_hash).ok().flatten() else {
             continue;
         };
@@ -237,6 +257,45 @@ fn collect_logs(from: u64, to: u64, filter: &LogFilter, state: &RpcState) -> Vec
     }
 
     result
+}
+
+/// Does this query name anything a bloom could be tested against?
+fn filter_constrains_anything(filter: &LogFilter) -> bool {
+    !filter.addresses.is_empty()
+        || filter.topics.iter().flatten().any(|allowed| !allowed.is_empty())
+}
+
+/// Could a block with this logs bloom hold a log matching `filter`?
+///
+/// **`false` is certain, `true` is a maybe.** A bloom filter has no false
+/// negatives, so a `false` here means no log in the block can match and the
+/// block is safe to skip without reading its receipts. A `true` proves
+/// nothing and every candidate is still confirmed by `matches_filter`.
+///
+/// The logic mirrors `matches_filter`: addresses are OR-ed, topic positions
+/// are AND-ed with the alternatives at each position OR-ed.
+fn bloom_may_match(bloom: &alloy_primitives::Bloom, filter: &LogFilter) -> bool {
+    use rustock_core::bloom::may_contain;
+
+    if !filter.addresses.is_empty()
+        && !filter.addresses.iter().any(|a| may_contain(bloom, a.as_slice()))
+    {
+        return false;
+    }
+
+    for allowed in filter.topics.iter().flatten() {
+        // An empty alternatives list at a position means "the log must have
+        // **no** topic here" (see `matches_filter`). There is nothing to look
+        // up, so the bloom says nothing about it and the block must be read.
+        if allowed.is_empty() {
+            continue;
+        }
+        if !allowed.iter().any(|t| may_contain(bloom, t.as_slice())) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn matches_filter(log: &rustock_core::Log, filter: &LogFilter) -> bool {
