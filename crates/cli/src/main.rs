@@ -897,10 +897,18 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let timer = log_timer(&args.log_timezone, local_offset)?;
 
     let _guard = if args.log_to_stdout {
+        // Colour only when stdout is a terminal. Under systemd it is a pipe
+        // into journald, and the escapes are then *stored* in the journal --
+        // invisible in `journalctl`'s default view, which strips them, and
+        // very visible the moment anyone uses `-o cat`, pipes to a file, or
+        // greps. The file path has always passed `false` here; the stdout
+        // path assumed a human was watching.
+        let colour = std::io::IsTerminal::is_terminal(&std::io::stdout());
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
             .with_timer(timer)
+            .with_ansi(colour)
             .init();
         None
     } else {
