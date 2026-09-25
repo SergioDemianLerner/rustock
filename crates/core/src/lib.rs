@@ -1,4 +1,5 @@
 pub mod bloom;
+pub mod events;
 pub mod types;
 pub mod validation;
 pub mod config;

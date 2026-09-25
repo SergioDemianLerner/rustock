@@ -360,6 +360,29 @@ rskj closer to linear in the number of groups. Not a compatibility difference,
 recorded here because someone comparing query latency between the two nodes
 will see it and should know why. Issue #122 tracks the grouped index.
 
+### `newHeads` announces blocks that never became the head
+
+`BlockHeaderNotificationEmitter` listens on `onBlock`, and in
+`BlockChainImpl.tryToConnect` that fires for `IMPORTED_NOT_BEST` as well as
+`IMPORTED_BEST`:
+
+```java
+// IMPORTED_NOT_BEST
+extendAlternativeBlockChain(block, totalDifficulty);
+saveReceipts(block, result);
+onBlock(block, result);          // <- newHeads fires here too
+```
+
+So an rskj `newHeads` subscriber is told about the losing side of a fork,
+which geth never does. rskj's *logs* emitter uses `onBestBlock` and does not
+have this, so the two subscriptions on the same node disagree about what a
+head is.
+
+rustock follows geth here rather than rskj -- see
+`docs/websocket-subscriptions.md` for why, and note the direction: a client
+written against rskj sees strictly fewer notifications here, never spurious
+ones.
+
 ---
 
 ## How to add an entry
