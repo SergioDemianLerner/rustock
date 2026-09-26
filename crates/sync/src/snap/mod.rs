@@ -37,6 +37,7 @@ pub mod client;
 pub mod driver;
 pub mod headers;
 pub mod indexer;
+pub mod rate;
 pub mod server;
 pub mod session;
 
@@ -44,6 +45,8 @@ pub mod session;
 mod header_tests;
 #[cfg(test)]
 mod indexer_tests;
+#[cfg(test)]
+mod rate_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]
@@ -106,7 +109,32 @@ pub struct SnapConfig {
     pub max_in_flight: usize,
     /// Chunk requests one peer may have queued here before being ignored
     /// (rskj `maxSenderRequests`).
+    ///
+    /// A limit on *concurrency*, not on rate: it stops a peer occupying every
+    /// worker, but on its own it does not stop one pulling state as fast as
+    /// the wire allows. Measured, a peer with three slots can take cached
+    /// cells at about 300 MB/s.
     pub max_requests_per_peer: usize,
+
+    /// State bytes per second one peer may be served.
+    ///
+    /// Egress is the one resource here that nothing else bounds. Computing
+    /// cells is bounded by the cache -- a server serves exactly one state, so
+    /// there are only ever ~9,200 distinct cells and the worst a peer can do
+    /// is make it compute them all once, which then benefits everyone.
+    ///
+    /// 8 MB/s is generous for an honest client: the whole 0.9 GB mainnet
+    /// state in about two minutes from a single server. It bounds one peer to
+    /// roughly a fortieth of what it could take unthrottled.
+    pub peer_bytes_per_second: u64,
+
+    /// State bytes per second this server will produce in total.
+    ///
+    /// Four peers at the per-peer limit reach it. 32 MB/s is 256 Mbit, which
+    /// leaves a gigabit host room for the ordinary block and transaction
+    /// traffic it exists to carry; a smaller uplink wants a smaller number,
+    /// which is why this is configuration rather than a constant.
+    pub total_bytes_per_second: u64,
 
     /// Blocks before the checkpoint whose bodies are needed, because
     /// contracts can read them (rskj `BLOCKS_REQUIRED`).
@@ -142,6 +170,8 @@ impl Default for SnapConfig {
             max_chunk_bytes: 1 << 20,
             max_in_flight: 8,
             max_requests_per_peer: 3,
+            peer_bytes_per_second: 8 * 1024 * 1024,
+            total_bytes_per_second: 32 * 1024 * 1024,
 
             blocks_required: 6_000,
             block_chunk_size: 400,

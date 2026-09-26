@@ -104,6 +104,10 @@ pub struct SnapshotSection {
     /// Fill the canonical index for history below the checkpoint window after
     /// a snapshot sync.
     pub index_history: Option<bool>,
+    /// State bytes per second one peer may be served.
+    pub peer_rate: Option<u64>,
+    /// State bytes per second this server will produce in total.
+    pub total_rate: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -309,6 +313,8 @@ pub const CONFIGURABLE: &[&str] = &[
     "snap_chunk_grid",
     "snap_parallel",
     "snap_index_history",
+    "snap_peer_rate",
+    "snap_total_rate",
     "pegout_alerts_config",
 ];
 

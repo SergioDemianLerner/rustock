@@ -208,6 +208,24 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     snap_index_history: bool,
 
+    /// State bytes per second one peer may be served.
+    ///
+    /// Computing chunks is bounded by the server's cache -- it serves one
+    /// state, so there are only so many distinct cells -- but egress is not
+    /// bounded by anything else. Unthrottled, one peer can pull cached cells
+    /// at about 300 MB/s. The default gives an honest client the whole
+    /// mainnet state in about two minutes from a single server.
+    #[arg(long, default_value_t = 8 * 1024 * 1024, value_name = "BYTES")]
+    snap_peer_rate: u64,
+
+    /// State bytes per second this server will produce in total.
+    ///
+    /// Four peers at the per-peer limit reach it. 32 MB/s is 256 Mbit, which
+    /// leaves a gigabit host room for the block and transaction traffic it
+    /// exists to carry; a smaller uplink wants a smaller number.
+    #[arg(long, default_value_t = 32 * 1024 * 1024, value_name = "BYTES")]
+    snap_total_rate: u64,
+
     /// Network ID (30 for mainnet, 33 for regtest)
     #[arg(long, default_value = "30")]
     network_id: u64,
@@ -747,6 +765,8 @@ fn apply_file_config(
         f.snapshot.index_history.as_ref(),
         &mut a.snap_index_history,
     );
+    apply(matches, "snap_peer_rate", f.snapshot.peer_rate.as_ref(), &mut a.snap_peer_rate);
+    apply(matches, "snap_total_rate", f.snapshot.total_rate.as_ref(), &mut a.snap_total_rate);
 
     apply(matches, "max_peers", f.peers.max_peers.as_ref(), &mut a.max_peers);
     apply(matches, "max_inbound_peers", f.peers.max_inbound_peers.as_ref(),
@@ -1622,6 +1642,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         chunk_bytes: args.snap_chunk_bytes,
         chunk_grid: args.snap_chunk_grid.max(1),
         index_history: args.snap_index_history,
+        peer_bytes_per_second: args.snap_peer_rate,
+        total_bytes_per_second: args.snap_total_rate,
         max_in_flight: args.snap_parallel.max(1),
         ..rustock_sync::SnapConfig::default()
     };

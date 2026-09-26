@@ -53,6 +53,8 @@ pub struct SnapServer {
     status_cache: Mutex<Option<CachedStatus>>,
     /// Requests currently being served, per peer.
     serving: Mutex<HashMap<B512, usize>>,
+    /// How fast state may leave, per peer and in total.
+    rate: super::rate::RateLimiter,
 }
 
 impl SnapServer {
@@ -60,10 +62,37 @@ impl SnapServer {
         Self {
             store,
             trie,
-            config,
             status_cache: Mutex::new(None),
             serving: Mutex::new(HashMap::new()),
+            rate: super::rate::RateLimiter::new(
+                config.peer_bytes_per_second,
+                config.total_bytes_per_second,
+                // Longer than this and a peer is better off asking elsewhere
+                // than holding one of its three slots open on us.
+                std::time::Duration::from_secs(5),
+                1024,
+            ),
+            config,
         }
+    }
+
+    /// How long this peer should wait before being served `bytes`, if it may
+    /// be served at all.
+    ///
+    /// Charged before the work is done rather than after, so a peer cannot
+    /// spend what it has not got by pipelining. Repeat requests for the same
+    /// cell are not treated differently from any other: they cost the peer the
+    /// same allowance, and remembering which cells a peer already had would
+    /// cost more memory than the behaviour costs bandwidth.
+    pub fn allowance(&self, peer: B512, bytes: u64) -> super::rate::Allowance {
+        self.rate.allow(peer, bytes)
+    }
+
+    /// What a chunk answer is likely to weigh, for charging before it is
+    /// built. One cell, near enough: they are within a few percent of the
+    /// grid by construction.
+    pub fn chunk_cost(&self) -> u64 {
+        self.config.chunk_grid.max(1)
     }
 
     /// Take a slot to serve this peer, or refuse.
