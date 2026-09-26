@@ -133,3 +133,43 @@ fn stripped_nodes_match_rskj_byte_for_byte() {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// **The whole chunk, byte for byte against rskj's.**
+///
+/// The node encoding is only half of it: the walk also decides which
+/// ancestors land in which list, what counts as a node's offset, and when the
+/// node straddling the far boundary is dropped. None of that is visible until
+/// an rskj client rejects a chunk, so it is checked against blobs rskj
+/// produced.
+#[test]
+fn legacy_chunks_match_rskj_byte_for_byte() {
+    use rustock_trie::snapshot_legacy::legacy_chunk;
+
+    let text = include_str!("rskj-vectors/chunks.txt");
+    let (mut keys, mut from, mut to) = (0usize, 0u64, 0u64);
+    let mut checked = 0;
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("KEYS ") {
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            keys = f[0].parse().unwrap();
+            from = f[2].parse().unwrap();
+            to = f[4].parse().unwrap();
+        } else if let Some(rest) = line.strip_prefix("BLOB ") {
+            let (root, store) = trie(keys);
+            let root_hash: [u8; 32] = root.compute_hash(&store).into();
+
+            let chunk = legacy_chunk(&root_hash, from, to, &store)
+                .unwrap_or_else(|| panic!("{keys} keys {from}..{to}: could not build"));
+
+            assert_eq!(
+                hex(&rustock_trie::snapshot_legacy::encode_blob(&chunk)),
+                rest.trim(),
+                "{keys} keys, {from}..{to}: blob differs from rskj's"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 6, "only {checked} blobs compared");
+}
+

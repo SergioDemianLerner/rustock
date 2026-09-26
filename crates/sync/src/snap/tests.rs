@@ -848,7 +848,7 @@ fn a_served_cell_is_cached_and_reused() {
     assert_eq!(first.refusal, Refusal::None);
 
     // It is on disk now, under this state root and cell index.
-    let cached = store.snap_chunk(peer.root_hash, 1).expect("readable");
+    let cached = store.snap_chunk(peer.root_hash, 4096, 0, 1).expect("readable");
     assert!(cached.is_some(), "the cell was not cached");
 
     // And a second ask returns exactly the same bytes.
@@ -979,10 +979,10 @@ fn a_rolled_checkpoint_drops_the_old_cells() {
     let other = B256::repeat_byte(0xC5);
 
     // Two states' worth of cached cells.
-    store.put_snap_chunk(peer.root_hash, 0, b"current").expect("put");
-    store.put_snap_chunk(other, 0, b"retired").expect("put");
-    store.put_snap_chunk(other, 7, b"retired").expect("put");
-    assert!(store.snap_chunk(other, 7).expect("readable").is_some());
+    store.put_snap_chunk(peer.root_hash, 4096, 0, 0, b"current").expect("put");
+    store.put_snap_chunk(other, 4096, 0, 0, b"retired").expect("put");
+    store.put_snap_chunk(other, 4096, 0, 7, b"retired").expect("put");
+    assert!(store.snap_chunk(other, 4096, 0, 7).expect("readable").is_some());
 
     let server = SnapServer::new(
         store.clone(),
@@ -999,10 +999,10 @@ fn a_rolled_checkpoint_drops_the_old_cells() {
     // Whatever the status returned, the retired state's cells must not
     // outlive a rollover; assert the mechanism rather than the schedule.
     store.clear_snap_chunks(other).expect("clear");
-    assert!(store.snap_chunk(other, 0).expect("readable").is_none());
-    assert!(store.snap_chunk(other, 7).expect("readable").is_none());
+    assert!(store.snap_chunk(other, 4096, 0, 0).expect("readable").is_none());
+    assert!(store.snap_chunk(other, 4096, 0, 7).expect("readable").is_none());
     assert!(
-        store.snap_chunk(peer.root_hash, 0).expect("readable").is_some(),
+        store.snap_chunk(peer.root_hash, 4096, 0, 0).expect("readable").is_some(),
         "clearing one state took another with it"
     );
 }
@@ -1016,14 +1016,137 @@ fn clearing_a_state_leaves_nothing_of_it() {
     let root = peer.root_hash;
 
     for index in [0u64, 1, 4096, u64::MAX - 1, u64::MAX] {
-        store.put_snap_chunk(root, index, b"x").expect("put");
+        store.put_snap_chunk(root, 4096, 0, index, b"x").expect("put");
     }
     store.clear_snap_chunks(root).expect("clear");
 
     for index in [0u64, 1, 4096, u64::MAX - 1, u64::MAX] {
         assert!(
-            store.snap_chunk(root, index).expect("readable").is_none(),
+            store.snap_chunk(root, 4096, 0, index).expect("readable").is_none(),
             "cell {index} survived the clear"
         );
     }
+}
+
+/// **An rskj client gets rskj's format.** It cannot read ours, so without this
+/// a rustock node can never serve one. It is told apart by what it does not
+/// send: an rskj chunk request has three elements, ours has four.
+#[test]
+fn an_rskj_client_is_served_rskj_format() {
+    use crate::snap::RSKJ_CHUNK_GRID;
+    use rustock_networking::protocol::snap::Refusal;
+
+    // Big enough that rskj's 51,200-byte cell is not the whole trie, so the
+    // grid is actually exercised rather than trivially satisfied.
+    let (store, peer, block_number) = server_fixture(900);
+    assert!(peer.total() > RSKJ_CHUNK_GRID, "the fixture must exceed one rskj cell");
+    let server = SnapServer::new(
+        store,
+        peer.store.clone() as Arc<dyn TrieStore>,
+        SnapConfig { server_enabled: true, chunk_grid: 100_000, ..config(4, 100_000) },
+    );
+
+    // No state root: the caller is rskj.
+    let response = server
+        .chunk(&SnapChunkRequest {
+            id: 1,
+            block_number,
+            from: 0,
+            chunk_size: 0,
+            state_root: None,
+        })
+        .expect("an answer");
+
+    assert_eq!(response.refusal, Refusal::None);
+    match &response.payload {
+        ChunkPayload::Legacy(blob) => assert!(!blob.is_empty(), "served an empty rskj chunk"),
+        other => panic!("an rskj client was served {other:?}"),
+    }
+
+    // And on rskj's grid, not ours: their step is a constant they cannot be
+    // talked out of.
+    assert_eq!(response.to, RSKJ_CHUNK_GRID.min(peer.total()));
+
+    let next = server
+        .chunk(&SnapChunkRequest {
+            id: 2,
+            block_number,
+            from: RSKJ_CHUNK_GRID,
+            chunk_size: 0,
+            state_root: None,
+        })
+        .expect("an answer");
+    assert_eq!(next.refusal, Refusal::None, "rskj's own grid was refused");
+}
+
+/// A rustock client still gets the proved format from the same server, and the
+/// two are cached apart -- the same range in two encodings must not be
+/// confused.
+#[test]
+fn the_two_formats_are_served_and_cached_apart() {
+    let (store, peer, block_number) = server_fixture(300);
+    let server = SnapServer::new(
+        store.clone(),
+        peer.store.clone() as Arc<dyn TrieStore>,
+        SnapConfig { server_enabled: true, chunk_grid: 51_200, ..config(4, 51_200) },
+    );
+
+    let ask = |root| SnapChunkRequest {
+        id: 1,
+        block_number,
+        from: 0,
+        chunk_size: 0,
+        state_root: root,
+    };
+
+    let proved = server.chunk(&ask(Some(peer.root_hash))).expect("an answer");
+    let legacy = server.chunk(&ask(None)).expect("an answer");
+
+    assert!(matches!(proved.payload, ChunkPayload::Proved { .. }));
+    assert!(matches!(legacy.payload, ChunkPayload::Legacy(_)));
+
+    // Asking again must return each its own bytes, not the other's.
+    let proved_again = server.chunk(&ask(Some(peer.root_hash))).expect("an answer");
+    let legacy_again = server.chunk(&ask(None)).expect("an answer");
+    assert_eq!(proved_again.payload, proved.payload, "the proved cell was overwritten");
+    assert_eq!(legacy_again.payload, legacy.payload, "the rskj cell was overwritten");
+}
+
+/// Changing the grid must not make a server hand back cells for ranges nobody
+/// asked about. Cell 3 of a 100 KB grid is a different range from cell 3 of a
+/// 51,200 byte one, so the grid is part of a cell's identity.
+#[test]
+fn a_changed_grid_does_not_reuse_the_old_cells() {
+    let (store, peer, block_number) = server_fixture(900);
+
+    let serve_with = |grid: u64| {
+        SnapServer::new(
+            store.clone(),
+            peer.store.clone() as Arc<dyn TrieStore>,
+            SnapConfig { server_enabled: true, chunk_grid: grid, ..config(4, grid) },
+        )
+        .chunk(&SnapChunkRequest {
+            id: 1,
+            block_number,
+            from: 0,
+            chunk_size: 0,
+            state_root: Some(peer.root_hash),
+        })
+        .expect("an answer")
+    };
+
+    let narrow = serve_with(8_192);
+    let wide = serve_with(24_576);
+
+    // Both are cell 0, of different widths. They must not be the same bytes.
+    assert_ne!(
+        narrow.payload, wide.payload,
+        "a wider grid was served the narrow grid's cached cell"
+    );
+    assert_eq!(narrow.to, 8_192);
+    assert_eq!(wide.to, 24_576);
+
+    // And asking again for each returns its own.
+    assert_eq!(serve_with(8_192).payload, narrow.payload);
+    assert_eq!(serve_with(24_576).payload, wide.payload);
 }

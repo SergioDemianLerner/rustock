@@ -724,6 +724,11 @@ fn apply_file_config(
     apply(matches, "no_rpc", f.rpc.disabled.as_ref(), &mut a.no_rpc);
     apply(matches, "ws", f.rpc.ws.as_ref(), &mut a.ws);
     apply(matches, "ws_port", f.rpc.ws_port.as_ref(), &mut a.ws_port);
+    apply(matches, "snap_server", f.snapshot.server.as_ref(), &mut a.snap_server);
+    apply(matches, "snap_sync", f.snapshot.sync.as_ref(), &mut a.snap_sync);
+    apply(matches, "snap_chunk_bytes", f.snapshot.chunk_bytes.as_ref(), &mut a.snap_chunk_bytes);
+    apply(matches, "snap_chunk_grid", f.snapshot.chunk_grid.as_ref(), &mut a.snap_chunk_grid);
+    apply(matches, "snap_parallel", f.snapshot.parallel.as_ref(), &mut a.snap_parallel);
 
     apply(matches, "max_peers", f.peers.max_peers.as_ref(), &mut a.max_peers);
     apply(matches, "max_inbound_peers", f.peers.max_inbound_peers.as_ref(),

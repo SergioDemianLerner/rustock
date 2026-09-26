@@ -171,3 +171,290 @@ impl<'a> Reader<'a> {
         self.data.get(self.pos..).unwrap_or(&[])
     }
 }
+
+// ------------------------------------------------- rskj's chunk, assembled
+
+use crate::node::{NodeRef, TrieNode};
+use crate::snapshot::{stream_size, total_size};
+
+/// A chunk as rskj assembles one.
+///
+/// The three lists are what its client needs to rebuild the subtree: the nodes
+/// themselves, the ancestors whose left subtrees the walk skipped (carrying
+/// the left hash it skipped), and the ancestors still owed their right subtree
+/// (carrying the right hash to come).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyChunk {
+    /// Ancestors the seek turned right at, with the left hash each skipped.
+    pub pre_root: Vec<(Vec<u8>, Option<ChildHash>)>,
+    /// The chunk's nodes, stripped, in order.
+    pub nodes: Vec<Vec<u8>>,
+    /// The left hash of the first node.
+    pub first_left: Option<ChildHash>,
+    /// The left and right hashes of the last node.
+    pub last: Option<(Option<ChildHash>, Option<ChildHash>)>,
+    /// Ancestors still owed their right subtree, with the right hash owed.
+    pub post_root: Vec<(Vec<u8>, Option<ChildHash>)>,
+}
+
+/// rskj's in-order walk, reproduced.
+///
+/// Written to match `TrieDTOInOrderIterator` step for step rather than to be
+/// the same shape as [`crate::snapshot::chunk_until`], because the two differ
+/// in ways that would be invisible until an rskj client rejected a chunk: what
+/// counts as the offset of a node, when the boundary node is dropped, and
+/// which ancestors end up in which of the two lists.
+struct Walk<'a> {
+    store: &'a dyn TrieStore,
+    /// Top of the stack is the end of the vector; rskj's `Deque` has it at the
+    /// front, so the order is reversed when the list is handed out.
+    visiting: Vec<TrieNode>,
+    pre_root: Vec<TrieNode>,
+    from: i128,
+    to: i128,
+}
+
+impl<'a> Walk<'a> {
+    fn node(&self, hash: &ChildHash) -> Option<TrieNode> {
+        let message = self.store.get(hash)?;
+        TrieNode::try_from_message(&message, self.store)
+    }
+
+    fn hash_of(child: &NodeRef) -> Option<ChildHash> {
+        match child {
+            NodeRef::Hash(h) => Some((*h).into()),
+            // An embedded child has no hash of its own on the wire, and an
+            // absent one has nothing to give.
+            _ => None,
+        }
+    }
+
+    fn embedded_total(&self, child: &NodeRef) -> i128 {
+        match child {
+            NodeRef::Node(n) => total_size(n, self.store) as i128,
+            _ => 0,
+        }
+    }
+
+    fn push_and_return(&mut self, node: TrieNode, offset: i128) {
+        self.from -= offset;
+        self.visiting.push(node);
+    }
+
+    /// `findByChildrenSize`: descend to the node covering `offset`, recording
+    /// on the way which ancestors were turned right at.
+    fn seek(&mut self, offset: i128, node: TrieNode) {
+        if !node.is_terminal() {
+            let left_embedded = matches!(node.left, NodeRef::Node(_));
+            let right_embedded = matches!(node.right, NodeRef::Node(_));
+
+            if let (false, Some(left_hash)) = (left_embedded, Self::hash_of(&node.left)) {
+                let Some(left) = self.node(&left_hash) else { return };
+                let mut max_left = total_size(&left, self.store) as i128;
+                if offset <= max_left {
+                    self.visiting.push(node);
+                    return self.seek(offset, left);
+                }
+                let left_total = max_left;
+                max_left += stream_size(&node, self.store) as i128;
+                if offset <= max_left {
+                    return self.push_and_return(node, offset - left_total);
+                }
+            } else if left_embedded && offset <= self.embedded_total(&node.left) {
+                return self.push_and_return(node, offset);
+            }
+
+            if let (false, Some(right_hash)) = (right_embedded, Self::hash_of(&node.right)) {
+                let Some(right) = self.node(&right_hash) else { return };
+                let total = total_size(&node, self.store) as i128;
+                let max_parent = total - total_size(&right, self.store) as i128;
+                if max_parent < offset && offset <= total {
+                    self.pre_root.push(node);
+                    return self.seek(offset - max_parent, right);
+                }
+            } else if right_embedded && offset <= total_size(&node, self.store) as i128 {
+                let left_and_parent =
+                    total_size(&node, self.store) as i128 - self.embedded_total(&node.right);
+                return self.push_and_return(node, offset - left_and_parent);
+            }
+        }
+
+        if total_size(&node, self.store) as i128 >= offset {
+            self.push_and_return(node, offset);
+        }
+        // Otherwise the node is past the range entirely and is not stacked.
+    }
+
+    fn has_next(&self) -> bool {
+        self.from < self.to && !self.visiting.is_empty()
+    }
+
+    fn next(&mut self) -> Option<TrieNode> {
+        let result = self.visiting.last()?.clone();
+        let offset = stream_size(&result, self.store) as i128;
+
+        if self.from + offset < self.to {
+            self.visiting.pop();
+            if let Some(right_hash) = Self::hash_of(&result.right) {
+                if let Some(right) = self.node(&right_hash) {
+                    self.visiting.push(right.clone());
+                    self.push_leftmost(right);
+                }
+            }
+        }
+        self.from += offset;
+        Some(result)
+    }
+
+    fn push_leftmost(&mut self, node: TrieNode) {
+        let mut current = node;
+        while let Some(left_hash) = Self::hash_of(&current.left) {
+            let Some(left) = self.node(&left_hash) else { return };
+            self.visiting.push(left.clone());
+            current = left;
+        }
+    }
+}
+
+/// Build the chunk covering `from..to` in rskj's format.
+///
+/// `None` when the root is unreadable or a node's long value is missing --
+/// the stripped form inlines values, so a server that has lost one cannot
+/// serve that node at all.
+pub fn legacy_chunk(
+    root_hash: &ChildHash,
+    from: u64,
+    to: u64,
+    store: &dyn TrieStore,
+) -> Option<LegacyChunk> {
+    let root_message = store.get(root_hash)?;
+    let root = TrieNode::try_from_message(&root_message, store)?;
+
+    let mut walk = Walk {
+        store,
+        visiting: Vec::new(),
+        pre_root: Vec::new(),
+        from: from as i128,
+        to: to as i128,
+    };
+    walk.seek(from as i128, root);
+
+    let first = walk.visiting.last().cloned();
+    let mut nodes: Vec<Vec<u8>> = Vec::new();
+    let mut last: Option<TrieNode> = None;
+
+    while walk.has_next() {
+        let node = walk.next()?;
+        // rskj keeps a node only while more remain or the walk is spent: the
+        // node that straddles the far boundary belongs to the next chunk, and
+        // dropping it here is what stops it being sent twice.
+        if walk.has_next() || walk.visiting.is_empty() {
+            nodes.push(strip(&node.to_message(store), store)?);
+            last = Some(node);
+        }
+    }
+
+    let strip_with = |node: &TrieNode, hash: Option<ChildHash>| -> Option<(Vec<u8>, Option<ChildHash>)> {
+        Some((strip(&node.to_message(store), store)?, hash))
+    };
+
+    let mut pre_root = Vec::new();
+    for node in &walk.pre_root {
+        pre_root.push(strip_with(node, Walk::hash_of(&node.left))?);
+    }
+
+    // rskj hands out its stack top-first.
+    let mut post_root = Vec::new();
+    for node in walk.visiting.iter().rev() {
+        post_root.push(strip_with(node, Walk::hash_of(&node.right))?);
+    }
+
+    Some(LegacyChunk {
+        pre_root,
+        nodes,
+        first_left: first.as_ref().and_then(|n| Walk::hash_of(&n.left)),
+        last: last
+            .as_ref()
+            .map(|n| (Walk::hash_of(&n.left), Walk::hash_of(&n.right))),
+        post_root,
+    })
+}
+
+/// The chunk as rskj frames it:
+/// `RLP([preRootNodes, nodes, firstNodeLeftHash, lastNodeHashes, postRootNodes])`.
+///
+/// Hand-rolled rather than derived, because the shape is not a struct: two of
+/// the five elements are lists of pairs and one is a bare element, and an
+/// absent hash is the empty string rather than an omission.
+pub fn encode_blob(chunk: &LegacyChunk) -> Vec<u8> {
+    let hash_or_empty = |h: &Option<ChildHash>| -> Vec<u8> {
+        rlp_element(h.as_ref().map_or(&[][..], |h| &h[..]))
+    };
+    let pair = |body: &[u8], hash: &Option<ChildHash>| {
+        let mut inner = rlp_element(body);
+        inner.extend_from_slice(&hash_or_empty(hash));
+        rlp_list(&inner)
+    };
+
+    let mut pre = Vec::new();
+    for (body, hash) in &chunk.pre_root {
+        pre.extend_from_slice(&pair(body, hash));
+    }
+
+    let mut nodes = Vec::new();
+    for body in &chunk.nodes {
+        nodes.extend_from_slice(&rlp_element(body));
+    }
+
+    let last = match &chunk.last {
+        Some((left, right)) => {
+            let mut inner = hash_or_empty(left);
+            inner.extend_from_slice(&hash_or_empty(right));
+            rlp_list(&inner)
+        }
+        None => rlp_list(&[]),
+    };
+
+    let mut post = Vec::new();
+    for (body, hash) in &chunk.post_root {
+        post.extend_from_slice(&pair(body, hash));
+    }
+
+    let mut all = rlp_list(&pre);
+    all.extend_from_slice(&rlp_list(&nodes));
+    all.extend_from_slice(&hash_or_empty(&chunk.first_left));
+    all.extend_from_slice(&last);
+    all.extend_from_slice(&rlp_list(&post));
+    rlp_list(&all)
+}
+
+fn rlp_element(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 9);
+    if bytes.len() == 1 && bytes[0] < 0x80 {
+        out.push(bytes[0]);
+    } else if bytes.len() < 56 {
+        out.push(0x80 + bytes.len() as u8);
+        out.extend_from_slice(bytes);
+    } else {
+        let len = bytes.len().to_be_bytes();
+        let first = len.iter().position(|b| *b != 0).unwrap_or(len.len() - 1);
+        out.push(0xB7 + (len.len() - first) as u8);
+        out.extend_from_slice(&len[first..]);
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+fn rlp_list(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 9);
+    if payload.len() < 56 {
+        out.push(0xC0 + payload.len() as u8);
+    } else {
+        let len = payload.len().to_be_bytes();
+        let first = len.iter().position(|b| *b != 0).unwrap_or(len.len() - 1);
+        out.push(0xF7 + (len.len() - first) as u8);
+        out.extend_from_slice(&len[first..]);
+    }
+    out.extend_from_slice(payload);
+    out
+}

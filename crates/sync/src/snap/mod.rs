@@ -133,6 +133,14 @@ impl Default for SnapConfig {
     }
 }
 
+/// The grid rskj's snapshot chunks sit on: `getSnapshotChunkSize()` returns a
+/// hard-coded 50, times `CHUNK_ITEM_SIZE` of 1024.
+///
+/// Not configurable on their side, so it is a constant on ours too. An rskj
+/// client asks on this grid and cannot be told otherwise, so serving one means
+/// serving cells of this size.
+pub const RSKJ_CHUNK_GRID: u64 = 50 * 1024;
+
 impl SnapConfig {
     /// The cell an offset belongs to, and where that cell begins.
     pub fn cell_of(&self, offset: u64) -> (u64, u64) {

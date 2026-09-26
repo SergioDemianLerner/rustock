@@ -818,12 +818,18 @@ impl BlockStore {
     }
 }
 
-/// `state_root || cell_index`, big-endian so a state's cells sort together
-/// and can be dropped as one range.
-fn snap_chunk_key(state_root: B256, index: u64) -> [u8; 40] {
-    let mut key = [0u8; 40];
+/// `state_root || grid || format || cell_index`, big-endian so a state's
+/// cells sort together and can be dropped as one range.
+///
+/// The grid and the format are in the key because they are part of what a
+/// cell *is*. A server whose grid changed, or which serves two dialects,
+/// would otherwise hand back bytes for a range nobody asked about.
+fn snap_chunk_key(state_root: B256, grid: u64, format: u8, index: u64) -> [u8; 49] {
+    let mut key = [0u8; 49];
     key[..32].copy_from_slice(state_root.as_slice());
-    key[32..].copy_from_slice(&index.to_be_bytes());
+    key[32..40].copy_from_slice(&grid.to_be_bytes());
+    key[40] = format;
+    key[41..].copy_from_slice(&index.to_be_bytes());
     key
 }
 
@@ -1183,16 +1189,39 @@ impl BlockStore {
     // --- Snapshot chunk cache ---
 
     /// A snapshot cell already computed, if it is still here.
-    pub fn snap_chunk(&self, state_root: B256, index: u64) -> Result<Option<Vec<u8>>> {
+    ///
+    /// `grid` and `format` are part of the identity of a cell, not decoration:
+    /// cell 3 of a 100 KB grid is a different range from cell 3 of a 51,200
+    /// byte one, and the same range in two encodings is two different answers.
+    /// Keying on the index alone would serve one client another's bytes the
+    /// first time an operator changed a setting.
+    pub fn snap_chunk(
+        &self,
+        state_root: B256,
+        grid: u64,
+        format: u8,
+        index: u64,
+    ) -> Result<Option<Vec<u8>>> {
         Ok(self
             .db
-            .get_cf(self.cf(CF_SNAP_CHUNKS)?, snap_chunk_key(state_root, index))
+            .get_cf(self.cf(CF_SNAP_CHUNKS)?, snap_chunk_key(state_root, grid, format, index))
             .context("Failed to read a snapshot chunk")?)
     }
 
-    pub fn put_snap_chunk(&self, state_root: B256, index: u64, bytes: &[u8]) -> Result<()> {
+    pub fn put_snap_chunk(
+        &self,
+        state_root: B256,
+        grid: u64,
+        format: u8,
+        index: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
         self.db
-            .put_cf(self.cf(CF_SNAP_CHUNKS)?, snap_chunk_key(state_root, index), bytes)
+            .put_cf(
+                self.cf(CF_SNAP_CHUNKS)?,
+                snap_chunk_key(state_root, grid, format, index),
+                bytes,
+            )
             .context("Failed to store a snapshot chunk")
     }
 
@@ -1201,15 +1230,17 @@ impl BlockStore {
     pub fn clear_snap_chunks(&self, state_root: B256) -> Result<()> {
         let cf = self.cf(CF_SNAP_CHUNKS)?;
         let mut batch = WriteBatch::default();
+        // Everything under this state root, whatever grid or format it was
+        // stored for.
         batch.delete_range_cf(
             cf,
-            snap_chunk_key(state_root, 0),
-            snap_chunk_key(state_root, u64::MAX),
+            snap_chunk_key(state_root, 0, 0, 0),
+            snap_chunk_key(state_root, u64::MAX, u8::MAX, u64::MAX),
         );
         // delete_range is end-exclusive, so the last possible cell needs
         // naming; a cache that kept one stale entry per state would leak one
         // per rollover forever.
-        batch.delete_cf(cf, snap_chunk_key(state_root, u64::MAX));
+        batch.delete_cf(cf, snap_chunk_key(state_root, u64::MAX, u8::MAX, u64::MAX));
         self.db.write(batch).context("Failed to clear snapshot chunks")
     }
 
