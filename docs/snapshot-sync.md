@@ -33,6 +33,12 @@ fails verification. All three end the same way: the range goes back in the
 queue and someone else is asked. Nothing a peer sends is written to the store
 before it is checked.
 
+What it does not yet do is hold that peer to account. A chunk that fails its
+proof is refused but not reported to peer scoring, and a bad *status* or header
+fails the whole session rather than the peer that sent it — which for now ends
+snapshot sync for the life of the process. Neither is a safety problem: nothing
+unverified is ever kept. Both are tracked as **issue #134**.
+
 ### What the header walk costs
 
 For a node that starts with nothing, step 2 walks from the checkpoint to
