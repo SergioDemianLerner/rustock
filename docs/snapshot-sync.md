@@ -154,6 +154,30 @@ chunk to verify, from any offset, from any peer, tells the client how much
 there is. The advertised figure is used only to fan out the initial slices and
 is discarded the moment a chunk lands.
 
+### Chunks sit on a fixed grid
+
+Cell `i` is the run of nodes covering `[i*G, (i+1)*G)` in offset space. It is a
+function of the trie and those two numbers and nothing else, so every client
+asking for cell `i` of a given state gets the same bytes.
+
+That is what makes a server's work reusable. The checkpoint moves only every
+5000 blocks — about **1.7 days** — so every client syncing in that window wants
+the same ~0.92 GB of state. Off a grid they would each ask at different
+boundaries and the server would recompute everything for every one of them.
+
+rskj does the same thing: its client steps `from` by a fixed
+`chunkSize * 1024` rather than resuming wherever the last node ended. What it
+does not do is *agree* on the step — each side reads its own config, so a
+client stepping by X against a server serving Y < X never requests the range
+between, and assembles state with a hole in it, every chunk individually
+valid. Here the server advertises its grid in the snap status and the client
+adopts it; and because the client still derives its next offset from the nodes
+it actually received, a gap cannot open even if the two disagree.
+
+A node straddling a cell boundary is sent whole in both neighbouring cells.
+That is the only duplication, it is at most one node per boundary, and it is
+what makes every node land in some cell.
+
 ### The witness
 
 For the replay to get off the ground the peer must send the nodes it would
@@ -175,6 +199,46 @@ Measured against mainnet state at #9272510 (0.92 GB of trie):
 The witness costs the same whatever the chunk size, so a bigger chunk spreads
 it further. 100 KB is the default: past it the saving is under two points and
 the cost is a slow peer holding a larger piece of the download for longer.
+
+## The server caches what it computed
+
+A cell is deterministic, so it is stored the first time it is served, keyed by
+`state_root || cell_index` in its own column family, and read back for every
+client after. Measured at #9272510:
+
+| serving path | per 100 KB chunk |
+|---|---|
+| cold traversal | 1.73 s |
+| warm traversal | 29 ms |
+| from cache | 0.46 ms to decode, plus one read |
+
+A cell stores at ~102 KB, so a whole state is ~0.94 GB of cache.
+
+The cells of a state are dropped when the checkpoint rolls past it — they will
+never be asked for again, and there is about a gigabyte of them per state.
+
+The cache is never a source of truth. Every entry can be recomputed from the
+trie, the lookup happens only *after* the state root has been located in the
+store, and a server that has pruned a state refuses rather than serving cells
+it can no longer justify.
+
+## When a server will not answer
+
+An empty answer alone says "not this one" without saying why, and the
+difference decides what the client should do next. So a refusal is named:
+
+| refusal | what the client does |
+|---|---|
+| `OffsetNotOnGrid` | realign and ask again — this is about the request |
+| `PastTheEnd` | our size was wrong; ask again |
+| `StateRootMismatch` | this peer is on another chain; stop asking it |
+| `StateNotStored` | it pruned that state; stop asking it |
+| `UnknownBlock` | it does not have the block; stop asking it |
+
+None of these is misbehaviour and none is charged. The distinction that
+matters is only whether another request to the same peer is worth a round
+trip. The reason travels as a sixth element of the response, past the five
+rskj reads.
 
 ## Differences from rskj
 

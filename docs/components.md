@@ -137,9 +137,17 @@ root node commits to its own subtree size, and every proof carries the root),
 and where a chunk stopped. rskj sends all three as fields the client must then
 check. The strongest check is a field that does not exist.
 
+Chunks sit on a fixed offset grid, which is what makes a server's work
+reusable: the checkpoint moves only every 5000 blocks — about 1.7 days — so
+every client syncing in that window wants the same bytes, and off a grid they
+would each ask at different boundaries. Cells are cached under
+`state_root || index` and dropped when the checkpoint rolls past them.
+
 Measured against mainnet state at #9272510: 2.1 disk reads per node served,
 a 100 KB chunk verified in ~11 ms, witness overhead 2.9%, and a contiguous
 sweep confirming consecutive chunks tile the offset space with no gaps.
+Serving one chunk costs 1.73 s from cold disk, 29 ms warm, and 0.46 ms from
+the cache.
 
 Every failure is charged to whoever *sent* the answer rather than whoever was
 asked, which is what lets a chunk be taken from any peer: a proved chunk is

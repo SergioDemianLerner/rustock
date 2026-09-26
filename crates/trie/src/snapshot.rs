@@ -205,6 +205,35 @@ pub fn chunk_from(
     chunk_from_limited(root, offset, budget, usize::MAX, store)
 }
 
+/// The run of nodes covering `from..to` in offset space.
+///
+/// This is the shape a *grid* wants: cell `i` is `chunk_until(i*G, (i+1)*G)`,
+/// which depends on nothing but the trie and the two numbers, so two servers
+/// asked for the same cell produce the same bytes and the answer can be
+/// cached.
+///
+/// A node straddling either boundary is emitted whole, so it appears in both
+/// neighbouring cells. That is the only duplication, it is at most one node
+/// per boundary, and it is what makes every node land in some cell: a node
+/// beginning at `a` belongs to cell `a / G` whether or not it ends there.
+pub fn chunk_until(
+    root: &TrieNode,
+    from: u64,
+    to: u64,
+    store: &dyn TrieStore,
+) -> Vec<StreamNode> {
+    collect(root, from, Stop::Offset(to), usize::MAX, store)
+}
+
+/// When to stop emitting.
+#[derive(Debug, Clone, Copy)]
+enum Stop {
+    /// Once the wire bytes emitted would exceed this.
+    Budget(u64),
+    /// Once the next node would begin at or past this offset.
+    Offset(u64),
+}
+
 /// As [`chunk_from`], but stopping after `max_nodes` entries.
 ///
 /// The verifier needs this: it replays the traversal over only what a peer
@@ -214,6 +243,16 @@ pub fn chunk_from_limited(
     root: &TrieNode,
     offset: u64,
     budget: u64,
+    max_nodes: usize,
+    store: &dyn TrieStore,
+) -> Vec<StreamNode> {
+    collect(root, offset, Stop::Budget(budget), max_nodes, store)
+}
+
+fn collect(
+    root: &TrieNode,
+    offset: u64,
+    stop: Stop,
     max_nodes: usize,
     store: &dyn TrieStore,
 ) -> Vec<StreamNode> {
@@ -271,7 +310,13 @@ pub fn chunk_from_limited(
         // Budgeted in wire bytes, because that is what the message costs;
         // advanced in span, because that is what the offset space counts.
         let cost = entry.wire_len();
-        if !out.is_empty() && (used.saturating_add(cost) > budget || out.len() >= max_nodes) {
+        let full = match stop {
+            Stop::Budget(budget) => used.saturating_add(cost) > budget,
+            // The node that straddles the far boundary belongs to this cell
+            // too, so the test is on where it *begins*, not where it ends.
+            Stop::Offset(to) => at >= to,
+        };
+        if !out.is_empty() && (full || out.len() >= max_nodes) {
             break;
         }
         at += entry.span;
@@ -325,6 +370,87 @@ fn is_embedded(child: &NodeRef, store: &dyn TrieStore) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A grid covers the trie exactly: every node lands in the cell its start
+    /// offset falls in, and nothing is missed.
+    #[test]
+    fn a_grid_covers_every_node_exactly_once() {
+        for (n, g) in [(1usize, 64u64), (40, 128), (300, 500), (300, 5000)] {
+            let (root, store) = toy_trie(n);
+            let total = total_size(&root, &store);
+
+            // Walk the whole trie once, as the ground truth.
+            let mut truth: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut offset = 0;
+            while offset < total {
+                let chunk = chunk_from(&root, offset, 1 << 30, &store);
+                for e in &chunk {
+                    truth.push((e.offset, e.message.clone()));
+                }
+                offset = chunk.last().expect("non-empty").end();
+            }
+
+            // Now take the same trie cell by cell.
+            let mut seen: std::collections::BTreeMap<u64, Vec<u8>> =
+                std::collections::BTreeMap::new();
+            let cells = total.div_ceil(g);
+            for i in 0..cells {
+                for e in chunk_until(&root, i * g, (i + 1) * g, &store) {
+                    // A straddling node appears in two cells; it must be the
+                    // same node both times.
+                    if let Some(prev) = seen.get(&e.offset) {
+                        assert_eq!(prev, &e.message, "n={n} g={g}: same offset, different node");
+                    }
+                    seen.insert(e.offset, e.message);
+                }
+            }
+
+            assert_eq!(
+                seen.len(),
+                truth.len(),
+                "n={n} g={g}: the grid found {} nodes, the trie has {}",
+                seen.len(),
+                truth.len()
+            );
+            for (offset, message) in truth {
+                assert_eq!(seen.get(&offset), Some(&message), "n={n} g={g}: node at {offset}");
+            }
+        }
+    }
+
+    /// A cell is a function of the trie and its two bounds and nothing else,
+    /// which is what makes it cacheable: ask twice, get the same bytes.
+    #[test]
+    fn a_cell_is_the_same_however_it_is_asked_for() {
+        let (root, store) = toy_trie(300);
+        let g = 4096;
+
+        for i in 0..6u64 {
+            let once = chunk_until(&root, i * g, (i + 1) * g, &store);
+            let twice = chunk_until(&root, i * g, (i + 1) * g, &store);
+            assert_eq!(once, twice, "cell {i} is not deterministic");
+            assert!(!once.is_empty(), "cell {i} is empty");
+        }
+    }
+
+    /// Duplication at a boundary is at most the one node that straddles it.
+    #[test]
+    fn at_most_one_node_is_shared_between_neighbouring_cells() {
+        let (root, store) = toy_trie(300);
+        let g = 3000;
+        let total = total_size(&root, &store);
+
+        for i in 0..(total / g).min(20) {
+            let left = chunk_until(&root, i * g, (i + 1) * g, &store);
+            let right = chunk_until(&root, (i + 1) * g, (i + 2) * g, &store);
+            let shared = left
+                .iter()
+                .filter(|a| right.iter().any(|b| b.offset == a.offset))
+                .count();
+            assert!(shared <= 1, "cells {i} and {} share {shared} nodes", i + 1);
+        }
+    }
+
+
     use super::*;
     use crate::{MemoryTrieStore, TrieKeySlice};
 

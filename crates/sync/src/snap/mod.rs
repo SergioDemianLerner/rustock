@@ -64,6 +64,18 @@ pub struct SnapConfig {
     /// (rskj `BLOCK_NUMBER_CHECKPOINT`).
     pub checkpoint_rounding: u64,
 
+    /// The grid every chunk sits on, in offset space.
+    ///
+    /// Cell `i` is the run of nodes covering `[i*G, (i+1)*G)`, which depends
+    /// on nothing but the trie and those two numbers. That is what lets a
+    /// server cache a cell and serve it to every client that asks, and it is
+    /// what rskj does too -- its client steps `from` by a fixed
+    /// `chunkSize * 1024` rather than resuming wherever the last node ended.
+    ///
+    /// 100 KB of offset space is about 95 KB on the wire, measured against
+    /// mainnet state at #9272510.
+    pub chunk_grid: u64,
+
     /// Bytes of trie nodes to ask for per chunk.
     ///
     /// The PoC report settles on 25-50KB. This defaults higher, because the
@@ -109,6 +121,7 @@ impl Default for SnapConfig {
             checkpoint_distance: 10_000,
             checkpoint_rounding: 5_000,
 
+            chunk_grid: 100_000,
             chunk_bytes: 100_000,
             max_chunk_bytes: 1 << 20,
             max_in_flight: 8,
@@ -121,6 +134,20 @@ impl Default for SnapConfig {
 }
 
 impl SnapConfig {
+    /// The cell an offset belongs to, and where that cell begins.
+    pub fn cell_of(&self, offset: u64) -> (u64, u64) {
+        let g = self.chunk_grid.max(1);
+        let index = offset / g;
+        (index, index * g)
+    }
+
+    /// Whether an offset is a cell boundary. A request that is not gets a
+    /// refusal naming the reason rather than a silent empty answer, because
+    /// the client's response should be to realign, not to give up on the peer.
+    pub fn on_grid(&self, offset: u64) -> bool {
+        offset % self.chunk_grid.max(1) == 0
+    }
+
     /// The checkpoint a node at `best` would offer: rounded down so that
     /// independent servers converge on the same block.
     pub fn checkpoint_for(&self, best: u64) -> u64 {

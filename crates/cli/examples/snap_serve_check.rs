@@ -21,7 +21,7 @@
 use alloy_primitives::keccak256;
 use rustock_storage::{BlockStore, RocksDbTrieStore};
 use rustock_trie::snapshot::total_size;
-use rustock_trie::snapshot_proof::{prove_chunk, verify_chunk, ChunkProof, Entry};
+use rustock_trie::snapshot_proof::{prove_cell, verify_chunk, ChunkProof, Entry};
 use rustock_trie::{TrieNode, TrieStore};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -45,6 +45,39 @@ impl TrieStore for Counting {
     }
     fn put(&self, key: &[u8], value: &[u8]) {
         self.inner.put(key, value)
+    }
+}
+
+/// A cached cell, as the server stores it.
+fn encode_cell(proof: &ChunkProof) -> Vec<u8> {
+    use rustock_networking::protocol::snap::{ChunkPayload, SnapEntry};
+    ChunkPayload::Proved {
+        entries: proof
+            .entries
+            .iter()
+            .map(|e| SnapEntry {
+                message: e.message.clone().into(),
+                long_values: e.long_values.iter().map(|v| v.clone().into()).collect(),
+            })
+            .collect(),
+        witness: proof.witness.iter().map(|w| w.clone().into()).collect(),
+    }
+    .encode_bytes()
+}
+
+fn decode_cell(bytes: &[u8]) -> ChunkProof {
+    use rustock_networking::protocol::snap::ChunkPayload;
+    let payload = ChunkPayload::decode_bytes(bytes).expect("a cell we wrote");
+    let ChunkPayload::Proved { entries, witness } = payload else { panic!("not proved") };
+    ChunkProof {
+        entries: entries
+            .iter()
+            .map(|e| Entry {
+                message: e.message.to_vec(),
+                long_values: e.long_values.iter().map(|v| v.to_vec()).collect(),
+            })
+            .collect(),
+        witness: witness.iter().map(|w| w.to_vec()).collect(),
     }
 }
 
@@ -139,14 +172,25 @@ fn main() -> anyhow::Result<()> {
     let mut serve_time = std::time::Duration::ZERO;
     let mut verify_time = std::time::Duration::ZERO;
     let mut widest_witness = 0usize;
+    let mut cache_time = std::time::Duration::ZERO;
+    let mut cache_bytes = 0u64;
 
     let mut i = 0usize;
     while i < offsets.len() && i < want_chunks {
         let from = offsets[i];
         let from = &from;
         let t0 = Instant::now();
-        let proof = prove_chunk(&root, *from, chunk_bytes, trie.as_ref());
+        // Grid cells, as a server serves them.
+        let proof = prove_cell(&root, *from, *from + chunk_bytes, trie.as_ref());
         serve_time += t0.elapsed();
+
+        // What a cached cell costs to hand back: decode the stored bytes.
+        let stored = encode_cell(&proof);
+        let t_cache = Instant::now();
+        let reheated = decode_cell(&stored);
+        cache_time += t_cache.elapsed();
+        cache_bytes += stored.len() as u64;
+        assert_eq!(reheated.entries.len(), proof.entries.len(), "cache round trip lost nodes");
 
         if proof.entries.is_empty() {
             println!("chunk at {from}: empty (past the end?)");
@@ -271,6 +315,12 @@ fn main() -> anyhow::Result<()> {
         counting.reads.load(Ordering::Relaxed),
         counting.bytes.load(Ordering::Relaxed),
         counting.reads.load(Ordering::Relaxed) as f64 / nodes.max(1) as f64
+    );
+    println!(
+        "cache     {:?} per cell to decode {} B stored ({:.0}x faster than serving)",
+        cache_time / sampled as u32,
+        cache_bytes / sampled,
+        serve_time.as_secs_f64() / cache_time.as_secs_f64().max(1e-9)
     );
     println!(
         "serve     {:?} total, {:?} per chunk",

@@ -13,6 +13,6 @@ pub use rsk::{
     BodyRequest, BodyResponse,
 };
 pub use snap::{
-    ChunkPayload, SnapBlocksRequest, SnapBlocksResponse, SnapChunkRequest, SnapChunkResponse,
+    ChunkPayload, Refusal, SnapBlocksRequest, SnapBlocksResponse, SnapChunkRequest, SnapChunkResponse,
     SnapEntry, SnapStatusRequest, SnapStatusResponse,
 };
