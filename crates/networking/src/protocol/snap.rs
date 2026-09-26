@@ -64,6 +64,14 @@ pub struct SnapStatusResponse {
     /// Cumulative difficulty of each block, positionally aligned.
     pub difficulties: Vec<U256>,
     pub trie_size: u64,
+    /// The offset-space grid this server's chunks sit on.
+    ///
+    /// Clients align their requests to it so that everyone asks for the same
+    /// cells and the server can answer from cache. Zero means unstated, which
+    /// is what an rskj server sends -- it has a grid, but keeps it in local
+    /// config and expects the client's to match, which is how a client and
+    /// server with different settings silently leave holes in a download.
+    pub chunk_grid: u64,
 }
 
 /// "Send me the state from this offset" (type 20).
@@ -103,6 +111,53 @@ pub enum ChunkPayload {
     Legacy(Bytes),
 }
 
+/// Why a server would not serve a chunk.
+///
+/// An empty answer alone says "not this one" without saying why, and the
+/// difference matters to the client: a peer on another chain should be dropped
+/// from the rotation, a peer whose grid disagrees should be realigned with,
+/// and neither is misbehaviour. Carried as a trailing element rskj never
+/// reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum Refusal {
+    /// Not a refusal: the chunk is in the payload.
+    #[default]
+    None = 0,
+    /// No block at that number on this chain.
+    UnknownBlock = 1,
+    /// This chain has a different state root at that height.
+    StateRootMismatch = 2,
+    /// The state was known but is no longer stored.
+    StateNotStored = 3,
+    /// The offset is past the end of the trie.
+    PastTheEnd = 4,
+    /// The offset is not a multiple of this server's chunk granularity.
+    OffsetNotOnGrid = 5,
+}
+
+impl Refusal {
+    pub fn from_code(code: u64) -> Self {
+        match code {
+            1 => Refusal::UnknownBlock,
+            2 => Refusal::StateRootMismatch,
+            3 => Refusal::StateNotStored,
+            4 => Refusal::PastTheEnd,
+            5 => Refusal::OffsetNotOnGrid,
+            _ => Refusal::None,
+        }
+    }
+
+    /// Whether asking this peer for a different range is worth the round trip.
+    ///
+    /// None of these is misbehaviour, so none is charged; the question is only
+    /// whether the peer can help with anything else. A grid disagreement is
+    /// about the request, not the peer, so it is the one worth retrying.
+    pub fn worth_asking_again(self) -> bool {
+        matches!(self, Refusal::None | Refusal::OffsetNotOnGrid | Refusal::PastTheEnd)
+    }
+}
+
 /// A chunk of state (type 21).
 ///
 /// Only [`ChunkPayload`] is load-bearing. `from`, `to` and `complete` are the
@@ -117,6 +172,9 @@ pub struct SnapChunkResponse {
     pub from: u64,
     pub to: u64,
     pub complete: bool,
+    /// Why the payload is empty, when it is. A sixth element beyond rskj's
+    /// five, which rskj's decoder never reaches.
+    pub refusal: Refusal,
 }
 
 /// "Send me the 400 blocks before this one" (type 24).
@@ -300,6 +358,9 @@ impl SnapStatusResponse {
         let mut params = Vec::new();
         encode_blocks_and_difficulties(&self.blocks, &self.difficulties, &mut params);
         self.trie_size.encode(&mut params);
+        if self.chunk_grid != 0 {
+            self.chunk_grid.encode(&mut params);
+        }
         with_id(self.id, list_of(params))
     }
 
@@ -311,7 +372,8 @@ impl SnapStatusResponse {
 
         let (blocks, difficulties) = decode_blocks_and_difficulties(&mut body)?;
         let trie_size = if body.is_empty() { 0 } else { decode_u64_lenient(&mut body)? };
-        Ok(Self { id, blocks, difficulties, trie_size })
+        let chunk_grid = if body.is_empty() { 0 } else { decode_u64_lenient(&mut body)? };
+        Ok(Self { id, blocks, difficulties, trie_size, chunk_grid })
     }
 }
 
@@ -346,6 +408,18 @@ impl SnapChunkRequest {
 }
 
 impl ChunkPayload {
+    /// The payload on its own, for storing a computed cell.
+    pub fn encode_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode(&mut out);
+        out
+    }
+
+    /// Reads back what [`ChunkPayload::encode_bytes`] wrote.
+    pub fn decode_bytes(bytes: &[u8]) -> alloy_rlp::Result<Self> {
+        Self::decode(&mut &bytes[..])
+    }
+
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
             ChunkPayload::Legacy(blob) => blob.encode(out),
@@ -440,6 +514,9 @@ impl SnapChunkResponse {
         self.from.encode(&mut params);
         self.to.encode(&mut params);
         (self.complete as u8).encode(&mut params);
+        if self.refusal != Refusal::None {
+            (self.refusal as u8).encode(&mut params);
+        }
         with_id(self.id, list_of(params))
     }
 
@@ -454,8 +531,13 @@ impl SnapChunkResponse {
         let from = decode_u64_lenient(&mut body)?;
         let to = decode_u64_lenient(&mut body)?;
         let complete = !body.is_empty() && decode_u64_lenient(&mut body)? != 0;
+        let refusal = if body.is_empty() {
+            Refusal::None
+        } else {
+            Refusal::from_code(decode_u64_lenient(&mut body)?)
+        };
 
-        Ok(Self { id, payload, block_number, from, to, complete })
+        Ok(Self { id, payload, block_number, from, to, complete, refusal })
     }
 }
 
@@ -559,12 +641,14 @@ mod tests {
             blocks: blocks.clone(),
             difficulties: difficulties.clone(),
             trie_size: 130_000_000_000,
+            chunk_grid: 100_000,
         };
 
         match roundtrip(RskSubMessage::SnapStatusResponse(Box::new(sent))) {
             RskSubMessage::SnapStatusResponse(got) => {
                 assert_eq!(got.id, 7);
                 assert_eq!(got.trie_size, 130_000_000_000);
+                assert_eq!(got.chunk_grid, 100_000, "the grid must reach the client");
                 assert_eq!(got.difficulties, difficulties);
                 assert_eq!(got.blocks.len(), 3);
                 for (a, b) in got.blocks.iter().zip(blocks.iter()) {
@@ -631,6 +715,7 @@ mod tests {
             from: 1024,
             to: 2048,
             complete: false,
+            refusal: Refusal::None,
         };
 
         match roundtrip(RskSubMessage::SnapChunkResponse(Box::new(sent.clone()))) {
@@ -648,6 +733,7 @@ mod tests {
             from: 0,
             to: 0,
             complete: true,
+            refusal: Refusal::None,
         };
         match roundtrip(RskSubMessage::SnapChunkResponse(Box::new(sent.clone()))) {
             RskSubMessage::SnapChunkResponse(got) => assert_eq!(*got, sent),
@@ -668,6 +754,7 @@ mod tests {
             from: 0,
             to: 500,
             complete: false,
+            refusal: Refusal::None,
         };
         match roundtrip(RskSubMessage::SnapChunkResponse(Box::new(sent))) {
             RskSubMessage::SnapChunkResponse(got) => {

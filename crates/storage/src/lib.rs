@@ -52,6 +52,15 @@ const CF_BRIDGE_EVENTS: &str = "bridge_events";
 /// blind put: no read-modify-write, no lost update when two writers race, and
 /// re-indexing the same block is idempotent.
 const CF_HEIGHT_INDEX: &str = "block_hashes_by_number";
+
+/// Snapshot chunks already computed, keyed `state_root || cell_index`.
+///
+/// A cache, not a source of truth: every entry can be recomputed from the
+/// trie, and dropping the whole family costs only the recomputation. It earns
+/// its place because the snapshot checkpoint moves once every 5000 blocks --
+/// about 1.7 days -- so every client syncing in that window asks for the same
+/// cells, and computing one costs a trie traversal.
+const CF_SNAP_CHUNKS: &str = "snap_chunks";
 const KEY_HEAD: &[u8] = b"head";
 const KEY_EXEC_HEAD: &[u8] = b"exec_head";
 
@@ -208,21 +217,34 @@ impl BlockStore {
             CF_RECEIPTS,
             CF_TX_INDEX,
             CF_BRIDGE_EVENTS,
+            CF_SNAP_CHUNKS,
             "trie_nodes",
         ];
         // `false`: do not fail when the writer's WAL files are present.
         //
         // A read-only open must name every column family it wants and fails if
-        // one is absent, so a database written before the height index existed
-        // would stop opening read-only the moment this build shipped. Try with
-        // it, fall back without: the reader then simply has no height index,
-        // which is what an un-upgraded database has anyway.
-        let mut with_index = cfs.clone();
-        with_index.push(CF_HEIGHT_INDEX);
-        let db = match DB::open_cf_for_read_only(&opts, path.as_ref(), with_index, false) {
-            Ok(db) => db,
-            Err(_) => DB::open_cf_for_read_only(&opts, path, cfs, false)
-                .context("Failed to open RocksDB read-only")?,
+        // one is absent, so a database written before any of these existed
+        // would stop opening read-only the moment a build that knows about
+        // them shipped. Rather than guess which vintage this is, ask: open
+        // exactly the families that are actually there.
+        let mut wanted = cfs.clone();
+        wanted.push(CF_HEIGHT_INDEX);
+
+        let present = DB::list_cf(&opts, path.as_ref()).unwrap_or_default();
+        let existing: Vec<&str> = wanted
+            .iter()
+            .copied()
+            .filter(|name| present.iter().any(|p| p == name))
+            .collect();
+
+        let db = if existing.is_empty() {
+            // Nothing readable, or `list_cf` could not say. Try the full set
+            // and let RocksDB report why.
+            DB::open_cf_for_read_only(&opts, path.as_ref(), wanted, false)
+                .context("Failed to open RocksDB read-only")?
+        } else {
+            DB::open_cf_for_read_only(&opts, path.as_ref(), existing, false)
+                .context("Failed to open RocksDB read-only")?
         };
         Ok(Self { db: Arc::new(db) })
     }
@@ -258,6 +280,7 @@ impl BlockStore {
             ColumnFamilyDescriptor::new(CF_TX_INDEX, cf_opts()),
             ColumnFamilyDescriptor::new(CF_BRIDGE_EVENTS, cf_opts()),
             ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, cf_opts()),
+            ColumnFamilyDescriptor::new(CF_SNAP_CHUNKS, cf_opts()),
             ColumnFamilyDescriptor::new("trie_nodes", cf_opts()),
         ];
 
@@ -795,6 +818,21 @@ impl BlockStore {
     }
 }
 
+/// `state_root || grid || format || cell_index`, big-endian so a state's
+/// cells sort together and can be dropped as one range.
+///
+/// The grid and the format are in the key because they are part of what a
+/// cell *is*. A server whose grid changed, or which serves two dialects,
+/// would otherwise hand back bytes for a range nobody asked about.
+fn snap_chunk_key(state_root: B256, grid: u64, format: u8, index: u64) -> [u8; 49] {
+    let mut key = [0u8; 49];
+    key[..32].copy_from_slice(state_root.as_slice());
+    key[32..40].copy_from_slice(&grid.to_be_bytes());
+    key[40] = format;
+    key[41..].copy_from_slice(&index.to_be_bytes());
+    key
+}
+
 /// What a `repair_canonical_lineage` pass changed.
 #[derive(Debug, Default, Clone)]
 pub struct CanonicalRepair {
@@ -1148,6 +1186,81 @@ impl BlockStore {
     }
 
     /// Returns a reference to the underlying RocksDB instance.
+    // --- Snapshot chunk cache ---
+
+    /// A snapshot cell already computed, if it is still here.
+    ///
+    /// `grid` and `format` are part of the identity of a cell, not decoration:
+    /// cell 3 of a 100 KB grid is a different range from cell 3 of a 51,200
+    /// byte one, and the same range in two encodings is two different answers.
+    /// Keying on the index alone would serve one client another's bytes the
+    /// first time an operator changed a setting.
+    pub fn snap_chunk(
+        &self,
+        state_root: B256,
+        grid: u64,
+        format: u8,
+        index: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .db
+            .get_cf(self.cf(CF_SNAP_CHUNKS)?, snap_chunk_key(state_root, grid, format, index))
+            .context("Failed to read a snapshot chunk")?)
+    }
+
+    pub fn put_snap_chunk(
+        &self,
+        state_root: B256,
+        grid: u64,
+        format: u8,
+        index: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.db
+            .put_cf(
+                self.cf(CF_SNAP_CHUNKS)?,
+                snap_chunk_key(state_root, grid, format, index),
+                bytes,
+            )
+            .context("Failed to store a snapshot chunk")
+    }
+
+    /// Drop every cell of a state, which is what a checkpoint rollover wants:
+    /// the old state will never be asked for again and is a gigabyte.
+    pub fn clear_snap_chunks(&self, state_root: B256) -> Result<()> {
+        let cf = self.cf(CF_SNAP_CHUNKS)?;
+        let mut batch = WriteBatch::default();
+        // Everything under this state root, whatever grid or format it was
+        // stored for.
+        batch.delete_range_cf(
+            cf,
+            snap_chunk_key(state_root, 0, 0, 0),
+            snap_chunk_key(state_root, u64::MAX, u8::MAX, u64::MAX),
+        );
+        // delete_range is end-exclusive, so the last possible cell needs
+        // naming; a cache that kept one stale entry per state would leak one
+        // per rollover forever.
+        batch.delete_cf(cf, snap_chunk_key(state_root, u64::MAX, u8::MAX, u64::MAX));
+        self.db.write(batch).context("Failed to clear snapshot chunks")
+    }
+
+    /// Every state root that has cells cached, for deciding what to drop.
+    pub fn cached_snap_roots(&self) -> Result<Vec<B256>> {
+        let cf = self.cf(CF_SNAP_CHUNKS)?;
+        let mut roots: Vec<B256> = Vec::new();
+        for item in self.db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+            let (key, _) = item.context("Failed to iterate snapshot chunks")?;
+            if key.len() >= 32 {
+                let root = B256::from_slice(&key[..32]);
+                if roots.last() != Some(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+        roots.dedup();
+        Ok(roots)
+    }
+
     pub fn db(&self) -> &Arc<DB> {
         &self.db
     }

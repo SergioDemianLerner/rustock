@@ -17,7 +17,7 @@ use rustock_networking::scoring::EventType;
 use alloy_primitives::{B256, B512, U256};
 use rustock_core::{Block, Header};
 use rustock_networking::protocol::snap::{
-    ChunkPayload, SnapBlocksRequest, SnapChunkRequest, SnapStatusRequest,
+    ChunkPayload, Refusal, SnapBlocksRequest, SnapChunkRequest, SnapStatusRequest,
 };
 use rustock_networking::protocol::{
     BlockHeadersQuery, BlockHeadersRequest, P2pMessage, RskMessage, RskSubMessage,
@@ -165,6 +165,9 @@ impl SnapDriver {
             // behaving correctly, and an rskj peer is speaking the protocol it
             // knows. Punishing either would teach the network to stop
             // offering; the right response is to stop asking.
+            // Not about the peer: our offset did not suit it, and another
+            // will. It keeps its place in the rotation.
+            Some(ChunkFault::Realign) => {}
             Some(ChunkFault::Declined) | Some(ChunkFault::Legacy) => {
                 if self.unhelpful.insert(peer) {
                     debug!(
@@ -330,12 +333,13 @@ impl SnapDriver {
         blocks: &[Block],
         difficulties: &[U256],
         trie_size: u64,
+        grid: u64,
         peers: &[B512],
     ) -> Vec<Outbound> {
         if !self.answers(id, |p| matches!(p, Pending::Status)) {
             return Vec::new();
         }
-        let actions = self.session.on_status(blocks, difficulties, trie_size);
+        let actions = self.session.on_status(blocks, difficulties, trie_size, grid);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
     }
@@ -364,6 +368,7 @@ impl SnapDriver {
         id: u64,
         sender: B512,
         payload: &ChunkPayload,
+        refusal: Refusal,
         peers: &[B512],
     ) -> Vec<Outbound> {
         let Some(request) = self.in_flight.remove(&id) else {
@@ -379,7 +384,7 @@ impl SnapDriver {
         // Taken from whoever sent it, not only from the peer it was asked of:
         // a valid chunk is valid whatever its route, and the download would
         // rather have it. The sender is what matters for what follows.
-        let actions = self.session.on_chunk(from, payload);
+        let actions = self.session.on_chunk(from, payload, refusal);
         self.charge_for_chunk(sender);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)

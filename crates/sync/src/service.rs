@@ -2613,14 +2613,22 @@ impl SyncService {
             SyncEvent::BodyResponse { id, transactions, uncles, .. } => {
                 self.on_body_response(id, transactions, uncles).await;
             }
-            SyncEvent::SnapStatusResponse { peer, id, blocks, difficulties, trie_size } => {
+            SyncEvent::SnapStatusResponse {
+                peer,
+                id,
+                blocks,
+                difficulties,
+                trie_size,
+                chunk_grid,
+            } => {
                 self.drive_snap(|driver, ps| {
-                    driver.on_status(id, peer, &blocks, &difficulties, trie_size, ps)
+                    driver.on_status(id, peer, &blocks, &difficulties, trie_size, chunk_grid, ps)
                 })
                 .await;
             }
-            SyncEvent::SnapChunkResponse { peer, id, payload, .. } => {
-                self.drive_snap(|driver, ps| driver.on_chunk(id, peer, &payload, ps)).await;
+            SyncEvent::SnapChunkResponse { peer, id, payload, refusal, .. } => {
+                self.drive_snap(|driver, ps| driver.on_chunk(id, peer, &payload, refusal, ps))
+                    .await;
             }
             SyncEvent::SnapBlocksResponse { peer, id, blocks, difficulties } => {
                 self.drive_snap(|driver, ps| driver.on_blocks(id, peer, &blocks, &difficulties, ps))

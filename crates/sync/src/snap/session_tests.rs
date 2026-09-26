@@ -169,7 +169,7 @@ fn no_state_is_requested_before_the_headers_are_verified() {
     let (blocks, tds) = chain(1, 5, genesis, 100, f.state_root);
 
     let mut session = f.session(HeaderVerifier::new());
-    let actions = session.on_status(&blocks, &tds, 5_000);
+    let actions = session.on_status(&blocks, &tds, 5_000, 0);
 
     assert_eq!(session.phase(), Phase::VerifyingHeaders);
     assert!(
@@ -189,7 +189,7 @@ fn a_checkpoint_that_fails_validation_is_refused_at_once() {
 
     let verifier = HeaderVerifier::new().with_static_rule(RefuseEverything);
     let mut session = f.session(verifier);
-    let actions = session.on_status(&blocks, &tds, 5_000);
+    let actions = session.on_status(&blocks, &tds, 5_000, 0);
 
     assert_eq!(session.phase(), Phase::Failed);
     assert!(actions.is_empty(), "asked for something after refusing the checkpoint");
@@ -208,7 +208,7 @@ fn a_header_in_the_walk_that_fails_validation_ends_the_session() {
     // Everything below the checkpoint fails; the checkpoint itself passes.
     let verifier = HeaderVerifier::new().with_static_rule(RefuseBelow(checkpoint));
     let mut session = f.session(verifier);
-    session.on_status(&blocks, &tds, 5_000);
+    session.on_status(&blocks, &tds, 5_000, 0);
     assert_eq!(session.phase(), Phase::VerifyingHeaders, "{:?}", session.failure());
 
     let parent = blocks[blocks.len() - 2].header.clone();
@@ -227,7 +227,7 @@ fn a_spliced_header_chain_is_refused() {
     let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
 
     let mut session = f.session(HeaderVerifier::new());
-    session.on_status(&blocks, &tds, 5_000);
+    session.on_status(&blocks, &tds, 5_000, 0);
 
     // A header from another chain entirely: valid on its own, wrong parent.
     let stranger = header(2, B256::repeat_byte(0x77), f.state_root, 100);
@@ -248,7 +248,7 @@ fn a_chain_back_to_a_foreign_genesis_is_refused() {
     let (blocks, tds) = chain(1, 2, foreign_genesis.hash(), 100, f.state_root);
 
     let mut session = f.session(HeaderVerifier::new());
-    session.on_status(&blocks, &tds, 5_000);
+    session.on_status(&blocks, &tds, 5_000, 0);
 
     session.on_headers(&[blocks[0].header.clone()]);
     session.on_headers(&[foreign_genesis]);
@@ -271,7 +271,7 @@ fn the_header_walk_cannot_satisfy_its_own_anchor() {
     let (blocks, tds) = chain(1, 3, foreign_genesis.hash(), 100, f.state_root);
 
     let mut session = f.session(HeaderVerifier::new());
-    session.on_status(&blocks, &tds, 5_000);
+    session.on_status(&blocks, &tds, 5_000, 0);
 
     // Feed the walk down to the foreign genesis, then offer it a second time:
     // by then its header is in the store, written by the walk itself.
@@ -298,7 +298,7 @@ fn a_status_whose_blocks_do_not_link_is_refused() {
     blocks[2] = block(header(3, B256::repeat_byte(0x55), f.state_root, 100));
 
     let mut session = f.session(HeaderVerifier::new());
-    session.on_status(&blocks, &tds, 5_000);
+    session.on_status(&blocks, &tds, 5_000, 0);
     assert_eq!(session.failure(), Some(&SnapFailure::BrokenChain));
 }
 
@@ -311,7 +311,7 @@ fn inflated_difficulty_is_refused() {
     tds[2] = tds[2] + U256::from(1_000_000u64);
 
     let mut session = f.session(HeaderVerifier::new());
-    session.on_status(&blocks, &tds, 5_000);
+    session.on_status(&blocks, &tds, 5_000, 0);
     assert_eq!(session.failure(), Some(&SnapFailure::BadDifficulty));
 }
 
@@ -319,7 +319,7 @@ fn inflated_difficulty_is_refused() {
 fn an_empty_status_is_refused() {
     let f = fixture(10);
     let mut session = f.session(HeaderVerifier::new());
-    session.on_status(&[], &[], 0);
+    session.on_status(&[], &[], 0, 0);
     assert_eq!(session.failure(), Some(&SnapFailure::NoCheckpoint));
 }
 
@@ -358,7 +358,7 @@ fn a_session_runs_to_completion() {
         config.clone(),
     );
 
-    let mut actions = session.on_status(&blocks, &tds, 8_000);
+    let mut actions = session.on_status(&blocks, &tds, 8_000, 0);
     assert_eq!(session.phase(), Phase::VerifyingHeaders);
 
     let mut guard = 0;
@@ -373,7 +373,7 @@ fn a_session_runs_to_completion() {
 
         let action = actions.remove(0);
         let next = match action {
-            Action::RequestStatus => session.on_status(&blocks, &tds, 8_000),
+            Action::RequestStatus => session.on_status(&blocks, &tds, 8_000, 0),
             Action::RequestHeaders { from, .. } => {
                 // Answer from the offered chain, newest first, as a peer does.
                 let answer: Vec<Header> = blocks
@@ -394,7 +394,7 @@ fn a_session_runs_to_completion() {
                         state_root: Some(f.state_root),
                     })
                     .expect("server answers");
-                session.on_chunk(from, &response.payload)
+                session.on_chunk(from, &response.payload, Refusal::None)
             }
             Action::RequestBlocks { block_number } => {
                 // Two blocks below the checkpoint, from the offered chain.
@@ -515,7 +515,7 @@ fn a_body_that_does_not_match_its_header_is_refused() {
     let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
 
     let mut session = f.session(HeaderVerifier::new());
-    session.on_status(&blocks, &tds, 5_000);
+    session.on_status(&blocks, &tds, 5_000, 0);
     // Anchor the walk: the parent of block 1 is our genesis.
     session.on_headers(&[blocks[1].header.clone()]);
     // The chunk requests the walk's success produces: dropping them would
@@ -561,7 +561,7 @@ fn a_body_that_does_not_match_its_header_is_refused() {
                     state_root: Some(f.state_root),
                 })
                 .expect("server answers");
-            actions.extend(session.on_chunk(from, &response.payload));
+            actions.extend(session.on_chunk(from, &response.payload, Refusal::None));
         }
     }
     assert_eq!(session.phase(), Phase::DownloadingBlocks, "{:?}", session.failure());
@@ -584,6 +584,7 @@ fn a_body_that_does_not_match_its_header_is_refused() {
 use alloy_primitives::B512;
 use crate::snap::driver::{Blame, SnapDriver};
 use rustock_networking::protocol::{P2pMessage, RskSubMessage};
+use rustock_networking::protocol::snap::Refusal;
 use rustock_networking::scoring::EventType;
 
 /// What a driver asked for, and under which id, so a test can answer it.
@@ -612,7 +613,7 @@ fn driver_awaiting_a_chunk(
     let mut out = driver.poll(peers);
     let (status_id, kind) = asked(&out[0]);
     assert_eq!(kind, "status");
-    out = driver.on_status(status_id, peers[0], blocks, tds, 8_000, peers);
+    out = driver.on_status(status_id, peers[0], blocks, tds, 8_000, 0, peers);
 
     // Walk the headers down to genesis, answering from the offered chain.
     let mut guard = 0;
@@ -660,7 +661,7 @@ fn a_peer_whose_chunk_fails_its_proof_is_charged() {
     let liar = B512::repeat_byte(9);
     let mut payload = served_chunk(&f, from);
     tamper(&mut payload);
-    driver.on_chunk(id, liar, &payload, &peers);
+    driver.on_chunk(id, liar, &payload, Refusal::None, &peers);
 
     let blame = driver.take_blame();
     assert_eq!(blame.len(), 1, "expected exactly one charge, got {blame:?}");
@@ -685,7 +686,7 @@ fn the_charge_follows_the_sender_not_the_peer_that_was_asked() {
     let interloper = B512::repeat_byte(77);
     let mut payload = served_chunk(&f, from);
     tamper(&mut payload);
-    driver.on_chunk(id, interloper, &payload, &peers);
+    driver.on_chunk(id, interloper, &payload, Refusal::None, &peers);
 
     let blame = driver.take_blame();
     assert_eq!(blame.len(), 1);
@@ -705,7 +706,7 @@ fn an_honest_peer_is_never_charged() {
     let (mut driver, id, from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
     driver.take_blame();
 
-    driver.on_chunk(id, peers[0], &served_chunk(&f, from), &peers);
+    driver.on_chunk(id, peers[0], &served_chunk(&f, from), Refusal::None, &peers);
     assert!(driver.take_blame().is_empty(), "charged an honest peer");
 }
 
@@ -724,7 +725,7 @@ fn a_peer_that_declines_is_dropped_not_punished() {
 
     let pruned = B512::repeat_byte(5);
     let declined = ChunkPayload::Proved { entries: Vec::new(), witness: Vec::new() };
-    driver.on_chunk(id, pruned, &declined, &peers);
+    driver.on_chunk(id, pruned, &declined, Refusal::None, &peers);
 
     assert!(driver.take_blame().is_empty(), "punished a peer for declining");
     assert!(driver.unhelpful().contains(&pruned), "kept asking a peer that cannot serve");
@@ -743,7 +744,7 @@ fn an_older_peer_is_dropped_not_punished() {
     driver.take_blame();
 
     let rskj = B512::repeat_byte(6);
-    driver.on_chunk(id, rskj, &ChunkPayload::Legacy(vec![0xC1, 0x80].into()), &peers);
+    driver.on_chunk(id, rskj, &ChunkPayload::Legacy(vec![0xC1, 0x80].into()), Refusal::None, &peers);
 
     assert!(driver.take_blame().is_empty(), "punished an rskj peer for being rskj");
     assert!(driver.unhelpful().contains(&rskj));
@@ -763,7 +764,7 @@ fn a_peer_offering_a_broken_chain_is_charged() {
     let (id, _) = asked(&out[0]);
 
     let liar = B512::repeat_byte(3);
-    driver.on_status(id, liar, &blocks, &tds, 5_000, &peers);
+    driver.on_status(id, liar, &blocks, &tds, 5_000, 0, &peers);
 
     let blame = driver.take_blame();
     assert_eq!(blame.len(), 1, "got {blame:?}");
@@ -785,7 +786,7 @@ fn a_peer_serving_an_unmined_header_is_charged_for_the_header() {
         SnapDriver::new(f.session(HeaderVerifier::new().with_static_rule(RefuseBelow(checkpoint))));
     let out = driver.poll(&peers);
     let (status_id, _) = asked(&out[0]);
-    let out = driver.on_status(status_id, peers[0], &blocks, &tds, 5_000, &peers);
+    let out = driver.on_status(status_id, peers[0], &blocks, &tds, 5_000, 0, &peers);
     driver.take_blame();
 
     let (headers_id, kind) = asked(&out[0]);
@@ -892,6 +893,7 @@ async fn a_bad_peer_does_not_end_snapshot_sync() {
             blocks: blocks.clone(),
             difficulties: tds.clone(),
             trie_size: 5_000,
+            chunk_grid: 0,
         })
         .await;
 
@@ -950,6 +952,7 @@ async fn a_charge_reaches_peer_scoring() {
             blocks,
             difficulties: tds,
             trie_size: 5_000,
+            chunk_grid: 0,
         })
         .await;
 

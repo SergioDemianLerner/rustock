@@ -53,6 +53,13 @@ struct Slice {
     end: u64,
     /// Whether a request for `cursor` is outstanding.
     in_flight: bool,
+    /// Ask for exactly `cursor` rather than the cell containing it.
+    ///
+    /// Set when a cell answer did not move the cursor -- a server that caps
+    /// its responses below the grid size will do that -- because asking for
+    /// the same cell again would produce the same answer forever. Costs a
+    /// cache miss at that server, which is strictly better than a stall.
+    exact: bool,
 }
 
 impl Slice {
@@ -111,6 +118,9 @@ pub struct StateDownload {
     root_hash: B256,
     store: Arc<dyn TrieStore>,
     budget: u64,
+    /// The grid cells sit on. Requests are aligned to it so that every client
+    /// asks for the same ranges and a server can answer from cache.
+    grid: u64,
     /// The most requests to have outstanding at once.
     max_in_flight: usize,
     slices: Vec<Slice>,
@@ -129,6 +139,19 @@ impl StateDownload {
         config: &SnapConfig,
         store: Arc<dyn TrieStore>,
     ) -> Self {
+        Self::on_grid(root_hash, hinted_total, config, config.chunk_grid, store)
+    }
+
+    /// The same, but aligned to a grid the server advertised rather than our
+    /// own. Asking on the server's grid is what makes its cache useful; a
+    /// server that states no grid (rskj does not) leaves us on ours.
+    pub fn on_grid(
+        root_hash: B256,
+        hinted_total: u64,
+        config: &SnapConfig,
+        grid: u64,
+        store: Arc<dyn TrieStore>,
+    ) -> Self {
         let workers = config.max_in_flight.max(1);
         let hinted_total = hinted_total.max(1);
 
@@ -136,6 +159,7 @@ impl StateDownload {
             root_hash,
             store,
             budget: config.chunk_bytes,
+            grid: if grid == 0 { config.chunk_grid.max(1) } else { grid },
             max_in_flight: workers,
             slices: Vec::new(),
             total: None,
@@ -157,7 +181,7 @@ impl StateDownload {
             .map(|i| {
                 let start = from + step * i as u64;
                 let end = if i + 1 == count { to } else { from + step * (i as u64 + 1) };
-                Slice { start, cursor: start, end, in_flight: false }
+                Slice { start, cursor: start, end, in_flight: false, exact: false }
             })
             .collect()
     }
@@ -174,9 +198,15 @@ impl StateDownload {
         if self.slices.iter().filter(|s| s.in_flight).count() >= self.max_in_flight {
             return None;
         }
+        let grid = self.grid;
         let slice = self.slices.iter_mut().find(|s| s.wants_work())?;
         slice.in_flight = true;
-        Some(ChunkRequest { from: slice.cursor, budget: self.budget })
+        // Asked for on the grid, whatever the cursor. A cell is the unit a
+        // server can cache and share; asking for `cursor` exactly would give
+        // every client a different range and every server a cache miss.
+        let from =
+            if slice.exact { slice.cursor } else { (slice.cursor / grid) * grid };
+        Some(ChunkRequest { from, budget: self.budget })
     }
 
     /// Give up on an outstanding request so someone else can be asked.
@@ -185,9 +215,28 @@ impl StateDownload {
     /// undo. Called on a timeout, a disconnect, or a chunk that failed to
     /// verify.
     pub fn release(&mut self, from: u64) {
-        if let Some(slice) = self.slices.iter_mut().find(|s| s.in_flight && s.cursor == from) {
-            slice.in_flight = false;
+        let grid = self.grid;
+        if let Some(i) = self.slice_for(from) {
+            self.slices[i].in_flight = false;
         }
+        let _ = grid;
+    }
+
+    /// The slice an answer for `from` belongs to.
+    ///
+    /// A cell begins at or before the cursor that asked for it, because the
+    /// request was aligned down to the grid. An exact match wins over an
+    /// aligned one, so two slices inside the same cell cannot be confused.
+    fn slice_for(&self, from: u64) -> Option<usize> {
+        let grid = self.grid;
+        self.slices
+            .iter()
+            .position(|s| s.in_flight && s.cursor == from)
+            .or_else(|| {
+                self.slices
+                    .iter()
+                    .position(|s| s.in_flight && (s.cursor / grid) * grid == from)
+            })
     }
 
     /// Check a chunk and, if it holds up, keep it.
@@ -195,21 +244,26 @@ impl StateDownload {
     /// The order matters: verify first, store second. A chunk that fails
     /// leaves the store exactly as it was.
     pub fn accept(&mut self, from: u64, proof: &ChunkProof) -> Result<Progress, ChunkError> {
-        if !self.slices.iter().any(|s| s.in_flight && s.cursor == from) {
+        if self.slice_for(from).is_none() {
             return Err(ChunkError::Unsolicited(from));
         }
 
         // Judged on size before anything is read: an answer wildly larger than
         // the question is refused without paying to verify it.
         //
-        // A chunk of one node is exempt. A server always sends at least one,
-        // whatever the budget, because a node bigger than the budget is the
-        // only way past it -- a contract's code, say. Refusing those on size
-        // would make them permanently undownloadable, which is a worse failure
-        // than the one this guards against. The transport's own limit still
-        // bounds a single node.
+        // Only the node messages and the witness are counted, because they are
+        // the only part a peer chooses. A long value's size is fixed by the
+        // node that commits to it, and that node's hash chains to the state
+        // root -- a peer cannot inflate one, it can only send the real bytes
+        // or fail verification. Counting them here would refuse a genuine
+        // account whose code is larger than the chunk, making it permanently
+        // undownloadable: a worse failure than the one this guards against.
+        //
+        // A chunk of one node is exempt for the same reason: a server always
+        // sends at least one, whatever the budget.
         let allowed = self.budget.saturating_mul(OVERSIZE_FACTOR).max(1 << 18);
-        let got = proof.wire_len();
+        let got: u64 = proof.entries.iter().map(|e| e.message.len() as u64).sum::<u64>()
+            + proof.witness.iter().map(|w| w.len() as u64).sum::<u64>();
         if got > allowed && proof.entries.len() > 1 {
             self.release(from);
             return Err(ChunkError::Oversized { asked: self.budget, got });
@@ -241,8 +295,17 @@ impl StateDownload {
 
         let reached = verified.nodes.last().expect("verified chunks are non-empty").end();
         let mut advanced = 0;
-        if let Some(slice) = self.slices.iter_mut().find(|s| s.in_flight && s.cursor == from) {
+        if let Some(i) = self.slice_for(from) {
+            let slice = &mut self.slices[i];
             advanced = reached.saturating_sub(slice.cursor).min(slice.end - slice.cursor);
+            // A cell can begin before the cursor, so it never moves backwards:
+            // the nodes before the cursor were already stored, and storing them
+            // again is harmless but must not un-advance the slice.
+            //
+            // An answer that moved nothing means this server serves less than
+            // a whole cell, so the next request names the cursor exactly
+            // rather than asking the same cell again and again.
+            slice.exact = reached <= slice.cursor;
             slice.cursor = reached.max(slice.cursor);
             slice.in_flight = false;
         }

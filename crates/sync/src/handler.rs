@@ -373,6 +373,7 @@ impl P2pHandler for SyncHandler {
                         blocks: r.blocks.clone(),
                         difficulties: r.difficulties.clone(),
                         trie_size: r.trie_size,
+                        chunk_grid: r.chunk_grid,
                     });
                 }
                 RskSubMessage::SnapChunkResponse(r) => {
@@ -381,6 +382,7 @@ impl P2pHandler for SyncHandler {
                         id: r.id,
                         from: r.from,
                         payload: r.payload.clone(),
+                        refusal: r.refusal,
                     });
                 }
                 RskSubMessage::SnapBlocksResponse(r) => {

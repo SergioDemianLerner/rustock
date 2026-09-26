@@ -6,6 +6,7 @@ pub mod path;
 pub mod shared_path;
 pub mod snapshot;
 pub mod snapshot_proof;
+pub mod snapshot_legacy;
 pub mod store;
 #[cfg(test)]
 mod tests;

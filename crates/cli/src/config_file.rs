@@ -54,6 +54,8 @@ pub struct FileConfig {
     pub log: LogSection,
     #[serde(default)]
     pub alerts: AlertsSection,
+    #[serde(default)]
+    pub snapshot: SnapshotSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -82,6 +84,23 @@ pub struct RpcSection {
     pub ws: Option<bool>,
     /// WebSocket port (rskj `providers.web.ws.port`, default 4445).
     pub ws_port: Option<u16>,
+}
+
+/// Snapshot sync, off on both sides by default (rskj ships it the same way).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotSection {
+    /// Serve snapshots of this node's state to peers that ask.
+    pub server: Option<bool>,
+    /// Catch up by downloading a state rather than executing into one.
+    pub sync: Option<bool>,
+    /// Bytes of state to ask for per chunk.
+    pub chunk_bytes: Option<u64>,
+    /// The offset grid chunks sit on. Changing it invalidates a server's
+    /// cached cells.
+    pub chunk_grid: Option<u64>,
+    /// Chunk requests in flight at once, across all peers.
+    pub parallel: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -281,6 +300,11 @@ pub const CONFIGURABLE: &[&str] = &[
     "log_level",
     "log_to_stdout",
     "log_timezone",
+    "snap_server",
+    "snap_sync",
+    "snap_chunk_bytes",
+    "snap_chunk_grid",
+    "snap_parallel",
     "pegout_alerts_config",
 ];
 

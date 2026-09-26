@@ -21,18 +21,24 @@
 use super::SnapConfig;
 use alloy_primitives::{B256, U256};
 use rustock_networking::protocol::snap::{
-    ChunkPayload, SnapBlocksRequest, SnapBlocksResponse, SnapChunkRequest, SnapChunkResponse,
-    SnapEntry, SnapStatusRequest, SnapStatusResponse,
+    ChunkPayload, Refusal, SnapBlocksRequest, SnapBlocksResponse, SnapChunkRequest,
+    SnapChunkResponse, SnapEntry, SnapStatusRequest, SnapStatusResponse,
 };
 use rustock_core::Block;
 use rustock_storage::BlockStore;
 use rustock_trie::snapshot::total_size;
-use rustock_trie::snapshot_proof::prove_chunk;
+use rustock_trie::snapshot_legacy::{encode_blob as encode_legacy_blob, legacy_chunk};
+use rustock_trie::snapshot_proof::prove_cell;
 use rustock_trie::{TrieNode, TrieStore};
 use alloy_primitives::B512;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, trace, warn};
+
+/// Which encoding a cached cell holds. Part of its key: the same range in two
+/// dialects is two different answers.
+const FORMAT_PROVED: u8 = 0;
+const FORMAT_LEGACY: u8 = 1;
 
 /// A snap status answer, kept so the hundredth client to ask costs nothing.
 struct CachedStatus {
@@ -194,11 +200,48 @@ impl SnapServer {
             blocks.len()
         );
 
-        let response = SnapStatusResponse { id: request.id, blocks, difficulties, trie_size };
+        let response = SnapStatusResponse {
+            id: request.id,
+            blocks,
+            difficulties,
+            trie_size,
+            chunk_grid: self.config.chunk_grid,
+        };
         if let Ok(mut cache) = self.status_cache.lock() {
+            let rolled = cache.as_ref().is_some_and(|c| c.checkpoint != hash);
             *cache = Some(CachedStatus { checkpoint: hash, response: response.clone() });
+            if rolled {
+                // The checkpoint moved, so the cells of every state but this
+                // one will never be asked for again -- and there is about a
+                // gigabyte of them.
+                self.drop_stale_cells(checkpoint.header.state_root);
+            }
         }
         Some(response)
+    }
+
+    /// Forget the cached cells of every state but the one now being offered.
+    ///
+    /// Cells are a cache, so losing them costs only recomputation; keeping
+    /// them costs a gigabyte per checkpoint, and the checkpoint moves every
+    /// 5000 blocks.
+    fn drop_stale_cells(&self, keep: B256) {
+        let Ok(roots) = self.store.cached_snap_roots() else { return };
+        for root in roots {
+            if root == keep {
+                continue;
+            }
+            match self.store.clear_snap_chunks(root) {
+                Ok(()) => debug!(
+                    target: "rustock::snap",
+                    "dropped cached snapshot cells for the retired state {root:?}"
+                ),
+                Err(e) => warn!(
+                    target: "rustock::snap",
+                    "could not drop cached cells for {root:?}: {e}"
+                ),
+            }
+        }
     }
 
     /// A chunk of the checkpoint state, with the proof that anchors it.
@@ -211,10 +254,10 @@ impl SnapServer {
             return None;
         }
 
-        let empty = |reason: &str| {
+        let refuse = |reason: Refusal| {
             debug!(
                 target: "rustock::snap",
-                "declining chunk request from {} at offset {}: {reason}",
+                "declining a chunk of #{} at offset {}: {reason:?}",
                 request.block_number, request.from
             );
             Some(SnapChunkResponse {
@@ -224,14 +267,29 @@ impl SnapServer {
                 from: request.from,
                 to: request.from,
                 complete: false,
+                refusal: reason,
             })
         };
 
+        // Which dialect is asking. An rskj client never names a state root --
+        // its request has three elements where ours has four -- and it cannot
+        // read our chunk format, so it gets rskj's, on rskj's grid, which is a
+        // constant on their side and therefore not ours to choose.
+        let legacy = request.state_root.is_none();
+        let grid = if legacy { super::RSKJ_CHUNK_GRID } else { self.config.chunk_grid.max(1) };
+
+        // A request off the grid cannot be cached and cannot be compared with
+        // anyone else's, so it is refused by name. The client's answer to this
+        // is to realign, not to look for another peer.
+        if request.from % grid != 0 {
+            return refuse(Refusal::OffsetNotOnGrid);
+        }
+
         let Ok(Some(hash)) = self.store.canonical_hash(request.block_number) else {
-            return empty("no such block");
+            return refuse(Refusal::UnknownBlock);
         };
         let Ok(Some(header)) = self.store.header(hash) else {
-            return empty("no such block");
+            return refuse(Refusal::UnknownBlock);
         };
 
         // A client that named a root is telling us which state it means. If
@@ -240,32 +298,55 @@ impl SnapServer {
         // to them like a peer contradicting itself much later.
         if let Some(wanted) = request.state_root {
             if wanted != header.state_root {
-                return empty("state root does not match our chain");
+                return refuse(Refusal::StateRootMismatch);
             }
         }
 
         let Some(root_message) = self.trie.get(header.state_root.as_slice()) else {
-            return empty("state not stored");
+            return refuse(Refusal::StateNotStored);
         };
         let Some(root) = TrieNode::try_from_message(&root_message, self.trie.as_ref()) else {
-            return empty("state root unreadable");
+            return refuse(Refusal::StateNotStored);
         };
 
         let total = total_size(&root, self.trie.as_ref());
         if request.from >= total {
-            return empty("offset past the end of the trie");
+            return refuse(Refusal::PastTheEnd);
         }
 
-        // Zero means "your choice", which is what rskj always sends.
-        let budget = if request.chunk_size == 0 {
-            self.config.chunk_bytes
-        } else {
-            request.chunk_size.min(self.config.max_chunk_bytes)
-        };
+        // The cell this offset names. `chunk_size` is now advisory: the grid
+        // decides how much a cell holds, because a cell that varied with the
+        // asker could not be shared between askers.
+        let index = request.from / grid;
+        let from = index * grid;
+        let to = from + grid;
 
-        let proof = prove_chunk(&root, request.from, budget, self.trie.as_ref());
+        if legacy {
+            return self.serve_legacy(request, &header.state_root, index, from, to, total);
+        }
+
+        // Already computed, for this state, by whoever asked first.
+        if let Ok(Some(cached)) = self.store.snap_chunk(header.state_root, grid, FORMAT_PROVED, index) {
+            if let Ok(payload) = ChunkPayload::decode_bytes(&cached) {
+                trace!(
+                    target: "rustock::snap",
+                    "serving cell {index} of {:?} from cache", header.state_root
+                );
+                return Some(SnapChunkResponse {
+                    id: request.id,
+                    payload,
+                    block_number: request.block_number,
+                    from,
+                    to: to.min(total),
+                    complete: to >= total,
+                    refusal: Refusal::None,
+                });
+            }
+        }
+
+        let proof = prove_cell(&root, from, to, self.trie.as_ref());
         if proof.entries.is_empty() {
-            return empty("no nodes at that offset");
+            return refuse(Refusal::PastTheEnd);
         }
 
         let entries: Vec<SnapEntry> = proof
@@ -276,27 +357,100 @@ impl SnapServer {
                 long_values: e.long_values.iter().map(|v| v.clone().into()).collect(),
             })
             .collect();
-        let witness = proof.witness.iter().map(|w| w.clone().into()).collect();
+        let witness: Vec<_> = proof.witness.iter().map(|w| w.clone().into()).collect();
+        let payload = ChunkPayload::Proved { entries, witness };
 
-        // `to` is a courtesy for the peer's logs. The client recomputes it
-        // from the nodes, and must: see `snapshot_proof`.
-        let to = request.from
-            + proof.entries.iter().map(|e| e.message.len() as u64).sum::<u64>();
+        // Kept for the next client to ask. A failure here costs only the
+        // recomputation, so it is logged and otherwise ignored.
+        if let Err(e) = self.store.put_snap_chunk(
+            header.state_root,
+            grid,
+            FORMAT_PROVED,
+            index,
+            &payload.encode_bytes(),
+        ) {
+            debug!(target: "rustock::snap", "could not cache cell {index}: {e}");
+        }
 
         trace!(
             target: "rustock::snap",
-            "serving {} nodes from offset {} ({} witness nodes, {} bytes)",
-            proof.entries.len(), request.from, proof.witness.len(), proof.wire_len()
+            "serving cell {index} ({from}..{to}): {} nodes, {} witness nodes, {} bytes",
+            proof.entries.len(), proof.witness.len(), proof.wire_len()
         );
 
         Some(SnapChunkResponse {
             id: request.id,
-            payload: ChunkPayload::Proved { entries, witness },
+            payload,
             block_number: request.block_number,
-            from: request.from,
-            to,
+            from,
+            to: to.min(total),
             complete: to >= total,
+            refusal: Refusal::None,
         })
+    }
+
+    /// Serve a cell in rskj's format, to an rskj client.
+    ///
+    /// Cached separately from the proved form: the same range, two encodings,
+    /// and a cache that confused them would serve one client the other's
+    /// bytes. The top bit of the index distinguishes them, which cells
+    /// themselves never reach.
+    fn serve_legacy(
+        &self,
+        request: &SnapChunkRequest,
+        state_root: &B256,
+        index: u64,
+        from: u64,
+        to: u64,
+        total: u64,
+    ) -> Option<SnapChunkResponse> {
+        let answer = |blob: Vec<u8>| {
+            Some(SnapChunkResponse {
+                id: request.id,
+                payload: ChunkPayload::Legacy(blob.into()),
+                block_number: request.block_number,
+                from,
+                to: to.min(total),
+                complete: to >= total,
+                refusal: Refusal::None,
+            })
+        };
+
+        let grid = super::RSKJ_CHUNK_GRID;
+        if let Ok(Some(cached)) = self.store.snap_chunk(*state_root, grid, FORMAT_LEGACY, index) {
+            trace!(target: "rustock::snap", "serving rskj-format cell {index} from cache");
+            return answer(cached);
+        }
+
+        let root: [u8; 32] = (*state_root).into();
+        let Some(chunk) = legacy_chunk(&root, from, to, self.trie.as_ref()) else {
+            debug!(
+                target: "rustock::snap",
+                "cannot build an rskj-format cell at {from}: a long value is missing"
+            );
+            return Some(SnapChunkResponse {
+                id: request.id,
+                payload: ChunkPayload::Legacy(Vec::new().into()),
+                block_number: request.block_number,
+                from,
+                to: from,
+                complete: false,
+                refusal: Refusal::StateNotStored,
+            });
+        };
+
+        let blob = encode_legacy_blob(&chunk);
+        if let Err(e) =
+            self.store.put_snap_chunk(*state_root, grid, FORMAT_LEGACY, index, &blob)
+        {
+            debug!(target: "rustock::snap", "could not cache rskj-format cell {index}: {e}");
+        }
+        trace!(
+            target: "rustock::snap",
+            "serving rskj-format cell {index} ({from}..{to}): {} nodes, {} bytes",
+            chunk.nodes.len(), blob.len()
+        );
+        answer(blob)
     }
 
     /// The 400 blocks before the one asked for.

@@ -3,7 +3,7 @@ use rustock_core::types::header::Header;
 use rustock_core::types::transaction::Transaction;
 use alloy_primitives::U256;
 use rustock_core::types::block::Block;
-use rustock_networking::protocol::snap::ChunkPayload;
+use rustock_networking::protocol::snap::{ChunkPayload, Refusal};
 use rustock_networking::protocol::BlockIdentifier;
 
 /// Forwarded from SyncHandler to the SyncService state machine.
@@ -42,6 +42,8 @@ pub enum SyncEvent {
         blocks: Vec<Block>,
         difficulties: Vec<U256>,
         trie_size: u64,
+        /// The offset grid the server serves on, or zero if it did not say.
+        chunk_grid: u64,
     },
     /// A chunk of state, still unverified. `from` is echoed by the peer and
     /// is a hint for routing only -- the request id is what says which range
@@ -51,6 +53,8 @@ pub enum SyncEvent {
         id: u64,
         from: u64,
         payload: ChunkPayload,
+        /// Why the payload is empty, when it is.
+        refusal: Refusal,
     },
     SnapBlocksResponse {
         peer: B512,
