@@ -221,6 +221,14 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        if sweep && i > 0 && i % 100 == 0 {
+            let reached = offsets.last().copied().unwrap_or(0);
+            println!(
+                "  ... {i} chunks, {nodes} nodes, at offset {reached} ({:.1}% of the trie)",
+                reached as f64 * 100.0 / total as f64
+            );
+        }
+
         if i < 3 || i + 1 == offsets.len().min(want_chunks) {
             println!(
                 "chunk at {from:>13}: {:>4} nodes, {:>6} B nodes, {:>6} B values, \

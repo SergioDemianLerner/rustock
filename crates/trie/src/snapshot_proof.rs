@@ -794,6 +794,25 @@ mod fuzz {
         }
     }
 
+    /// A message may not make the parser allocate far more than the message
+    /// itself. A shared path is expanded one byte per bit, so a peer declaring
+    /// a huge one would turn bytes the transport carried cheaply into memory
+    /// eight times over.
+    #[test]
+    fn a_declared_shared_path_cannot_outgrow_its_message() {
+        // flags: version 01, shared prefix present, no children, no value.
+        // Then the long-form length marker, and a varint saying 8 million bits.
+        let mut message = vec![0b0101_0000u8, 255];
+        message.extend_from_slice(&[254, 0x00, 0x00, 0x7A, 0x00]); // 8_000_000
+        message.extend(std::iter::repeat(0u8).take(64));
+
+        let store = MemoryTrieStore::new();
+        assert!(
+            TrieNode::try_from_message(&message, &store).is_none(),
+            "a shared path longer than any key was accepted"
+        );
+    }
+
     /// Junk grafted onto a real proof is still junk.
     #[test]
     fn no_corruption_of_a_real_proof_can_panic_the_verifier() {

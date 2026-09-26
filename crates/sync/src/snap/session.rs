@@ -402,9 +402,29 @@ impl SnapSession {
         if let Some(header) = &checkpoint {
             let hash = header.hash();
             let _ = self.store.put_total_difficulty(hash, self.checkpoint_td);
-            if let Err(e) = self.store.update_canonical_chain(hash) {
-                warn!(target: "rustock::snap", "could not index the verified chain: {e}");
+
+            // Index the window this session will work in, and no more.
+            //
+            // The walk stored every header it verified, by hash, which for a
+            // fresh node is the whole chain. Indexing all of it here would
+            // build one write batch of nine million entries -- hundreds of
+            // megabytes, in the middle of the sync loop. What the session
+            // needs indexed is the range whose bodies it is about to fetch,
+            // plus a margin; the rest is a local pass over data already on
+            // disk, and belongs in the background. See issue #133.
+            let window = self.config.blocks_required + self.config.block_chunk_size + 1;
+            match self.store.repair_canonical_lineage(hash, window) {
+                Ok(report) => debug!(
+                    target: "rustock::snap",
+                    "indexed {} blocks down to #{:?} for the checkpoint",
+                    report.walked, report.lowest
+                ),
+                Err(e) => warn!(
+                    target: "rustock::snap",
+                    "could not index the verified chain: {e}"
+                ),
             }
+            let _ = self.store.set_head(hash);
         }
 
         info!(

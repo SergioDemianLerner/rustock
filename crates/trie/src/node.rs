@@ -126,6 +126,14 @@ fn orchid_child_hash(child: &NodeRef, is_secure: bool, store: &dyn TrieStore) ->
     Some(node.compute_hash_orchid(is_secure, store))
 }
 
+/// The longest shared path any unitrie node can have.
+///
+/// The longest key the trie holds is a storage slot: an account key
+/// (1 prefix + 10 secure + 20 address) then 1 storage prefix, 10 secure and
+/// up to 32 slot bytes -- 74 bytes, 592 bits. This is comfortably above that
+/// and far below the point where declaring a length becomes an amplification.
+const MAX_SHARED_PATH_BITS: usize = 1024;
+
 /// A bounds-checked walk over a node message.
 ///
 /// Returning `None` where the plain indexing would have panicked is the whole
@@ -375,6 +383,13 @@ impl TrieNode {
             } else {
                 r.varint()? as usize
             };
+            // A shared path longer than any key the trie can hold is not a
+            // trie node. Without this a peer could declare a huge one and have
+            // the parser expand it eightfold -- one bit per byte -- from a
+            // message the transport was happy to carry.
+            if lshared > MAX_SHARED_PATH_BITS {
+                return None;
+            }
             let encoded = r.take(crate::path::encoded_len(lshared))?;
             TrieKeySlice::from_encoded(encoded, lshared)
         } else {

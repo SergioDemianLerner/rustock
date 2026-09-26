@@ -60,6 +60,18 @@ costs the most. rskj's client walks sequentially too. Tracked as **issue
 A node that has already imported a header chain — from the rskj database
 import, say — anchors on its first answer and skips the walk entirely.
 
+### What a snap-synced node has afterwards
+
+Every header of the chain, on disk and verified, keyed by hash. State at the
+checkpoint. Bodies for the 6000 blocks behind it. And a canonical
+`number → hash` index covering only that 6400-block window.
+
+`eth_getBlockByNumber` for an older height therefore finds nothing, even
+though the header is right there. Indexing the whole walk where it finishes
+would mean one write batch of nine million entries in the middle of the sync
+loop; it belongs in a background pass over data already on disk. Tracked as
+**issue #133**.
+
 ## How a chunk is proved
 
 The unitrie gives every node an offset in the in-order traversal, because each
