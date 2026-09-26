@@ -10,6 +10,12 @@ it. The header chain to the snapshot point is verified under the same
 proof-of-work rules a full sync applies, and every chunk of state is proved
 against that chain's state root as it arrives.
 
+Both sides are implemented, and both dialects: rustock serves and reads its own
+chunk format, and serves and reads rskj's. The verification algorithms are
+specified below in enough detail to reimplement, and the costs quoted
+throughout are measured against mainnet state rather than estimated — the tools
+that produced them are in the tree.
+
 ## What the client ends up trusting
 
 Proof-of-work, and nothing else — the same thing a full sync trusts.
@@ -146,11 +152,25 @@ Measured against mainnet at #9274144 (9.27M blocks):
 
 A freshly snap-synced node is the cold case: it has just written ~5.5 GB of
 headers. The writes are not the cost — nine million batched puts is seconds —
-the reads are, and they are disk-bound.
+the reads are, and they are genuinely disk-bound rather than merely slow: the
+cold walk sits in `D` state at 10% CPU, ~1,770 read syscalls a second.
 
-Which is why the pass yields between batches and, more importantly,
-**resumes**: the cursor is stored before each pause, so a node that restarts
-daily still converges instead of starting the hour again every morning.
+Which shapes the pass. It runs 10,000 heights per batch on a blocking thread,
+so it never occupies an async worker, and rests 250 ms between batches so the
+node it runs behind keeps its disk for executing blocks. And it **resumes**:
+the cursor is stored *before* each pause, so a kill during the pause costs
+nothing and a node that restarts daily still converges instead of starting the
+hour again every morning.
+
+Asking whether there is anything to do at all is one lookup at the bottom of
+the chain, not an hour of reads discovering there was not. The gap a snapshot
+sync leaves is at the bottom, so if the bottom is indexed the rest is too.
+
+One rule in here is easy to get backwards, and was: stopping the walk at the
+first height the index already agrees with. That is right for a node that
+indexed downward contiguously, and wrong for a snap-synced one, which is
+indexed at the *top* and bare underneath — the walk stopped at the head having
+written nothing. Agreeing heights are skipped, not stopped at.
 
 `crates/cli/examples/canonical_index_cost.rs` measures both halves on a real
 database, read-only, beside a running node.
@@ -500,8 +520,8 @@ for peers that cannot speak it.
 
 rskj has snapshot sync, experimental and off by default on both sides, with no
 snap boot nodes configured. It does verify each chunk as it arrives
-(`TrieDTOInOrderRecoverer.verifyChunk`). Three things differ here, all in the
-direction of trusting the peer less or doing less work.
+(`TrieDTOInOrderRecoverer.verifyChunk`). What differs here differs in the
+direction of trusting the peer less, or doing less work, or both.
 
 **Linear replay instead of heuristic reconstruction.** rskj rebuilds the
 chunk's subtree by scanning the range for the largest `children_size` to guess
@@ -527,6 +547,28 @@ root it wants. Peers cannot then disagree about what is being downloaded, which
 is also what makes fetching one state from several unrelated peers
 straightforward. A server whose chain has a different root at that height
 declines rather than answering a different question.
+
+**The header walk is pipelined.** rskj's is serial — about 48,000 round trips,
+one at a time, before any state is asked for. A skeleton request is addressed
+by height rather than hash, which breaks the dependency, and the identifiers it
+returns are never believed: what makes an answer trustworthy is that the runs
+link.
+
+**Cells are cached.** The checkpoint is stable for about 1.7 days, so every
+client in that window wants the same bytes; rskj recomputes them for each.
+
+**A refusal says why.** rskj answers "not this one" with an empty chunk and no
+reason, which leaves a client unable to tell "realign" from "ask someone else".
+
+**Bad data is charged to the peer that sent it.** rskj refuses a failed chunk
+without recording anything against its sender.
+
+Two things rskj does that are not copied. Its client rebuilds a chunk by
+scanning for the largest `children_size` recursively; when rustock reads rskj's
+format it derives the same tree with a linear Cartesian-tree pass instead. And
+its snapshot chunk size is a hard-coded constant rather than something a server
+states, so two implementations with different constants could not agree —
+rustock advertises its grid.
 
 ## Wire protocol
 
@@ -575,7 +617,7 @@ rustock --snap-sync --snap-parallel 8 --snap-chunk-bytes 100000
 | `--snap-parallel` | 8 | chunk requests in flight, across all peers |
 | `--snap-index-history` | true | fill the canonical index below the checkpoint window afterwards |
 
-All five are settable from the config file too, under `[snapshot]`:
+All six are settable from the config file too, under `[snapshot]`:
 
 ```toml
 [snapshot]
@@ -654,3 +696,9 @@ holds under that hash.
 | covering the offset space | `crates/sync/src/snap/client.rs` |
 | sequencing a whole sync | `crates/sync/src/snap/session.rs` |
 | peers, request ids, timeouts | `crates/sync/src/snap/driver.rs` |
+| the parallel header walk | `crates/sync/src/snap/headers.rs` |
+| filling the canonical index | `crates/sync/src/snap/indexer.rs` |
+| rskj's node encoding, both ways | `crates/trie/src/snapshot_legacy.rs` |
+| vectors from rskj's own code | `crates/trie/tests/rskj-vectors/` |
+| measuring against a real state | `crates/cli/examples/snap_serve_check.rs` |
+| measuring the index | `crates/cli/examples/canonical_index_cost.rs` |
