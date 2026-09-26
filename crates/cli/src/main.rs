@@ -196,6 +196,18 @@ struct Args {
     #[arg(long, default_value_t = 8, value_name = "N")]
     snap_parallel: usize,
 
+    /// After a snapshot sync, fill in the canonical number-to-hash index for
+    /// the history below the checkpoint window.
+    ///
+    /// Nothing about consensus needs it: every execution-path lookup is
+    /// bounded well inside the window the sync already indexes. What needs it
+    /// is answering RPC about old heights, and serving history to other peers
+    /// -- without it the node takes history from the network and gives none
+    /// back. Costs about 0.4 GB and, on a cold store, up to an hour and a half
+    /// of low-priority background disk. Resumable across restarts.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    snap_index_history: bool,
+
     /// Network ID (30 for mainnet, 33 for regtest)
     #[arg(long, default_value = "30")]
     network_id: u64,
@@ -729,6 +741,12 @@ fn apply_file_config(
     apply(matches, "snap_chunk_bytes", f.snapshot.chunk_bytes.as_ref(), &mut a.snap_chunk_bytes);
     apply(matches, "snap_chunk_grid", f.snapshot.chunk_grid.as_ref(), &mut a.snap_chunk_grid);
     apply(matches, "snap_parallel", f.snapshot.parallel.as_ref(), &mut a.snap_parallel);
+    apply(
+        matches,
+        "snap_index_history",
+        f.snapshot.index_history.as_ref(),
+        &mut a.snap_index_history,
+    );
 
     apply(matches, "max_peers", f.peers.max_peers.as_ref(), &mut a.max_peers);
     apply(matches, "max_inbound_peers", f.peers.max_inbound_peers.as_ref(),
@@ -1603,6 +1621,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         client_enabled: args.snap_sync,
         chunk_bytes: args.snap_chunk_bytes,
         chunk_grid: args.snap_chunk_grid.max(1),
+        index_history: args.snap_index_history,
         max_in_flight: args.snap_parallel.max(1),
         ..rustock_sync::SnapConfig::default()
     };

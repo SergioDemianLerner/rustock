@@ -36,11 +36,14 @@
 pub mod client;
 pub mod driver;
 pub mod headers;
+pub mod indexer;
 pub mod server;
 pub mod session;
 
 #[cfg(test)]
 mod header_tests;
+#[cfg(test)]
+mod indexer_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]
@@ -110,6 +113,16 @@ pub struct SnapConfig {
     pub blocks_required: u64,
     /// Blocks per `SnapBlocks` response (rskj `BLOCK_CHUNK_SIZE`).
     pub block_chunk_size: u64,
+
+    /// After a snapshot sync, fill in the canonical `number -> hash` index for
+    /// the history below the checkpoint window.
+    ///
+    /// Nothing about consensus needs it -- every execution-path lookup is
+    /// bounded well inside the window the sync already indexes. What needs it
+    /// is answering RPC about old heights, and serving history to other
+    /// peers: without it the node takes history from the network and gives
+    /// none back.
+    pub index_history: bool,
 }
 
 impl Default for SnapConfig {
@@ -132,6 +145,7 @@ impl Default for SnapConfig {
 
             blocks_required: 6_000,
             block_chunk_size: 400,
+            index_history: true,
         }
     }
 }

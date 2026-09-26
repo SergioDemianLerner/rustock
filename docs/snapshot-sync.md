@@ -115,13 +115,45 @@ anchors on its first answer and skips the walk entirely.
 
 Every header of the chain, on disk and verified, keyed by hash. State at the
 checkpoint. Bodies for the 6000 blocks behind it. And a canonical
-`number → hash` index covering only that 6400-block window.
+`number → hash` index covering only that ~6400-block window, because building
+the rest where the sync finishes would mean one write batch of nine million
+entries in the middle of the sync loop.
 
-`eth_getBlockByNumber` for an older height therefore finds nothing, even
-though the header is right there. Indexing the whole walk where it finishes
-would mean one write batch of nine million entries in the middle of the sync
-loop; it belongs in a background pass over data already on disk. Tracked as
-**issue #133**.
+**Nothing about consensus needs the rest.** Every `number → hash` lookup on the
+execution path is bounded, and all of them fall inside that window:
+
+| lookup | depth |
+|---|---|
+| `BlockHeader` precompile (RSKIP119) | 4000 — rskj's `MAX_DEPTH` |
+| REMASC sibling scan | a few generations around its maturity |
+| EVM `BLOCKHASH` | 256 |
+
+Two things do need it: RPC about old heights, and **serving history to other
+peers** — `serve_block_hash_request` and `serve_skeleton_request` both resolve
+by height, so without it the node takes history from the network and gives none
+back.
+
+So it is filled in the background, after the sync, and `--snap-index-history`
+turns it off for a node that will never serve or answer about history.
+
+Measured against mainnet at #9274144 (9.27M blocks):
+
+| | |
+|---|---|
+| index size | **415 MB** (44.8 bytes per height) |
+| walk, warm page cache | 82,700 headers/s — **~112 s** |
+| walk, cold | 1,770 headers/s — **~87 min** |
+
+A freshly snap-synced node is the cold case: it has just written ~5.5 GB of
+headers. The writes are not the cost — nine million batched puts is seconds —
+the reads are, and they are disk-bound.
+
+Which is why the pass yields between batches and, more importantly,
+**resumes**: the cursor is stored before each pause, so a node that restarts
+daily still converges instead of starting the hour again every morning.
+
+`crates/cli/examples/canonical_index_cost.rs` measures both halves on a real
+database, read-only, beside a running node.
 
 ## How a chunk is proved
 
@@ -541,6 +573,7 @@ rustock --snap-sync --snap-parallel 8 --snap-chunk-bytes 100000
 | `--snap-chunk-bytes` | 100000 | bytes of state per chunk |
 | `--snap-chunk-grid` | 100000 | the offset grid cells sit on |
 | `--snap-parallel` | 8 | chunk requests in flight, across all peers |
+| `--snap-index-history` | true | fill the canonical index below the checkpoint window afterwards |
 
 All five are settable from the config file too, under `[snapshot]`:
 
@@ -550,6 +583,7 @@ server = true
 sync = false
 chunk_grid = 100000
 parallel = 8
+index_history = true
 ```
 
 A cached cell is keyed by `state_root || grid || format || index`, so changing

@@ -64,6 +64,14 @@ const CF_SNAP_CHUNKS: &str = "snap_chunks";
 const KEY_HEAD: &[u8] = b"head";
 const KEY_EXEC_HEAD: &[u8] = b"exec_head";
 
+/// Where a background canonical-index pass got to, so an interrupted one
+/// resumes instead of starting again.
+///
+/// Filling the index for a snap-synced node is an hour of disk on a cold
+/// store; losing that to a restart would mean it effectively never finishes on
+/// a node that restarts daily.
+const KEY_INDEX_CURSOR: &[u8] = b"canonical_index_cursor";
+
 /// `number (8 BE) || hash (32)`: sorts by height, then groups every block at
 /// that height together, so "all blocks at N" is a prefix scan.
 fn height_index_key(number: u64, hash: B256) -> [u8; 40] {
@@ -1259,6 +1267,85 @@ impl BlockStore {
         }
         roots.dedup();
         Ok(roots)
+    }
+
+    // --- Background canonical indexing ---
+
+    /// The height a background index pass should resume from, and the hash it
+    /// was expecting there.
+    pub fn index_cursor(&self) -> Result<Option<(u64, B256)>> {
+        let Some(bytes) = self.db.get(KEY_INDEX_CURSOR).context("read index cursor")? else {
+            return Ok(None);
+        };
+        if bytes.len() != 40 {
+            return Ok(None);
+        }
+        let mut number = [0u8; 8];
+        number.copy_from_slice(&bytes[..8]);
+        Ok(Some((u64::from_be_bytes(number), B256::from_slice(&bytes[8..]))))
+    }
+
+    pub fn set_index_cursor(&self, number: u64, hash: B256) -> Result<()> {
+        let mut bytes = [0u8; 40];
+        bytes[..8].copy_from_slice(&number.to_be_bytes());
+        bytes[8..].copy_from_slice(hash.as_slice());
+        self.db.put(KEY_INDEX_CURSOR, bytes).context("write index cursor")
+    }
+
+    pub fn clear_index_cursor(&self) -> Result<()> {
+        self.db.delete(KEY_INDEX_CURSOR).context("clear index cursor")
+    }
+
+    /// Index one batch of the canonical chain, walking down from `hash`.
+    ///
+    /// Heights already mapped to the same block are skipped rather than
+    /// rewritten, but the walk does **not** stop at one. A snap-synced node is
+    /// indexed at the top and bare underneath, so stopping at the first
+    /// agreement would stop at the head having done nothing -- which is
+    /// exactly what it did before this was written the other way round.
+    ///
+    /// Returns how many heights were newly written and where to resume, or
+    /// `None` when the walk reached genesis or a header it cannot read.
+    /// Bounded, so the caller can yield between batches: this runs behind a
+    /// node that has better things to do with its disk.
+    pub fn index_canonical_batch(
+        &self,
+        hash: B256,
+        batch_size: u64,
+    ) -> Result<(u64, Option<(u64, B256)>)> {
+        let cf = self.cf(CF_NUMBERS)?;
+        let mut batch = WriteBatch::default();
+        let mut written = 0u64;
+        let mut current = hash;
+
+        for _ in 0..batch_size {
+            let Some(header) = self.header(current)? else {
+                self.db.write(batch).context("commit canonical index batch")?;
+                return Ok((written, None));
+            };
+
+            // Rewriting an agreeing height would be wasted I/O; disagreeing
+            // ones are corrected, because this walk is following the chain the
+            // node itself accepted.
+            if self.canonical_hash(header.number)? != Some(current) {
+                batch.put_cf(cf, header.number.to_be_bytes(), current.as_slice());
+                written += 1;
+            }
+
+            if header.number == 0 {
+                self.db.write(batch).context("commit canonical index batch")?;
+                return Ok((written, None));
+            }
+            current = header.parent_hash;
+        }
+
+        self.db.write(batch).context("commit canonical index batch")?;
+
+        let next_number = match self.header(current)? {
+            Some(h) => h.number,
+            None => return Ok((written, None)),
+        };
+        Ok((written, Some((next_number, current))))
     }
 
     pub fn db(&self) -> &Arc<DB> {

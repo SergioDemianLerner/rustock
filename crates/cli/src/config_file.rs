@@ -101,6 +101,9 @@ pub struct SnapshotSection {
     pub chunk_grid: Option<u64>,
     /// Chunk requests in flight at once, across all peers.
     pub parallel: Option<usize>,
+    /// Fill the canonical index for history below the checkpoint window after
+    /// a snapshot sync.
+    pub index_history: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -305,6 +308,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "snap_chunk_bytes",
     "snap_chunk_grid",
     "snap_parallel",
+    "snap_index_history",
     "pegout_alerts_config",
 ];
 
