@@ -33,7 +33,7 @@ use super::SnapConfig;
 use alloy_primitives::{B256, U256};
 use rustock_core::validation::HeaderVerifier;
 use rustock_core::{Block, Header};
-use rustock_networking::protocol::snap::ChunkPayload;
+use rustock_networking::protocol::snap::{ChunkPayload, Refusal};
 use rustock_storage::BlockStore;
 use rustock_trie::TrieStore;
 use std::sync::Arc;
@@ -107,6 +107,10 @@ pub enum ChunkFault {
     Misbehaved(ChunkError),
     /// The peer cannot serve this range: pruned, or on another chain.
     Declined,
+    /// The peer could not answer *this* request, but could answer another --
+    /// our offset was not on its grid, or past an end we had wrong. About the
+    /// request, not the peer, so it keeps its place in the rotation.
+    Realign,
     /// The peer speaks rskj's older chunk format, which this node does not
     /// read. Not a fault, but not worth asking again.
     Legacy,
@@ -289,6 +293,7 @@ impl SnapSession {
         blocks: &[Block],
         difficulties: &[U256],
         trie_size: u64,
+        grid: u64,
     ) -> Vec<Action> {
         if self.phase != Phase::AwaitingStatus {
             return Vec::new();
@@ -324,10 +329,11 @@ impl SnapSession {
 
         // The state download is set up now but does not start until the
         // header chain is verified: see the module header.
-        self.download = Some(StateDownload::new(
+        self.download = Some(StateDownload::on_grid(
             header.state_root,
             trie_size,
             &self.config,
+            grid,
             self.trie.clone(),
         ));
         self.blocks_wanted_to = header.number.saturating_sub(self.config.blocks_required);
@@ -490,9 +496,27 @@ impl SnapSession {
     ///
     /// `from` is the offset the *client* asked for, carried through the
     /// request's own bookkeeping -- never read off the response.
-    pub fn on_chunk(&mut self, from: u64, payload: &ChunkPayload) -> Vec<Action> {
+    pub fn on_chunk(
+        &mut self,
+        from: u64,
+        payload: &ChunkPayload,
+        refusal: Refusal,
+    ) -> Vec<Action> {
         if self.phase != Phase::DownloadingState {
             return Vec::new();
+        }
+
+        // A server that said why it could not answer is believed about that
+        // much: it costs it nothing to lie, but the lie only wastes our
+        // requests, and the alternative is guessing from an empty payload.
+        if refusal != Refusal::None {
+            self.chunk_fault = Some(if refusal.worth_asking_again() {
+                ChunkFault::Realign
+            } else {
+                ChunkFault::Declined
+            });
+            debug!(target: "rustock::snap", "peer refused offset {from}: {refusal:?}");
+            return self.fruitless(from);
         }
 
         let proof = match super::client::proof_from_payload(payload) {

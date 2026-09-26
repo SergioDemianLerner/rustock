@@ -172,10 +172,33 @@ impl TrieStore for Recorder<'_> {
 /// `budget` is a soft byte limit: at least one node always comes back, so a
 /// client asking for less than a single node still makes progress rather than
 /// stalling.
+/// Prove the grid cell covering `from..to`.
+///
+/// The same as [`prove_chunk`] but bounded by an offset rather than a byte
+/// budget, so the answer depends on nothing but the trie and the two numbers.
+/// That is what makes a cell cacheable: every client asking for cell `i` of a
+/// given state gets the same bytes, and a server need compute it once.
+pub fn prove_cell(
+    root: &TrieNode,
+    from: u64,
+    to: u64,
+    store: &dyn TrieStore,
+) -> ChunkProof {
+    prove_with(root, |r, s| crate::snapshot::chunk_until(r, from, to, s), store)
+}
+
 pub fn prove_chunk(
     root: &TrieNode,
     from: u64,
     budget: u64,
+    store: &dyn TrieStore,
+) -> ChunkProof {
+    prove_with(root, |r, s| chunk_from_limited(r, from, budget, usize::MAX, s), store)
+}
+
+fn prove_with(
+    root: &TrieNode,
+    take: impl Fn(&TrieNode, &dyn TrieStore) -> Vec<StreamNode>,
     store: &dyn TrieStore,
 ) -> ChunkProof {
     let recorder = Recorder { inner: store, seen: Mutex::new(HashMap::new()) };
@@ -188,7 +211,7 @@ pub fn prove_chunk(
     let root_message = root.to_message(store);
     let root = TrieNode::from_message(&root_message, &recorder);
 
-    let nodes = chunk_from_limited(&root, from, budget, usize::MAX, &recorder);
+    let nodes = take(&root, &recorder);
 
     let entries: Vec<Entry> = nodes
         .into_iter()

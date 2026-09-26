@@ -183,6 +183,15 @@ struct Args {
     #[arg(long, default_value_t = 100_000, value_name = "BYTES")]
     snap_chunk_bytes: u64,
 
+    /// The offset-space grid snapshot chunks sit on.
+    ///
+    /// Every chunk covers one cell of this grid, so every client asks for the
+    /// same ranges and a server answers the second client from cache rather
+    /// than from a trie traversal. A server advertises its grid and clients
+    /// adopt it; changing this on a server invalidates its cached cells.
+    #[arg(long, default_value_t = 100_000, value_name = "BYTES")]
+    snap_chunk_grid: u64,
+
     /// Chunk requests to keep in flight at once, across all peers.
     #[arg(long, default_value_t = 8, value_name = "N")]
     snap_parallel: usize,
@@ -715,6 +724,11 @@ fn apply_file_config(
     apply(matches, "no_rpc", f.rpc.disabled.as_ref(), &mut a.no_rpc);
     apply(matches, "ws", f.rpc.ws.as_ref(), &mut a.ws);
     apply(matches, "ws_port", f.rpc.ws_port.as_ref(), &mut a.ws_port);
+    apply(matches, "snap_server", f.snapshot.server.as_ref(), &mut a.snap_server);
+    apply(matches, "snap_sync", f.snapshot.sync.as_ref(), &mut a.snap_sync);
+    apply(matches, "snap_chunk_bytes", f.snapshot.chunk_bytes.as_ref(), &mut a.snap_chunk_bytes);
+    apply(matches, "snap_chunk_grid", f.snapshot.chunk_grid.as_ref(), &mut a.snap_chunk_grid);
+    apply(matches, "snap_parallel", f.snapshot.parallel.as_ref(), &mut a.snap_parallel);
 
     apply(matches, "max_peers", f.peers.max_peers.as_ref(), &mut a.max_peers);
     apply(matches, "max_inbound_peers", f.peers.max_inbound_peers.as_ref(),
@@ -1588,6 +1602,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         server_enabled: args.snap_server,
         client_enabled: args.snap_sync,
         chunk_bytes: args.snap_chunk_bytes,
+        chunk_grid: args.snap_chunk_grid.max(1),
         max_in_flight: args.snap_parallel.max(1),
         ..rustock_sync::SnapConfig::default()
     };
