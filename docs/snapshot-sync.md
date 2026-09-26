@@ -135,6 +135,108 @@ what their parents say, and yields the same sequence, then that sequence *is*
 the trie's in-order run at that offset. Omitting a node changes the replay;
 changing a node changes a hash.
 
+### The two sizes everything rests on
+
+Both are built from `children_size`, which RSKIP107 varint-encodes into the
+node's message — and the message is what the hash is taken over. So both are
+**committed to by the node's hash**: a peer cannot move a node by misreporting
+a size, it would have to find a collision.
+
+They are rskj's `TrieDTO.getTotalSize()` and `TrieDTO.getSize()` respectively,
+under names that say what they are for here.
+
+For a node `n`, writing `external(n)` for the length of a value stored outside
+the node (non-zero only when `n` has a long value) and `message_len(n)` for its
+consensus serialization:
+
+```
+total_size(n)  = children_size(n) + external(n) + message_len(n)
+stream_size(n) = external(n) + message_len(n)
+               + total_size(c) for each embedded child c of n
+```
+
+`total_size` is the footprint of `n`'s whole subtree. `stream_size` is the
+footprint of `n`'s own entry — itself plus any children small enough to travel
+inside it, which are therefore not separate entries. It is `stream_size` that
+the traversal advances by, and this is the one place the two must not be
+confused: advancing by wire bytes instead never reaches the total, and the
+download never terminates.
+
+**The offset of a node is the sum of `stream_size` over every node before it in
+the in-order traversal**, and `total_size(root)` is the size of the whole trie.
+
+### The verification algorithm
+
+Given the state root `R` the client trusts, the offset `F` the client asked
+for, and a chunk of `entries` (each a node message plus its long values) and a
+`witness` (bare node messages):
+
+1. **Parse every entry, refusing malformed ones.** Every read is bounds-checked;
+   a message that does not describe a node is rejected here rather than
+   panicking later.
+
+2. **Check each entry's long values against what its node commits to** — the
+   exact multiset, no forgeries, no omissions, no extras. This comes *first*
+   because a node that commits to a long value cannot even be measured without
+   it: the value's length is part of `message_len`, hence of `total_size`, hence
+   of every offset downstream. A missing value silently turns a node into a
+   different node.
+
+3. **Index everything the peer sent by its own keccak** — entries, witness, and
+   long values into one map. A message filed under a key it does not hash to is
+   simply never found, so there is nothing to check separately.
+
+4. **Look up `R` in that map.** If no message the peer sent hashes to the root
+   the client trusts, stop. This is the anchor: everything after it descends
+   from a node whose identity the client already knew.
+
+5. **Replay the traversal** from `F`, reading *only* that map, stopping after
+   `entries.len()` nodes. Resolving a child means looking up the hash its
+   parent's message gives; a hash not in the map is unresolvable and the
+   traversal ends there.
+
+6. **Require the replay to reproduce the chunk**: same number of nodes, same
+   messages, in the same order.
+
+The result carries the offsets the replay derived and `total_size(root)` — both
+computed, neither claimed.
+
+### What each step stops
+
+| attack | caught by |
+|---|---|
+| a node altered | 5 — it no longer hashes to what its parent says, so the replay cannot reach it |
+| a node dropped from the middle | 6 — the replay produces the real node at that position, the messages differ |
+| entries reordered | 6 — the traversal order is fixed by the trie |
+| a genuine node spliced in from elsewhere | 6 — genuine, but not the node at *that* point of the run |
+| a chunk for a different offset | 5 — the replay starts at `F`, which the client supplied |
+| a chunk from a different trie | 4 — nothing hashes to `R` |
+| a long value forged, dropped, or added | 2 |
+| the witness withheld | 5 — the traversal cannot descend and stops short, failing 6 |
+| a malformed message | 1 |
+
+The property that makes the table short: **the client never reads a number the
+peer chose.** The offset comes from its own request, the sizes from
+hash-committed fields, the order from the trie's own shape.
+
+### Where the witness comes from
+
+The replay has to descend from `R` to `F`, and to skip subtrees on the way
+without reading them — which it can only do if it knows their sizes, which
+means having their root messages. That is the witness: the ancestors between
+the root and the chunk, plus the roots of the subtrees passed over. O(depth)
+nodes.
+
+It is derived rather than reasoned about. The server traverses its own trie
+through a recording store, then keeps every message the traversal reached by
+*following a child hash* — starting from the root and walking forward through
+what it read, including through the chunk's own nodes, since the traversal
+descends past them too. Long values are excluded: a node knows its value's
+length from its own message, so navigation never needs the bytes.
+
+Deriving it this way means the witness is exactly what the replay will ask for,
+because it is the same traversal. What it costs is measured below.
+
 ### Nothing is claimed that could be checked instead
 
 Because the replay computes the offsets, a chunk entry does not state where it
@@ -181,14 +283,7 @@ A node straddling a cell boundary is sent whole in both neighbouring cells.
 That is the only duplication, it is at most one node per boundary, and it is
 what makes every node land in some cell.
 
-### The witness
-
-For the replay to get off the ground the peer must send the nodes it would
-otherwise be missing: the ancestors between the root and the chunk, and the
-roots of the sibling subtrees the traversal skips on the way down. This is the
-**witness** — O(depth) nodes, derived rather than guessed: the server records
-what its own traversal read, then keeps what is reachable by following child
-hashes.
+### What the witness costs
 
 Measured against mainnet state at #9272510 (0.92 GB of trie):
 
@@ -291,12 +386,66 @@ while any other node's is a proper subset of that, short by at least its own
 bytes. A sequence whose tree is "the maximum splits the range" is a Cartesian
 tree, and those build with a stack in one pass. Same tree, linear time.
 
-What this gives up is stated plainly: completeness is established *at the end*
-rather than by construction. If the rebuilt root matches, the nodes and their
-arrangement are the ones the trie commits to, since any other set or shape
-would have to collide with the root hash. Sound — but the property arrives as
-a conclusion rather than falling out of a comparison, which is why rustock
-asks for its own format whenever it can.
+### The rebuild algorithm
+
+An rskj chunk is `[pre, nodes, first_left, last_hashes, post]`: the nodes
+themselves, the ancestors the walk turned right at (each carrying the left
+hash it skipped), the ancestors still owed a right subtree (each carrying the
+right hash to come), and the boundary hashes of the first and last node.
+
+Given the state root `R` the client trusts:
+
+1. **Concatenate** `pre ++ nodes ++ post` into one in-order sequence, attaching
+   each stub's given hash to the side it belongs to, and the boundary hashes to
+   the first and last of the chunk's own nodes.
+
+2. **Parse each stripped node** far enough to know its flags, its
+   `children_size`, and its embedded children — converting those to consensus
+   form as it goes, because their length prefix differs between the two
+   encodings and an embedded child that inlines a long value is a different
+   length in each.
+
+3. **Build the Cartesian tree** over the `children_size` sequence, maximum at
+   the root, with a stack in one pass.
+
+4. **Walk it bottom-up**, and for each node emit its consensus message:
+   flags and shared path copied; each non-embedded child's 32-byte hash filled
+   in from the child the tree gave it, or from the stub hash the chunk supplied
+   for a subtree it did not carry; embedded children re-prefixed with a
+   one-byte length; a long value replaced by its keccak and a three-byte
+   length, the bytes kept aside to store separately. Its hash is the keccak of
+   that message.
+
+5. **Compare the tree root's hash with `R`.** Everything stands or falls here.
+
+### Why the Cartesian tree is the right tree
+
+Step 3 replaces rskj's recursive scan, so it had better find the same tree.
+
+For a range that forms a subtree, its root `r` satisfies
+`children_size(r) = total of the range − stream_size(r)`, because the root's
+subtree is the whole range. Any other node `k` in that range has
+`children_size(k) = total of k's subtree − stream_size(k)`, and `k`'s subtree
+is a proper subset of the range that excludes `r`. So
+
+```
+children_size(k) < k's subtree total ≤ range total − stream_size(r) = children_size(r)
+```
+
+— strictly, since `stream_size` is never zero. The maximum is unique, which is
+what makes the Cartesian tree well defined. Had it been merely non-strict, ties
+would leave the shape ambiguous, and an ambiguous rebuild is a *wrong* answer
+rather than a slow one.
+
+### What this gives up
+
+Completeness is established *at the end* rather than by construction. If the
+rebuilt root matches, the nodes and their arrangement are the ones the trie
+commits to, since any other set or shape would have to collide with the root
+hash. Sound — but the property arrives as a conclusion rather than falling out
+of a comparison, and a conclusion is easier to get subtly wrong. It is why
+rustock asks for its own format whenever it can, and why this path exists only
+for peers that cannot speak it.
 
 ## Differences from rskj
 

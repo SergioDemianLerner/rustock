@@ -300,3 +300,48 @@ fn unhex(text: &str) -> Vec<u8> {
         .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
         .collect()
 }
+
+/// The sizes `docs/snapshot-sync.md` states are the sizes the code computes,
+/// and they are rskj's too.
+///
+/// A document that drifts from the code is worse than no document, and these
+/// two numbers are the ones every offset in the protocol is built from.
+#[test]
+fn the_documented_size_formulas_hold() {
+    use rustock_trie::snapshot::{chunk_from, stream_size, total_size};
+    use rustock_trie::TrieStore;
+
+    let (root, store) = trie(12);
+
+    // total_size(root) is the whole trie, and rskj said 915 for this one.
+    let total = total_size(&root, &store);
+    assert_eq!(total, 915, "rskj's TrieDTO.getTotalSize() for this trie");
+
+    // A node's offset is the sum of stream_size over everything before it,
+    // and the run ends exactly at the total.
+    let nodes = chunk_from(&root, 0, u64::MAX, &store);
+    let mut at = 0u64;
+    for entry in &nodes {
+        assert_eq!(entry.offset, at, "offsets are not the running sum of stream_size");
+        let node = rustock_trie::TrieNode::from_message(&entry.message, &store);
+        assert_eq!(
+            entry.span,
+            stream_size(&node, &store),
+            "a node's span is not its stream_size"
+        );
+        at += entry.span;
+    }
+    assert_eq!(at, total, "the traversal does not span the trie exactly");
+
+    // total_size = children_size + external + message_len, as documented.
+    for entry in &nodes {
+        let node = rustock_trie::TrieNode::from_message(&entry.message, &store);
+        let external =
+            if node.has_long_value() { node.value_length() as u64 } else { 0 };
+        assert_eq!(
+            total_size(&node, &store),
+            node.children_size + external + node.message_length(&store) as u64
+        );
+    }
+    let _ = store.get(&[0u8; 32]);
+}
