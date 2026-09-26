@@ -240,18 +240,32 @@ impl TrieStore for EmptyStore {
     fn put(&self, _key: &[u8], _value: &[u8]) {}
 }
 
-/// Check a chunk against the state root the client independently trusts, and
-/// return the nodes with the offsets the trie actually puts them at.
+/// What a verified chunk establishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    /// The chunk's nodes, at the offsets the trie actually puts them at.
+    ///
+    /// Each may be written straight into the store under the keccak of its
+    /// message; the next chunk starts at the last one's [`StreamNode::end`].
+    pub nodes: Vec<StreamNode>,
+    /// The size of the whole trie, in offset space.
+    ///
+    /// Comes from the root node, which every proof carries because every
+    /// traversal starts there, and which commits to its own subtree size. So
+    /// the first verified chunk -- from anywhere in the trie -- tells the
+    /// client how much there is to download, without anyone being asked.
+    pub total: u64,
+}
+
+/// Check a chunk against the state root the client independently trusts.
 ///
 /// `from` is the offset the *client* asked for, never a number the peer sent
-/// back. On success every returned node may be written straight into the trie
-/// store under the keccak of its message, and the next chunk starts at the
-/// last node's [`StreamNode::end`].
+/// back.
 pub fn verify_chunk(
     root_hash: B256,
     from: u64,
     proof: &ChunkProof,
-) -> Result<Vec<StreamNode>, VerifyError> {
+) -> Result<Verified, VerifyError> {
     if proof.entries.is_empty() {
         return Err(VerifyError::Empty);
     }
@@ -304,7 +318,7 @@ pub fn verify_chunk(
         }
     }
 
-    Ok(replay)
+    Ok(Verified { nodes: replay, total: crate::snapshot::total_size(&root, &store) })
 }
 
 /// An entry must carry exactly the long values its node, and its node's
@@ -391,7 +405,8 @@ mod tests {
                 let proof = prove_chunk(&root, offset, budget, &store);
                 assert!(!proof.entries.is_empty(), "n={n} budget={budget}: stalled");
                 let nodes = verify_chunk(root_hash, offset, &proof)
-                    .unwrap_or_else(|e| panic!("n={n} budget={budget} at {offset}: {e}"));
+                    .unwrap_or_else(|e| panic!("n={n} budget={budget} at {offset}: {e}"))
+                    .nodes;
                 seen += nodes.len();
                 let next = nodes.last().expect("non-empty").end();
                 assert!(next > offset, "n={n} budget={budget}: no progress at {offset}");
@@ -408,7 +423,7 @@ mod tests {
         let (root, store, root_hash) = toy_trie(150);
         let truth = crate::snapshot::chunk_from(&root, 0, 2048, &store);
         let proof = prove_chunk(&root, 0, 2048, &store);
-        let got = verify_chunk(root_hash, 0, &proof).expect("honest chunk");
+        let got = verify_chunk(root_hash, 0, &proof).expect("honest chunk").nodes;
 
         assert_eq!(got.len(), truth.len());
         for (a, b) in got.iter().zip(truth.iter()) {
@@ -416,6 +431,22 @@ mod tests {
             assert_eq!(a.span, b.span);
             assert_eq!(a.message, b.message);
             assert_eq!(a.long_values, b.long_values);
+        }
+    }
+
+    /// Every chunk tells the client how big the trie is, because every proof
+    /// carries the root and the root commits to its own size. A client can
+    /// therefore plan the whole download from the first answer it gets, from
+    /// whichever peer, without trusting the size any of them claims.
+    #[test]
+    fn any_chunk_reveals_the_size_of_the_whole_trie() {
+        let (root, store, root_hash) = toy_trie(200);
+        let total = total_size(&root, &store);
+
+        for from in [0, total / 4, total / 2, total - 1] {
+            let proof = prove_chunk(&root, from, 512, &store);
+            let verified = verify_chunk(root_hash, from, &proof).expect("honest");
+            assert_eq!(verified.total, total, "wrong total from offset {from}");
         }
     }
 
@@ -460,7 +491,7 @@ mod tests {
         let small = prove_chunk(&root, 0, 200, &store);
         assert!(small.entries.len() < full.entries.len(), "budget was not binding");
 
-        let nodes = verify_chunk(root_hash, 0, &small).expect("a short chunk is legitimate");
+        let nodes = verify_chunk(root_hash, 0, &small).expect("a short chunk is legitimate").nodes;
         let next = nodes.last().unwrap().end();
 
         let rest = prove_chunk(&root, next, 4096, &store);
@@ -478,14 +509,14 @@ mod tests {
     fn truncating_an_honest_chunk_never_yields_wrong_offsets() {
         let (root, store, root_hash) = toy_trie(120);
         let full = prove_chunk(&root, 0, 4096, &store);
-        let truth = verify_chunk(root_hash, 0, &full).expect("honest");
+        let truth = verify_chunk(root_hash, 0, &full).expect("honest").nodes;
 
         for keep in 1..full.entries.len() {
             let mut cut = full.clone();
             cut.entries.truncate(keep);
             // The witness is left untouched, which is the best a peer could
             // manage: it may withhold, not invent.
-            if let Ok(nodes) = verify_chunk(root_hash, 0, &cut) {
+            if let Ok(nodes) = verify_chunk(root_hash, 0, &cut).map(|v| v.nodes) {
                 assert_eq!(nodes.len(), keep);
                 for (a, b) in nodes.iter().zip(truth.iter()) {
                     assert_eq!(a.offset, b.offset, "truncation moved an offset");
@@ -513,7 +544,7 @@ mod tests {
         let (root, store, root_hash) = toy_trie(200);
         let first = prove_chunk(&root, 0, 2048, &store);
         let first_end =
-            verify_chunk(root_hash, 0, &first).expect("honest").last().unwrap().end();
+            verify_chunk(root_hash, 0, &first).expect("honest").nodes.last().unwrap().end();
         let later = prove_chunk(&root, first_end, 2048, &store);
 
         let mut tampered = first.clone();
@@ -648,7 +679,7 @@ mod tests {
         let mut offset = 0u64;
         while offset < total {
             let proof = prove_chunk(&root, offset, 1024, &store);
-            let nodes = verify_chunk(root_hash, offset, &proof).expect("honest chunk");
+            let nodes = verify_chunk(root_hash, offset, &proof).expect("honest chunk").nodes;
             for node in &nodes {
                 rebuilt.put(alloy_primitives::keccak256(&node.message).as_slice(), &node.message);
                 for value in &node.long_values {
