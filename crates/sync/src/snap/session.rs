@@ -111,9 +111,11 @@ pub enum ChunkFault {
     /// our offset was not on its grid, or past an end we had wrong. About the
     /// request, not the peer, so it keeps its place in the rotation.
     Realign,
-    /// The peer speaks rskj's older chunk format, which this node does not
-    /// read. Not a fault, but not worth asking again.
-    Legacy,
+    /// The peer's rskj-format chunk did not rebuild to the state root. It is
+    /// misbehaviour like any other bad chunk, but named apart because the
+    /// failure says less about which node was wrong: a rebuild proves itself
+    /// at the root, not node by node.
+    BadRebuild,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,18 +521,37 @@ impl SnapSession {
             return self.fruitless(from);
         }
 
-        let proof = match super::client::proof_from_payload(payload) {
-            Ok(proof) => proof,
+        let Some(root_hash) = self.checkpoint.as_ref().map(|h| h.state_root) else {
+            return Vec::new();
+        };
+
+        let arrived = match super::client::chunk_from_payload(payload, root_hash) {
+            Ok(arrived) => arrived,
             Err(e) => {
-                // A peer speaking the wrong dialect is not a reason to abandon
-                // the sync, only that peer: the range goes back in the queue.
                 debug!(target: "rustock::snap", "chunk from offset {from} unusable: {e}");
                 self.chunk_fault = Some(match e {
-                    ChunkError::LegacyFormat => ChunkFault::Legacy,
+                    ChunkError::LegacyRebuild(_) => ChunkFault::BadRebuild,
                     other => ChunkFault::Misbehaved(other),
                 });
                 return self.fruitless(from);
             }
+        };
+
+        // An rskj chunk proves itself by rebuilding to the root, which has
+        // already happened -- there is no way to inspect one without
+        // reconstructing it. What is left is to keep the nodes.
+        let proof = match arrived {
+            super::client::Arrived::Rebuilt(rebuilt) => {
+                let Some(download) = self.download.as_mut() else { return Vec::new() };
+                let progress = download.accept_rebuilt(from, &rebuilt);
+                self.fruitless_chunks = 0;
+                return if progress.complete {
+                    self.finish_state_download()
+                } else {
+                    self.poll()
+                };
+            }
+            super::client::Arrived::Proved(proof) => proof,
         };
 
         if proof.entries.is_empty() {

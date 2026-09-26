@@ -97,14 +97,26 @@ pub struct Progress {
 /// verification. Rejecting on size costs nothing; verifying does not.
 const OVERSIZE_FACTOR: u64 = 4;
 
+/// A chunk that arrived in rskj's format, already rebuilt and checked.
+///
+/// Kept apart from [`ChunkProof`] because the two prove themselves
+/// differently: a proved chunk is replayed against the trie's own traversal,
+/// while this one is reconstructed and checked at the root. Both end with
+/// nodes in consensus form, which is all the store cares about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuiltChunk {
+    pub nodes: Vec<(B256, Vec<u8>)>,
+    pub long_values: Vec<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChunkError {
     #[error("the chunk failed verification: {0}")]
     Invalid(#[from] VerifyError),
     #[error("no request for offset {0} was outstanding")]
     Unsolicited(u64),
-    #[error("the peer serves rskj's older chunk format, which this node does not read")]
-    LegacyFormat,
+    #[error("the peer's rskj-format chunk did not rebuild: {0}")]
+    LegacyRebuild(String),
     #[error("the answer is {got} bytes against a {asked} byte request")]
     Oversized { asked: u64, got: u64 },
 }
@@ -319,6 +331,47 @@ impl StateDownload {
         Ok(Progress { nodes: verified.nodes.len(), advanced, complete: self.is_complete() })
     }
 
+    /// Keep a chunk that arrived in rskj's format.
+    ///
+    /// It has already proved itself: the only way to read one is to rebuild
+    /// it, and the rebuild is checked against the state root. So there is
+    /// nothing left to verify here, only nodes to store and a cursor to move.
+    ///
+    /// The offsets it covers are not stated anywhere -- rskj's format carries
+    /// no per-node offsets and the rebuild derives structure, not position --
+    /// so the slice advances by the cell it asked for rather than by where
+    /// the nodes turned out to sit.
+    pub fn accept_rebuilt(&mut self, from: u64, chunk: &RebuiltChunk) -> Progress {
+        for (hash, message) in &chunk.nodes {
+            self.store.put(hash.as_slice(), message);
+            self.stored_bytes += message.len() as u64;
+        }
+        for value in &chunk.long_values {
+            self.store.put(keccak256(value).as_slice(), value);
+            self.stored_bytes += value.len() as u64;
+        }
+        self.stored_nodes += chunk.nodes.len() as u64;
+
+        let reached = from.saturating_add(self.grid);
+        let mut advanced = 0;
+        if let Some(i) = self.slice_for(from) {
+            let slice = &mut self.slices[i];
+            advanced = reached.saturating_sub(slice.cursor).min(slice.end - slice.cursor);
+            slice.exact = reached <= slice.cursor;
+            slice.cursor = reached.max(slice.cursor);
+            slice.in_flight = false;
+        }
+
+        // The size of the trie comes from the root, which a rebuilt chunk
+        // always reconstructs; without a parsed root here it stays whatever
+        // the peer advertised until a proved chunk settles it.
+        if self.total.is_none() {
+            self.adopt_total(self.hinted_total);
+        }
+
+        Progress { nodes: chunk.nodes.len(), advanced, complete: self.is_complete() }
+    }
+
     /// Replace the hinted size with the one the root proves, and reshape the
     /// slices around it.
     fn adopt_total(&mut self, total: u64) {
@@ -431,12 +484,49 @@ impl StateDownload {
     }
 }
 
-/// Turns a wire payload into the proof the verifier reads.
+/// What a chunk turned out to be, whichever dialect it arrived in.
+#[derive(Debug)]
+pub enum Arrived {
+    /// rustock's own format: nodes to replay against the traversal.
+    Proved(ChunkProof),
+    /// rskj's format: already rebuilt and checked against the root, because
+    /// there is no way to check it that does not also rebuild it.
+    Rebuilt(RebuiltChunk),
+}
+
+/// Turns a wire payload into something the download can use.
 ///
-/// rskj's older format is refused by name rather than guessed at.
+/// An rskj chunk is rebuilt here rather than later, because unlike a proved
+/// chunk it cannot be examined without being reconstructed: its nodes are
+/// missing the child hashes that would let them be checked one at a time.
+pub fn chunk_from_payload(
+    payload: &ChunkPayload,
+    root_hash: B256,
+) -> Result<Arrived, ChunkError> {
+    match payload {
+        ChunkPayload::Proved { entries, witness } => Ok(Arrived::Proved(ChunkProof {
+            entries: entries.iter().map(entry_from_wire).collect(),
+            witness: witness.iter().map(|w| w.to_vec()).collect(),
+        })),
+        ChunkPayload::Legacy(blob) => {
+            let chunk = rustock_trie::snapshot_legacy::decode_blob(blob)
+                .ok_or_else(|| ChunkError::LegacyRebuild("malformed blob".into()))?;
+            let rebuilt = rustock_trie::snapshot_legacy::rebuild(&chunk, root_hash)
+                .map_err(|e| ChunkError::LegacyRebuild(e.to_string()))?;
+            Ok(Arrived::Rebuilt(RebuiltChunk {
+                nodes: rebuilt.nodes,
+                long_values: rebuilt.long_values,
+            }))
+        }
+    }
+}
+
+/// Kept for callers that only handle rustock's own format.
 pub fn proof_from_payload(payload: &ChunkPayload) -> Result<ChunkProof, ChunkError> {
     match payload {
-        ChunkPayload::Legacy(_) => Err(ChunkError::LegacyFormat),
+        ChunkPayload::Legacy(_) => {
+            Err(ChunkError::LegacyRebuild("a proved chunk was expected".into()))
+        }
         ChunkPayload::Proved { entries, witness } => Ok(ChunkProof {
             entries: entries.iter().map(entry_from_wire).collect(),
             witness: witness.iter().map(|w| w.to_vec()).collect(),

@@ -168,7 +168,12 @@ impl SnapDriver {
             // Not about the peer: our offset did not suit it, and another
             // will. It keeps its place in the rotation.
             Some(ChunkFault::Realign) => {}
-            Some(ChunkFault::Declined) | Some(ChunkFault::Legacy) => {
+            // A rebuild that did not reach the root is bad data like any
+            // other, even though it cannot say which node was wrong.
+            Some(ChunkFault::BadRebuild) => {
+                self.charge(peer, EventType::InvalidMessage, "an rskj chunk did not rebuild");
+            }
+            Some(ChunkFault::Declined) => {
                 if self.unhelpful.insert(peer) {
                     debug!(
                         target: "rustock::snap",
