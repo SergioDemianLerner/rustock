@@ -637,3 +637,44 @@ fn a_slightly_oversized_chunk_is_still_accepted() {
     let proof = proof_from_payload(&response.payload).unwrap();
     client.accept(request.from, &proof).expect("a generous answer is fine");
 }
+
+/// A single node bigger than the whole budget must still get through. A
+/// server sends at least one node whatever it is asked for, because that is
+/// the only way past a node larger than the budget -- and a value that can
+/// never be downloaded is a state that can never be completed.
+#[test]
+fn one_node_larger_than_the_budget_still_arrives() {
+    let store = Arc::new(MemoryTrieStore::new());
+    let mut root = TrieNode::empty();
+
+    // One account carrying far more than any sane chunk budget.
+    let huge: Vec<u8> = (0..900_000u32).map(|i| i as u8).collect();
+    root = root.put(&TrieKeySlice::from_key(&[1, 2, 3, 4]), &huge, store.as_ref());
+    for i in 0..20u8 {
+        root = root.put(&TrieKeySlice::from_key(&[9, i, 0, 0]), &[i, 1], store.as_ref());
+    }
+    root.save(store.as_ref(), true);
+    let root_hash = root.compute_hash(store.as_ref());
+
+    let peer = Peer { root, store, root_hash };
+    let local = Arc::new(MemoryTrieStore::new());
+    let mut client =
+        StateDownload::new(root_hash, peer.total(), &config(1, 1024), local.clone());
+
+    let mut guard = 0;
+    while !client.is_complete() {
+        guard += 1;
+        assert!(guard < 1000, "download stalled on the oversized node");
+        let request = client.next_request().expect("work remains");
+        let response = peer.serve(request.from, request.budget);
+        let proof = proof_from_payload(&response.payload).unwrap();
+        client.accept(request.from, &proof).expect("every chunk is honest");
+    }
+
+    client.verify_stored().expect("the state is whole");
+    assert_eq!(
+        local.get(alloy_primitives::keccak256(&huge).as_slice()),
+        Some(huge),
+        "the oversized value did not survive"
+    );
+}

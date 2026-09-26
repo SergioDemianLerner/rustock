@@ -192,9 +192,16 @@ impl StateDownload {
 
         // Judged on size before anything is read: an answer wildly larger than
         // the question is refused without paying to verify it.
+        //
+        // A chunk of one node is exempt. A server always sends at least one,
+        // whatever the budget, because a node bigger than the budget is the
+        // only way past it -- a contract's code, say. Refusing those on size
+        // would make them permanently undownloadable, which is a worse failure
+        // than the one this guards against. The transport's own limit still
+        // bounds a single node.
         let allowed = self.budget.saturating_mul(OVERSIZE_FACTOR).max(1 << 18);
         let got = proof.wire_len();
-        if got > allowed {
+        if got > allowed && proof.entries.len() > 1 {
             self.release(from);
             return Err(ChunkError::Oversized { asked: self.budget, got });
         }
