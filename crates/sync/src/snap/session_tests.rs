@@ -30,10 +30,13 @@ impl HeaderValidator for RefuseEverything {
 fn header(number: u64, parent: B256, state_root: B256, difficulty: u64) -> Header {
     Header {
         parent_hash: parent,
-        ommers_hash: B256::ZERO,
+        ommers_hash: rustock_execution::processor::compute_ommers_hash(&[]),
         beneficiary: Address::ZERO,
         state_root,
-        transactions_root: B256::ZERO,
+        // The roots an empty body actually produces. A header claiming ZERO
+        // alongside no transactions is not a block that could exist, and the
+        // body check below is right to refuse it.
+        transactions_root: rustock_core::ordered_tx_trie_root(&[], true),
         receipts_root: B256::ZERO,
         logs_bloom: Default::default(),
         extension_data: None,
@@ -291,13 +294,15 @@ fn a_session_runs_to_completion() {
     let (blocks, tds) = chain(1, 4, genesis, 100, f.state_root);
     let checkpoint = blocks.last().unwrap().header.clone();
 
-    // The peer's own store knows the chain it is offering, so its server can
-    // find the state by block number.
+    // The peer keeps its own block store, as a different node would. The
+    // client knows only its genesis, so the header walk has real work to do.
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let peer_store = Arc::new(BlockStore::open(peer_dir.path()).expect("open"));
     for (b, td) in blocks.iter().zip(tds.iter()) {
         let hash = b.header.hash();
-        f.store.put_header_with_hash(hash, &b.header).expect("header");
-        f.store.put_canonical_hash(b.header.number, hash).expect("index");
-        f.store.put_total_difficulty(hash, *td).expect("td");
+        peer_store.put_header_with_hash(hash, &b.header).expect("header");
+        peer_store.put_canonical_hash(b.header.number, hash).expect("index");
+        peer_store.put_total_difficulty(hash, *td).expect("td");
     }
 
     let mut session = f.session(HeaderVerifier::new());
@@ -310,7 +315,7 @@ fn a_session_runs_to_completion() {
 
     // A server backed by the peer's copy of the state.
     let server = SnapServer::new(
-        f.store.clone(),
+        peer_store.clone(),
         f.trie.clone() as Arc<dyn TrieStore>,
         config.clone(),
     );
@@ -458,4 +463,80 @@ fn a_node_that_has_executed_blocks_does_not_snap_sync() {
 
     service.start_snap_sync(SnapConfig::default(), Arc::new(HeaderVerifier::new()));
     assert!(service.snap_phase().is_none(), "snap sync started on a node with state");
+}
+
+/// **The blocks behind the checkpoint are never executed**, so nothing
+/// downstream would ever notice a body that does not belong to its header.
+/// The session checks it, or no one does.
+#[test]
+fn a_body_that_does_not_match_its_header_is_refused() {
+    use rustock_core::Transaction;
+
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+
+    let mut session = f.session(HeaderVerifier::new());
+    session.on_status(&blocks, &tds, 5_000);
+    // Anchor the walk: the parent of block 1 is our genesis.
+    session.on_headers(&[blocks[1].header.clone()]);
+    // The chunk requests the walk's success produces: dropping them would
+    // leave every slice marked in flight with nothing coming back.
+    let started = session.on_headers(&[blocks[0].header.clone()]);
+    assert_eq!(session.phase(), Phase::DownloadingState, "{:?}", session.failure());
+
+    // Skip ahead to the block phase by finishing the (tiny) state.
+    // Here it is enough to call on_blocks directly once the phase allows it:
+    // drive the state download to completion first.
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let peer_store = Arc::new(BlockStore::open(peer_dir.path()).expect("open"));
+    for (b, td) in blocks.iter().zip(tds.iter()) {
+        let hash = b.header.hash();
+        peer_store.put_header_with_hash(hash, &b.header).expect("header");
+        peer_store.put_canonical_hash(b.header.number, hash).expect("index");
+        peer_store.put_total_difficulty(hash, *td).expect("td");
+    }
+    let server = SnapServer::new(
+        peer_store,
+        f.trie.clone() as Arc<dyn TrieStore>,
+        SnapConfig { server_enabled: true, ..SnapConfig::default() },
+    );
+
+    let checkpoint = blocks.last().unwrap().header.number;
+    let mut actions = started;
+    let mut guard = 0;
+    while session.phase() == Phase::DownloadingState {
+        guard += 1;
+        assert!(guard < 1000, "state download stalled");
+        if actions.is_empty() {
+            actions = session.poll();
+            assert!(!actions.is_empty(), "no work and not finished");
+        }
+        let action = actions.remove(0);
+        if let Action::RequestChunk { from, budget, .. } = action {
+            let response = server
+                .chunk(&SnapChunkRequest {
+                    id: 1,
+                    block_number: checkpoint,
+                    from,
+                    chunk_size: budget,
+                    state_root: Some(f.state_root),
+                })
+                .expect("server answers");
+            actions.extend(session.on_chunk(from, &response.payload));
+        }
+    }
+    assert_eq!(session.phase(), Phase::DownloadingBlocks, "{:?}", session.failure());
+
+    // A genuine header with a transaction it never carried.
+    let mut forged = blocks[0].clone();
+    forged.transactions.push(Transaction::default());
+    session.on_blocks(&[forged], &[tds[0]]);
+
+    assert_eq!(session.phase(), Phase::Failed);
+    assert!(
+        matches!(session.failure(), Some(SnapFailure::BadBody { what: "transactions", .. })),
+        "wrong failure: {:?}",
+        session.failure()
+    );
 }

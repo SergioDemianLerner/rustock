@@ -87,6 +87,8 @@ pub enum SnapFailure {
     IncompleteState(String),
     #[error("{0} chunk requests in a row came back with nothing usable")]
     NoProgress(u32),
+    #[error("block #{number}: the {what} are not the ones its header commits to")]
+    BadBody { number: u64, what: &'static str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,31 +524,29 @@ impl SnapSession {
             return self.poll();
         }
         self.fruitless_blocks = 0;
+
         if let Err(why) = check_chain_shape(blocks, difficulties) {
             return self.fail(why);
-        }
-
-        // The run must hang off the chain already verified, or it is someone
-        // else's chain.
-        let newest = &blocks[blocks.len() - 1];
-        let attached = self
-            .store
-            .has_block(newest.header.hash())
-            .unwrap_or(false)
-            || self.store.header(newest.header.hash()).ok().flatten().is_some();
-        if !attached && newest.header.number + 1 > self.blocks_cursor {
-            return self.fail(SnapFailure::BrokenChain);
         }
 
         let mut oldest = self.blocks_cursor;
         for (block, td) in blocks.iter().zip(difficulties.iter()) {
             let hash = block.header.hash();
-            if self.store.put_header_with_hash(hash, &block.header).is_err() {
-                continue;
+
+            // These blocks are never executed -- they are fetched because
+            // contracts can read them -- so nothing downstream would ever
+            // check them. Bind each body to the header this node verified for
+            // itself during the walk: the right chain, and the right contents
+            // for that chain.
+            if !self.is_ours(block.header.number, hash) {
+                return self.fail(SnapFailure::BrokenChain);
             }
+            if let Err(why) = check_body_matches_header(block) {
+                return self.fail(why);
+            }
+
             let _ = self.store.put_body(hash, &block.transactions, &block.ommers);
             let _ = self.store.put_total_difficulty(hash, *td);
-            let _ = self.store.put_canonical_hash(block.header.number, hash);
             oldest = oldest.min(block.header.number);
         }
 
@@ -563,6 +563,33 @@ impl SnapSession {
         }
         self.poll()
     }
+}
+
+/// A body must be the one its header commits to.
+///
+/// The transaction root's encoding changed at the unitrie fork, and this has
+/// no hardfork table to consult, so either encoding is accepted: both are
+/// genuine, and matching one of them is what proves the transaction set. The
+/// question being answered is "are these the right transactions", not "which
+/// era is this".
+fn check_body_matches_header(block: &Block) -> Result<(), SnapFailure> {
+    use rustock_core::ordered_tx_trie_root;
+
+    let wanted = block.header.transactions_root;
+    if ordered_tx_trie_root(&block.transactions, true) != wanted
+        && ordered_tx_trie_root(&block.transactions, false) != wanted
+    {
+        return Err(SnapFailure::BadBody {
+            number: block.header.number,
+            what: "transactions",
+        });
+    }
+    if rustock_execution::processor::compute_ommers_hash(&block.ommers)
+        != block.header.ommers_hash
+    {
+        return Err(SnapFailure::BadBody { number: block.header.number, what: "uncles" });
+    }
+    Ok(())
 }
 
 /// Blocks must form one chain, oldest first, with cumulative difficulty
