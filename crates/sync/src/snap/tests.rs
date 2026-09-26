@@ -592,3 +592,48 @@ fn a_node_without_the_state_offers_nothing() {
     );
     assert_eq!(server.offer(), None);
 }
+
+/// An answer far larger than the question is thrown away unread. The
+/// transport allows 16 MB; verifying that much costs real CPU, and a peer
+/// that can make a client spend it on demand can make it spend it forever.
+#[test]
+fn a_wildly_oversized_chunk_is_refused_without_verifying() {
+    // Big enough that a chunk can exceed the 256 KB floor.
+    let peer = Peer::new(6000);
+    let local = Arc::new(MemoryTrieStore::new());
+    let mut client =
+        StateDownload::new(peer.root_hash, peer.total(), &config(1, 512), local.clone());
+
+    let request = client.next_request().expect("work");
+    // A genuine chunk, just enormously bigger than what was asked for.
+    let response = peer.serve(request.from, 8 << 20);
+    let proof = proof_from_payload(&response.payload).unwrap();
+    assert!(proof.wire_len() > 1 << 18, "the fixture is not big enough to test this");
+
+    match client.accept(request.from, &proof) {
+        Err(ChunkError::Oversized { asked, .. }) => assert_eq!(asked, 512),
+        other => panic!("oversized chunk was not refused: {other:?}"),
+    }
+    assert_eq!(client.stored_nodes(), 0);
+
+    // The range is still available, so an honest answer still lands.
+    let retry = client.next_request().expect("the range came back");
+    let honest = peer.serve(retry.from, retry.budget);
+    let proof = proof_from_payload(&honest.payload).unwrap();
+    client.accept(retry.from, &proof).expect("a right-sized answer is taken");
+}
+
+/// But a server rounding up, or a straddling node at the end, is not an
+/// attack: a chunk somewhat over the budget is still accepted.
+#[test]
+fn a_slightly_oversized_chunk_is_still_accepted() {
+    let peer = Peer::new(400);
+    let local = Arc::new(MemoryTrieStore::new());
+    let mut client =
+        StateDownload::new(peer.root_hash, peer.total(), &config(1, 100_000), local);
+
+    let request = client.next_request().expect("work");
+    let response = peer.serve(request.from, 150_000);
+    let proof = proof_from_payload(&response.payload).unwrap();
+    client.accept(request.from, &proof).expect("a generous answer is fine");
+}

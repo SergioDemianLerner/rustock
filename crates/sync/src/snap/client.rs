@@ -81,6 +81,15 @@ pub struct Progress {
     pub complete: bool,
 }
 
+/// How much more than the requested budget a chunk may be before it is thrown
+/// away unread.
+///
+/// A server is free to round up, and a straddling node at the end can push a
+/// chunk over. What this stops is a peer answering a 100KB request with the
+/// 16MB the transport allows, repeatedly, to spend the client's CPU on
+/// verification. Rejecting on size costs nothing; verifying does not.
+const OVERSIZE_FACTOR: u64 = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChunkError {
     #[error("the chunk failed verification: {0}")]
@@ -89,6 +98,8 @@ pub enum ChunkError {
     Unsolicited(u64),
     #[error("the peer serves rskj's older chunk format, which this node does not read")]
     LegacyFormat,
+    #[error("the answer is {got} bytes against a {asked} byte request")]
+    Oversized { asked: u64, got: u64 },
 }
 
 /// Downloading one state trie.
@@ -177,6 +188,15 @@ impl StateDownload {
     pub fn accept(&mut self, from: u64, proof: &ChunkProof) -> Result<Progress, ChunkError> {
         if !self.slices.iter().any(|s| s.in_flight && s.cursor == from) {
             return Err(ChunkError::Unsolicited(from));
+        }
+
+        // Judged on size before anything is read: an answer wildly larger than
+        // the question is refused without paying to verify it.
+        let allowed = self.budget.saturating_mul(OVERSIZE_FACTOR).max(1 << 18);
+        let got = proof.wire_len();
+        if got > allowed {
+            self.release(from);
+            return Err(ChunkError::Oversized { asked: self.budget, got });
         }
 
         let verified = match verify_chunk(self.root_hash, from, proof) {
