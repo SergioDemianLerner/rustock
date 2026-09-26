@@ -522,3 +522,73 @@ fn server_fixture(n: usize) -> (Arc<rustock_storage::BlockStore>, Peer, u64) {
 
     (store, peer, number)
 }
+
+/// The last seam: a request arriving as a p2p message is answered as one.
+///
+/// Everything between is the real path -- the handler's dispatch, the message
+/// envelope, the RLP -- so this catches a variant wired to the wrong arm,
+/// which the pieces tested separately cannot.
+#[test]
+fn a_snap_request_is_answered_through_the_handler() {
+    use crate::events::SyncEvent;
+    use crate::manager::SyncManager;
+    use crate::SyncHandler;
+    use alloy_primitives::B512;
+    use rustock_core::validation::HeaderVerifier;
+    use rustock_networking::peers::PeerStore;
+    use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
+
+    let (store, peer, block_number) = server_fixture(120);
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        Arc::new(HeaderVerifier::new()),
+        Arc::new(PeerStore::new()),
+    ));
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SyncEvent>();
+    let handler = SyncHandler::new(manager, event_tx).with_snap_server(Arc::new(
+        SnapServer::new(store, peer.store.clone() as Arc<dyn TrieStore>, config(4, 700)),
+    ));
+
+    let request = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SnapChunkRequest(
+        SnapChunkRequest {
+            id: 77,
+            block_number,
+            from: 0,
+            chunk_size: 700,
+            state_root: Some(peer.root_hash),
+        },
+    )));
+
+    let reply = handler
+        .handle_message(B512::repeat_byte(1), &request)
+        .expect("the handler answers a chunk request");
+
+    let P2pMessage::RskMessage(message) = reply else { panic!("not an rsk message") };
+    let RskSubMessage::SnapChunkResponse(response) = message.sub_message else {
+        panic!("wrong reply type")
+    };
+    assert_eq!(response.id, 77, "the answer must carry the request's id");
+
+    // And it verifies, which is the only thing that makes it an answer.
+    let proof = proof_from_payload(&response.payload).expect("proved format");
+    assert!(!proof.entries.is_empty());
+    rustock_trie::snapshot_proof::verify_chunk(peer.root_hash, 0, &proof)
+        .expect("the handler's answer verifies");
+}
+
+/// A node that serves snapshots but has pruned the state it would offer says
+/// so, rather than reporting a checkpoint it cannot serve.
+#[test]
+fn a_node_without_the_state_offers_nothing() {
+    use rustock_storage::BlockStore;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(BlockStore::open(dir.path()).expect("open"));
+    // An empty trie store: whatever the chain says, the state is not here.
+    let server = SnapServer::new(
+        store,
+        Arc::new(MemoryTrieStore::new()) as Arc<dyn TrieStore>,
+        config(4, 512),
+    );
+    assert_eq!(server.offer(), None);
+}

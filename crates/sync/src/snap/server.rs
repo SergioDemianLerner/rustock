@@ -54,6 +54,17 @@ impl SnapServer {
         &self.config
     }
 
+    /// What this node can currently offer, for reporting at startup.
+    ///
+    /// A pruned node holds no state at its checkpoint and so serves nothing.
+    /// That is correct behaviour, but silent: peers would ask and get no
+    /// reply. Saying so once, where an operator will see it, is worth the
+    /// line.
+    pub fn offer(&self) -> Option<(u64, B256)> {
+        let block = self.checkpoint()?;
+        Some((block.header.number, block.header.state_root))
+    }
+
     /// The block this node offers as a snapshot point, and its header.
     ///
     /// `None` when there is no such block or its state is no longer on disk --

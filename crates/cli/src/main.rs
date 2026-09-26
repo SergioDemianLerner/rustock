@@ -1596,11 +1596,24 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             "Snapshot server enabled: serving state at #(head - {}) in chunks of up to {} bytes",
             snap_config.checkpoint_distance, snap_config.max_chunk_bytes
         );
-        sync_handler.attach_snap_server(Arc::new(rustock_sync::SnapServer::new(
+        let snap_server = Arc::new(rustock_sync::SnapServer::new(
             store.clone(),
             trie_store_for_exec.clone(),
             snap_config.clone(),
-        )));
+        ));
+        match snap_server.offer() {
+            Some((number, root)) => {
+                info!("Snapshot server: currently offering the state at #{number} ({root:?})")
+            }
+            // Worth a warning rather than silence: peers will ask and get no
+            // reply, and the operator would have no way to know why.
+            None => warn!(
+                "Snapshot server: nothing to offer -- the state {} blocks behind the tip is \
+                 not retained. A pruning node can only serve snapshots it still holds.",
+                snap_config.checkpoint_distance
+            ),
+        }
+        sync_handler.attach_snap_server(snap_server);
     }
 
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
