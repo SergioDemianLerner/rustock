@@ -2,6 +2,7 @@ use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable, Header as RlpH
 use alloy_primitives::{B256, Bytes, U256};
 use rustock_core::{Header, Transaction};
 use rustock_core::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
+use super::snap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RskStatus {
@@ -143,6 +144,12 @@ pub enum RskMessageType {
     BodyResponse = 15,
     SkeletonRequest = 16,
     BlockHashResponse = 18,
+    SnapStateChunkRequest = 20,
+    SnapStateChunkResponse = 21,
+    SnapStatusRequest = 22,
+    SnapStatusResponse = 23,
+    SnapBlocksRequest = 24,
+    SnapBlocksResponse = 25,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +165,12 @@ pub enum RskSubMessage {
     BodyResponse(BodyResponse),
     NewBlockHashes(Vec<BlockIdentifier>),
     Transactions(Vec<Bytes>),
+    SnapStatusRequest(snap::SnapStatusRequest),
+    SnapStatusResponse(Box<snap::SnapStatusResponse>),
+    SnapChunkRequest(snap::SnapChunkRequest),
+    SnapChunkResponse(Box<snap::SnapChunkResponse>),
+    SnapBlocksRequest(snap::SnapBlocksRequest),
+    SnapBlocksResponse(Box<snap::SnapBlocksResponse>),
     Unknown(u8),
 }
 
@@ -175,6 +188,12 @@ impl RskSubMessage {
             RskSubMessage::BodyResponse(_) => RskMessageType::BodyResponse,
             RskSubMessage::NewBlockHashes(_) => RskMessageType::NewBlockHashes,
             RskSubMessage::Transactions(_) => RskMessageType::Transactions,
+            RskSubMessage::SnapStatusRequest(_) => RskMessageType::SnapStatusRequest,
+            RskSubMessage::SnapStatusResponse(_) => RskMessageType::SnapStatusResponse,
+            RskSubMessage::SnapChunkRequest(_) => RskMessageType::SnapStateChunkRequest,
+            RskSubMessage::SnapChunkResponse(_) => RskMessageType::SnapStateChunkResponse,
+            RskSubMessage::SnapBlocksRequest(_) => RskMessageType::SnapBlocksRequest,
+            RskSubMessage::SnapBlocksResponse(_) => RskMessageType::SnapBlocksResponse,
             RskSubMessage::Unknown(_) => RskMessageType::Status, // Not used for encoding
         }
     }
@@ -368,6 +387,14 @@ impl RskSubMessage {
                 RlpHeader { list: true, payload_length: txs_payload.len() }.encode(out);
                 out.extend_from_slice(&txs_payload);
             }
+            // Snap bodies are built in `snap`, which owns their shape; here
+            // they are already-encoded parameter lists.
+            RskSubMessage::SnapStatusRequest(m) => out.extend_from_slice(&m.encode_body()),
+            RskSubMessage::SnapStatusResponse(m) => out.extend_from_slice(&m.encode_body()),
+            RskSubMessage::SnapChunkRequest(m) => out.extend_from_slice(&m.encode_body()),
+            RskSubMessage::SnapChunkResponse(m) => out.extend_from_slice(&m.encode_body()),
+            RskSubMessage::SnapBlocksRequest(m) => out.extend_from_slice(&m.encode_body()),
+            RskSubMessage::SnapBlocksResponse(m) => out.extend_from_slice(&m.encode_body()),
             RskSubMessage::NewBlockHashes(_) | RskSubMessage::Unknown(_) => {
                 // Receive-only messages are not encoded/sent
             }
@@ -626,6 +653,24 @@ impl Decodable for RskMessage {
                 }
                 RskSubMessage::Transactions(txs)
             }
+            snap::message_type::STATUS_REQUEST => RskSubMessage::SnapStatusRequest(
+                snap::SnapStatusRequest::decode_body(&mut body_params)?,
+            ),
+            snap::message_type::STATUS_RESPONSE => RskSubMessage::SnapStatusResponse(
+                Box::new(snap::SnapStatusResponse::decode_body(&mut body_params)?),
+            ),
+            snap::message_type::STATE_CHUNK_REQUEST => RskSubMessage::SnapChunkRequest(
+                snap::SnapChunkRequest::decode_body(&mut body_params)?,
+            ),
+            snap::message_type::STATE_CHUNK_RESPONSE => RskSubMessage::SnapChunkResponse(
+                Box::new(snap::SnapChunkResponse::decode_body(&mut body_params)?),
+            ),
+            snap::message_type::BLOCKS_REQUEST => RskSubMessage::SnapBlocksRequest(
+                snap::SnapBlocksRequest::decode_body(&mut body_params)?,
+            ),
+            snap::message_type::BLOCKS_RESPONSE => RskSubMessage::SnapBlocksResponse(
+                Box::new(snap::SnapBlocksResponse::decode_body(&mut body_params)?),
+            ),
             other => {
                 RskSubMessage::Unknown(other)
             }
