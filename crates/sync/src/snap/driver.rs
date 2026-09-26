@@ -20,7 +20,8 @@ use rustock_networking::protocol::snap::{
     ChunkPayload, Refusal, SnapBlocksRequest, SnapChunkRequest, SnapStatusRequest,
 };
 use rustock_networking::protocol::{
-    BlockHeadersQuery, BlockHeadersRequest, P2pMessage, RskMessage, RskSubMessage,
+    BlockHeadersQuery, BlockHeadersRequest, BlockIdentifier, P2pMessage, RskMessage,
+    RskSubMessage,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -40,7 +41,11 @@ fn fresh_id() -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
     Status,
-    Headers,
+    /// A header range, remembered by the height it fills and how it was
+    /// asked, so an unanswered one can be asked again.
+    Headers { point: u64, from: B256, count: u32 },
+    /// Block identifiers from a height upward.
+    Skeleton { start: u64 },
     Chunk { from: u64 },
     Blocks,
 }
@@ -234,7 +239,10 @@ impl SnapDriver {
     fn release(&mut self, what: Pending) {
         match what {
             Pending::Status => {}
-            Pending::Headers => self.session.release_headers(),
+            Pending::Headers { point, from, count } => {
+                self.session.release_header_request(point, from, count)
+            }
+            Pending::Skeleton { start } => self.session.release_skeleton_request(start),
             Pending::Chunk { from } => self.session.release_chunk(from),
             Pending::Blocks => self.session.release_blocks(),
         }
@@ -299,12 +307,18 @@ impl SnapDriver {
                     Pending::Status,
                     RskSubMessage::SnapStatusRequest(SnapStatusRequest { id }),
                 ),
-                Action::RequestHeaders { from, count } => (
-                    Pending::Headers,
+                Action::RequestHeaders { from, count, point } => (
+                    Pending::Headers { point, from, count },
                     RskSubMessage::BlockHeadersRequest(BlockHeadersRequest {
                         id,
                         query: BlockHeadersQuery { hash: from, count },
                     }),
+                ),
+                Action::RequestSkeleton { start } => (
+                    Pending::Skeleton { start },
+                    RskSubMessage::SkeletonRequest(
+                        rustock_networking::protocol::SkeletonRequest { id, start_number: start },
+                    ),
                 ),
                 Action::RequestChunk { block_number, state_root, from, budget } => (
                     Pending::Chunk { from },
@@ -356,10 +370,30 @@ impl SnapDriver {
         headers: &[Header],
         peers: &[B512],
     ) -> Vec<Outbound> {
-        if !self.answers(id, |p| matches!(p, Pending::Headers)) {
+        let Some(Pending::Headers { point, .. }) =
+            self.in_flight.get(&id).map(|r| r.what)
+        else {
+            return Vec::new();
+        };
+        self.in_flight.remove(&id);
+
+        let actions = self.session.on_headers(point, headers);
+        self.charge_for_failure(sender);
+        self.dispatch(actions, peers)
+    }
+
+    /// Block identifiers: where to ask, nothing more.
+    pub fn on_skeleton(
+        &mut self,
+        id: u64,
+        sender: B512,
+        identifiers: &[BlockIdentifier],
+        peers: &[B512],
+    ) -> Vec<Outbound> {
+        if !self.answers(id, |p| matches!(p, Pending::Skeleton { .. })) {
             return Vec::new();
         }
-        let actions = self.session.on_headers(headers);
+        let actions = self.session.on_skeleton(identifiers);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
     }
@@ -429,7 +463,12 @@ impl SnapDriver {
     /// Headers arriving through the ordinary sync path may or may not belong
     /// to this session; this says whether the id is one of ours.
     pub fn awaits_headers(&self, id: u64) -> bool {
-        matches!(self.in_flight.get(&id).map(|r| r.what), Some(Pending::Headers))
+        matches!(self.in_flight.get(&id).map(|r| r.what), Some(Pending::Headers { .. }))
+    }
+
+    /// The same for skeletons, which the ordinary sync also uses.
+    pub fn awaits_skeleton(&self, id: u64) -> bool {
+        matches!(self.in_flight.get(&id).map(|r| r.what), Some(Pending::Skeleton { .. }))
     }
 
     /// The state root being downloaded, once one has been offered.

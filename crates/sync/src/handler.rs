@@ -302,6 +302,7 @@ impl P2pHandler for SyncHandler {
                 RskSubMessage::SkeletonResponse(r) => {
                     let _ = self.event_tx.send(SyncEvent::SkeletonResponse {
                         peer: id,
+                        id: r.id,
                         identifiers: r.block_identifiers.clone(),
                     });
                 }

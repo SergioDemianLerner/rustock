@@ -129,6 +129,7 @@ as functions.
 | Snap messages (types 20-25) | `co.rsk.net.messages.Snap*Message` | `crates/networking/src/protocol/snap.rs` |
 | rskj's snapshot node encoding | `co.rsk.trie.TrieDTO`, `TrieDTOInOrderIterator` | `crates/trie/src/snapshot_legacy.rs` |
 | Snap request queueing | `SnapSyncRequestManager`, `SnapshotPeersInformation` | `crates/sync/src/snap/driver.rs` |
+| Snap header verification | `SnapshotProcessor.validateBlockHeaders` (serial) | `crates/sync/src/snap/headers.rs` (pipelined by skeleton) |
 
 rustock's sync has no rskj counterpart for three of its files — see
 "rustock-only" below.

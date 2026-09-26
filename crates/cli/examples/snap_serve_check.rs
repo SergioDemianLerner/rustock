@@ -163,7 +163,6 @@ fn main() -> anyhow::Result<()> {
         (0..want_chunks).map(|i| (total / want_chunks as u64) * i as u64).collect()
     };
     offsets.dedup();
-    let mut gaps = 0u64;
 
     let mut served_bytes = 0u64;
     let mut witness_bytes = 0u64;
@@ -255,7 +254,6 @@ fn main() -> anyhow::Result<()> {
             let mut at = verified.nodes[0].offset;
             for node in &verified.nodes {
                 if node.offset != at {
-                    gaps += 1;
                     anyhow::bail!(
                         "gap inside the chunk from {from}: expected a node at {at}, found one at {}",
                         node.offset
@@ -292,7 +290,7 @@ fn main() -> anyhow::Result<()> {
         let reached = offsets.last().copied().unwrap_or(0);
         println!();
         println!(
-            "swept {sweep_from}..{reached} of {total} ({:.1}%), {gaps} gaps",
+            "swept {sweep_from}..{reached} of {total} ({:.1}%), no gaps",
             (reached - sweep_from) as f64 * 100.0 / total as f64
         );
     }
