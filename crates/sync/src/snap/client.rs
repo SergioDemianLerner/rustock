@@ -111,6 +111,8 @@ pub struct StateDownload {
     root_hash: B256,
     store: Arc<dyn TrieStore>,
     budget: u64,
+    /// The most requests to have outstanding at once.
+    max_in_flight: usize,
     slices: Vec<Slice>,
     /// The size the root proves, once a chunk has carried it.
     total: Option<u64>,
@@ -134,6 +136,7 @@ impl StateDownload {
             root_hash,
             store,
             budget: config.chunk_bytes,
+            max_in_flight: workers,
             slices: Vec::new(),
             total: None,
             hinted_total,
@@ -165,6 +168,12 @@ impl StateDownload {
     /// someone -- meaning the caller should wait for an answer rather than
     /// open another request.
     pub fn next_request(&mut self) -> Option<ChunkRequest> {
+        // The cap is on requests, not on slices. Those were the same number
+        // until the trie turned out bigger than advertised and more slices
+        // were cut; keeping the two separate means the limit stays the limit.
+        if self.slices.iter().filter(|s| s.in_flight).count() >= self.max_in_flight {
+            return None;
+        }
         let slice = self.slices.iter_mut().find(|s| s.wants_work())?;
         slice.in_flight = true;
         Some(ChunkRequest { from: slice.cursor, budget: self.budget })
@@ -259,18 +268,22 @@ impl StateDownload {
             "trie size is {total}, peer hinted {}; adjusting slices", self.hinted_total
         );
 
-        // Anything wholly past the end is finished by definition; the slice
-        // that straddles the end stops there; the last one grows if the trie
-        // turned out bigger than advertised.
-        let last = self.slices.len().saturating_sub(1);
-        for (i, slice) in self.slices.iter_mut().enumerate() {
-            if i == last {
-                slice.end = total.max(slice.cursor);
-            } else {
-                slice.end = slice.end.min(total);
-            }
+        // Smaller than advertised: anything wholly past the end is finished by
+        // definition, and the slice straddling the end stops there.
+        for slice in self.slices.iter_mut() {
+            slice.end = slice.end.min(total);
             slice.start = slice.start.min(slice.end);
             slice.cursor = slice.cursor.clamp(slice.start, slice.end);
+        }
+
+        // Bigger than advertised: the extra space gets its own slices rather
+        // than being tacked onto the last one. A peer that understates the
+        // size would otherwise have left the tail of the trie to a single
+        // worker -- a cheap way to make a parallel download serial.
+        if total > self.hinted_total {
+            let workers = self.max_in_flight.max(1);
+            let extra = self.split(self.hinted_total, total, workers);
+            self.slices.extend(extra);
         }
     }
 
@@ -303,6 +316,12 @@ impl StateDownload {
 
     pub fn root_hash(&self) -> B256 {
         self.root_hash
+    }
+
+    /// The ranges the workers divide the trie into.
+    #[cfg(test)]
+    pub(crate) fn slice_bounds(&self) -> Vec<(u64, u64)> {
+        self.slices.iter().map(|s| (s.start, s.end)).collect()
     }
 
     /// Walk the assembled trie in the local store and confirm it is all

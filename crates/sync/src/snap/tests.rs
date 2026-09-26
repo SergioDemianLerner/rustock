@@ -678,3 +678,72 @@ fn one_node_larger_than_the_budget_still_arrives() {
         "the oversized value did not survive"
     );
 }
+
+/// A peer that understates the size of the trie must not end up serializing
+/// the download: the space it left out gets its own workers, not tacked onto
+/// the last slice.
+#[test]
+fn understating_the_size_does_not_serialize_the_tail() {
+    let peer = Peer::new(600);
+    let local = Arc::new(MemoryTrieStore::new());
+    let workers = 4;
+    let mut client = StateDownload::new(
+        peer.root_hash,
+        peer.total() / 10, // a tenth of the truth
+        &config(workers, 400),
+        local,
+    );
+
+    // One honest chunk teaches it the real size.
+    let first = client.next_request().expect("work");
+    let response = peer.serve(first.from, first.budget);
+    let proof = proof_from_payload(&response.payload).unwrap();
+    client.accept(first.from, &proof).expect("honest");
+
+    // The space the peer left out is divided among the workers rather than
+    // left to one, so no slice is a disproportionate share of the trie.
+    let bounds = client.slice_bounds();
+    let total = peer.total();
+    let biggest = bounds.iter().map(|(a, b)| b - a).max().unwrap();
+    assert!(
+        biggest < total / 2,
+        "one slice owns {biggest} of {total} bytes: {bounds:?}"
+    );
+
+    // And the ranges still tile the trie exactly: no gap, no overlap.
+    let mut sorted = bounds.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted[0].0, 0);
+    assert_eq!(sorted.last().unwrap().1, total);
+    for pair in sorted.windows(2) {
+        assert_eq!(pair[0].1, pair[1].0, "slices do not tile: {sorted:?}");
+    }
+
+    // The in-flight limit still holds: the first request has been answered,
+    // so all four slots are free again and exactly four reopen.
+    let mut opened = 0;
+    while client.next_request().is_some() {
+        opened += 1;
+        assert!(opened <= workers, "opened {opened} requests with a limit of {workers}");
+    }
+    assert_eq!(opened, workers);
+
+    // And it still finishes, covering everything.
+    let client = download(&peer, workers, 400, peer.total() / 10);
+    client.verify_stored().expect("the state is whole");
+}
+
+/// The in-flight limit is a limit on requests, whatever the slice count.
+#[test]
+fn no_more_requests_are_opened_than_allowed() {
+    let peer = Peer::new(600);
+    let local = Arc::new(MemoryTrieStore::new());
+    let mut client = StateDownload::new(peer.root_hash, peer.total(), &config(3, 400), local);
+
+    let mut opened = 0;
+    while client.next_request().is_some() {
+        opened += 1;
+        assert!(opened <= 3, "opened {opened} requests with a limit of 3");
+    }
+    assert_eq!(opened, 3);
+}
