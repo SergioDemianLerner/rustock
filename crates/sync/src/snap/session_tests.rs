@@ -731,10 +731,10 @@ fn a_peer_that_declines_is_dropped_not_punished() {
     assert!(driver.unhelpful().contains(&pruned), "kept asking a peer that cannot serve");
 }
 
-/// The same for an rskj peer speaking the older chunk format: not a fault, but
-/// not worth asking again either.
+/// An rskj peer sending a chunk that does not rebuild is charged like any
+/// other bad data. Reading their format does not mean trusting it.
 #[test]
-fn an_older_peer_is_dropped_not_punished() {
+fn an_rskj_chunk_that_does_not_rebuild_is_charged() {
     let f = fixture(250);
     let genesis = f.with_genesis();
     let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
@@ -743,14 +743,19 @@ fn an_older_peer_is_dropped_not_punished() {
     let (mut driver, id, _from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
     driver.take_blame();
 
-    let rskj = B512::repeat_byte(6);
-    driver.on_chunk(id, rskj, &ChunkPayload::Legacy(vec![0xC1, 0x80].into()), Refusal::None, &peers);
+    // A well-formed but empty rskj blob: it decodes and rebuilds to nothing
+    // like the state root.
+    let liar = B512::repeat_byte(6);
+    let blob = rustock_trie::snapshot_legacy::encode_blob(&Default::default());
+    driver.on_chunk(id, liar, &ChunkPayload::Legacy(blob.into()), Refusal::None, &peers);
 
-    assert!(driver.take_blame().is_empty(), "punished an rskj peer for being rskj");
-    assert!(driver.unhelpful().contains(&rskj));
+    let blame = driver.take_blame();
+    assert_eq!(blame.len(), 1, "got {blame:?}");
+    assert_eq!(blame[0].peer, liar);
+    assert_eq!(blame[0].event, EventType::InvalidMessage);
 }
 
-/// A peer that offers a chain which does not link is charged for the status,
+/// A peer that offers a chain which does not link is charged for the status,/// A peer that offers a chain which does not link is charged for the status,
 /// not merely ignored.
 #[test]
 fn a_peer_offering_a_broken_chain_is_charged() {

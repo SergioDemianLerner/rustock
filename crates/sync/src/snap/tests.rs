@@ -277,14 +277,80 @@ fn an_unsolicited_chunk_is_refused() {
     assert_eq!(client.accept(0, &proof), Err(ChunkError::Unsolicited(0)));
 }
 
-/// rskj's older chunk format is named, not guessed at.
+/// **A rustock client reads an rskj server's chunks.** The server here emits
+/// rskj's format, and the client rebuilds it into the same nodes the trie
+/// holds -- child hashes recomputed, structure derived, root checked.
 #[test]
-fn an_rskj_chunk_is_reported_rather_than_parsed() {
-    let payload = ChunkPayload::Legacy(vec![0xC1, 0x80].into());
-    assert_eq!(proof_from_payload(&payload), Err(ChunkError::LegacyFormat));
+fn an_rskj_format_chunk_is_rebuilt_and_kept() {
+    use crate::snap::client::{chunk_from_payload, Arrived};
+    use crate::snap::RSKJ_CHUNK_GRID;
+
+    let (store, peer, block_number) = server_fixture(900);
+    let server = SnapServer::new(
+        store,
+        peer.store.clone() as Arc<dyn TrieStore>,
+        SnapConfig { server_enabled: true, ..config(4, 100_000) },
+    );
+
+    // No state root in the request: served rskj's format.
+    let response = server
+        .chunk(&SnapChunkRequest {
+            id: 1,
+            block_number,
+            from: 0,
+            chunk_size: 0,
+            state_root: None,
+        })
+        .expect("an answer");
+    assert!(matches!(response.payload, ChunkPayload::Legacy(_)));
+
+    let arrived = chunk_from_payload(&response.payload, peer.root_hash)
+        .expect("an rskj chunk must rebuild");
+    let Arrived::Rebuilt(rebuilt) = arrived else { panic!("expected a rebuild") };
+
+    assert!(!rebuilt.nodes.is_empty());
+    // Every node must be one the trie really holds.
+    for (hash, message) in &rebuilt.nodes {
+        assert_eq!(alloy_primitives::keccak256(message), *hash);
+        assert_eq!(
+            peer.store.get(hash.as_slice()).as_deref(),
+            Some(message.as_slice()),
+            "rebuilt a node the trie does not hold"
+        );
+    }
+    let _ = RSKJ_CHUNK_GRID;
 }
 
-/// Requests go out to different offsets, so peers work on the trie at once
+/// A chunk that does not rebuild to the root this client trusts is refused --
+/// the whole of the security argument for reading rskj's format.
+#[test]
+fn an_rskj_chunk_for_another_state_is_refused() {
+    use crate::snap::client::chunk_from_payload;
+
+    let (store, peer, block_number) = server_fixture(300);
+    let server = SnapServer::new(
+        store,
+        peer.store.clone() as Arc<dyn TrieStore>,
+        SnapConfig { server_enabled: true, ..config(4, 100_000) },
+    );
+    let response = server
+        .chunk(&SnapChunkRequest {
+            id: 1,
+            block_number,
+            from: 0,
+            chunk_size: 0,
+            state_root: None,
+        })
+        .expect("an answer");
+
+    let wrong = B256::repeat_byte(0xAB);
+    match chunk_from_payload(&response.payload, wrong) {
+        Err(ChunkError::LegacyRebuild(_)) => {}
+        other => panic!("a chunk for another state was accepted: {other:?}"),
+    }
+}
+
+/// Requests go out to different offsets/// Requests go out to different offsets, so peers work on the trie at once
 /// rather than queueing behind each other.
 #[test]
 fn workers_are_given_different_parts_of_the_trie() {

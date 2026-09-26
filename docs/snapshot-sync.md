@@ -272,9 +272,31 @@ that the vectors did:
   why a server that has lost a value cannot serve that node in this format at
   all.
 
-What is still missing is the other direction: a rustock client reading rskj's
-chunks, which needs the bottom-up rebuild described in **issue #136**. Until
-then a rustock client meeting an rskj server reports the format and moves on.
+## Reading rskj's chunks
+
+The other direction works too: a rustock client can sync from an rskj server.
+
+It costs more than reading our own format, and the cost is structural. rskj
+drops each non-embedded child's 32-byte hash, so its nodes cannot be checked
+one at a time — there is nothing to check them against until the subtree is
+rebuilt and hashed from the bottom. So an rskj chunk is reconstructed first
+and checked at the root, where a proved chunk is replayed and compared node by
+node.
+
+**The quadratic step is not inherited.** rskj finds each subtree's root by
+scanning its range for the largest `children_size`, recursively. The scan is
+unnecessary: the root of a range is the *strict* maximum of `children_size`
+over it — a subtree root's children size is everything else in its range,
+while any other node's is a proper subset of that, short by at least its own
+bytes. A sequence whose tree is "the maximum splits the range" is a Cartesian
+tree, and those build with a stack in one pass. Same tree, linear time.
+
+What this gives up is stated plainly: completeness is established *at the end*
+rather than by construction. If the rebuilt root matches, the nodes and their
+arrangement are the ones the trie commits to, since any other set or shape
+would have to collide with the root hash. Sound — but the property arrives as
+a conclusion rather than falling out of a comparison, which is why rustock
+asks for its own format whenever it can.
 
 ## Differences from rskj
 

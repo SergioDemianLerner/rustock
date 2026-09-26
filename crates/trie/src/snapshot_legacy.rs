@@ -36,6 +36,9 @@
 
 use crate::store::TrieStore;
 
+/// The longest shared path any unitrie node can have; see `node.rs`.
+const MAX_SHARED_PATH_BITS: usize = 1024;
+
 /// Where a node's own hash would have gone, for the boundary nodes that carry
 /// one.
 pub type ChildHash = [u8; 32];
@@ -457,4 +460,435 @@ fn rlp_list(payload: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(payload);
     out
+}
+
+// ------------------------------------------------- reading rskj's chunks
+
+use alloy_primitives::{keccak256, B256};
+
+/// What a rebuilt chunk yields: nodes in consensus form, ready to store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rebuilt {
+    /// Every node recovered, keyed by its own hash.
+    pub nodes: Vec<(B256, Vec<u8>)>,
+    /// Values too long to sit inside a node, which rskj's format inlines.
+    pub long_values: Vec<Vec<u8>>,
+    /// The state root the reconstruction produced.
+    pub root: B256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RebuildError {
+    #[error("the chunk is not a well-formed rskj blob")]
+    Malformed,
+    #[error("node {index} does not parse")]
+    BadNode { index: usize },
+    #[error("node {index} needs a child hash the chunk did not carry")]
+    MissingChildHash { index: usize },
+    #[error("the chunk rebuilds to {got}, not the expected {expected}")]
+    WrongRoot { expected: B256, got: B256 },
+    #[error("the chunk is empty")]
+    Empty,
+}
+
+/// One node as the blob carries it.
+struct Stub {
+    stripped: Vec<u8>,
+    given_left: Option<ChildHash>,
+    given_right: Option<ChildHash>,
+    /// Parsed once, because the rebuild needs these repeatedly.
+    flags: u8,
+    children_size: u64,
+    /// Where the stripped body's children and value begin, so the consensus
+    /// form can be rebuilt without parsing twice.
+    after_path: usize,
+    /// The embedded children, already converted to consensus form.
+    embedded: Vec<Vec<u8>>,
+    /// The inlined value, if the node carries one.
+    value: Vec<u8>,
+    has_long_value: bool,
+}
+
+/// Rebuild a chunk of rskj's, and check it against the state root.
+///
+/// # Why this is linear
+///
+/// rskj's recoverer finds each subtree's root by scanning the range for the
+/// largest `children_size`, recursively -- quadratic in the worst case, and
+/// the step its own report lists as future work.
+///
+/// The scan is unnecessary. The root of any range is the *strict* maximum of
+/// `children_size` over it: a subtree root's children size is everything else
+/// in its range, and any other node's is a proper subset of that, short by at
+/// least its own bytes. A sequence whose tree is "the maximum splits the
+/// range" is a Cartesian tree, and those build with a stack in linear time.
+/// Same tree, same answer, one pass.
+///
+/// # What this proves
+///
+/// Less directly than rustock's own format does. There the traversal is
+/// replayed and each node compared, so completeness falls out of the
+/// comparison. Here the structure is *derived* from the nodes and then the
+/// root is checked: if the derived root matches, the nodes and their
+/// arrangement are the ones the trie commits to, since any other set or shape
+/// would have to collide with the root hash. It is sound, but it establishes
+/// the property at the end rather than by construction -- which is why
+/// rustock asks for its own format when it can.
+pub fn rebuild(chunk: &LegacyChunk, expected_root: B256) -> Result<Rebuilt, RebuildError> {
+    let mut stubs = assemble(chunk)?;
+    if stubs.is_empty() {
+        return Err(RebuildError::Empty);
+    }
+
+    let (left_of, right_of, root_index) = cartesian_tree(&stubs);
+
+    // Post-order: a node's message needs its children's hashes.
+    let mut hashes: Vec<Option<B256>> = vec![None; stubs.len()];
+    let mut nodes: Vec<(B256, Vec<u8>)> = Vec::with_capacity(stubs.len());
+    let mut long_values: Vec<Vec<u8>> = Vec::new();
+
+    let mut stack = vec![(root_index, false)];
+    while let Some((index, expanded)) = stack.pop() {
+        if !expanded {
+            stack.push((index, true));
+            if let Some(right) = right_of[index] {
+                stack.push((right, false));
+            }
+            if let Some(left) = left_of[index] {
+                stack.push((left, false));
+            }
+            continue;
+        }
+
+        let left_hash = match left_of[index] {
+            Some(child) => hashes[child],
+            None => stubs[index].given_left.map(B256::from),
+        };
+        let right_hash = match right_of[index] {
+            Some(child) => hashes[child],
+            None => stubs[index].given_right.map(B256::from),
+        };
+
+        let message = consensus_message(&stubs[index], left_hash, right_hash)
+            .ok_or(RebuildError::MissingChildHash { index })?;
+        let hash = keccak256(&message);
+        hashes[index] = Some(hash);
+
+        if stubs[index].has_long_value {
+            long_values.push(std::mem::take(&mut stubs[index].value));
+        }
+        nodes.push((hash, message));
+    }
+
+    let root = hashes[root_index].ok_or(RebuildError::Malformed)?;
+    if root != expected_root {
+        return Err(RebuildError::WrongRoot { expected: expected_root, got: root });
+    }
+    Ok(Rebuilt { nodes, long_values, root })
+}
+
+/// pre-root nodes, the chunk's own, then post-root, with the boundary hashes
+/// attached to the nodes they belong to.
+fn assemble(chunk: &LegacyChunk) -> Result<Vec<Stub>, RebuildError> {
+    let mut out: Vec<Stub> = Vec::new();
+
+    for (body, hash) in &chunk.pre_root {
+        out.push(parse_stub(body, *hash, None, out.len())?);
+    }
+
+    let first = out.len();
+    for body in &chunk.nodes {
+        out.push(parse_stub(body, None, None, out.len())?);
+    }
+    let last = out.len().checked_sub(1);
+
+    if let Some(stub) = out.get_mut(first) {
+        stub.given_left = chunk.first_left;
+    }
+    if let (Some(last), Some((left, right))) = (last, chunk.last) {
+        if last >= first {
+            out[last].given_left = left;
+            out[last].given_right = right;
+        }
+    }
+
+    for (body, hash) in &chunk.post_root {
+        out.push(parse_stub(body, None, *hash, out.len())?);
+    }
+    Ok(out)
+}
+
+/// Parse a stripped node far enough to rebuild it later.
+fn parse_stub(
+    body: &[u8],
+    given_left: Option<ChildHash>,
+    given_right: Option<ChildHash>,
+    index: usize,
+) -> Result<Stub, RebuildError> {
+    let bad = || RebuildError::BadNode { index };
+    let mut r = Reader { data: body, pos: 0 };
+
+    let flags = r.byte().ok_or_else(bad)?;
+    let has_long_value = flags & 0b0010_0000 != 0;
+    let shared_prefix = flags & 0b0001_0000 != 0;
+    let left_present = flags & 0b0000_1000 != 0;
+    let right_present = flags & 0b0000_0100 != 0;
+    let left_embedded = flags & 0b0000_0010 != 0;
+    let right_embedded = flags & 0b0000_0001 != 0;
+
+    if shared_prefix {
+        let first = r.byte().ok_or_else(bad)?;
+        let bits = match first {
+            0..=31 => first as usize + 1,
+            32..=254 => first as usize + 128,
+            _ => decode_varint(r.varint_bytes().ok_or_else(bad)?).ok_or_else(bad)? as usize,
+        };
+        if bits > MAX_SHARED_PATH_BITS {
+            return Err(bad());
+        }
+        r.take(crate::path::encoded_len(bits)).ok_or_else(bad)?;
+    }
+    let after_path = r.pos;
+
+    // Embedded children come back in consensus form now, because their length
+    // prefix differs between the two encodings and an embedded child that
+    // inlines a long value is a different length in each.
+    let mut embedded = Vec::new();
+    for (present, is_embedded) in
+        [(left_present, left_embedded), (right_present, right_embedded)]
+    {
+        if present && is_embedded {
+            let len = read_uint24(&mut r).ok_or_else(bad)?;
+            let child = r.take(len).ok_or_else(bad)?;
+            let stub = parse_stub(child, None, None, index)?;
+            embedded.push(consensus_message(&stub, None, None).ok_or_else(bad)?);
+        }
+    }
+
+    let children_size = if left_present || right_present {
+        decode_varint(r.varint_bytes().ok_or_else(bad)?).ok_or_else(bad)?
+    } else {
+        0
+    };
+
+    // Whatever remains is the value, inlined.
+    let value = r.rest().to_vec();
+
+    Ok(Stub {
+        stripped: body.to_vec(),
+        given_left,
+        given_right,
+        flags,
+        children_size,
+        after_path,
+        embedded,
+        value,
+        has_long_value,
+    })
+}
+
+fn read_uint24(r: &mut Reader<'_>) -> Option<usize> {
+    let b = r.take(3)?;
+    Some(((b[0] as usize) << 16) | ((b[1] as usize) << 8) | b[2] as usize)
+}
+
+/// Put back what rskj left out: the child hashes, the consensus length prefix
+/// on embedded children, and a long value's reference in place of its bytes.
+fn consensus_message(
+    stub: &Stub,
+    left_hash: Option<B256>,
+    right_hash: Option<B256>,
+) -> Option<Vec<u8>> {
+    let left_present = stub.flags & 0b0000_1000 != 0;
+    let right_present = stub.flags & 0b0000_0100 != 0;
+    let left_embedded = stub.flags & 0b0000_0010 != 0;
+    let right_embedded = stub.flags & 0b0000_0001 != 0;
+
+    let mut out = Vec::with_capacity(stub.stripped.len() + 64);
+    // Flags and shared path are unchanged between the two encodings.
+    out.extend_from_slice(stub.stripped.get(..stub.after_path)?);
+
+    let mut embedded = stub.embedded.iter();
+    for (present, is_embedded, hash) in [
+        (left_present, left_embedded, left_hash),
+        (right_present, right_embedded, right_hash),
+    ] {
+        if !present {
+            continue;
+        }
+        if is_embedded {
+            let child = embedded.next()?;
+            out.push(u8::try_from(child.len()).ok()?);
+            out.extend_from_slice(child);
+        } else {
+            // The hash rskj dropped, recovered from the child this rebuild
+            // gave the node, or supplied by the chunk for a subtree it did
+            // not carry.
+            out.extend_from_slice(hash?.as_slice());
+        }
+    }
+
+    if left_present || right_present {
+        let mut buf = [0u8; 9];
+        out.extend_from_slice(encode_varint(stub.children_size, &mut buf));
+    }
+
+    if stub.has_long_value {
+        out.extend_from_slice(keccak256(&stub.value).as_slice());
+        out.extend_from_slice(&uint24(stub.value.len())?);
+    } else {
+        out.extend_from_slice(&stub.value);
+    }
+    Some(out)
+}
+
+fn encode_varint(value: u64, buf: &mut [u8; 9]) -> &[u8] {
+    if value < 253 {
+        buf[0] = value as u8;
+        &buf[..1]
+    } else if value <= u16::MAX as u64 {
+        buf[0] = 253;
+        buf[1..3].copy_from_slice(&(value as u16).to_le_bytes());
+        &buf[..3]
+    } else if value <= u32::MAX as u64 {
+        buf[0] = 254;
+        buf[1..5].copy_from_slice(&(value as u32).to_le_bytes());
+        &buf[..5]
+    } else {
+        buf[0] = 255;
+        buf[1..9].copy_from_slice(&value.to_le_bytes());
+        &buf[..9]
+    }
+}
+
+/// The tree whose root is the maximum `children_size` of every range, built
+/// with a stack in one pass.
+///
+/// Returns each node's children and the index of the root.
+fn cartesian_tree(stubs: &[Stub]) -> (Vec<Option<usize>>, Vec<Option<usize>>, usize) {
+    let n = stubs.len();
+    let mut left: Vec<Option<usize>> = vec![None; n];
+    let mut right: Vec<Option<usize>> = vec![None; n];
+    let mut stack: Vec<usize> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let mut last = None;
+        while let Some(&top) = stack.last() {
+            if stubs[top].children_size >= stubs[i].children_size {
+                break;
+            }
+            last = stack.pop();
+        }
+        // Everything popped sits to this node's left; this node takes the
+        // place of the last one popped under whatever remains.
+        left[i] = last;
+        if let Some(&top) = stack.last() {
+            right[top] = Some(i);
+        }
+        stack.push(i);
+    }
+
+    let root = stack.first().copied().unwrap_or(0);
+    (left, right, root)
+}
+
+/// Read back what [`encode_blob`] writes, and what rskj sends.
+pub fn decode_blob(bytes: &[u8]) -> Option<LegacyChunk> {
+    let mut outer = rlp_payload(bytes, true)?;
+
+    let pre_body = take_item(&mut outer, true)?;
+    let nodes_body = take_item(&mut outer, true)?;
+    let first_left = take_item(&mut outer, false)?;
+    let last_body = take_item(&mut outer, true)?;
+    let post_body = take_item(&mut outer, true)?;
+
+    let pairs = |mut body: &[u8]| -> Option<Vec<(Vec<u8>, Option<ChildHash>)>> {
+        let mut out = Vec::new();
+        while !body.is_empty() {
+            let mut pair = take_item(&mut body, true)?;
+            let node = take_item(&mut pair, false)?.to_vec();
+            let hash = as_hash(take_item(&mut pair, false)?);
+            out.push((node, hash));
+        }
+        Some(out)
+    };
+
+    let mut nodes = Vec::new();
+    let mut body = nodes_body;
+    while !body.is_empty() {
+        nodes.push(take_item(&mut body, false)?.to_vec());
+    }
+
+    let mut last_rest = last_body;
+    let last = if last_rest.is_empty() {
+        None
+    } else {
+        let left = as_hash(take_item(&mut last_rest, false)?);
+        let right = as_hash(take_item(&mut last_rest, false)?);
+        Some((left, right))
+    };
+
+    Some(LegacyChunk {
+        pre_root: pairs(pre_body)?,
+        nodes,
+        first_left: as_hash(first_left),
+        last,
+        post_root: pairs(post_body)?,
+    })
+}
+
+fn as_hash(bytes: &[u8]) -> Option<ChildHash> {
+    (bytes.len() == 32).then(|| {
+        let mut h = [0u8; 32];
+        h.copy_from_slice(bytes);
+        h
+    })
+}
+
+/// The payload of one RLP item, checking it is the kind expected.
+fn rlp_payload(bytes: &[u8], want_list: bool) -> Option<&[u8]> {
+    let (payload, rest) = split_item(bytes, want_list)?;
+    rest.is_empty().then_some(payload)
+}
+
+/// Takes the next RLP item from `cursor`, returning its payload.
+fn take_item<'a>(cursor: &mut &'a [u8], want_list: bool) -> Option<&'a [u8]> {
+    let (payload, rest) = split_item(cursor, want_list)?;
+    *cursor = rest;
+    Some(payload)
+}
+
+fn split_item(bytes: &[u8], want_list: bool) -> Option<(&[u8], &[u8])> {
+    let first = *bytes.first()?;
+    let (is_list, header, length) = match first {
+        0x00..=0x7F => (false, 0usize, 1usize),
+        0x80..=0xB7 => (false, 1, first as usize - 0x80),
+        0xB8..=0xBF => {
+            let n = first as usize - 0xB7;
+            (false, 1 + n, be_len(bytes.get(1..1 + n)?)?)
+        }
+        0xC0..=0xF7 => (true, 1, first as usize - 0xC0),
+        _ => {
+            let n = first as usize - 0xF7;
+            (true, 1 + n, be_len(bytes.get(1..1 + n)?)?)
+        }
+    };
+    if is_list != want_list {
+        return None;
+    }
+    // A single byte below 0x80 is its own payload.
+    let start = if header == 0 { 0 } else { header };
+    let end = start.checked_add(length)?;
+    Some((bytes.get(start..end)?, bytes.get(end..)?))
+}
+
+fn be_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() || bytes.len() > 8 {
+        return None;
+    }
+    let mut value = 0usize;
+    for b in bytes {
+        value = value.checked_mul(256)?.checked_add(*b as usize)?;
+    }
+    Some(value)
 }
