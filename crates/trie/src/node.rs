@@ -172,6 +172,17 @@ pub struct TrieNode {
     pub shared_path: TrieKeySlice,
     pub value: Option<Vec<u8>>,
     pub value_hash: Option<B256>,
+    /// Length of a value stored outside the node, when the value itself is
+    /// not in hand.
+    ///
+    /// The length is written into the node's message and so is part of its
+    /// hash. Without it, a node parsed from a store that does not hold its
+    /// long value looks like a node with no value at all: a different length,
+    /// a different hash, a different subtree size. Reading it from the message
+    /// means such a node still measures correctly, which is what lets a
+    /// snapshot witness carry node messages without dragging their values
+    /// along.
+    pub long_value_len: Option<u32>,
     pub left: NodeRef,
     pub right: NodeRef,
     pub children_size: u64,
@@ -202,6 +213,7 @@ impl TrieNode {
             right: NodeRef::Empty,
             children_size: 0,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         }
     }
@@ -215,7 +227,7 @@ impl TrieNode {
         left: NodeRef,
         right: NodeRef,
     ) -> Self {
-        Self { shared_path, value, value_hash, left, right, children_size: 0, saved: false, hash_cache: OnceLock::new() }
+        Self { shared_path, value, value_hash, left, right, children_size: 0, saved: false, long_value_len: None, hash_cache: OnceLock::new() }
     }
 
     pub fn new_leaf(shared_path: TrieKeySlice, value: Vec<u8>) -> Self {
@@ -228,12 +240,16 @@ impl TrieNode {
             right: NodeRef::Empty,
             children_size: 0,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         }
     }
 
     pub fn is_empty_trie(&self) -> bool {
-        self.value.is_none() && self.left.is_empty() && self.right.is_empty()
+        self.value.is_none()
+            && self.long_value_len.is_none()
+            && self.left.is_empty()
+            && self.right.is_empty()
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -241,7 +257,10 @@ impl TrieNode {
     }
 
     pub fn value_length(&self) -> usize {
-        self.value.as_ref().map_or(0, |v| v.len())
+        match &self.value {
+            Some(v) => v.len(),
+            None => self.long_value_len.unwrap_or(0) as usize,
+        }
     }
 
     pub fn has_long_value(&self) -> bool {
@@ -380,6 +399,7 @@ impl TrieNode {
         let children_size =
             if left_present || right_present { r.varint()? } else { 0 };
 
+        let mut long_value_len = None;
         let (value, value_hash) = if has_long_val {
             let vh = B256::from_slice(r.take(32)?);
             let len = r.take(3)?;
@@ -391,6 +411,7 @@ impl TrieNode {
             if val.as_ref().is_some_and(|v| v.len() != vlen as usize) {
                 return None;
             }
+            long_value_len = Some(vlen);
             (val, Some(vh))
         } else if r.pos < data.len() {
             let v = data[r.pos..].to_vec();
@@ -408,6 +429,7 @@ impl TrieNode {
             right,
             children_size,
             saved: false,
+            long_value_len,
             hash_cache: OnceLock::new(),
         })
     }
@@ -618,6 +640,7 @@ impl TrieNode {
             right: child.right,
             children_size: child.children_size,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         })
     }
@@ -665,7 +688,8 @@ impl TrieNode {
                     right: NodeRef::Empty,
                     children_size: 0,
                     saved: false,
-                    hash_cache: OnceLock::new(),
+                    long_value_len: None,
+            hash_cache: OnceLock::new(),
                 });
             }
 
@@ -682,7 +706,8 @@ impl TrieNode {
                 right: self.right.clone(),
                 children_size: self.children_size,
                 saved: false,
-                hash_cache: OnceLock::new(),
+                long_value_len: None,
+            hash_cache: OnceLock::new(),
             });
         }
 
@@ -697,7 +722,8 @@ impl TrieNode {
                 right: NodeRef::Empty,
                 children_size: 0,
                 saved: false,
-                hash_cache: OnceLock::new(),
+                long_value_len: None,
+            hash_cache: OnceLock::new(),
             });
         }
 
@@ -737,6 +763,7 @@ impl TrieNode {
             right: new_right,
             children_size: new_cs,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         })
     }
@@ -752,6 +779,7 @@ impl TrieNode {
             right: self.right.clone(),
             children_size: self.children_size,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         };
 
@@ -773,6 +801,7 @@ impl TrieNode {
             right: new_right,
             children_size: cs,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         }
     }

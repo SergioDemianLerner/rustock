@@ -66,9 +66,21 @@ pub struct SnapConfig {
 
     /// Bytes of trie nodes to ask for per chunk.
     ///
-    /// The PoC report settles on 25-50KB: large enough that per-message
-    /// overhead disappears, small enough that a slow peer holding one request
-    /// does not stall the pipeline.
+    /// The PoC report settles on 25-50KB. This defaults higher, because the
+    /// witness that proves a chunk costs O(depth) regardless of the chunk's
+    /// size, so a bigger chunk spreads it further. Measured against mainnet
+    /// state at #9272510:
+    ///
+    /// ```text
+    ///  25 KB chunks -> witness is 13.4% of the payload
+    ///  50 KB        ->             7.4%
+    /// 100 KB        ->             3.4%
+    /// 250 KB        ->             1.3%
+    /// ```
+    ///
+    /// 100KB is where the curve flattens: past it the saving is under two
+    /// points and the cost is a slow peer holding a larger piece of the
+    /// download hostage for longer.
     pub chunk_bytes: u64,
     /// The most this node will serve in one chunk, whatever is asked.
     pub max_chunk_bytes: u64,
@@ -97,7 +109,7 @@ impl Default for SnapConfig {
             checkpoint_distance: 10_000,
             checkpoint_rounding: 5_000,
 
-            chunk_bytes: 50_000,
+            chunk_bytes: 100_000,
             max_chunk_bytes: 1 << 20,
             max_in_flight: 8,
             max_requests_per_peer: 3,

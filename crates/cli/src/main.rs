@@ -162,6 +162,31 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_peer_punishment: bool,
 
+    /// Serve snapshots of this node's state to peers that ask for one.
+    ///
+    /// Costs disk reads and bandwidth; answers are proved, so a peer needs no
+    /// further trust in this node than it would have in any other.
+    #[arg(long, default_value_t = false)]
+    snap_server: bool,
+
+    /// Catch up by downloading a state instead of replaying the chain into
+    /// one.
+    ///
+    /// The header chain to the snapshot point is verified first, under the
+    /// same proof-of-work rules as a full sync, and every chunk of state is
+    /// checked against that chain's state root as it arrives. What is given
+    /// up is the re-execution of history, not the verification of it.
+    #[arg(long, default_value_t = false)]
+    snap_sync: bool,
+
+    /// Bytes of state to ask for per chunk.
+    #[arg(long, default_value_t = 100_000, value_name = "BYTES")]
+    snap_chunk_bytes: u64,
+
+    /// Chunk requests to keep in flight at once, across all peers.
+    #[arg(long, default_value_t = 8, value_name = "N")]
+    snap_parallel: usize,
+
     /// Network ID (30 for mainnet, 33 for regtest)
     #[arg(long, default_value = "30")]
     network_id: u64,
@@ -1164,6 +1189,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     info!("Genesis Hash: {:?}", genesis_hash);
 
     let verifier = Arc::new(HeaderVerifier::default_rsk(config.clone()));
+    // The manager takes ownership below; snapshot sync needs the same rules.
+    let verifier_for_snap = verifier.clone();
 
     let key_path = std::path::Path::new(&args.data_dir).join("node.key");
 
@@ -1557,12 +1584,40 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         !args.no_peer_punishment,
     ));
 
+    let snap_config = rustock_sync::SnapConfig {
+        server_enabled: args.snap_server,
+        client_enabled: args.snap_sync,
+        chunk_bytes: args.snap_chunk_bytes,
+        max_in_flight: args.snap_parallel.max(1),
+        ..rustock_sync::SnapConfig::default()
+    };
+    if args.snap_server {
+        info!(
+            "Snapshot server enabled: serving state at #(head - {}) in chunks of up to {} bytes",
+            snap_config.checkpoint_distance, snap_config.max_chunk_bytes
+        );
+        sync_handler.attach_snap_server(Arc::new(rustock_sync::SnapServer::new(
+            store.clone(),
+            trie_store_for_exec.clone(),
+            snap_config.clone(),
+        )));
+    }
+
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_tx_pool(pool.clone())
         .with_block_processor(block_processor, trie_store_for_exec, initial_state_root)
         .with_gas_price_tracker(gas_price_tracker.clone())
         .with_scoring(Some(scoring.clone()))
         .with_events(events.clone());
+
+    if args.snap_sync {
+        info!(
+            "Snapshot sync enabled: verifying the header chain to the snapshot point \
+             before downloading state, {} chunks of {} bytes in flight",
+            snap_config.max_in_flight, snap_config.chunk_bytes
+        );
+        sync_service.start_snap_sync(snap_config.clone(), verifier_for_snap.clone());
+    }
 
     // Taken before the service is moved into its task: the RPC layer reads the
     // same gauge the sync loop publishes, so `debug_wireProtocolQueueSize`

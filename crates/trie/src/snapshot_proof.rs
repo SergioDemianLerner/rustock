@@ -117,6 +117,29 @@ impl ChunkProof {
     }
 }
 
+/// The non-embedded child hashes a node message points at.
+///
+/// Read straight from the message, so it needs no store and cannot be misled
+/// by one.
+fn child_hashes(message: &[u8], out: &mut Vec<B256>) {
+    let Some(node) = TrieNode::try_from_message(message, &EmptyStore) else { return };
+    for child in [&node.left, &node.right] {
+        match child {
+            crate::node::NodeRef::Hash(h) => out.push(*h),
+            // An embedded child travels inside its parent, so it is never
+            // fetched -- but it may itself point at grandchildren.
+            crate::node::NodeRef::Node(n) => {
+                for grandchild in [&n.left, &n.right] {
+                    if let crate::node::NodeRef::Hash(h) = grandchild {
+                        out.push(*h);
+                    }
+                }
+            }
+            crate::node::NodeRef::Empty => {}
+        }
+    }
+}
+
 /// A store that remembers every key it served.
 ///
 /// Used to derive the witness by construction rather than by reasoning about
@@ -172,21 +195,43 @@ pub fn prove_chunk(
         .map(|n| Entry { message: n.message, long_values: n.long_values })
         .collect();
 
-    // Whatever the traversal read that is not already travelling with the
-    // chunk is what the client will be missing.
-    let mut carried: std::collections::HashSet<&[u8]> =
-        entries.iter().map(|e| e.message.as_slice()).collect();
-    carried.extend(entries.iter().flat_map(|e| e.long_values.iter().map(|v| v.as_slice())));
-
+    // The witness is what the replay must be able to *resolve*: the root, and
+    // every node it reaches by following a child hash that the chunk does not
+    // already carry. Deriving it from child references rather than from
+    // everything the traversal happened to read leaves out the long values of
+    // witness nodes -- read while measuring, never needed to navigate, since
+    // a node knows its value's length from its own message.
     let seen = recorder.seen.into_inner().unwrap_or_else(|e| e.into_inner());
-    let mut witness: Witness =
-        seen.into_values().filter(|m| !carried.contains(m.as_slice())).collect();
 
-    // The root's own message is read by nobody -- the traversal starts from
-    // it -- so the recorder cannot have seen it. Without it the client has
-    // nothing to anchor against the expected state root.
-    if !carried.contains(root_message.as_slice()) && !witness.contains(&root_message) {
-        witness.push(root_message);
+    let carried: std::collections::HashSet<B256> =
+        entries.iter().map(|e| alloy_primitives::keccak256(&e.message)).collect();
+
+    let mut known: HashMap<B256, &[u8]> = HashMap::new();
+    for (hash, message) in &seen {
+        known.insert(*hash, message.as_slice());
+    }
+    for entry in &entries {
+        known.insert(alloy_primitives::keccak256(&entry.message), entry.message.as_slice());
+    }
+    let root_hash = alloy_primitives::keccak256(&root_message);
+    known.insert(root_hash, root_message.as_slice());
+
+    let mut witness: Witness = Vec::new();
+    let mut queue: Vec<B256> = vec![root_hash];
+    let mut walked: std::collections::HashSet<B256> = std::collections::HashSet::new();
+
+    while let Some(hash) = queue.pop() {
+        if !walked.insert(hash) {
+            continue;
+        }
+        let Some(message) = known.get(&hash).copied() else { continue };
+        // Children are followed through carried nodes as well as witness
+        // ones: the traversal descends past the chunk's own nodes, and
+        // whatever it resolved there the replay resolves too.
+        child_hashes(message, &mut queue);
+        if !carried.contains(&hash) {
+            witness.push(message.to_vec());
+        }
     }
 
     // Deterministic order: a proof should be a function of what it proves,

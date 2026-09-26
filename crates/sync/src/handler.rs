@@ -28,11 +28,14 @@ pub struct SyncHandler {
     /// and costs nothing: snap requests are then simply not answered, which
     /// is what a node without the feature looks like from outside.
     snap: Option<Arc<SnapServer>>,
+    /// Attached after the handler is shared, which is when the node knows
+    /// whether it was asked to serve snapshots.
+    snap_late: std::sync::RwLock<Option<Arc<SnapServer>>>,
 }
 
 impl SyncHandler {
     pub fn new(manager: Arc<SyncManager>, event_tx: mpsc::UnboundedSender<SyncEvent>) -> Self {
-        Self { manager, event_tx, snap: None }
+        Self { manager, event_tx, snap: None, snap_late: std::sync::RwLock::new(None) }
     }
 
     /// Serve snapshots of this node's state to peers that ask.
@@ -41,12 +44,30 @@ impl SyncHandler {
         self
     }
 
+    /// Same, for a handler already shared behind an `Arc`.
+    ///
+    /// Installed once at startup, before any peer is connected, so the
+    /// lock is uncontended and the read on the message path stays cheap.
+    pub fn attach_snap_server(&self, snap: Arc<SnapServer>) {
+        if let Ok(mut slot) = self.snap_late.write() {
+            *slot = Some(snap);
+        }
+    }
+
+    fn snap_server(&self) -> Option<Arc<SnapServer>> {
+        if let Some(snap) = &self.snap {
+            return Some(snap.clone());
+        }
+        self.snap_late.read().ok()?.clone()
+    }
+
     /// Wraps a snap reply in the message envelope, or stays silent.
     fn serve_snap<F>(&self, reply: F) -> Option<P2pMessage>
     where
         F: FnOnce(&SnapServer) -> Option<RskSubMessage>,
     {
-        let sub = reply(self.snap.as_deref()?)?;
+        let server = self.snap_server()?;
+        let sub = reply(&server)?;
         Some(P2pMessage::RskMessage(RskMessage::new(sub)))
     }
 
