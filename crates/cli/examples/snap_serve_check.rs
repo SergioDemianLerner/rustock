@@ -6,7 +6,17 @@
 //!
 //! The trie is opened read-only, so this is safe to run beside a syncing node.
 //!
-//! Usage: snap_serve_check <data-dir> [block-number] [chunk-bytes] [chunks]
+//! Two modes:
+//!
+//!   - **sampled** (default) takes chunks spread across the whole trie, which
+//!     catches structural variety: a chunk near the root looks nothing like
+//!     one deep in a subtree.
+//!   - **sweep** walks forward from an offset, checking that each chunk begins
+//!     exactly where the last ended. That is the tiling property -- no gap, no
+//!     overlap in offset space -- which is what makes "cover 0..total" the
+//!     same thing as "download the state".
+//!
+//! Usage: snap_serve_check <data-dir> [block] [chunk-bytes] [chunks] [sweep [from]]
 
 use alloy_primitives::keccak256;
 use rustock_storage::{BlockStore, RocksDbTrieStore};
@@ -107,12 +117,20 @@ fn main() -> anyhow::Result<()> {
     );
     println!();
 
+    let sweep = a.get(5).is_some_and(|m| m == "sweep");
+    let sweep_from: u64 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
+
     // Sample across the whole trie rather than only the start: the shape of a
     // chunk near the root differs from one deep in a subtree.
-    let mut offsets: Vec<u64> = (0..want_chunks)
-        .map(|i| (total / want_chunks as u64) * i as u64)
-        .collect();
+    let mut offsets: Vec<u64> = if sweep {
+        // Filled in as we go: where the next chunk starts is what is being
+        // tested, so it cannot be computed in advance.
+        vec![sweep_from]
+    } else {
+        (0..want_chunks).map(|i| (total / want_chunks as u64) * i as u64).collect()
+    };
     offsets.dedup();
+    let mut gaps = 0u64;
 
     let mut served_bytes = 0u64;
     let mut witness_bytes = 0u64;
@@ -122,7 +140,10 @@ fn main() -> anyhow::Result<()> {
     let mut verify_time = std::time::Duration::ZERO;
     let mut widest_witness = 0usize;
 
-    for (i, from) in offsets.iter().enumerate() {
+    let mut i = 0usize;
+    while i < offsets.len() && i < want_chunks {
+        let from = offsets[i];
+        let from = &from;
         let t0 = Instant::now();
         let proof = prove_chunk(&root, *from, chunk_bytes, trie.as_ref());
         serve_time += t0.elapsed();
@@ -175,7 +196,32 @@ fn main() -> anyhow::Result<()> {
         witness_bytes += proof.witness.iter().map(|w| w.len() as u64).sum::<u64>();
         widest_witness = widest_witness.max(proof.witness.len());
 
-        if i < 3 || i + 1 == offsets.len() {
+        if sweep {
+            // The next chunk must begin exactly where this one ended. A gap
+            // would be state nobody downloads; an overlap, state downloaded
+            // twice.
+            let next = verified.nodes.last().expect("non-empty").end();
+            if next <= *from {
+                anyhow::bail!("chunk at {from} did not advance (ended at {next})");
+            }
+            if next < total {
+                offsets.push(next);
+            }
+            // Every node must sit where the one before it ended.
+            let mut at = verified.nodes[0].offset;
+            for node in &verified.nodes {
+                if node.offset != at {
+                    gaps += 1;
+                    anyhow::bail!(
+                        "gap inside the chunk from {from}: expected a node at {at}, found one at {}",
+                        node.offset
+                    );
+                }
+                at = node.end();
+            }
+        }
+
+        if i < 3 || i + 1 == offsets.len().min(want_chunks) {
             println!(
                 "chunk at {from:>13}: {:>4} nodes, {:>6} B nodes, {:>6} B values, \
                  {:>2} witness nodes ({} B)",
@@ -186,9 +232,18 @@ fn main() -> anyhow::Result<()> {
                 proof.witness.iter().map(|w| w.len()).sum::<usize>(),
             );
         }
+        i += 1;
     }
 
-    let sampled = offsets.len() as u64;
+    let sampled = i as u64;
+    if sweep {
+        let reached = offsets.last().copied().unwrap_or(0);
+        println!();
+        println!(
+            "swept {sweep_from}..{reached} of {total} ({:.1}%), {gaps} gaps",
+            (reached - sweep_from) as f64 * 100.0 / total as f64
+        );
+    }
     let payload = served_bytes + value_bytes;
     println!();
     println!("{sampled} chunks verified, {nodes} nodes, all matching the store");

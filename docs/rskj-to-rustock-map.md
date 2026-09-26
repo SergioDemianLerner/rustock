@@ -122,9 +122,23 @@ as functions.
 | Account rate limiting | `co.rsk.net.handler.quota.*` (`TxQuotaChecker`, `TxVirtualGasCalculator`) | `crates/sync/src/quota.rs` |
 | Transaction relay | `co.rsk.net.TransactionGateway` | `crates/sync/src/tx_relay.rs` |
 | Gas price suggestion | `org.ethereum.listener.GasPriceTracker` | `crates/sync/src/gas_price.rs` |
+| Snapshot sync, server | `co.rsk.net.SnapshotProcessor` (`processStateChunkRequest`, `processSnapStatusRequest`) | `crates/sync/src/snap/server.rs` |
+| Snapshot sync, client | `SnapshotProcessor` (`processStateChunkResponse`), `net/sync/SnapSyncState` | `crates/sync/src/snap/client.rs`, `session.rs`, `driver.rs` |
+| Chunk proof | `co.rsk.trie.TrieDTOInOrderRecoverer.verifyChunk` (heuristic reconstruction) | `crates/trie/src/snapshot_proof.rs` (linear replay) |
+| Trie traversal by offset | `co.rsk.trie.TrieDTOInOrderIterator`, `TrieDTO` | `crates/trie/src/snapshot.rs` |
+| Snap messages (types 20-25) | `co.rsk.net.messages.Snap*Message` | `crates/networking/src/protocol/snap.rs` |
+| Snap request queueing | `SnapSyncRequestManager`, `SnapshotPeersInformation` | `crates/sync/src/snap/driver.rs` |
 
 rustock's sync has no rskj counterpart for three of its files — see
 "rustock-only" below.
+
+Snapshot sync is the same six p2p commands and the same trust model, with
+three differences documented in `docs/snapshot-sync.md`: chunks are verified
+by replaying the traversal (linear) rather than by rebuilding the subtree from
+a `children_size` heuristic (quadratic); nodes travel in consensus form, so a
+verified node is written straight to the store with nothing to reconstruct;
+and the chunk request names the state root, so peers cannot disagree about
+which state is being downloaded.
 
 ### Mining
 
@@ -180,14 +194,15 @@ Split by *why*, because the three kinds call for different responses.
 
 ### Genuine gaps
 
-Two entries left this table on 2026-09-25: **WebSocket RPC and
+Three entries left this table. On 2026-09-25: **WebSocket RPC and
 `eth_subscribe`** (#121, closed by #123 — `crates/rpc/src/ws.rs` and
 `subscribe.rs`) and the per-block half of the **log bloom index** (#122,
-#124). What remains of the second is the grouped range index, kept below.
+#124); what remains of the second is the grouped range index, kept below.
+On 2026-09-26: **snapshot sync** (#84), now in `crates/sync/src/snap/` on
+both sides — see the Sync table.
 
 | rskj | classes | what is missing |
 |---|---|---|
-| **Snap sync** | `co.rsk.net.SnapshotProcessor`, `net/sync/SnapSyncState`, `SnapProcessor`, `SnapSyncRequestManager` | Joining the network without executing from genesis. Tracked as **issue #84**. rustock's substitute is the rskj database import, which needs an existing node. |
 | **Grouped log bloom index** | `co.rsk.logfilter.BlocksBloomStore`, `BlocksBloom`, `BlocksBloomProcessor` | rskj keeps one ORed bloom per *group* of blocks, so a wide `eth_getLogs` can discard a whole group with one test. rustock tests each block's own header bloom (#124) — same answers, one read per block rather than per group. The grouped index needs new storage and a confirmation-depth invariant; **issue #122** stays open for it. |
 | **Metrics and profiling** | `co.rsk.metrics.profilers.*`, `co.rsk.metrics.jmx.*`, `HashRateCalculator` | No JMX, no profiler hooks, no hash-rate estimate. rustock has structured `tracing` logs and periodic summaries instead, which is not the same thing for an operator with a dashboard. |
 | **Parallel transaction execution** | `co.rsk.core.bc.ParallelizeTransactionHandler`, `ReadWrittenKeysTracker` | RSKIP144. Testnet-only today (`reed810`), so not a mainnet consensus gap — but it becomes one the day it activates. Tracked as **issue #48**. |

@@ -10,7 +10,7 @@ use rustock_trie::{AccountState, TrieKeySlice, TrieNode, TrieStore, account_key}
 use std::sync::Arc;
 use alloy_primitives::U256;
 use anyhow::{Result, Context};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Reads block bodies from a synced rskj `blocks` LevelDB (keyed by block
