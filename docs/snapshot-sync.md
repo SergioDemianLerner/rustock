@@ -104,9 +104,15 @@ changing a node changes a hash.
 ### Nothing is claimed that could be checked instead
 
 Because the replay computes the offsets, a chunk entry does not state where it
-sits. rskj's chunk response carries `from` and `to` as claims the client must
-then check; here they are not on the wire at all, and the client takes the
-offset it asked for from its own record of the request.
+sits: a `SnapEntry` is a node message and its long values, and nothing else.
+
+The response envelope still carries `from`, `to` and `complete` — rskj's shape,
+kept — but the client never reads them. It matches an answer to a question by
+request id, the way every other message in the protocol is matched, and takes
+the offset from its own record of what it asked for. That is deliberate: a
+client that trusted the echoed `from` could be answered a question nobody
+asked, served the cheap start of the trie over and over while a range it had
+actually assigned went unfilled.
 
 The same goes for the size of the trie. Snap status offers one, but every proof
 carries the root node, which commits to its own subtree size — so the first
