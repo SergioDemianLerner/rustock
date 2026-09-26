@@ -28,12 +28,18 @@
 //! # Layout
 //!
 //! - [`server`] answers other nodes' requests from this node's own trie.
-//! - [`client`] drives a download: status, then chunks, then the blocks
-//!   around the checkpoint.
+//! - [`client`] covers the trie's offset space, verifying and storing what
+//!   comes back.
+//! - [`session`] sequences a whole sync: status, header verification, state,
+//!   then the blocks around the checkpoint.
 
 pub mod client;
+pub mod driver;
 pub mod server;
+pub mod session;
 
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod tests;
 

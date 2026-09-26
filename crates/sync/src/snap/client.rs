@@ -254,8 +254,15 @@ impl StateDownload {
 
     /// Offset space covered so far, and the total once it is known.
     pub fn progress(&self) -> (u64, Option<u64>) {
-        let covered: u64 =
-            self.slices.iter().map(|s| s.cursor.saturating_sub(s.start)).sum();
+        // A slice's cursor can run past its end: the last chunk of a slice
+        // usually straddles the boundary, and the whole node comes with it.
+        // Those bytes belong to the next slice, which will fetch them again,
+        // so counting them here would put progress over 100%.
+        let covered: u64 = self
+            .slices
+            .iter()
+            .map(|s| s.cursor.min(s.end).saturating_sub(s.start))
+            .sum();
         (covered, self.total)
     }
 

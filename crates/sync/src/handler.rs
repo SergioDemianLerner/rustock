@@ -1,6 +1,7 @@
 use crate::events::SyncEvent;
 use crate::manager::SyncManager;
 use alloy_primitives::B512;
+use crate::snap::server::SnapServer;
 use rustock_networking::protocol::{
     BlockHashResponse, BlockHeadersResponse, BlockIdentifier, BodyResponse,
     P2pHandler, P2pMessage, RskMessage, RskSubMessage, SkeletonResponse,
@@ -23,11 +24,30 @@ const MAX_HEADERS_SERVE: u32 = 192;
 pub struct SyncHandler {
     manager: Arc<SyncManager>,
     event_tx: mpsc::UnboundedSender<SyncEvent>,
+    /// Present only when this node serves snapshots. Absent is the default
+    /// and costs nothing: snap requests are then simply not answered, which
+    /// is what a node without the feature looks like from outside.
+    snap: Option<Arc<SnapServer>>,
 }
 
 impl SyncHandler {
     pub fn new(manager: Arc<SyncManager>, event_tx: mpsc::UnboundedSender<SyncEvent>) -> Self {
-        Self { manager, event_tx }
+        Self { manager, event_tx, snap: None }
+    }
+
+    /// Serve snapshots of this node's state to peers that ask.
+    pub fn with_snap_server(mut self, snap: Arc<SnapServer>) -> Self {
+        self.snap = Some(snap);
+        self
+    }
+
+    /// Wraps a snap reply in the message envelope, or stays silent.
+    fn serve_snap<F>(&self, reply: F) -> Option<P2pMessage>
+    where
+        F: FnOnce(&SnapServer) -> Option<RskSubMessage>,
+    {
+        let sub = reply(self.snap.as_deref()?)?;
+        Some(P2pMessage::RskMessage(RskMessage::new(sub)))
     }
 
     /// Respond to a BodyRequest by looking up the block and returning its body.
@@ -224,6 +244,7 @@ impl P2pHandler for SyncHandler {
                 RskSubMessage::BlockHeadersResponse(r) => {
                     let _ = self.event_tx.send(SyncEvent::HeadersResponse {
                         peer: id,
+                        id: r.id,
                         headers: r.headers.clone(),
                     });
                 }
@@ -260,6 +281,48 @@ impl P2pHandler for SyncHandler {
                 }
                 RskSubMessage::BodyRequest(r) => {
                     return self.serve_body_request(r.id, r.hash);
+                }
+
+                // --- Snapshot sync ---
+                RskSubMessage::SnapStatusRequest(r) => {
+                    return self.serve_snap(|s| {
+                        s.status(r).map(|m| RskSubMessage::SnapStatusResponse(Box::new(m)))
+                    });
+                }
+                RskSubMessage::SnapChunkRequest(r) => {
+                    return self.serve_snap(|s| {
+                        s.chunk(r).map(|m| RskSubMessage::SnapChunkResponse(Box::new(m)))
+                    });
+                }
+                RskSubMessage::SnapBlocksRequest(r) => {
+                    return self.serve_snap(|s| {
+                        s.blocks(r).map(|m| RskSubMessage::SnapBlocksResponse(Box::new(m)))
+                    });
+                }
+                RskSubMessage::SnapStatusResponse(r) => {
+                    let _ = self.event_tx.send(SyncEvent::SnapStatusResponse {
+                        peer: id,
+                        id: r.id,
+                        blocks: r.blocks.clone(),
+                        difficulties: r.difficulties.clone(),
+                        trie_size: r.trie_size,
+                    });
+                }
+                RskSubMessage::SnapChunkResponse(r) => {
+                    let _ = self.event_tx.send(SyncEvent::SnapChunkResponse {
+                        peer: id,
+                        id: r.id,
+                        from: r.from,
+                        payload: r.payload.clone(),
+                    });
+                }
+                RskSubMessage::SnapBlocksResponse(r) => {
+                    let _ = self.event_tx.send(SyncEvent::SnapBlocksResponse {
+                        peer: id,
+                        id: r.id,
+                        blocks: r.blocks.clone(),
+                        difficulties: r.difficulties.clone(),
+                    });
                 }
 
                 _ => {}
