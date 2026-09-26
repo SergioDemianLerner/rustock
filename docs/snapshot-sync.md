@@ -33,6 +33,33 @@ fails verification. All three end the same way: the range goes back in the
 queue and someone else is asked. Nothing a peer sends is written to the store
 before it is checked.
 
+### What the header walk costs
+
+For a node that starts with nothing, step 2 walks from the checkpoint to
+genesis: about 9.2 million headers on mainnet today. The protocol serves 192
+per request on both sides (rskj caps at `syncConfiguration.chunkSize`, and so
+does rustock), and each request needs the parent hash from the answer before
+it — so the walk is **sequential, around 48,000 round trips**.
+
+Two things are worth saying plainly about that.
+
+It is not extra work. A node needs the header chain regardless; a full sync
+downloads exactly the same headers. What snapshot sync skips is executing the
+transactions under them, and downloading the bodies.
+
+But it is *serial* work, where the rest of sync is not. rustock's ordinary
+forward sync pipelines headers with a skeleton — ask for block identifiers
+every 192 blocks, then fetch the chunks between them in parallel — and the
+backward walk could do the same, linking the chunks by hash at the end with
+exactly the strictness it has now. That is the obvious next improvement, and
+it is deliberately not in this version: it duplicates machinery that already
+exists for the forward direction, and the walk is the part where a mistake
+costs the most. rskj's client walks sequentially too. Tracked as **issue
+#131**.
+
+A node that has already imported a header chain — from the rskj database
+import, say — anchors on its first answer and skips the walk entirely.
+
 ## How a chunk is proved
 
 The unitrie gives every node an offset in the in-order traversal, because each
