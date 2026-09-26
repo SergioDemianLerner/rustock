@@ -111,6 +111,39 @@ several times an hour on ordinary tip forks, almost always one block deep —
 and the violation is never logged at all, because it is fixed before it is old
 enough to be worth reporting.
 
+## Snapshot sync
+
+Joining the network by downloading the state instead of executing every
+transaction into it. Both sides: serving snapshots to peers, and using one to
+catch up.
+
+What is given up is the re-execution of history, not the verification of it.
+The header chain to the snapshot point is verified under the same
+proof-of-work rules a full sync applies, and every chunk of state is proved
+against that chain's state root as it arrives.
+
+The property worth naming is **completeness**. Inclusion proofs — the natural
+thing to reach for — show that each node sent is in the trie. They do not show
+that none *between* them was skipped, and a peer that sends a truthful subset
+leaves the client with state full of holes: worse than a failure, because it
+looks like success and breaks later, somewhere else. Both properties are proved
+at once by re-running the server's traversal over nothing but the bytes the
+peer supplied and requiring it to reproduce the chunk. Omitting a node changes
+the replay; changing a node changes a hash.
+
+Three things the client is never told, because it can work them out: where a
+node sits in the traversal (the replay computes it), how big the trie is (the
+root node commits to its own subtree size, and every proof carries the root),
+and where a chunk stopped. rskj sends all three as fields the client must then
+check. The strongest check is a field that does not exist.
+
+Measured against mainnet state at #9272510: 2.1 disk reads per node served,
+a 100 KB chunk verified in ~11 ms, witness overhead 2.9%, and a contiguous
+sweep confirming consecutive chunks tile the offset space with no gaps.
+
+Off by default on both sides — snapshot sync changes how a node comes to trust
+its state, which is a decision an operator makes rather than one they discover.
+
 ## Transaction pool and account rate limiter
 
 A mempool with nonce-gap handling and pending/queued separation, plus a port of

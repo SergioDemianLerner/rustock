@@ -44,8 +44,11 @@ impl NodeRef {
             NodeRef::Empty => None,
             NodeRef::Node(n) => Some(*n.clone()),
             NodeRef::Hash(h) => {
+                // Unresolvable and unparseable are the same answer here. A
+                // store can hold bytes a peer supplied, and a node nobody can
+                // read is a node that is not there.
                 let data = store.get(h.as_slice())?;
-                Some(TrieNode::from_message(&data, store))
+                TrieNode::try_from_message(&data, store)
             }
         }
     }
@@ -103,7 +106,9 @@ impl NodeRef {
             }
             NodeRef::Hash(h) => {
                 if let Some(data) = store.get(h.as_slice()) {
-                    let node = TrieNode::from_message(&data, store);
+                    let Some(node) = TrieNode::try_from_message(&data, store) else {
+                        return 0;
+                    };
                     let external_val_len = if node.has_long_value() { node.value_length() as u64 } else { 0 };
                     node.children_size + external_val_len + data.len() as u64
                 } else {
@@ -121,11 +126,71 @@ fn orchid_child_hash(child: &NodeRef, is_secure: bool, store: &dyn TrieStore) ->
     Some(node.compute_hash_orchid(is_secure, store))
 }
 
+/// The longest shared path any unitrie node can have.
+///
+/// The longest key the trie holds is a storage slot: an account key
+/// (1 prefix + 10 secure + 20 address) then 1 storage prefix, 10 secure and
+/// up to 32 slot bytes -- 74 bytes, 592 bits. This is comfortably above that
+/// and far below the point where declaring a length becomes an amplification.
+const MAX_SHARED_PATH_BITS: usize = 1024;
+
+/// A bounds-checked walk over a node message.
+///
+/// Returning `None` where the plain indexing would have panicked is the whole
+/// point: these bytes can come from a peer.
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl Reader<'_> {
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.data.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.data.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+
+    fn varint(&mut self) -> Option<u64> {
+        let first = *self.data.get(self.pos)?;
+        let width = match first {
+            0..=252 => 1,
+            253 => 3,
+            254 => 5,
+            _ => 9,
+        };
+        let bytes = self.take(width)?;
+        Some(match width {
+            1 => first as u64,
+            3 => u16::from_le_bytes(bytes[1..3].try_into().ok()?) as u64,
+            5 => u32::from_le_bytes(bytes[1..5].try_into().ok()?) as u64,
+            _ => u64::from_le_bytes(bytes[1..9].try_into().ok()?),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TrieNode {
     pub shared_path: TrieKeySlice,
     pub value: Option<Vec<u8>>,
     pub value_hash: Option<B256>,
+    /// Length of a value stored outside the node, when the value itself is
+    /// not in hand.
+    ///
+    /// The length is written into the node's message and so is part of its
+    /// hash. Without it, a node parsed from a store that does not hold its
+    /// long value looks like a node with no value at all: a different length,
+    /// a different hash, a different subtree size. Reading it from the message
+    /// means such a node still measures correctly, which is what lets a
+    /// snapshot witness carry node messages without dragging their values
+    /// along.
+    pub long_value_len: Option<u32>,
     pub left: NodeRef,
     pub right: NodeRef,
     pub children_size: u64,
@@ -156,6 +221,7 @@ impl TrieNode {
             right: NodeRef::Empty,
             children_size: 0,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         }
     }
@@ -169,7 +235,7 @@ impl TrieNode {
         left: NodeRef,
         right: NodeRef,
     ) -> Self {
-        Self { shared_path, value, value_hash, left, right, children_size: 0, saved: false, hash_cache: OnceLock::new() }
+        Self { shared_path, value, value_hash, left, right, children_size: 0, saved: false, long_value_len: None, hash_cache: OnceLock::new() }
     }
 
     pub fn new_leaf(shared_path: TrieKeySlice, value: Vec<u8>) -> Self {
@@ -182,12 +248,16 @@ impl TrieNode {
             right: NodeRef::Empty,
             children_size: 0,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         }
     }
 
     pub fn is_empty_trie(&self) -> bool {
-        self.value.is_none() && self.left.is_empty() && self.right.is_empty()
+        self.value.is_none()
+            && self.long_value_len.is_none()
+            && self.left.is_empty()
+            && self.right.is_empty()
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -195,7 +265,10 @@ impl TrieNode {
     }
 
     pub fn value_length(&self) -> usize {
-        self.value.as_ref().map_or(0, |v| v.len())
+        match &self.value {
+            Some(v) => v.len(),
+            None => self.long_value_len.unwrap_or(0) as usize,
+        }
     }
 
     pub fn has_long_value(&self) -> bool {
@@ -276,12 +349,24 @@ impl TrieNode {
     }
 
     /// Deserializes a node from the RSKIP107 wire format.
+    ///
+    /// Panics on a malformed message. Use [`TrieNode::try_from_message`] for
+    /// bytes that came from anywhere but our own database -- a peer's, above
+    /// all, where a malformed message is an attack rather than corruption.
     pub fn from_message(data: &[u8], store: &dyn TrieStore) -> Self {
-        let mut pos = 0;
+        Self::try_from_message(data, store).expect("malformed trie node message")
+    }
 
-        let flags = data[pos];
-        pos += 1;
+    /// Deserializes a node from the RSKIP107 wire format, returning `None`
+    /// rather than panicking if the bytes do not describe a node.
+    ///
+    /// Every read is bounds-checked, so any byte string at all is safe to
+    /// pass: a node arriving over the wire is exactly as trustworthy as
+    /// whoever sent it.
+    pub fn try_from_message(data: &[u8], store: &dyn TrieStore) -> Option<Self> {
+        let mut r = Reader { data, pos: 0 };
 
+        let flags = r.byte()?;
         let has_long_val = flags & 0b0010_0000 != 0;
         let shared_prefix_present = flags & 0b0001_0000 != 0;
         let left_present = flags & 0b0000_1000 != 0;
@@ -289,70 +374,69 @@ impl TrieNode {
         let left_embedded = flags & 0b0000_0010 != 0;
         let right_embedded = flags & 0b0000_0001 != 0;
 
-        let (shared_path, sp_consumed) = shared_path::deserialize(data, pos, shared_prefix_present);
-        pos += sp_consumed;
-
-        let left = if left_present {
-            if left_embedded {
-                let len = data[pos] as usize;
-                pos += 1;
-                let node = TrieNode::from_message(&data[pos..pos + len], store);
-                pos += len;
-                NodeRef::Node(Box::new(node))
+        let shared_path = if shared_prefix_present {
+            let first = r.byte()? as usize;
+            let lshared = if first <= 31 {
+                first + 1
+            } else if first <= 254 {
+                first + 128
             } else {
-                let hash = B256::from_slice(&data[pos..pos + 32]);
-                pos += 32;
-                NodeRef::Hash(hash)
+                r.varint()? as usize
+            };
+            // A shared path longer than any key the trie can hold is not a
+            // trie node. Without this a peer could declare a huge one and have
+            // the parser expand it eightfold -- one bit per byte -- from a
+            // message the transport was happy to carry.
+            if lshared > MAX_SHARED_PATH_BITS {
+                return None;
             }
+            let encoded = r.take(crate::path::encoded_len(lshared))?;
+            TrieKeySlice::from_encoded(encoded, lshared)
         } else {
-            NodeRef::Empty
+            TrieKeySlice::empty()
         };
 
-        let right = if right_present {
-            if right_embedded {
-                let len = data[pos] as usize;
-                pos += 1;
-                let node = TrieNode::from_message(&data[pos..pos + len], store);
-                pos += len;
-                NodeRef::Node(Box::new(node))
+        let mut child = |present: bool, embedded: bool| -> Option<NodeRef> {
+            if !present {
+                return Some(NodeRef::Empty);
+            }
+            if embedded {
+                let len = r.byte()? as usize;
+                let body = r.take(len)?;
+                Some(NodeRef::Node(Box::new(TrieNode::try_from_message(body, store)?)))
             } else {
-                let hash = B256::from_slice(&data[pos..pos + 32]);
-                pos += 32;
-                NodeRef::Hash(hash)
+                Some(NodeRef::Hash(B256::from_slice(r.take(32)?)))
             }
-        } else {
-            NodeRef::Empty
         };
+        let left = child(left_present, left_embedded)?;
+        let right = child(right_present, right_embedded)?;
 
-        let children_size = if left_present || right_present {
-            let (v, vs) = varint::decode_varint(&data[pos..]);
-            pos += vs;
-            v
-        } else {
-            0
-        };
+        let children_size =
+            if left_present || right_present { r.varint()? } else { 0 };
 
+        let mut long_value_len = None;
         let (value, value_hash) = if has_long_val {
-            let vh = B256::from_slice(&data[pos..pos + 32]);
-            pos += 32;
-            let vlen = ((data[pos] as u32) << 16)
-                | ((data[pos + 1] as u32) << 8)
-                | (data[pos + 2] as u32);
+            let vh = B256::from_slice(r.take(32)?);
+            let len = r.take(3)?;
+            let vlen =
+                ((len[0] as u32) << 16) | ((len[1] as u32) << 8) | (len[2] as u32);
             let val = store.get(vh.as_slice());
-            debug_assert!(val.as_ref().is_none_or(|v| v.len() == vlen as usize));
-            (val, Some(vh))
-        } else {
-            let remaining = data.len() - pos;
-            if remaining > 0 {
-                let v = data[pos..].to_vec();
-                let vh = keccak(&v);
-                (Some(v), Some(vh))
-            } else {
-                (None, None)
+            // A stored value of the wrong length is not this node's value: the
+            // length is part of the message and so part of the node's hash.
+            if val.as_ref().is_some_and(|v| v.len() != vlen as usize) {
+                return None;
             }
+            long_value_len = Some(vlen);
+            (val, Some(vh))
+        } else if r.pos < data.len() {
+            let v = data[r.pos..].to_vec();
+            let vh = keccak(&v);
+            (Some(v), Some(vh))
+        } else {
+            (None, None)
         };
 
-        Self {
+        Some(Self {
             shared_path,
             value,
             value_hash,
@@ -360,8 +444,9 @@ impl TrieNode {
             right,
             children_size,
             saved: false,
+            long_value_len,
             hash_cache: OnceLock::new(),
-        }
+        })
     }
 
     /// Computes the Keccak-256 hash of this node's serialized message.
@@ -570,6 +655,7 @@ impl TrieNode {
             right: child.right,
             children_size: child.children_size,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         })
     }
@@ -617,7 +703,8 @@ impl TrieNode {
                     right: NodeRef::Empty,
                     children_size: 0,
                     saved: false,
-                    hash_cache: OnceLock::new(),
+                    long_value_len: None,
+            hash_cache: OnceLock::new(),
                 });
             }
 
@@ -634,7 +721,8 @@ impl TrieNode {
                 right: self.right.clone(),
                 children_size: self.children_size,
                 saved: false,
-                hash_cache: OnceLock::new(),
+                long_value_len: None,
+            hash_cache: OnceLock::new(),
             });
         }
 
@@ -649,7 +737,8 @@ impl TrieNode {
                 right: NodeRef::Empty,
                 children_size: 0,
                 saved: false,
-                hash_cache: OnceLock::new(),
+                long_value_len: None,
+            hash_cache: OnceLock::new(),
             });
         }
 
@@ -689,6 +778,7 @@ impl TrieNode {
             right: new_right,
             children_size: new_cs,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         })
     }
@@ -704,6 +794,7 @@ impl TrieNode {
             right: self.right.clone(),
             children_size: self.children_size,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         };
 
@@ -725,6 +816,7 @@ impl TrieNode {
             right: new_right,
             children_size: cs,
             saved: false,
+            long_value_len: None,
             hash_cache: OnceLock::new(),
         }
     }
