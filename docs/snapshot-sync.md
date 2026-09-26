@@ -67,32 +67,49 @@ a free denial of service. Now the peer is charged, the session is abandoned,
 and another starts against a different peer — up to `MAX_SNAP_ATTEMPTS` (5),
 carrying forward the list of peers already found unhelpful.
 
-### What the header walk costs
+### The header walk runs in parallel
 
-For a node that starts with nothing, step 2 walks from the checkpoint to
-genesis: about 9.2 million headers on mainnet today. The protocol serves 192
-per request on both sides (rskj caps at `syncConfiguration.chunkSize`, and so
-does rustock), and each request needs the parent hash from the answer before
-it — so the walk is **sequential, around 48,000 round trips**.
+For a node that starts with nothing, step 2 covers the whole mainnet chain:
+about 9.2 million headers, at 192 per request — roughly 48,000 requests.
 
-Two things are worth saying plainly about that.
+The naive walk is strictly **serial**: to ask for headers you need a hash, and
+the only hash you have is the one the last answer gave you. rskj's client walks
+that way, one round trip at a time, before a single byte of state is requested.
 
-It is not extra work. A node needs the header chain regardless; a full sync
-downloads exactly the same headers. What snapshot sync skips is executing the
-transactions under them, and downloading the bodies.
+A *skeleton* request breaks the dependency. It is addressed by height rather
+than by hash, and answers with twenty block identifiers 192 apart. So every
+skeleton can be asked for at once, and every identifier they return is the
+starting hash for a header request that can also be asked for at once. The
+messages stop waiting for each other.
 
-But it is *serial* work, where the rest of sync is not. rustock's ordinary
-forward sync pipelines headers with a skeleton — ask for block identifiers
-every 192 blocks, then fetch the chunks between them in parallel — and the
-backward walk could do the same, linking the chunks by hash at the end with
-exactly the strictness it has now. That is the obvious next improvement, and
-it is deliberately not in this version: it duplicates machinery that already
-exists for the forward direction, and the walk is the part where a mistake
-costs the most. rskj's client walks sequentially too. Tracked as **issue
-#131**.
+**A skeleton identifier is never believed.** It says only *where to ask*. What
+makes an answer trustworthy is that the runs **link**, and because a request
+from height `p` returns `p` down to `p-191`, the linking is arithmetic rather
+than a search:
 
-A node that has already imported a header chain — from the rskj database
-import, say — anchors on its first answer and skips the walk entirely.
+```text
+run(p).oldest.parent_hash == run(p-192).newest.hash()
+```
+
+The walk holds one piece of state — the header it still needs, and the hash its
+child already named for it. A run satisfies that need when it is keyed at that
+height *and* its newest header is that hash. Nothing else moves it, so a peer
+pointing at another chain produces a run that simply never fits, and the range
+is asked of somebody else.
+
+Every header still faces the full consensus rules, merged-mining proof of work
+included, and every adjacent pair the parent-dependent ones. Pipelining changes
+when the questions are asked, not which answers are accepted. The chain is
+trusted exactly when an unbroken run of links reaches from the checkpoint down
+to a block already in this node's **canonical index** — the one thing the walk
+cannot write, and so the one anchor its own output cannot forge.
+
+Memory stays flat: headers go to the store as they are verified, and only each
+run's two ends are kept. Nine million headers cost a few megabytes of
+bookkeeping.
+
+A node that already has a header chain — from the rskj database import, say —
+anchors on its first answer and skips the walk entirely.
 
 ### What a snap-synced node has afterwards
 

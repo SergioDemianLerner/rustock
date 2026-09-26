@@ -34,13 +34,11 @@ use alloy_primitives::{B256, U256};
 use rustock_core::validation::HeaderVerifier;
 use rustock_core::{Block, Header};
 use rustock_networking::protocol::snap::{ChunkPayload, Refusal};
+use rustock_networking::protocol::BlockIdentifier;
 use rustock_storage::BlockStore;
 use rustock_trie::TrieStore;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
-
-/// Headers to ask for in one request while walking back from the checkpoint.
-const HEADER_WALK_CHUNK: u32 = 192;
 
 /// How many peers may answer the header walk with nothing before the session
 /// concludes the chain does not connect to ours.
@@ -60,7 +58,13 @@ pub enum Action {
     /// Ask a peer which state it can serve.
     RequestStatus,
     /// Ask for headers below `from`, walking toward genesis.
-    RequestHeaders { from: B256, count: u32 },
+    ///
+    /// `point` is the height the walk filed the request under, so an answer
+    /// can be matched to the range it fills without trusting anything in it.
+    RequestHeaders { from: B256, count: u32, point: u64 },
+    /// Ask for block identifiers from this height upward, to learn where to
+    /// ask for headers without waiting for the walk to get there.
+    RequestSkeleton { start: u64 },
     /// Ask for a range of the state.
     RequestChunk { block_number: u64, state_root: B256, from: u64, budget: u64 },
     /// Ask for the 400 blocks below `block_number`.
@@ -151,10 +155,9 @@ pub struct SnapSession {
     /// The blocks that came with the status, held until the header walk
     /// vouches for the chain they sit on.
     offered: Vec<(Block, U256)>,
-    /// The oldest header verified so far while walking back.
-    walk_tip: Option<Header>,
-    /// Outstanding header request, so a late duplicate is ignored.
-    headers_in_flight: bool,
+    /// The pipelined walk from the checkpoint down to ground we already
+    /// trust. Replaces a serial chain of 48,000 round trips.
+    walk: Option<super::headers::HeaderWalk>,
     /// Consecutive peers that answered the header walk with nothing.
     empty_header_replies: u32,
 
@@ -189,8 +192,7 @@ impl SnapSession {
             checkpoint: None,
             checkpoint_td: U256::ZERO,
             offered: Vec::new(),
-            walk_tip: None,
-            headers_in_flight: false,
+            walk: None,
             empty_header_replies: 0,
             download: None,
             fruitless_chunks: 0,
@@ -249,12 +251,19 @@ impl SnapSession {
             Phase::AwaitingStatus => vec![Action::RequestStatus],
 
             Phase::VerifyingHeaders => {
-                if self.headers_in_flight {
-                    return Vec::new();
-                }
-                let Some(tip) = self.walk_tip.clone() else { return Vec::new() };
-                self.headers_in_flight = true;
-                vec![Action::RequestHeaders { from: tip.parent_hash, count: HEADER_WALK_CHUNK }]
+                let budget = self.config.max_in_flight.max(1);
+                let Some(walk) = self.walk.as_mut() else { return Vec::new() };
+                walk.wants(budget)
+                    .into_iter()
+                    .map(|want| match want {
+                        super::headers::Want::Skeleton { start } => {
+                            Action::RequestSkeleton { start }
+                        }
+                        super::headers::Want::Headers { from, count, point } => {
+                            Action::RequestHeaders { from, count, point }
+                        }
+                    })
+                    .collect()
             }
 
             Phase::DownloadingState => {
@@ -344,7 +353,12 @@ impl SnapSession {
         self.checkpoint_td = *difficulties.last().unwrap_or(&U256::ZERO);
         self.offered = blocks.iter().cloned().zip(difficulties.iter().copied()).collect();
 
-        self.walk_tip = Some(header.clone());
+        self.walk = Some(super::headers::HeaderWalk::new(
+            header.clone(),
+            self.store.clone(),
+            self.verifier.clone(),
+        ));
+
         self.checkpoint = Some(header);
         self.phase = Phase::VerifyingHeaders;
         self.poll()
@@ -352,94 +366,93 @@ impl SnapSession {
 
     /// Headers walking back from the checkpoint, newest first, as rskj's
     /// `BlockHeadersResponse` delivers them.
-    pub fn on_headers(&mut self, headers: &[Header]) -> Vec<Action> {
+    pub fn on_headers(&mut self, point: u64, headers: &[Header]) -> Vec<Action> {
         if self.phase != Phase::VerifyingHeaders {
             return Vec::new();
         }
-        self.headers_in_flight = false;
-
-        let Some(mut child) = self.walk_tip.clone() else {
+        let Some(walk) = self.walk.as_mut() else {
             return self.fail(SnapFailure::NoCheckpoint);
         };
 
-        for header in headers {
-            // Linked by hash to the header we already verified, so a peer
-            // cannot splice a different chain onto the walk.
-            if header.hash() != child.parent_hash {
-                return self.fail(SnapFailure::BrokenChain);
-            }
-            // Proof of work and the rest of the header's own rules, once.
-            // Its parent is not in hand yet -- it is the next header in this
-            // very walk -- so the parent-dependent rules are checked from the
-            // other side, binding the child that is.
-            //
-            // Each header is checked exactly once each way. Asking `verify`
-            // for the pair would re-run the static rules on the child, and
-            // proof-of-work is the expensive half of them: over nine million
-            // headers that is twice the work for no second opinion.
-            if let Err(e) = self.verifier.verify(header, None) {
-                return self.fail(SnapFailure::InvalidHeader {
-                    number: header.number,
-                    reason: e.to_string(),
-                });
-            }
-            if let Err(e) = self.verifier.verify_against_parent(&child, header) {
-                return self.fail(SnapFailure::InvalidHeader {
-                    number: child.number,
-                    reason: e.to_string(),
-                });
-            }
-
-            // Written by hash, not indexed: a header nobody points at is
-            // inert, so storing it now costs nothing if the walk later turns
-            // out to be a foreign chain. The canonical index -- the thing
-            // that makes a header part of *this* node's chain -- is written
-            // only once the walk reaches ground this node already trusts.
-            let _ = self.store.put_header_with_hash(header.hash(), header);
-
-            child = header.clone();
-            self.walk_tip = Some(header.clone());
-
-            // Met the chain we already have: everything above this is now
-            // anchored to work this node had already accepted.
-            if self.is_ours(header.number.saturating_sub(1), header.parent_hash) {
-                return self.start_state_download();
-            }
-
-            // Reaching block zero is only an answer if it is *our* genesis.
-            // A chain of well-formed headers back to a genesis this node has
-            // never seen is a different network, or an invented one, and the
-            // work behind it says nothing about ours.
-            if header.number == 0 {
-                return if self.is_ours(0, header.hash()) {
-                    self.start_state_download()
-                } else {
-                    self.fail(SnapFailure::ForeignGenesis)
-                };
-            }
-        }
-
         if headers.is_empty() {
-            // That peer cannot continue the walk; another might. Give up only
+            // That peer cannot fill this range; another might. Give up only
             // once several in a row have come back empty.
             self.empty_header_replies += 1;
             if self.empty_header_replies >= EMPTY_HEADER_REPLIES_ALLOWED {
                 return self.fail(SnapFailure::NoCommonAncestor);
             }
-        } else {
-            self.empty_header_replies = 0;
+            return self.poll();
+        }
+        self.empty_header_replies = 0;
+
+        // Every header's own rules and every adjacent pair's, exactly as the
+        // serial walk did. What has changed is when the request went out, not
+        // what is accepted.
+        if let Err(e) = walk.on_headers(point, headers) {
+            return self.fail(match e {
+                super::headers::WalkError::InvalidHeader { number, reason } => {
+                    SnapFailure::InvalidHeader { number, reason }
+                }
+                super::headers::WalkError::BrokenChunk { .. } => SnapFailure::BrokenChain,
+                super::headers::WalkError::ForeignGenesis => SnapFailure::ForeignGenesis,
+            });
+        }
+
+        self.link_headers()
+    }
+
+    /// Block identifiers telling the walk where to ask next. Claims about
+    /// where blocks sit, believed only as far as the runs they lead to link.
+    pub fn on_skeleton(&mut self, identifiers: &[BlockIdentifier]) -> Vec<Action> {
+        if self.phase != Phase::VerifyingHeaders {
+            return Vec::new();
+        }
+        let Some(walk) = self.walk.as_mut() else { return Vec::new() };
+        walk.on_skeleton(identifiers);
+        self.poll()
+    }
+
+    /// Follow whatever links now reach, and start the state download if the
+    /// chain has come all the way down.
+    fn link_headers(&mut self) -> Vec<Action> {
+        let Some(walk) = self.walk.as_mut() else { return Vec::new() };
+        match walk.advance() {
+            Ok(_) => {}
+            Err(super::headers::WalkError::ForeignGenesis) => {
+                return self.fail(SnapFailure::ForeignGenesis)
+            }
+            Err(super::headers::WalkError::InvalidHeader { number, reason }) => {
+                return self.fail(SnapFailure::InvalidHeader { number, reason })
+            }
+            Err(super::headers::WalkError::BrokenChunk { .. }) => {
+                return self.fail(SnapFailure::BrokenChain)
+            }
+        }
+        if walk.is_done() {
+            return self.start_state_download();
         }
         self.poll()
+    }
+
+    /// Ask again for a header range nobody answered.
+    pub fn release_header_request(&mut self, point: u64, from: B256, count: u32) {
+        if let Some(walk) = self.walk.as_mut() {
+            walk.release(&super::headers::Want::Headers { from, count, point });
+        }
+    }
+
+    /// Ask again for a skeleton nobody answered.
+    pub fn release_skeleton_request(&mut self, start: u64) {
+        if let Some(walk) = self.walk.as_mut() {
+            walk.release(&super::headers::Want::Skeleton { start });
+        }
     }
 
     /// Is this block one this node had already accepted as canonical?
     ///
     /// Asked of the canonical index rather than of "is this header stored",
-    /// because the walk itself stores headers by hash as it goes. A check that
-    /// its own writes could satisfy would be no check at all: a peer could
-    /// walk the client back to an invented genesis and have the client agree,
-    /// on the strength of headers the client had just been handed. The
-    /// canonical index is written only once the walk has already succeeded.
+    /// because the walk itself stores headers by hash as it goes. A check its
+    /// own writes could satisfy would be no check at all.
     fn is_ours(&self, number: u64, hash: B256) -> bool {
         self.store.canonical_hash(number).ok().flatten() == Some(hash)
     }
@@ -487,7 +500,7 @@ impl SnapSession {
         info!(
             target: "rustock::snap",
             "header chain verified back to #{}; downloading state at #{}",
-            self.walk_tip.as_ref().map_or(0, |h| h.number),
+            self.walk.as_ref().map_or(0, |w| w.frontier()),
             checkpoint.as_ref().map_or(0, |h| h.number)
         );
         self.phase = Phase::DownloadingState;
@@ -599,10 +612,7 @@ impl SnapSession {
         }
     }
 
-    /// Ask for the header walk again after a timeout.
-    pub fn release_headers(&mut self) {
-        self.headers_in_flight = false;
-    }
+
 
     /// Ask for a block range again after a timeout.
     pub fn release_blocks(&mut self) {

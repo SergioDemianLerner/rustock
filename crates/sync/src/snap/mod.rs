@@ -35,9 +35,12 @@
 
 pub mod client;
 pub mod driver;
+pub mod headers;
 pub mod server;
 pub mod session;
 
+#[cfg(test)]
+mod header_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]

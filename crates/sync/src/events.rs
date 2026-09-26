@@ -12,6 +12,10 @@ pub enum SyncEvent {
     BlockHashResponse { peer: B512, hash: B256 },
     SkeletonResponse {
         peer: B512,
+        /// The id of the request this answers. Ordinary sync matches
+        /// skeletons by content; snapshot sync uses the id to tell its own
+        /// parallel walk apart from everything else in flight.
+        id: u64,
         identifiers: Vec<BlockIdentifier>,
     },
     HeadersResponse {

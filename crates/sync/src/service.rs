@@ -2596,7 +2596,15 @@ impl SyncService {
             SyncEvent::BlockHashResponse { hash, .. } => {
                 self.on_block_hash_response(hash).await;
             }
-            SyncEvent::SkeletonResponse { identifiers, .. } => {
+            SyncEvent::SkeletonResponse { peer, id, identifiers } => {
+                // A snap session's parallel walk shares the ordinary skeleton
+                // message, so it is claimed by request id before the normal
+                // path sees it.
+                if self.snap.as_ref().is_some_and(|d| d.awaits_skeleton(id)) {
+                    self.drive_snap(|driver, ps| driver.on_skeleton(id, peer, &identifiers, ps))
+                        .await;
+                    return;
+                }
                 self.on_skeleton_response(identifiers).await;
             }
             SyncEvent::HeadersResponse { peer, id, headers } => {

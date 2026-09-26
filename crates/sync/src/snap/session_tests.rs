@@ -151,6 +151,52 @@ impl Fixture {
     }
 }
 
+/// Headers from the offered chain, newest first, as a peer answers.
+fn headers_for(blocks: &[Block], point: u64, count: u32) -> Vec<Header> {
+    let mut out = Vec::new();
+    let mut n = point as i64;
+    while out.len() < count as usize && n >= 0 {
+        if let Some(b) = blocks.iter().find(|b| b.header.number == n as u64) {
+            out.push(b.header.clone());
+        }
+        n -= 1;
+    }
+    out
+}
+
+/// Answers every header and skeleton request the session makes, until it
+/// leaves the header phase. Returns the actions it was left with.
+fn answer_header_walk(
+    session: &mut SnapSession,
+    blocks: &[Block],
+    mut actions: Vec<Action>,
+) -> Vec<Action> {
+    for _ in 0..200 {
+        if session.phase() != Phase::VerifyingHeaders {
+            return actions;
+        }
+        if actions.is_empty() {
+            actions = session.poll();
+            if actions.is_empty() {
+                return actions;
+            }
+        }
+        let action = actions.remove(0);
+        let next = match action {
+            Action::RequestHeaders { point, count, .. } => {
+                session.on_headers(point, &headers_for(blocks, point, count))
+            }
+            Action::RequestSkeleton { .. } => session.on_skeleton(&[]),
+            other => {
+                actions.push(other);
+                continue;
+            }
+        };
+        actions.extend(next);
+    }
+    actions
+}
+
 #[test]
 fn a_fresh_session_asks_what_peers_can_serve() {
     let f = fixture(10);
@@ -173,7 +219,9 @@ fn no_state_is_requested_before_the_headers_are_verified() {
 
     assert_eq!(session.phase(), Phase::VerifyingHeaders);
     assert!(
-        actions.iter().all(|a| matches!(a, Action::RequestHeaders { .. })),
+        actions
+            .iter()
+            .all(|a| matches!(a, Action::RequestHeaders { .. } | Action::RequestSkeleton { .. })),
         "asked for state before verifying headers: {actions:?}"
     );
 }
@@ -211,8 +259,8 @@ fn a_header_in_the_walk_that_fails_validation_ends_the_session() {
     session.on_status(&blocks, &tds, 5_000, 0);
     assert_eq!(session.phase(), Phase::VerifyingHeaders, "{:?}", session.failure());
 
-    let parent = blocks[blocks.len() - 2].header.clone();
-    session.on_headers(&[parent]);
+    let checkpoint = blocks.last().unwrap().header.number;
+    session.on_headers(checkpoint, &headers_for(&blocks, checkpoint, checkpoint as u32));
 
     assert_eq!(session.phase(), Phase::Failed);
     assert!(matches!(session.failure(), Some(SnapFailure::InvalidHeader { .. })));
@@ -230,11 +278,19 @@ fn a_spliced_header_chain_is_refused() {
     session.on_status(&blocks, &tds, 5_000, 0);
 
     // A header from another chain entirely: valid on its own, wrong parent.
+    // The pipelined walk does not fail on it -- one peer's junk should not
+    // end a session -- it simply never links, so the walk stays where it was
+    // and the state download never starts.
     let stranger = header(2, B256::repeat_byte(0x77), f.state_root, 100);
-    session.on_headers(&[stranger]);
+    session.on_headers(2, &[stranger]);
 
-    assert_eq!(session.phase(), Phase::Failed);
-    assert_eq!(session.failure(), Some(&SnapFailure::BrokenChain));
+    assert_eq!(session.phase(), Phase::VerifyingHeaders, "a stranger was accepted");
+    assert!(session.failure().is_none());
+
+    // And the honest chain is still taken afterwards.
+    let checkpoint = blocks.last().unwrap().header.number;
+    session.on_headers(checkpoint, &headers_for(&blocks, checkpoint, checkpoint as u32));
+    assert_eq!(session.phase(), Phase::DownloadingState, "{:?}", session.failure());
 }
 
 /// **Another network's chain is not this one's**, however much work is behind
@@ -250,8 +306,10 @@ fn a_chain_back_to_a_foreign_genesis_is_refused() {
     let mut session = f.session(HeaderVerifier::new());
     session.on_status(&blocks, &tds, 5_000, 0);
 
-    session.on_headers(&[blocks[0].header.clone()]);
-    session.on_headers(&[foreign_genesis]);
+    let top = blocks.last().unwrap().header.number;
+    let mut all: Vec<Block> = blocks.clone();
+    all.insert(0, block(foreign_genesis));
+    session.on_headers(top, &headers_for(&all, top, (top + 1) as u32));
 
     assert_eq!(session.phase(), Phase::Failed);
     // Told apart from merely running out of answers: this one is the peer's
@@ -275,9 +333,10 @@ fn the_header_walk_cannot_satisfy_its_own_anchor() {
 
     // Feed the walk down to the foreign genesis, then offer it a second time:
     // by then its header is in the store, written by the walk itself.
-    session.on_headers(&[blocks[1].header.clone()]);
-    session.on_headers(&[blocks[0].header.clone()]);
-    session.on_headers(&[foreign_genesis.clone()]);
+    let top = blocks.last().unwrap().header.number;
+    let mut all: Vec<Block> = blocks.clone();
+    all.insert(0, block(foreign_genesis.clone()));
+    session.on_headers(top, &headers_for(&all, top, (top + 1) as u32));
     assert_eq!(session.phase(), Phase::Failed, "the walk vouched for itself");
     assert_eq!(session.failure(), Some(&SnapFailure::ForeignGenesis));
 
@@ -374,16 +433,10 @@ fn a_session_runs_to_completion() {
         let action = actions.remove(0);
         let next = match action {
             Action::RequestStatus => session.on_status(&blocks, &tds, 8_000, 0),
-            Action::RequestHeaders { from, .. } => {
-                // Answer from the offered chain, newest first, as a peer does.
-                let answer: Vec<Header> = blocks
-                    .iter()
-                    .rev()
-                    .map(|b| b.header.clone())
-                    .filter(|h| h.hash() == from)
-                    .collect();
-                session.on_headers(&answer)
+            Action::RequestHeaders { point, count, .. } => {
+                session.on_headers(point, &headers_for(&blocks, point, count))
             }
+            Action::RequestSkeleton { .. } => session.on_skeleton(&[]),
             Action::RequestChunk { from, budget, .. } => {
                 let response = server
                     .chunk(&SnapChunkRequest {
@@ -516,11 +569,12 @@ fn a_body_that_does_not_match_its_header_is_refused() {
 
     let mut session = f.session(HeaderVerifier::new());
     session.on_status(&blocks, &tds, 5_000, 0);
-    // Anchor the walk: the parent of block 1 is our genesis.
-    session.on_headers(&[blocks[1].header.clone()]);
-    // The chunk requests the walk's success produces: dropping them would
-    // leave every slice marked in flight with nothing coming back.
-    let started = session.on_headers(&[blocks[0].header.clone()]);
+    // Anchor the walk: one request covers this whole chain, and its oldest
+    // header's parent is our genesis. The actions it produces are the chunk
+    // requests -- dropping them would leave every slice marked in flight with
+    // nothing coming back.
+    let top = blocks.last().unwrap().header.number;
+    let started = session.on_headers(top, &headers_for(&blocks, top, top as u32));
     assert_eq!(session.phase(), Phase::DownloadingState, "{:?}", session.failure());
 
     // Skip ahead to the block phase by finishing the (tiny) state.
@@ -593,6 +647,7 @@ fn asked(out: &crate::snap::driver::Outbound) -> (u64, &'static str) {
     match &m.sub_message {
         RskSubMessage::SnapStatusRequest(r) => (r.id, "status"),
         RskSubMessage::BlockHeadersRequest(r) => (r.id, "headers"),
+        RskSubMessage::SkeletonRequest(r) => (r.id, "skeleton"),
         RskSubMessage::SnapChunkRequest(r) => (r.id, "chunk"),
         RskSubMessage::SnapBlocksRequest(r) => (r.id, "blocks"),
         other => panic!("unexpected request {other:?}"),
@@ -624,18 +679,27 @@ fn driver_awaiting_a_chunk(
         if kind == "chunk" {
             break;
         }
-        assert_eq!(kind, "headers");
         let P2pMessage::RskMessage(m) = &out[0].message else { unreachable!() };
-        let RskSubMessage::BlockHeadersRequest(req) = m.sub_message.clone() else {
-            unreachable!()
+        out = match m.sub_message.clone() {
+            RskSubMessage::BlockHeadersRequest(req) => {
+                // The walk files a request by the height it fills; answer it
+                // from the offered chain, newest first.
+                let point = blocks
+                    .iter()
+                    .find(|b| b.header.hash() == req.query.hash)
+                    .map_or(0, |b| b.header.number);
+                driver.on_headers(
+                    id,
+                    peers[0],
+                    &headers_for(blocks, point, req.query.count),
+                    peers,
+                )
+            }
+            RskSubMessage::SkeletonRequest(_) => {
+                driver.on_skeleton(id, peers[0], &[], peers)
+            }
+            other => panic!("unexpected request {other:?}"),
         };
-        let answer: Vec<Header> = blocks
-            .iter()
-            .rev()
-            .map(|b| b.header.clone())
-            .filter(|h| h.hash() == req.query.hash)
-            .collect();
-        out = driver.on_headers(id, peers[0], &answer, peers);
         assert!(!out.is_empty(), "the walk stalled");
     }
 
