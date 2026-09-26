@@ -219,6 +219,35 @@ fn a_chain_back_to_a_foreign_genesis_is_refused() {
     assert_eq!(session.failure(), Some(&SnapFailure::NoCommonAncestor));
 }
 
+/// **The walk may not vouch for itself.** Headers are written to the store as
+/// the walk verifies them, so the test for "a block we already had" must ask
+/// something the walk cannot have written: the canonical index. Otherwise a
+/// peer could walk the client back to an invented genesis and have the client
+/// agree, on the strength of headers it had just been handed.
+#[test]
+fn the_header_walk_cannot_satisfy_its_own_anchor() {
+    let f = fixture(20);
+    let foreign_genesis = header(0, B256::ZERO, B256::repeat_byte(9), 100);
+    let (blocks, tds) = chain(1, 3, foreign_genesis.hash(), 100, f.state_root);
+
+    let mut session = f.session(HeaderVerifier::new());
+    session.on_status(&blocks, &tds, 5_000);
+
+    // Feed the walk down to the foreign genesis, then offer it a second time:
+    // by then its header is in the store, written by the walk itself.
+    session.on_headers(&[blocks[1].header.clone()]);
+    session.on_headers(&[blocks[0].header.clone()]);
+    session.on_headers(&[foreign_genesis.clone()]);
+    assert_eq!(session.phase(), Phase::Failed, "the walk vouched for itself");
+
+    // And the chain really is in the store by hash -- which is why the check
+    // has to look elsewhere.
+    assert!(
+        f.store.has_block(foreign_genesis.hash()).unwrap(),
+        "the test is not exercising what it claims"
+    );
+}
+
 /// Blocks that do not form a chain are refused before anything expensive
 /// happens.
 #[test]

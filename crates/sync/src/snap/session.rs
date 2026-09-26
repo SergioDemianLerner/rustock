@@ -116,6 +116,12 @@ pub struct SnapSession {
 
     /// The block whose state is being downloaded, once one has been offered.
     checkpoint: Option<Header>,
+    /// Its cumulative difficulty, as offered and then vouched for by the
+    /// header walk.
+    checkpoint_td: U256,
+    /// The blocks that came with the status, held until the header walk
+    /// vouches for the chain they sit on.
+    offered: Vec<(Block, U256)>,
     /// The oldest header verified so far while walking back.
     walk_tip: Option<Header>,
     /// Outstanding header request, so a late duplicate is ignored.
@@ -150,6 +156,8 @@ impl SnapSession {
             phase: Phase::AwaitingStatus,
             failure: None,
             checkpoint: None,
+            checkpoint_td: U256::ZERO,
+            offered: Vec::new(),
             walk_tip: None,
             headers_in_flight: false,
             empty_header_replies: 0,
@@ -279,6 +287,9 @@ impl SnapSession {
         self.blocks_wanted_to = header.number.saturating_sub(self.config.blocks_required);
         self.blocks_cursor = header.number;
 
+        self.checkpoint_td = *difficulties.last().unwrap_or(&U256::ZERO);
+        self.offered = blocks.iter().cloned().zip(difficulties.iter().copied()).collect();
+
         self.walk_tip = Some(header.clone());
         self.checkpoint = Some(header);
         self.phase = Phase::VerifyingHeaders;
@@ -320,12 +331,19 @@ impl SnapSession {
                 });
             }
 
+            // Written by hash, not indexed: a header nobody points at is
+            // inert, so storing it now costs nothing if the walk later turns
+            // out to be a foreign chain. The canonical index -- the thing
+            // that makes a header part of *this* node's chain -- is written
+            // only once the walk reaches ground this node already trusts.
+            let _ = self.store.put_header_with_hash(header.hash(), header);
+
             child = header.clone();
             self.walk_tip = Some(header.clone());
 
             // Met the chain we already have: everything above this is now
             // anchored to work this node had already accepted.
-            if self.store.has_block(header.parent_hash).unwrap_or(false) {
+            if self.is_ours(header.number.saturating_sub(1), header.parent_hash) {
                 return self.start_state_download();
             }
 
@@ -334,7 +352,7 @@ impl SnapSession {
             // never seen is a different network, or an invented one, and the
             // work behind it says nothing about ours.
             if header.number == 0 {
-                return if self.store.has_block(header.hash()).unwrap_or(false) {
+                return if self.is_ours(0, header.hash()) {
                     self.start_state_download()
                 } else {
                     self.fail(SnapFailure::NoCommonAncestor)
@@ -355,8 +373,38 @@ impl SnapSession {
         self.poll()
     }
 
+    /// Is this block one this node had already accepted as canonical?
+    ///
+    /// Asked of the canonical index rather than of "is this header stored",
+    /// because the walk itself stores headers by hash as it goes. A check that
+    /// its own writes could satisfy would be no check at all: a peer could
+    /// walk the client back to an invented genesis and have the client agree,
+    /// on the strength of headers the client had just been handed. The
+    /// canonical index is written only once the walk has already succeeded.
+    fn is_ours(&self, number: u64, hash: B256) -> bool {
+        self.store.canonical_hash(number).ok().flatten() == Some(hash)
+    }
+
     fn start_state_download(&mut self) -> Vec<Action> {
         let checkpoint = self.checkpoint.clone();
+
+        // The walk reached a block this node already had, so everything above
+        // it is anchored to work this node had already accepted. Only now do
+        // the headers become part of this chain.
+        for (block, td) in std::mem::take(&mut self.offered) {
+            let hash = block.header.hash();
+            let _ = self.store.put_header_with_hash(hash, &block.header);
+            let _ = self.store.put_body(hash, &block.transactions, &block.ommers);
+            let _ = self.store.put_total_difficulty(hash, td);
+        }
+        if let Some(header) = &checkpoint {
+            let hash = header.hash();
+            let _ = self.store.put_total_difficulty(hash, self.checkpoint_td);
+            if let Err(e) = self.store.update_canonical_chain(hash) {
+                warn!(target: "rustock::snap", "could not index the verified chain: {e}");
+            }
+        }
+
         info!(
             target: "rustock::snap",
             "header chain verified back to #{}; downloading state at #{}",
