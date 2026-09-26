@@ -760,6 +760,14 @@ impl SyncService {
         }
     }
 
+    /// Attach a trie store without a block processor, for tests that exercise
+    /// snapshot sync in isolation.
+    #[cfg(test)]
+    pub fn with_trie_store_for_test(mut self, trie_store: Arc<dyn TrieStore>) -> Self {
+        self.trie_store = Some(trie_store);
+        self
+    }
+
     /// Start a snapshot sync instead of replaying the chain from genesis.
     ///
     /// Takes effect on the next tick. Does nothing if a session is already
@@ -776,6 +784,28 @@ impl SyncService {
             warn!(target: "rustock::snap", "snapshot sync needs a trie store; not starting");
             return;
         };
+
+        // Only for a node that has never executed anything. A node that is
+        // merely behind should catch up the ordinary way: executing the
+        // blocks it is missing is cheaper than downloading a state, and
+        // downloading one would throw away the state it already has.
+        let executed = self
+            .manager
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| self.manager.store.header(hash).ok().flatten())
+            .map(|h| h.number)
+            .unwrap_or(0);
+        if executed > 0 {
+            info!(
+                target: "rustock::snap",
+                "not starting snapshot sync: this node has already executed to #{executed}, \
+                 so ordinary sync is the shorter path"
+            );
+            return;
+        }
         info!(
             target: "rustock::snap",
             "starting snapshot sync (chunk {} bytes, {} in flight)",

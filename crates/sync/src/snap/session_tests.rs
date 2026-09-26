@@ -430,3 +430,32 @@ fn the_server_will_not_substitute_a_different_state() {
     }
     let _ = &f.trie_root;
 }
+
+/// Snapshot sync is for a node that has nothing, not one that is behind. A
+/// node that has executed blocks catches up the ordinary way rather than
+/// throwing away the state it has.
+#[test]
+fn a_node_that_has_executed_blocks_does_not_snap_sync() {
+    use crate::manager::SyncManager;
+    use crate::SyncService;
+    use rustock_networking::peers::PeerStore;
+
+    let f = fixture(10);
+    let number = 500_000u64;
+    let h = header(number, B256::repeat_byte(1), f.state_root, 100);
+    let hash = h.hash();
+    f.store.put_header_with_hash(hash, &h).expect("header");
+    f.store.set_exec_head(hash, f.state_root).expect("exec head");
+
+    let manager = Arc::new(SyncManager::new(
+        f.store.clone(),
+        Arc::new(HeaderVerifier::new()),
+        Arc::new(PeerStore::new()),
+    ));
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, Arc::new(PeerStore::new()), rx)
+        .with_trie_store_for_test(f.trie.clone() as Arc<dyn TrieStore>);
+
+    service.start_snap_sync(SnapConfig::default(), Arc::new(HeaderVerifier::new()));
+    assert!(service.snap_phase().is_none(), "snap sync started on a node with state");
+}
