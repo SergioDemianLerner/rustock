@@ -4,6 +4,7 @@ pub mod node;
 pub mod orchid_converter;
 pub mod path;
 pub mod shared_path;
+pub mod snapshot;
 pub mod store;
 #[cfg(test)]
 mod tests;
