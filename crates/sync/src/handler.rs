@@ -8,7 +8,7 @@ use rustock_networking::protocol::{
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::trace;
+use tracing::{trace, warn};
 
 /// Skeleton step size (must match rskj's chunkSize = 192).
 const SKELETON_STEP: u64 = 192;
@@ -61,14 +61,57 @@ impl SyncHandler {
         self.snap_late.read().ok()?.clone()
     }
 
-    /// Wraps a snap reply in the message envelope, or stays silent.
-    fn serve_snap<F>(&self, reply: F) -> Option<P2pMessage>
+    /// Answers a snap request off the network thread.
+    ///
+    /// Serving state is disk-bound -- on a cold store a single chunk is most
+    /// of a second -- and this is called from inside the peer's async task.
+    /// Doing the work here would block not just that peer but every other task
+    /// sharing the runtime worker: a node that serves snapshots would stop
+    /// following the chain while it did. So the work goes to a blocking thread
+    /// and the answer is sent when it is ready, which is also what rskj does
+    /// (`scheduleJob`).
+    ///
+    /// Returns `None` always: the reply does not travel back through the
+    /// handler's return value.
+    fn serve_snap<F>(&self, peer: B512, reply: F) -> Option<P2pMessage>
     where
-        F: FnOnce(&SnapServer) -> Option<RskSubMessage>,
+        F: FnOnce(&SnapServer) -> Option<RskSubMessage> + Send + 'static,
     {
         let server = self.snap_server()?;
-        let sub = reply(&server)?;
-        Some(P2pMessage::RskMessage(RskMessage::new(sub)))
+        if !server.admit(peer) {
+            trace!(
+                target: "rustock::snap",
+                "refusing a snap request from {:?}: already serving its limit", &peer.0[..4]
+            );
+            return None;
+        }
+
+        let peer_store = self.manager.peer_store.clone();
+        tokio::spawn(async move {
+            let serving = server.clone();
+            let built = tokio::task::spawn_blocking(move || {
+                let answer = reply(&serving);
+                serving.release(peer);
+                answer
+            })
+            .await;
+
+            match built {
+                Ok(Some(sub)) => {
+                    peer_store
+                        .send_to_peer(&peer, P2pMessage::RskMessage(RskMessage::new(sub)))
+                        .await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // The slot is released inside the blocking closure, which
+                    // did not run to completion; release it here too.
+                    server.release(peer);
+                    warn!(target: "rustock::snap", "serving a snap request failed: {e}");
+                }
+            }
+        });
+        None
     }
 
     /// Respond to a BodyRequest by looking up the block and returning its body.
@@ -306,18 +349,21 @@ impl P2pHandler for SyncHandler {
 
                 // --- Snapshot sync ---
                 RskSubMessage::SnapStatusRequest(r) => {
-                    return self.serve_snap(|s| {
-                        s.status(r).map(|m| RskSubMessage::SnapStatusResponse(Box::new(m)))
+                    let r = r.clone();
+                    return self.serve_snap(id, move |s| {
+                        s.status(&r).map(|m| RskSubMessage::SnapStatusResponse(Box::new(m)))
                     });
                 }
                 RskSubMessage::SnapChunkRequest(r) => {
-                    return self.serve_snap(|s| {
-                        s.chunk(r).map(|m| RskSubMessage::SnapChunkResponse(Box::new(m)))
+                    let r = r.clone();
+                    return self.serve_snap(id, move |s| {
+                        s.chunk(&r).map(|m| RskSubMessage::SnapChunkResponse(Box::new(m)))
                     });
                 }
                 RskSubMessage::SnapBlocksRequest(r) => {
-                    return self.serve_snap(|s| {
-                        s.blocks(r).map(|m| RskSubMessage::SnapBlocksResponse(Box::new(m)))
+                    let r = r.clone();
+                    return self.serve_snap(id, move |s| {
+                        s.blocks(&r).map(|m| RskSubMessage::SnapBlocksResponse(Box::new(m)))
                     });
                 }
                 RskSubMessage::SnapStatusResponse(r) => {

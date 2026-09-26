@@ -525,11 +525,12 @@ fn server_fixture(n: usize) -> (Arc<rustock_storage::BlockStore>, Peer, u64) {
 
 /// The last seam: a request arriving as a p2p message is answered as one.
 ///
-/// Everything between is the real path -- the handler's dispatch, the message
+/// Everything between is the real path -- the handler's dispatch, the blocking
+/// thread it serves on, the peer store it answers through, the message
 /// envelope, the RLP -- so this catches a variant wired to the wrong arm,
 /// which the pieces tested separately cannot.
-#[test]
-fn a_snap_request_is_answered_through_the_handler() {
+#[tokio::test]
+async fn a_snap_request_is_answered_through_the_handler() {
     use crate::events::SyncEvent;
     use crate::manager::SyncManager;
     use crate::SyncHandler;
@@ -539,10 +540,15 @@ fn a_snap_request_is_answered_through_the_handler() {
     use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
 
     let (store, peer, block_number) = server_fixture(120);
+    let peers = Arc::new(PeerStore::new());
+    let peer_id = B512::repeat_byte(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    peers.add_peer(peer_id, tx).await;
+
     let manager = Arc::new(SyncManager::new(
         store.clone(),
         Arc::new(HeaderVerifier::new()),
-        Arc::new(PeerStore::new()),
+        peers.clone(),
     ));
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SyncEvent>();
     let handler = SyncHandler::new(manager, event_tx).with_snap_server(Arc::new(
@@ -559,9 +565,13 @@ fn a_snap_request_is_answered_through_the_handler() {
         },
     )));
 
-    let reply = handler
-        .handle_message(B512::repeat_byte(1), &request)
-        .expect("the handler answers a chunk request");
+    // Nothing comes back inline: serving happens off the network thread.
+    assert!(handler.handle_message(peer_id, &request).is_none());
+
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the answer should arrive")
+        .expect("the channel should stay open");
 
     let P2pMessage::RskMessage(message) = reply else { panic!("not an rsk message") };
     let RskSubMessage::SnapChunkResponse(response) = message.sub_message else {
@@ -574,6 +584,36 @@ fn a_snap_request_is_answered_through_the_handler() {
     assert!(!proof.entries.is_empty());
     rustock_trie::snapshot_proof::verify_chunk(peer.root_hash, 0, &proof)
         .expect("the handler's answer verifies");
+}
+
+/// One peer may not occupy the whole server. A snapshot request is the most
+/// expensive thing a stranger can ask this node to do, and a peer that
+/// pipelines them would otherwise keep every worker busy on its own behalf.
+#[test]
+fn one_peer_cannot_take_every_serving_slot() {
+    use alloy_primitives::B512;
+
+    let (store, peer, _) = server_fixture(50);
+    let limit = 3;
+    let server = SnapServer::new(
+        store,
+        peer.store.clone() as Arc<dyn TrieStore>,
+        SnapConfig { max_requests_per_peer: limit, ..config(4, 512) },
+    );
+
+    let greedy = B512::repeat_byte(7);
+    for i in 0..limit {
+        assert!(server.admit(greedy), "slot {i} should have been free");
+    }
+    assert!(!server.admit(greedy), "the limit did not hold");
+
+    // Another peer is unaffected: the limit is per peer, not a global queue.
+    assert!(server.admit(B512::repeat_byte(8)));
+
+    // And a finished request frees its slot.
+    server.release(greedy);
+    assert_eq!(server.serving_for(greedy), limit - 1);
+    assert!(server.admit(greedy));
 }
 
 /// A node that serves snapshots but has pruned the state it would offer says

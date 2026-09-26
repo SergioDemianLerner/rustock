@@ -29,6 +29,8 @@ use rustock_storage::BlockStore;
 use rustock_trie::snapshot::total_size;
 use rustock_trie::snapshot_proof::prove_chunk;
 use rustock_trie::{TrieNode, TrieStore};
+use alloy_primitives::B512;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, trace, warn};
 
@@ -43,11 +45,53 @@ pub struct SnapServer {
     trie: Arc<dyn TrieStore>,
     config: SnapConfig,
     status_cache: Mutex<Option<CachedStatus>>,
+    /// Requests currently being served, per peer.
+    serving: Mutex<HashMap<B512, usize>>,
 }
 
 impl SnapServer {
     pub fn new(store: Arc<BlockStore>, trie: Arc<dyn TrieStore>, config: SnapConfig) -> Self {
-        Self { store, trie, config, status_cache: Mutex::new(None) }
+        Self {
+            store,
+            trie,
+            config,
+            status_cache: Mutex::new(None),
+            serving: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Take a slot to serve this peer, or refuse.
+    ///
+    /// One peer may not occupy the whole server: a snapshot request is the
+    /// most expensive thing a stranger can ask this node to do, and a peer
+    /// that pipelines them would otherwise be able to keep every worker busy
+    /// on its own behalf. rskj bounds the same thing with `maxSenderRequests`.
+    pub fn admit(&self, peer: B512) -> bool {
+        let Ok(mut serving) = self.serving.lock() else { return false };
+        let slot = serving.entry(peer).or_insert(0);
+        if *slot >= self.config.max_requests_per_peer {
+            return false;
+        }
+        *slot += 1;
+        true
+    }
+
+    /// Give the slot back, whatever the outcome.
+    pub fn release(&self, peer: B512) {
+        if let Ok(mut serving) = self.serving.lock() {
+            if let Some(slot) = serving.get_mut(&peer) {
+                *slot = slot.saturating_sub(1);
+                if *slot == 0 {
+                    serving.remove(&peer);
+                }
+            }
+        }
+    }
+
+    /// How many requests this peer has in flight here.
+    #[cfg(test)]
+    pub(crate) fn serving_for(&self, peer: B512) -> usize {
+        self.serving.lock().map(|s| s.get(&peer).copied().unwrap_or(0)).unwrap_or(0)
     }
 
     pub fn config(&self) -> &SnapConfig {

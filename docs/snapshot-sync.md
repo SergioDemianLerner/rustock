@@ -230,6 +230,24 @@ Serving state is the one place a peer chooses how much work this node does:
   server is not an oracle for arbitrary historical states.
 - Snap status is cached per checkpoint, because every client asks for the same
   one and computing it walks 400 blocks.
+- Three requests per peer at a time (rskj's `maxSenderRequests`). A snapshot
+  request is the most expensive thing a stranger can ask this node to do, and
+  a peer that pipelines them would otherwise keep every worker busy on its own
+  behalf.
+
+**Serving happens off the network thread.** A chunk is disk-bound — most of a
+second on a cold store — and the handler is called from inside the peer's
+async task, so doing the work there would block every other task sharing that
+runtime worker: a node that serves snapshots would stop following the chain
+while it did. The work goes to a blocking thread and the answer is sent when
+it is ready. This is the PoC report's V5 "dedicated thread", and what rskj
+does with `scheduleJob`.
+
+A client is likewise bounded by what it will read: a chunk more than four
+times the budget it asked for is thrown away unverified, since the transport
+allows 16 MB and verifying that much costs real CPU. A chunk of a single node
+is exempt — a server always sends at least one, and a node larger than the
+budget (a contract's code, say) would otherwise be undownloadable.
 
 ## Checking it against a real state
 

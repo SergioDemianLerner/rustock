@@ -27,6 +27,22 @@ impl HeaderValidator for RefuseEverything {
     }
 }
 
+/// Refuses only headers below a height, so a checkpoint can pass while a
+/// header further down the walk does not.
+struct RefuseBelow(u64);
+
+impl HeaderValidator for RefuseBelow {
+    fn validate(&self, header: &Header) -> Result<(), ValidationError> {
+        if header.number < self.0 {
+            return Err(ValidationError::BitcoinPowInvalid {
+                hash: header.hash(),
+                target: U256::ZERO,
+            });
+        }
+        Ok(())
+    }
+}
+
 fn header(number: u64, parent: B256, state_root: B256, difficulty: u64) -> Header {
     Header {
         parent_hash: parent,
@@ -162,20 +178,39 @@ fn no_state_is_requested_before_the_headers_are_verified() {
     );
 }
 
-/// A peer whose headers fail the consensus rules is refused, and nothing it
-/// offered is used.
+/// **The checkpoint's own proof of work is checked the moment it is offered.**
+/// It is the one header the walk never visits as a candidate -- it is only
+/// ever the child -- so nothing else would check it.
 #[test]
-fn a_header_that_fails_validation_ends_the_session() {
+fn a_checkpoint_that_fails_validation_is_refused_at_once() {
     let f = fixture(20);
     let genesis = f.with_genesis();
     let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
 
     let verifier = HeaderVerifier::new().with_static_rule(RefuseEverything);
     let mut session = f.session(verifier);
-    session.on_status(&blocks, &tds, 5_000);
+    let actions = session.on_status(&blocks, &tds, 5_000);
 
-    // The walk asks for the parent of the checkpoint; answer with a genuine
-    // header that the (refusing) verifier will reject.
+    assert_eq!(session.phase(), Phase::Failed);
+    assert!(actions.is_empty(), "asked for something after refusing the checkpoint");
+    assert!(matches!(session.failure(), Some(SnapFailure::InvalidHeader { .. })));
+}
+
+/// And a header further down the walk is refused too, after the checkpoint
+/// has been accepted.
+#[test]
+fn a_header_in_the_walk_that_fails_validation_ends_the_session() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let checkpoint = blocks.last().unwrap().header.number;
+
+    // Everything below the checkpoint fails; the checkpoint itself passes.
+    let verifier = HeaderVerifier::new().with_static_rule(RefuseBelow(checkpoint));
+    let mut session = f.session(verifier);
+    session.on_status(&blocks, &tds, 5_000);
+    assert_eq!(session.phase(), Phase::VerifyingHeaders, "{:?}", session.failure());
+
     let parent = blocks[blocks.len() - 2].header.clone();
     session.on_headers(&[parent]);
 

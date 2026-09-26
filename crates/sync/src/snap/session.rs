@@ -272,6 +272,18 @@ impl SnapSession {
         }
 
         let header = checkpoint.header.clone();
+
+        // The checkpoint is the one header the walk never visits as a
+        // candidate -- it is only ever the child -- so its own rules, proof of
+        // work included, are checked here. A peer offering a checkpoint it did
+        // not mine gets no further than this.
+        if let Err(e) = self.verifier.verify(&header, None) {
+            return self.fail(SnapFailure::InvalidHeader {
+                number: header.number,
+                reason: e.to_string(),
+            });
+        }
+
         info!(
             target: "rustock::snap",
             "peer offers state at #{} ({:?}), {} bytes; verifying its header chain first",
@@ -316,17 +328,22 @@ impl SnapSession {
             if header.hash() != child.parent_hash {
                 return self.fail(SnapFailure::BrokenChain);
             }
-            // Proof of work and the rest of the static rules. The parent is
-            // not in hand yet -- it is the next header in this very walk --
-            // so parent-dependent rules are checked from the other side, when
-            // this header validates its own child.
+            // Proof of work and the rest of the header's own rules, once.
+            // Its parent is not in hand yet -- it is the next header in this
+            // very walk -- so the parent-dependent rules are checked from the
+            // other side, binding the child that is.
+            //
+            // Each header is checked exactly once each way. Asking `verify`
+            // for the pair would re-run the static rules on the child, and
+            // proof-of-work is the expensive half of them: over nine million
+            // headers that is twice the work for no second opinion.
             if let Err(e) = self.verifier.verify(header, None) {
                 return self.fail(SnapFailure::InvalidHeader {
                     number: header.number,
                     reason: e.to_string(),
                 });
             }
-            if let Err(e) = self.verifier.verify(&child, Some(header)) {
+            if let Err(e) = self.verifier.verify_against_parent(&child, header) {
                 return self.fail(SnapFailure::InvalidHeader {
                     number: child.number,
                     reason: e.to_string(),

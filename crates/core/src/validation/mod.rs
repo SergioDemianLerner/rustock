@@ -212,6 +212,23 @@ impl HeaderVerifier {
         self
     }
 
+    /// Runs only the rules that relate a header to its parent.
+    ///
+    /// For walking a chain, where each header's own rules are checked once as
+    /// it arrives and its relationship to its neighbour once as the walk
+    /// passes: `verify` would re-run the static rules on every header a second
+    /// time, and proof-of-work is the expensive half of them.
+    pub fn verify_against_parent(
+        &self,
+        header: &Header,
+        parent: &Header,
+    ) -> Result<(), ValidationError> {
+        for rule in &self.parent_rules {
+            rule.validate_with_parent(header, parent)?;
+        }
+        Ok(())
+    }
+
     pub fn verify(&self, header: &Header, parent: Option<&Header>) -> Result<(), ValidationError> {
         for rule in &self.static_rules {
             rule.validate(header)?;
