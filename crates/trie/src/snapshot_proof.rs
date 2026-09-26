@@ -29,6 +29,11 @@
 //! exploit: omitting a node changes the replay, and changing a node changes
 //! a hash.
 //!
+//! Because the replay computes the offsets, the peer never states them. It
+//! sends nodes; where they sit is not its opinion to give. rskj's chunk
+//! response carries `from` and `to` as claims the client must then check --
+//! fields that cannot be wrong here because they do not exist on the wire.
+//!
 //! The extra data a peer must send for the replay to get off the ground is
 //! the [`Witness`] -- the ancestors between the root and the chunk, and the
 //! roots of the sibling subtrees the traversal skips over on the way down.
@@ -39,10 +44,15 @@
 //! # Why the chunk carries full consensus messages
 //!
 //! rskj's snapshot serializer strips child hashes, recovering roughly 40% of
-//! the bytes, and rebuilds them on the client. This does not, and the reason
-//! is that stripping forces the client to rebuild the trie bottom-up before
-//! it can hash anything -- the step the PoC report measures as quadratic and
-//! lists as future work to replace.
+//! the bytes, and rebuilds them on the client: `TrieDTOInOrderRecoverer`
+//! guesses each subtree root by scanning for the largest `children_size` in
+//! the range, recursively. That is the step the PoC report measures as
+//! quadratic and lists as future work to replace, and it is also a heuristic
+//! standing where a definition belongs.
+//!
+//! This does not strip them. The replay walks *forward* from an offset, which
+//! is linear and needs no guessing, because the trie says where its children
+//! are rather than being asked to reveal it.
 //!
 //! Keeping the consensus message means a verified node is *already* what the
 //! store holds: the client writes `put(hash, message)` and is done. No
@@ -59,40 +69,59 @@ use alloy_primitives::B256;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Node messages a client needs in order to replay the traversal, beyond the
-/// chunk itself: the path from the root down to the chunk, and the roots of
-/// the subtrees skipped along the way.
-pub type Witness = Vec<Vec<u8>>;
+/// One node as it travels: its consensus message, plus any values too long to
+/// live inside it.
+///
+/// Note what is *not* here. The entry does not say where in the traversal it
+/// belongs. A peer is not asked where a node is, it is told -- the verifier
+/// derives every offset itself, from sizes the node's own hash commits to. A
+/// field a peer does not fill in is a field a peer cannot lie about.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Entry {
+    /// RSKIP107 node message: exactly the bytes the store holds under this
+    /// node's hash.
+    pub message: Vec<u8>,
+    /// Values over 32 bytes, which the trie keeps outside the node under
+    /// their own hash. Carried with the node that commits to them, including
+    /// on behalf of its embedded children.
+    pub long_values: Vec<Vec<u8>>,
+}
 
-/// A chunk together with everything needed to prove it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProvenChunk {
-    /// Offset the chunk starts at, in the in-order traversal.
-    pub from: u64,
-    /// The chunk's entries, in order.
-    pub nodes: Vec<StreamNode>,
-    /// Extra node messages the replay needs. Not stored by the client; used
-    /// once and discarded.
+/// A chunk together with everything needed to check it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChunkProof {
+    /// The chunk's nodes, in traversal order.
+    pub entries: Vec<Entry>,
+    /// Node messages the replay needs but that the client is not being given
+    /// to keep: the path down to the chunk and the subtree roots skipped on
+    /// the way. Used once and discarded.
     pub witness: Witness,
 }
 
-impl ProvenChunk {
-    /// Offset just past the last entry: where the next chunk begins.
-    pub fn end(&self) -> u64 {
-        self.nodes.last().map_or(self.from, |n| n.end())
-    }
+/// Node messages a client needs in order to replay the traversal, beyond the
+/// chunk itself.
+pub type Witness = Vec<Vec<u8>>;
 
+impl ChunkProof {
+    /// Bytes on the wire, near enough: the payload without RLP framing.
     pub fn wire_len(&self) -> u64 {
-        self.nodes.iter().map(|n| n.wire_len()).sum::<u64>()
-            + self.witness.iter().map(|w| w.len() as u64).sum::<u64>()
+        let entries: u64 = self
+            .entries
+            .iter()
+            .map(|e| {
+                e.message.len() as u64
+                    + e.long_values.iter().map(|v| v.len() as u64).sum::<u64>()
+            })
+            .sum();
+        entries + self.witness.iter().map(|w| w.len() as u64).sum::<u64>()
     }
 }
 
 /// A store that remembers every key it served.
 ///
 /// Used to derive the witness by construction rather than by reasoning about
-/// which nodes *ought* to be needed -- if the traversal read it, the replay
-/// will read it too, because it is the same traversal.
+/// which nodes *ought* to be needed: if the traversal read it, the replay will
+/// read it too, because it is the same traversal.
 struct Recorder<'a> {
     inner: &'a dyn TrieStore,
     seen: Mutex<HashMap<B256, Vec<u8>>>,
@@ -114,13 +143,18 @@ impl TrieStore for Recorder<'_> {
     }
 }
 
-/// Build a chunk and the witness that proves it.
+/// Serve a chunk of the traversal starting at `from`, with the witness that
+/// proves it.
+///
+/// `budget` is a soft byte limit: at least one node always comes back, so a
+/// client asking for less than a single node still makes progress rather than
+/// stalling.
 pub fn prove_chunk(
     root: &TrieNode,
     from: u64,
     budget: u64,
     store: &dyn TrieStore,
-) -> ProvenChunk {
+) -> ChunkProof {
     let recorder = Recorder { inner: store, seen: Mutex::new(HashMap::new()) };
 
     // Round-trip the root through its own message before traversing. A node
@@ -133,12 +167,16 @@ pub fn prove_chunk(
 
     let nodes = chunk_from_limited(&root, from, budget, usize::MAX, &recorder);
 
+    let entries: Vec<Entry> = nodes
+        .into_iter()
+        .map(|n| Entry { message: n.message, long_values: n.long_values })
+        .collect();
+
     // Whatever the traversal read that is not already travelling with the
-    // chunk is what the client will be missing. Long values are excluded:
-    // they are carried by their own entry and are never needed to navigate.
+    // chunk is what the client will be missing.
     let mut carried: std::collections::HashSet<&[u8]> =
-        nodes.iter().map(|n| n.message.as_slice()).collect();
-    carried.extend(nodes.iter().flat_map(|n| n.long_values.iter().map(|v| v.as_slice())));
+        entries.iter().map(|e| e.message.as_slice()).collect();
+    carried.extend(entries.iter().flat_map(|e| e.long_values.iter().map(|v| v.as_slice())));
 
     let seen = recorder.seen.into_inner().unwrap_or_else(|e| e.into_inner());
     let mut witness: Witness =
@@ -155,7 +193,7 @@ pub fn prove_chunk(
     // not of a hash map's iteration order.
     witness.sort_unstable();
 
-    ProvenChunk { from, nodes, witness }
+    ChunkProof { entries, witness }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -164,18 +202,14 @@ pub enum VerifyError {
     Empty,
     #[error("no node in the proof hashes to the expected root {0}")]
     RootMissing(B256),
-    #[error("the replayed traversal produced {replayed} nodes, the chunk has {received}")]
-    LengthMismatch { replayed: usize, received: usize },
-    #[error("entry {index} differs from what the trie actually holds at that offset")]
-    NodeMismatch { index: usize },
-    #[error("entry {index} claims offset {claimed}, the traversal puts it at {actual}")]
-    OffsetMismatch { index: usize, claimed: u64, actual: u64 },
-    #[error("entry {index} carries a long value that is not the one its node commits to")]
-    BadLongValue { index: usize },
-    #[error("the chunk does not start at the requested offset {requested}")]
-    WrongStart { requested: u64 },
     #[error("entry {index} is not a well-formed trie node message")]
     Malformed { index: usize },
+    #[error("entry {index} carries long values that are not the ones its node commits to")]
+    BadLongValue { index: usize },
+    #[error("the trie holds {replayed} nodes from offset {from}, the chunk claims {received}")]
+    LengthMismatch { from: u64, replayed: usize, received: usize },
+    #[error("entry {index} is not the node the trie holds at that point in the traversal")]
+    NodeMismatch { index: usize },
 }
 
 /// A store backed only by what a peer sent.
@@ -189,81 +223,6 @@ impl TrieStore for ProofStore {
         self.0.get(&B256::from_slice(key)).cloned()
     }
     fn put(&self, _key: &[u8], _value: &[u8]) {}
-}
-
-/// Check a chunk against the expected state root.
-///
-/// On success the caller may write every returned entry straight into its
-/// trie store: the messages are the consensus serialization, keyed by their
-/// own keccak.
-pub fn verify_chunk(root_hash: B256, chunk: &ProvenChunk) -> Result<(), VerifyError> {
-    if chunk.nodes.is_empty() {
-        return Err(VerifyError::Empty);
-    }
-    if chunk.nodes[0].offset > chunk.from {
-        // A straddled node legitimately starts *before* the requested offset;
-        // starting after it would mean a gap.
-        return Err(VerifyError::WrongStart { requested: chunk.from });
-    }
-
-    // A node that commits to a long value cannot even be parsed without it:
-    // the value's length is part of the node's message length and therefore
-    // of its hash. So check the values first -- both that each is the one its
-    // node commits to and that none is missing -- and only then replay. This
-    // also means a lie about a value is reported as a lie about a value,
-    // rather than surfacing later as an unexplained node mismatch.
-    for (index, entry) in chunk.nodes.iter().enumerate() {
-        if TrieNode::try_from_message(&entry.message, &EmptyStore).is_none() {
-            return Err(VerifyError::Malformed { index });
-        }
-        check_long_values(entry).map_err(|_| VerifyError::BadLongValue { index })?;
-    }
-
-    // Everything the peer sent, addressed the only way it can be: by hash.
-    // A message filed under a key it does not hash to simply is not found
-    // later, so there is nothing to check separately here.
-    let mut map: HashMap<B256, Vec<u8>> = HashMap::new();
-    for message in chunk.witness.iter().chain(chunk.nodes.iter().map(|n| &n.message)) {
-        map.insert(alloy_primitives::keccak256(message), message.clone());
-    }
-    for value in chunk.nodes.iter().flat_map(|n| n.long_values.iter()) {
-        map.insert(alloy_primitives::keccak256(value), value.clone());
-    }
-
-    let store = ProofStore(map);
-    let root_message =
-        store.get(root_hash.as_slice()).ok_or(VerifyError::RootMissing(root_hash))?;
-    // Safe to unwrap only because the witness has already been screened: a
-    // message that does not parse cannot be under its own keccak here.
-    let root = TrieNode::try_from_message(&root_message, &store)
-        .ok_or(VerifyError::RootMissing(root_hash))?;
-
-    // Replay the server's traversal over only these bytes. Stop where the
-    // peer stopped, so a short chunk is judged on what it claims rather than
-    // on what a full one would have held.
-    let replay =
-        chunk_from_limited(&root, chunk.from, u64::MAX, chunk.nodes.len(), &store);
-
-    if replay.len() != chunk.nodes.len() {
-        return Err(VerifyError::LengthMismatch {
-            replayed: replay.len(),
-            received: chunk.nodes.len(),
-        });
-    }
-    for (index, (expected, got)) in replay.iter().zip(chunk.nodes.iter()).enumerate() {
-        if expected.message != got.message {
-            return Err(VerifyError::NodeMismatch { index });
-        }
-        if expected.offset != got.offset {
-            return Err(VerifyError::OffsetMismatch {
-                index,
-                claimed: got.offset,
-                actual: expected.offset,
-            });
-        }
-    }
-
-    Ok(())
 }
 
 /// A store that knows nothing.
@@ -281,6 +240,73 @@ impl TrieStore for EmptyStore {
     fn put(&self, _key: &[u8], _value: &[u8]) {}
 }
 
+/// Check a chunk against the state root the client independently trusts, and
+/// return the nodes with the offsets the trie actually puts them at.
+///
+/// `from` is the offset the *client* asked for, never a number the peer sent
+/// back. On success every returned node may be written straight into the trie
+/// store under the keccak of its message, and the next chunk starts at the
+/// last node's [`StreamNode::end`].
+pub fn verify_chunk(
+    root_hash: B256,
+    from: u64,
+    proof: &ChunkProof,
+) -> Result<Vec<StreamNode>, VerifyError> {
+    if proof.entries.is_empty() {
+        return Err(VerifyError::Empty);
+    }
+
+    // A node that commits to a long value cannot even be parsed without it:
+    // the value's length is part of the node's message and therefore of its
+    // hash. So settle the values first -- each is the one its node commits to,
+    // and none is missing -- and only then replay. This also means a lie about
+    // a value is reported as a lie about a value rather than surfacing later
+    // as an unexplained mismatch.
+    for (index, entry) in proof.entries.iter().enumerate() {
+        if TrieNode::try_from_message(&entry.message, &EmptyStore).is_none() {
+            return Err(VerifyError::Malformed { index });
+        }
+        check_long_values(entry).map_err(|_| VerifyError::BadLongValue { index })?;
+    }
+
+    // Everything the peer sent, addressed the only way it can be: by hash. A
+    // message filed under a key it does not hash to is simply never found, so
+    // there is nothing to check separately here.
+    let mut map: HashMap<B256, Vec<u8>> = HashMap::new();
+    for message in proof.witness.iter().chain(proof.entries.iter().map(|e| &e.message)) {
+        map.insert(alloy_primitives::keccak256(message), message.clone());
+    }
+    for value in proof.entries.iter().flat_map(|e| e.long_values.iter()) {
+        map.insert(alloy_primitives::keccak256(value), value.clone());
+    }
+
+    let store = ProofStore(map);
+    let root_message =
+        store.get(root_hash.as_slice()).ok_or(VerifyError::RootMissing(root_hash))?;
+    let root = TrieNode::try_from_message(&root_message, &store)
+        .ok_or(VerifyError::RootMissing(root_hash))?;
+
+    // Replay the server's traversal over nothing but these bytes. Stop where
+    // the peer stopped, so a short chunk is judged on what it claims rather
+    // than on what a full one would have held.
+    let replay = chunk_from_limited(&root, from, u64::MAX, proof.entries.len(), &store);
+
+    if replay.len() != proof.entries.len() {
+        return Err(VerifyError::LengthMismatch {
+            from,
+            replayed: replay.len(),
+            received: proof.entries.len(),
+        });
+    }
+    for (index, (expected, got)) in replay.iter().zip(proof.entries.iter()).enumerate() {
+        if expected.message != got.message {
+            return Err(VerifyError::NodeMismatch { index });
+        }
+    }
+
+    Ok(replay)
+}
+
 /// An entry must carry exactly the long values its node, and its node's
 /// embedded children, commit to: no forgeries, no omissions, no extras.
 ///
@@ -288,7 +314,7 @@ impl TrieStore for EmptyStore {
 /// parses as a node with no value at all -- a different node, of a different
 /// length, with a different hash -- so letting one through would corrupt the
 /// state rather than merely leave a gap in it.
-fn check_long_values(entry: &StreamNode) -> Result<(), ()> {
+fn check_long_values(entry: &Entry) -> Result<(), ()> {
     let node = TrieNode::try_from_message(&entry.message, &EmptyStore).ok_or(())?;
     let mut wanted: Vec<B256> = Vec::new();
     collect_value_hashes(&node, &mut wanted);
@@ -311,8 +337,8 @@ fn check_long_values(entry: &StreamNode) -> Result<(), ()> {
 /// Long-value hashes committed by a node and by its embedded children.
 ///
 /// Reads the commitment, not the value: parsed against [`EmptyStore`], a node
-/// that holds a hash but no value is exactly a node with a long value stored
-/// elsewhere. A short value is inline, so it arrives with both.
+/// holding a hash but no value is exactly a node whose value lives elsewhere.
+/// A short value is inline, so it arrives with both.
 ///
 /// In a node parsed from a message the in-memory children are precisely the
 /// embedded ones -- anything else is a hash -- so recursing into them needs no
@@ -362,14 +388,34 @@ mod tests {
             let mut offset = 0u64;
             let mut seen = 0usize;
             while offset < total {
-                let chunk = prove_chunk(&root, offset, budget, &store);
-                assert!(!chunk.nodes.is_empty(), "n={n} budget={budget}: stalled");
-                verify_chunk(root_hash, &chunk)
+                let proof = prove_chunk(&root, offset, budget, &store);
+                assert!(!proof.entries.is_empty(), "n={n} budget={budget}: stalled");
+                let nodes = verify_chunk(root_hash, offset, &proof)
                     .unwrap_or_else(|e| panic!("n={n} budget={budget} at {offset}: {e}"));
-                seen += chunk.nodes.len();
-                offset = chunk.end();
+                seen += nodes.len();
+                let next = nodes.last().expect("non-empty").end();
+                assert!(next > offset, "n={n} budget={budget}: no progress at {offset}");
+                offset = next;
             }
             assert!(seen > 0);
+        }
+    }
+
+    /// The offsets come out of the trie, not out of the message: what the
+    /// verifier returns is what an honest traversal of the real trie gives.
+    #[test]
+    fn the_verifier_derives_the_true_offsets() {
+        let (root, store, root_hash) = toy_trie(150);
+        let truth = crate::snapshot::chunk_from(&root, 0, 2048, &store);
+        let proof = prove_chunk(&root, 0, 2048, &store);
+        let got = verify_chunk(root_hash, 0, &proof).expect("honest chunk");
+
+        assert_eq!(got.len(), truth.len());
+        for (a, b) in got.iter().zip(truth.iter()) {
+            assert_eq!(a.offset, b.offset);
+            assert_eq!(a.span, b.span);
+            assert_eq!(a.message, b.message);
+            assert_eq!(a.long_values, b.long_values);
         }
     }
 
@@ -380,23 +426,72 @@ mod tests {
     /// peer sends is genuine, so each one proves its own membership. What is
     /// wrong is the *set* -- and the client that accepts it builds state with
     /// a hole in it, which is worse than a failure because it looks like
-    /// success and fails later, somewhere else.
+    /// success and fails later, somewhere else entirely.
     #[test]
     fn dropping_a_node_from_the_middle_is_caught() {
         let (root, store, root_hash) = toy_trie(120);
-        let chunk = prove_chunk(&root, 0, 4096, &store);
-        assert!(chunk.nodes.len() > 4, "need a chunk worth cutting a hole in");
+        let proof = prove_chunk(&root, 0, 4096, &store);
+        assert!(proof.entries.len() > 4, "need a chunk worth cutting a hole in");
 
-        for victim in 1..chunk.nodes.len() - 1 {
-            let mut tampered = chunk.clone();
-            // The dropped node's bytes are still in the proof, so the peer is
-            // not even hiding data -- only omitting an entry.
-            let removed = tampered.nodes.remove(victim);
+        for victim in 1..proof.entries.len() - 1 {
+            let mut tampered = proof.clone();
+            // The dropped node's bytes stay in the proof, so the peer is not
+            // even hiding data -- only omitting an entry.
+            let removed = tampered.entries.remove(victim);
             tampered.witness.push(removed.message);
             assert!(
-                verify_chunk(root_hash, &tampered).is_err(),
+                verify_chunk(root_hash, 0, &tampered).is_err(),
                 "dropping entry {victim} went undetected"
             );
+        }
+    }
+
+    /// A peer may always send fewer nodes than asked for -- a smaller chunk
+    /// is a legitimate answer, not an attack. What it cannot do is mislead
+    /// the client about where the short chunk stopped, because it never says:
+    /// the client resumes from an offset it derived itself, so the node that
+    /// was left out is the next one it asks for.
+    #[test]
+    fn a_short_chunk_resumes_exactly_where_it_stopped() {
+        let (root, store, root_hash) = toy_trie(120);
+        let full = prove_chunk(&root, 0, 4096, &store);
+        assert!(full.entries.len() > 4);
+
+        let small = prove_chunk(&root, 0, 200, &store);
+        assert!(small.entries.len() < full.entries.len(), "budget was not binding");
+
+        let nodes = verify_chunk(root_hash, 0, &small).expect("a short chunk is legitimate");
+        let next = nodes.last().unwrap().end();
+
+        let rest = prove_chunk(&root, next, 4096, &store);
+        assert_eq!(
+            rest.entries[0].message,
+            full.entries[nodes.len()].message,
+            "resuming skipped or repeated a node"
+        );
+    }
+
+    /// Cutting entries off the end of an honest chunk cannot produce a *wrong*
+    /// answer, only a shorter one or none at all. The offsets the client keeps
+    /// are true whatever the peer withholds.
+    #[test]
+    fn truncating_an_honest_chunk_never_yields_wrong_offsets() {
+        let (root, store, root_hash) = toy_trie(120);
+        let full = prove_chunk(&root, 0, 4096, &store);
+        let truth = verify_chunk(root_hash, 0, &full).expect("honest");
+
+        for keep in 1..full.entries.len() {
+            let mut cut = full.clone();
+            cut.entries.truncate(keep);
+            // The witness is left untouched, which is the best a peer could
+            // manage: it may withhold, not invent.
+            if let Ok(nodes) = verify_chunk(root_hash, 0, &cut) {
+                assert_eq!(nodes.len(), keep);
+                for (a, b) in nodes.iter().zip(truth.iter()) {
+                    assert_eq!(a.offset, b.offset, "truncation moved an offset");
+                    assert_eq!(a.message, b.message);
+                }
+            }
         }
     }
 
@@ -404,12 +499,12 @@ mod tests {
     #[test]
     fn reordering_entries_is_caught() {
         let (root, store, root_hash) = toy_trie(120);
-        let chunk = prove_chunk(&root, 0, 4096, &store);
-        assert!(chunk.nodes.len() > 3);
+        let proof = prove_chunk(&root, 0, 4096, &store);
+        assert!(proof.entries.len() > 3);
 
-        let mut tampered = chunk.clone();
-        tampered.nodes.swap(1, 2);
-        assert!(verify_chunk(root_hash, &tampered).is_err(), "a swap went undetected");
+        let mut tampered = proof.clone();
+        tampered.entries.swap(1, 2);
+        assert!(verify_chunk(root_hash, 0, &tampered).is_err(), "a swap went undetected");
     }
 
     /// A node from elsewhere in the same trie cannot be spliced in.
@@ -417,32 +512,33 @@ mod tests {
     fn substituting_a_genuine_node_from_elsewhere_is_caught() {
         let (root, store, root_hash) = toy_trie(200);
         let first = prove_chunk(&root, 0, 2048, &store);
-        let later = prove_chunk(&root, first.end(), 2048, &store);
-        assert!(!first.nodes.is_empty() && !later.nodes.is_empty());
+        let first_end =
+            verify_chunk(root_hash, 0, &first).expect("honest").last().unwrap().end();
+        let later = prove_chunk(&root, first_end, 2048, &store);
 
         let mut tampered = first.clone();
-        let index = tampered.nodes.len() / 2;
-        tampered.nodes[index] = StreamNode {
-            offset: tampered.nodes[index].offset,
-            ..later.nodes[0].clone()
-        };
+        let index = tampered.entries.len() / 2;
+        tampered.entries[index] = later.entries[0].clone();
         tampered.witness.extend(later.witness.clone());
-        assert!(verify_chunk(root_hash, &tampered).is_err(), "a splice went undetected");
+        assert!(
+            verify_chunk(root_hash, 0, &tampered).is_err(),
+            "a splice went undetected"
+        );
     }
 
     /// Editing a node's bytes is caught -- it no longer hashes to what its
-    /// parent commits to, so the replay cannot find it.
+    /// parent commits to, so the replay cannot reach it.
     #[test]
     fn mutating_a_node_is_caught() {
         let (root, store, root_hash) = toy_trie(80);
-        let chunk = prove_chunk(&root, 0, 4096, &store);
+        let proof = prove_chunk(&root, 0, 4096, &store);
 
-        for victim in 0..chunk.nodes.len().min(12) {
-            let mut tampered = chunk.clone();
-            let last = tampered.nodes[victim].message.len() - 1;
-            tampered.nodes[victim].message[last] ^= 0x01;
+        for victim in 0..proof.entries.len().min(12) {
+            let mut tampered = proof.clone();
+            let last = tampered.entries[victim].message.len() - 1;
+            tampered.entries[victim].message[last] ^= 0x01;
             assert!(
-                verify_chunk(root_hash, &tampered).is_err(),
+                verify_chunk(root_hash, 0, &tampered).is_err(),
                 "a flipped bit in entry {victim} went undetected"
             );
         }
@@ -453,51 +549,57 @@ mod tests {
     fn a_chunk_from_a_different_trie_is_rejected() {
         let (root_a, store_a, _) = toy_trie(100);
         let (_, _, hash_b) = toy_trie(101);
-        let chunk = prove_chunk(&root_a, 0, 4096, &store_a);
-        assert_eq!(verify_chunk(hash_b, &chunk), Err(VerifyError::RootMissing(hash_b)));
+        let proof = prove_chunk(&root_a, 0, 4096, &store_a);
+        assert_eq!(
+            verify_chunk(hash_b, 0, &proof),
+            Err(VerifyError::RootMissing(hash_b))
+        );
     }
 
-    /// Lying about an entry's offset is caught even when the node is real and
-    /// in the right place -- the client uses that number to decide where the
-    /// next chunk starts, so a lie here opens a gap.
+    /// A chunk is bound to the offset the client asked for. Serving the start
+    /// of the trie to someone resuming in the middle is caught.
     #[test]
-    fn a_false_offset_is_caught() {
-        let (root, store, root_hash) = toy_trie(100);
-        let chunk = prove_chunk(&root, 0, 4096, &store);
-        let mut tampered = chunk.clone();
-        let last = tampered.nodes.len() - 1;
-        tampered.nodes[last].offset += 7;
-        assert!(matches!(
-            verify_chunk(root_hash, &tampered),
-            Err(VerifyError::OffsetMismatch { .. })
-        ));
+    fn a_chunk_for_the_wrong_offset_is_caught() {
+        let (root, store, root_hash) = toy_trie(200);
+        let proof = prove_chunk(&root, 0, 2048, &store);
+        let total = total_size(&root, &store);
+        assert!(verify_chunk(root_hash, total / 2, &proof).is_err(), "wrong offset accepted");
     }
 
     /// A substituted long value is caught: it must hash to what its node
     /// commits to. Without this the state would carry attacker-chosen bytes
-    /// under a genuine key.
+    /// under a genuine key -- a balance, a nonce, a contract's code.
     #[test]
     fn a_forged_long_value_is_caught() {
         let (root, store, root_hash) = toy_trie(60);
-        let chunk = prove_chunk(&root, 0, u64::MAX, &store);
-        let index = chunk
-            .nodes
+        let proof = prove_chunk(&root, 0, u64::MAX, &store);
+        let index = proof
+            .entries
             .iter()
-            .position(|n| !n.long_values.is_empty())
+            .position(|e| !e.long_values.is_empty())
             .expect("the fixture holds long values");
 
-        let mut tampered = chunk.clone();
-        tampered.nodes[index].long_values[0] = vec![0xAA; 64];
+        let mut tampered = proof.clone();
+        tampered.entries[index].long_values[0] = vec![0xAA; 64];
         assert_eq!(
-            verify_chunk(root_hash, &tampered),
+            verify_chunk(root_hash, 0, &tampered),
             Err(VerifyError::BadLongValue { index })
         );
 
-        // Dropping it is caught too.
-        let mut missing = chunk.clone();
-        missing.nodes[index].long_values.clear();
+        // Dropping it is caught too: a node whose long value is missing is a
+        // different node, not an incomplete one.
+        let mut missing = proof.clone();
+        missing.entries[index].long_values.clear();
         assert_eq!(
-            verify_chunk(root_hash, &missing),
+            verify_chunk(root_hash, 0, &missing),
+            Err(VerifyError::BadLongValue { index })
+        );
+
+        // And so is an extra one nobody asked for.
+        let mut extra = proof.clone();
+        extra.entries[index].long_values.push(vec![0x11; 64]);
+        assert_eq!(
+            verify_chunk(root_hash, 0, &extra),
             Err(VerifyError::BadLongValue { index })
         );
     }
@@ -507,32 +609,36 @@ mod tests {
     #[test]
     fn an_absent_witness_fails_closed() {
         let (root, store, root_hash) = toy_trie(200);
-        let chunk = prove_chunk(&root, 3000, 2048, &store);
-        assert!(!chunk.witness.is_empty(), "a mid-trie chunk needs a witness");
+        let total = total_size(&root, &store);
+        let from = total / 2;
+        let proof = prove_chunk(&root, from, 2048, &store);
+        assert!(!proof.witness.is_empty(), "a mid-trie chunk needs a witness");
 
-        let mut stripped = chunk.clone();
+        let mut stripped = proof.clone();
         stripped.witness.clear();
-        assert!(verify_chunk(root_hash, &stripped).is_err(), "verified without a witness");
+        assert!(
+            verify_chunk(root_hash, from, &stripped).is_err(),
+            "verified without a witness"
+        );
     }
 
-    /// The witness is small: a few nodes on the path, not a second copy of
-    /// the trie.
+    /// The witness is a path, not a second copy of the trie.
     #[test]
     fn the_witness_is_proportional_to_depth_not_to_size() {
         let (root, store, _) = toy_trie(400);
         let total = total_size(&root, &store);
-        let chunk = prove_chunk(&root, total / 2, 4096, &store);
-        let witness_bytes: u64 = chunk.witness.iter().map(|w| w.len() as u64).sum();
-        let chunk_bytes: u64 = chunk.nodes.iter().map(|n| n.wire_len()).sum();
+        let proof = prove_chunk(&root, total / 2, 4096, &store);
+        let witness_bytes: u64 = proof.witness.iter().map(|w| w.len() as u64).sum();
+        let chunk_bytes = proof.wire_len() - witness_bytes;
         assert!(
             witness_bytes < chunk_bytes,
             "witness {witness_bytes}B should be smaller than the chunk {chunk_bytes}B"
         );
     }
 
-    /// A verified chunk is directly storable: its messages are the consensus
+    /// A verified chunk is directly storable: the messages are the consensus
     /// serialization, keyed by their own hash. This is what removes the
-    /// reconstruction pass entirely.
+    /// reconstruction pass rskj needs -- there is nothing left to rebuild.
     #[test]
     fn verified_chunks_rebuild_the_trie_by_plain_insertion() {
         let (root, store, root_hash) = toy_trie(200);
@@ -541,16 +647,15 @@ mod tests {
         let rebuilt = MemoryTrieStore::new();
         let mut offset = 0u64;
         while offset < total {
-            let chunk = prove_chunk(&root, offset, 1024, &store);
-            verify_chunk(root_hash, &chunk).expect("honest chunk");
-            for entry in &chunk.nodes {
-                let h = alloy_primitives::keccak256(&entry.message);
-                rebuilt.put(h.as_slice(), &entry.message);
-                for value in &entry.long_values {
+            let proof = prove_chunk(&root, offset, 1024, &store);
+            let nodes = verify_chunk(root_hash, offset, &proof).expect("honest chunk");
+            for node in &nodes {
+                rebuilt.put(alloy_primitives::keccak256(&node.message).as_slice(), &node.message);
+                for value in &node.long_values {
                     rebuilt.put(alloy_primitives::keccak256(value).as_slice(), value);
                 }
             }
-            offset = chunk.end();
+            offset = nodes.last().expect("non-empty").end();
         }
 
         // The rebuilt store must answer every key the original does.
@@ -573,20 +678,24 @@ mod fuzz {
     use super::*;
     use crate::MemoryTrieStore;
 
+    fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+        let mut s = seed;
+        move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        }
+    }
+
     /// A verifier that can be made to panic is a verifier that can be used to
     /// stop the node. Nothing a peer can say may do worse than return an
     /// error, so throw junk at every entry point.
     #[test]
     fn no_peer_input_can_panic_the_verifier() {
-        let mut seed = 0x9E3779B97F4A7C15u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-
+        let mut next = xorshift(0x9E3779B97F4A7C15);
         let store = MemoryTrieStore::new();
+
         for case in 0..3000 {
             let len = (next() % 70) as usize;
             let junk: Vec<u8> = (0..len).map(|_| next() as u8).collect();
@@ -594,19 +703,18 @@ mod fuzz {
             // The parser itself: any answer is fine, a panic is not.
             let _ = TrieNode::try_from_message(&junk, &store);
 
-            // And the whole verification path, with junk in every field.
-            let chunk = ProvenChunk {
-                from: next(),
-                nodes: vec![StreamNode {
-                    offset: next(),
-                    span: next(),
+            let proof = ChunkProof {
+                entries: vec![Entry {
                     message: junk.clone(),
                     long_values: vec![junk.clone()],
                 }],
                 witness: vec![junk.clone()],
             };
             let root = alloy_primitives::keccak256(&junk);
-            assert!(verify_chunk(root, &chunk).is_err(), "case {case} verified junk");
+            assert!(
+                verify_chunk(root, next(), &proof).is_err(),
+                "case {case} verified junk"
+            );
         }
     }
 
@@ -625,46 +733,38 @@ mod fuzz {
         let root_hash = root.compute_hash(&store);
         let honest = prove_chunk(&root, 0, 3000, &store);
 
-        let mut seed = 0xD1B54A32D192ED03u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-
+        let mut next = xorshift(0xD1B54A32D192ED03);
         for _ in 0..4000 {
-            let mut chunk = honest.clone();
+            let mut proof = honest.clone();
             match next() % 5 {
                 0 => {
-                    let i = (next() as usize) % chunk.nodes.len();
-                    let m = &mut chunk.nodes[i].message;
+                    let i = (next() as usize) % proof.entries.len();
+                    let m = &mut proof.entries[i].message;
                     if !m.is_empty() {
                         let at = (next() as usize) % m.len();
                         m[at] = next() as u8;
                     }
                 }
                 1 => {
-                    let i = (next() as usize) % chunk.nodes.len();
-                    chunk.nodes[i].message.truncate((next() as usize) % 40);
+                    let i = (next() as usize) % proof.entries.len();
+                    proof.entries[i].message.truncate((next() as usize) % 40);
                 }
                 2 => {
-                    let i = (next() as usize) % chunk.nodes.len();
-                    chunk.nodes[i].long_values.push(vec![next() as u8; 40]);
+                    let i = (next() as usize) % proof.entries.len();
+                    proof.entries[i].long_values.push(vec![next() as u8; 40]);
                 }
-                3 if !chunk.witness.is_empty() => {
-                    let i = (next() as usize) % chunk.witness.len();
-                    let w = &mut chunk.witness[i];
+                3 if !proof.witness.is_empty() => {
+                    let i = (next() as usize) % proof.witness.len();
+                    let w = &mut proof.witness[i];
                     let at = (next() as usize) % w.len();
                     w[at] ^= 0xFF;
                 }
                 _ => {
-                    chunk.nodes.truncate(1 + (next() as usize) % chunk.nodes.len());
-                    chunk.from = next() % 5000;
+                    proof.entries.truncate(1 + (next() as usize) % proof.entries.len());
                 }
             }
-            // Only the outcome is asserted; the point is that it returns one.
-            let _ = verify_chunk(root_hash, &chunk);
+            // Only that it returns an outcome at all is asserted here.
+            let _ = verify_chunk(root_hash, next() % 5000, &proof);
         }
     }
 }
