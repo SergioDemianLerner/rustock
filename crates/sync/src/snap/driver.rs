@@ -12,7 +12,8 @@
 //! unfilled. So the offset is taken from this node's own record of the
 //! request, keyed by id, and the echoed field is used for nothing.
 
-use super::session::{Action, Phase, SnapSession};
+use super::session::{Action, ChunkFault, Phase, SnapFailure, SnapSession};
+use rustock_networking::scoring::EventType;
 use alloy_primitives::{B256, B512, U256};
 use rustock_core::{Block, Header};
 use rustock_networking::protocol::snap::{
@@ -56,16 +57,124 @@ pub struct Outbound {
     pub message: P2pMessage,
 }
 
+/// Something a peer did that it should be charged for.
+///
+/// The driver names the peer and the offence; applying it is the caller's,
+/// because scoring is a node-wide policy and this is one download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blame {
+    pub peer: B512,
+    pub event: EventType,
+    /// Why, for the log line that accompanies the punishment.
+    pub why: String,
+}
+
+/// What a session-level failure says about the peer that caused it.
+///
+/// `None` means the failure was not that peer's doing: running out of answers
+/// is nobody's fault in particular, and a state this node failed to store is
+/// this node's problem.
+fn blame_for(failure: &SnapFailure) -> Option<EventType> {
+    match failure {
+        SnapFailure::InvalidHeader { .. } => Some(EventType::InvalidHeader),
+        SnapFailure::BadBody { .. } => Some(EventType::InvalidBlock),
+        SnapFailure::NoCheckpoint
+        | SnapFailure::BrokenChain
+        | SnapFailure::BadDifficulty
+        | SnapFailure::ForeignGenesis
+        | SnapFailure::BadChunk(_) => Some(EventType::InvalidMessage),
+        SnapFailure::NoCommonAncestor
+        | SnapFailure::NoProgress(_)
+        | SnapFailure::IncompleteState(_) => None,
+    }
+}
+
 pub struct SnapDriver {
     session: SnapSession,
     in_flight: HashMap<u64, InFlight>,
     /// Rotated through so one peer is not asked for everything.
     next_peer: usize,
+    /// Offences waiting to be charged, oldest first.
+    blame: Vec<Blame>,
+    /// Peers not worth asking again: they speak the older chunk format, or
+    /// keep declining. Not an accusation -- just a note to stop wasting
+    /// requests on them.
+    unhelpful: std::collections::HashSet<B512>,
 }
 
 impl SnapDriver {
     pub fn new(session: SnapSession) -> Self {
-        Self { session, in_flight: HashMap::new(), next_peer: 0 }
+        Self {
+            session,
+            in_flight: HashMap::new(),
+            next_peer: 0,
+            blame: Vec::new(),
+            unhelpful: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Ids of requests currently outstanding.
+    #[cfg(test)]
+    pub(crate) fn outstanding_ids(&self) -> Vec<u64> {
+        self.in_flight.keys().copied().collect()
+    }
+
+    /// Offences to charge, taken once.
+    pub fn take_blame(&mut self) -> Vec<Blame> {
+        std::mem::take(&mut self.blame)
+    }
+
+    /// Peers this session has stopped asking. Carried across a restart so a
+    /// new session does not rediscover them one timeout at a time.
+    pub fn unhelpful(&self) -> &std::collections::HashSet<B512> {
+        &self.unhelpful
+    }
+
+    /// Start a session already knowing which peers not to bother.
+    pub fn avoiding(mut self, peers: std::collections::HashSet<B512>) -> Self {
+        self.unhelpful = peers;
+        self
+    }
+
+    /// Which peer, if any, caused the session to fail -- and what it cost.
+    fn charge(&mut self, peer: B512, event: EventType, why: impl Into<String>) {
+        let why = why.into();
+        debug!(target: "rustock::snap", "charging {:?}: {why}", &peer.0[..4]);
+        self.blame.push(Blame { peer, event, why });
+    }
+
+    /// Note the session's own verdict against whoever answered last.
+    fn charge_for_failure(&mut self, peer: B512) {
+        let Some(failure) = self.session.failure().cloned() else { return };
+        if let Some(event) = blame_for(&failure) {
+            self.charge(peer, event, failure.to_string());
+        }
+    }
+
+    /// Read what the last chunk answer was worth, and act on it.
+    fn charge_for_chunk(&mut self, peer: B512) {
+        match self.session.take_chunk_fault() {
+            Some(ChunkFault::Misbehaved(e)) => {
+                let event = match e {
+                    super::client::ChunkError::Unsolicited(_) => EventType::UnexpectedMessage,
+                    _ => EventType::InvalidMessage,
+                };
+                self.charge(peer, event, e.to_string());
+            }
+            // Neither of these is misbehaviour. A pruned peer declining is
+            // behaving correctly, and an rskj peer is speaking the protocol it
+            // knows. Punishing either would teach the network to stop
+            // offering; the right response is to stop asking.
+            Some(ChunkFault::Declined) | Some(ChunkFault::Legacy) => {
+                if self.unhelpful.insert(peer) {
+                    debug!(
+                        target: "rustock::snap",
+                        "no longer asking {:?} for state", &peer.0[..4]
+                    );
+                }
+            }
+            None => {}
+        }
     }
 
     pub fn phase(&self) -> Phase {
@@ -106,7 +215,9 @@ impl SnapDriver {
                     target: "rustock::snap",
                     "snap request {id} to {:?} timed out", &request.peer.0[..4]
                 );
+                let peer = request.peer;
                 self.release(request.what);
+                self.charge(peer, EventType::TimeoutMessage, "snap request timed out");
             }
         }
         stale.len()
@@ -146,8 +257,30 @@ impl SnapDriver {
         self.dispatch(actions, peers)
     }
 
+    /// The peers worth asking, which is all of them minus the ones that have
+    /// already said they cannot help.
+    fn worth_asking<'a>(&self, peers: &'a [B512]) -> Vec<B512> {
+        let willing: Vec<B512> =
+            peers.iter().copied().filter(|p| !self.unhelpful.contains(p)).collect();
+        // If that leaves nobody, ask anyway rather than stall: a peer that
+        // declined one range may serve another, and being wrong here costs a
+        // round trip where giving up costs the sync.
+        if willing.is_empty() {
+            peers.to_vec()
+        } else {
+            willing
+        }
+    }
+
     fn dispatch(&mut self, actions: Vec<Action>, peers: &[B512]) -> Vec<Outbound> {
         let mut out = Vec::new();
+        if actions.is_empty() {
+            return out;
+        }
+        let peers = self.worth_asking(peers);
+        if peers.is_empty() {
+            return out;
+        }
         for action in actions {
             let peer = peers[self.next_peer % peers.len()];
             self.next_peer = self.next_peer.wrapping_add(1);
@@ -193,6 +326,7 @@ impl SnapDriver {
     pub fn on_status(
         &mut self,
         id: u64,
+        sender: B512,
         blocks: &[Block],
         difficulties: &[U256],
         trie_size: u64,
@@ -202,12 +336,14 @@ impl SnapDriver {
             return Vec::new();
         }
         let actions = self.session.on_status(blocks, difficulties, trie_size);
+        self.charge_for_failure(sender);
         self.dispatch(actions, peers)
     }
 
     pub fn on_headers(
         &mut self,
         id: u64,
+        sender: B512,
         headers: &[Header],
         peers: &[B512],
     ) -> Vec<Outbound> {
@@ -215,6 +351,7 @@ impl SnapDriver {
             return Vec::new();
         }
         let actions = self.session.on_headers(headers);
+        self.charge_for_failure(sender);
         self.dispatch(actions, peers)
     }
 
@@ -225,6 +362,7 @@ impl SnapDriver {
     pub fn on_chunk(
         &mut self,
         id: u64,
+        sender: B512,
         payload: &ChunkPayload,
         peers: &[B512],
     ) -> Vec<Outbound> {
@@ -238,13 +376,19 @@ impl SnapDriver {
             return Vec::new();
         };
 
+        // Taken from whoever sent it, not only from the peer it was asked of:
+        // a valid chunk is valid whatever its route, and the download would
+        // rather have it. The sender is what matters for what follows.
         let actions = self.session.on_chunk(from, payload);
+        self.charge_for_chunk(sender);
+        self.charge_for_failure(sender);
         self.dispatch(actions, peers)
     }
 
     pub fn on_blocks(
         &mut self,
         id: u64,
+        sender: B512,
         blocks: &[Block],
         difficulties: &[U256],
         peers: &[B512],
@@ -253,6 +397,7 @@ impl SnapDriver {
             return Vec::new();
         }
         let actions = self.session.on_blocks(blocks, difficulties);
+        self.charge_for_failure(sender);
         self.dispatch(actions, peers)
     }
 

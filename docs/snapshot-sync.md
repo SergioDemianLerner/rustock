@@ -33,11 +33,39 @@ fails verification. All three end the same way: the range goes back in the
 queue and someone else is asked. Nothing a peer sends is written to the store
 before it is checked.
 
-What it does not yet do is hold that peer to account. A chunk that fails its
-proof is refused but not reported to peer scoring, and a bad *status* or header
-fails the whole session rather than the peer that sent it — which for now ends
-snapshot sync for the life of the process. Neither is a safety problem: nothing
-unverified is ever kept. Both are tracked as **issue #134**.
+### What it costs the peer
+
+Refusing bad data is not enough on its own — a peer that pays nothing for
+serving garbage can serve it again immediately. Every failure is therefore
+charged to whoever *sent* the answer, not to whoever was asked for it:
+
+| what the peer did | charged as |
+|---|---|
+| chunk failed its proof | `InvalidMessage` |
+| answered far larger than the request | `InvalidMessage` |
+| answered a question nobody asked | `UnexpectedMessage` |
+| header failed validation | `InvalidHeader` |
+| offered a chain that does not link, or an invented genesis | `InvalidMessage` |
+| body that is not the one its header commits to | `InvalidBlock` |
+| never answered | `TimeoutMessage` |
+
+Taking a chunk from whichever peer sends it is deliberate — a proved chunk is
+good whatever its route — and it only works because blame follows the sender.
+
+Two things are **not** misbehaviour and are never charged. A peer that declines
+to serve a range is behaving correctly: it may have pruned that state, or be on
+another chain. An rskj peer answering in the older chunk format is speaking the
+protocol it knows. Punishing either would teach the network to stop offering;
+the right response is to stop asking, so both are dropped from the rotation for
+the rest of the download.
+
+### One peer cannot end the sync
+
+A bad status or a header that fails proof of work fails that *session*. It used
+to end snapshot sync for the life of the process, which handed any single peer
+a free denial of service. Now the peer is charged, the session is abandoned,
+and another starts against a different peer — up to `MAX_SNAP_ATTEMPTS` (5),
+carrying forward the list of peers already found unhelpful.
 
 ### What the header walk costs
 

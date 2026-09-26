@@ -26,6 +26,14 @@ use tracing::{info, debug, trace, warn, error};
 /// Timeout for pending requests before resetting to Idle.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Snapshot sync sessions to try before concluding it will not work here.
+///
+/// A session that fails on one peer's bad data is that peer's fault, not a
+/// reason to abandon the feature -- but trying forever against a hostile
+/// network is not better. Each attempt costs a status round trip and whatever
+/// of the header walk it got through.
+const MAX_SNAP_ATTEMPTS: u32 = 5;
+
 /// How long a coherence violation must persist before it is worth reporting.
 ///
 /// Long enough to cover the ordinary gap between canonicalising a header and
@@ -403,6 +411,16 @@ pub struct SyncService {
     /// snap events are dropped and this service behaves exactly as it did
     /// before snapshot sync existed.
     snap: Option<crate::snap::driver::SnapDriver>,
+    /// What it would take to start another session, kept so a session that
+    /// fails on one peer's bad data can be retried against a different one.
+    snap_restart: Option<(
+        crate::snap::SnapConfig,
+        Arc<rustock_core::validation::HeaderVerifier>,
+    )>,
+    /// Sessions started so far, including the one running.
+    snap_attempts: u32,
+    /// Peers not worth asking, carried between sessions.
+    snap_avoid: std::collections::HashSet<B512>,
     block_processor: Option<Arc<BlockProcessor>>,
     trie_store: Option<Arc<dyn TrieStore>>,
     pub(crate) current_state_root: Option<TrieNode>,
@@ -524,6 +542,9 @@ impl SyncService {
             progress: SyncProgress::new(),
             block_processor: None,
             snap: None,
+            snap_restart: None,
+            snap_attempts: 0,
+            snap_avoid: std::collections::HashSet::new(),
             trie_store: None,
             current_state_root: None,
             executing: None,
@@ -811,18 +832,45 @@ impl SyncService {
             "starting snapshot sync (chunk {} bytes, {} in flight)",
             config.chunk_bytes, config.max_in_flight
         );
+        self.snap_restart = Some((config.clone(), verifier.clone()));
+        self.snap_attempts = 0;
+        self.open_snap_session(config, verifier, trie_store);
+    }
+
+    fn open_snap_session(
+        &mut self,
+        config: crate::snap::SnapConfig,
+        verifier: Arc<rustock_core::validation::HeaderVerifier>,
+        trie_store: Arc<dyn TrieStore>,
+    ) {
+        self.snap_attempts += 1;
         let session = crate::snap::session::SnapSession::new(
             config,
             self.manager.store.clone(),
             trie_store,
             verifier,
         );
-        self.snap = Some(crate::snap::driver::SnapDriver::new(session));
+        self.snap = Some(
+            crate::snap::driver::SnapDriver::new(session).avoiding(self.snap_avoid.clone()),
+        );
     }
 
     /// Whether a snapshot sync is running.
     pub fn snap_phase(&self) -> Option<crate::snap::session::Phase> {
         self.snap.as_ref().map(|d| d.phase())
+    }
+
+    /// The id of any outstanding snap request, for tests that need to answer
+    /// one without a network.
+    #[cfg(test)]
+    pub(crate) fn snap_request_id_for_test(&self) -> Option<u64> {
+        self.snap.as_ref()?.outstanding_ids().first().copied()
+    }
+
+    /// Sessions started so far.
+    #[cfg(test)]
+    pub(crate) fn snap_attempts_for_test(&self) -> u32 {
+        self.snap_attempts
     }
 
     /// Runs one step of the snap driver and sends whatever it asks for.
@@ -842,6 +890,22 @@ impl SyncService {
         let Some(driver) = self.snap.as_mut() else { return };
 
         let outbound = step(driver, &peers);
+
+        // Charge whatever the step turned up before anything else: a peer that
+        // misbehaved should pay for it even if the session went on to finish
+        // or fail for some other reason.
+        let blame = driver.take_blame();
+        for fault in &blame {
+            if let Some(scoring) = &self.scoring {
+                scoring.record_peer(fault.peer, fault.event);
+            }
+            warn!(
+                target: "rustock::snap",
+                "peer {:?} charged {:?}: {}",
+                &fault.peer.0[..4], fault.event, fault.why
+            );
+        }
+
         for out in outbound {
             self.peer_store.send_to_peer(&out.peer, out.message).await;
         }
@@ -871,13 +935,37 @@ impl SyncService {
                         error!(target: "rustock::snap", "could not record the snapshot head: {e}");
                     }
                 }
+                self.snap_restart = None;
             }
             _ => {
+                // One peer's bad data must not end snapshot sync. The peer has
+                // already been charged for it; what is left is to ask someone
+                // else, which is the whole reason peers are plural.
+                let why = driver
+                    .session()
+                    .failure()
+                    .map_or("unknown".to_string(), |f| f.to_string());
+                self.snap_avoid.extend(driver.unhelpful().iter().copied());
+
+                let Some((config, verifier)) = self.snap_restart.clone() else {
+                    warn!(target: "rustock::snap", "snapshot sync gave up: {why}");
+                    return;
+                };
+                if self.snap_attempts >= MAX_SNAP_ATTEMPTS {
+                    warn!(
+                        target: "rustock::snap",
+                        "snapshot sync gave up after {} attempts: {why}", self.snap_attempts
+                    );
+                    self.snap_restart = None;
+                    return;
+                }
+                let Some(trie_store) = self.trie_store.clone() else { return };
                 warn!(
                     target: "rustock::snap",
-                    "snapshot sync gave up: {}",
-                    driver.session().failure().map_or("unknown".to_string(), |f| f.to_string())
+                    "snapshot sync attempt {} failed ({why}); starting another",
+                    self.snap_attempts
                 );
+                self.open_snap_session(config, verifier, trie_store);
             }
         }
     }
@@ -2503,7 +2591,7 @@ impl SyncService {
     // Event handlers
     // -----------------------------------------------------------------------
 
-    async fn handle_event(&mut self, event: SyncEvent) {
+    pub(crate) async fn handle_event(&mut self, event: SyncEvent) {
         match event {
             SyncEvent::BlockHashResponse { hash, .. } => {
                 self.on_block_hash_response(hash).await;
@@ -2516,7 +2604,7 @@ impl SyncService {
                 // message, so it is claimed by request id before the normal
                 // path sees it.
                 if self.snap.as_ref().is_some_and(|d| d.awaits_headers(id)) {
-                    self.drive_snap(|driver, peers| driver.on_headers(id, &headers, peers))
+                    self.drive_snap(|driver, ps| driver.on_headers(id, peer, &headers, ps))
                         .await;
                     return;
                 }
@@ -2525,17 +2613,17 @@ impl SyncService {
             SyncEvent::BodyResponse { id, transactions, uncles, .. } => {
                 self.on_body_response(id, transactions, uncles).await;
             }
-            SyncEvent::SnapStatusResponse { id, blocks, difficulties, trie_size, .. } => {
-                self.drive_snap(|driver, peers| {
-                    driver.on_status(id, &blocks, &difficulties, trie_size, peers)
+            SyncEvent::SnapStatusResponse { peer, id, blocks, difficulties, trie_size } => {
+                self.drive_snap(|driver, ps| {
+                    driver.on_status(id, peer, &blocks, &difficulties, trie_size, ps)
                 })
                 .await;
             }
-            SyncEvent::SnapChunkResponse { id, payload, .. } => {
-                self.drive_snap(|driver, peers| driver.on_chunk(id, &payload, peers)).await;
+            SyncEvent::SnapChunkResponse { peer, id, payload, .. } => {
+                self.drive_snap(|driver, ps| driver.on_chunk(id, peer, &payload, ps)).await;
             }
-            SyncEvent::SnapBlocksResponse { id, blocks, difficulties, .. } => {
-                self.drive_snap(|driver, peers| driver.on_blocks(id, &blocks, &difficulties, peers))
+            SyncEvent::SnapBlocksResponse { peer, id, blocks, difficulties } => {
+                self.drive_snap(|driver, ps| driver.on_blocks(id, peer, &blocks, &difficulties, ps))
                     .await;
             }
             SyncEvent::NewBlockHashes { peer, identifiers } => {
