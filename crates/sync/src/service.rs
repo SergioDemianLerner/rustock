@@ -934,6 +934,15 @@ impl SyncService {
                     if let Err(e) = self.manager.store.set_exec_head(hash, checkpoint.state_root) {
                         error!(target: "rustock::snap", "could not record the snapshot head: {e}");
                     }
+
+                    // The headers are all on disk; only the index below the
+                    // checkpoint window is missing. Filling it is an hour of
+                    // background disk that the node does not have to wait for,
+                    // so it runs behind the sync rather than in front of it.
+                    if self.snap_restart.as_ref().is_some_and(|(c, _)| c.index_history) {
+                        let store = self.manager.store.clone();
+                        tokio::spawn(crate::snap::indexer::fill_canonical_index(store, hash));
+                    }
                 }
                 self.snap_restart = None;
             }

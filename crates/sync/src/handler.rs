@@ -19,6 +19,17 @@ const MAX_SKELETON_ENTRIES: usize = 20;
 /// Maximum headers to serve in a single response.
 const MAX_HEADERS_SERVE: u32 = 192;
 
+/// What a snap answer is expected to weigh, for rate limiting.
+///
+/// Only state is metered. A status or a block range is small, infrequent, and
+/// already bounded by the concurrency limit; metering them would complicate
+/// the accounting for nothing.
+#[derive(Debug, Clone, Copy)]
+enum Cost {
+    Small,
+    Chunk,
+}
+
 /// Dispatches inbound messages to the state machine channel and serves
 /// data to peers (headers, block hashes, skeletons).
 pub struct SyncHandler {
@@ -73,11 +84,29 @@ impl SyncHandler {
     ///
     /// Returns `None` always: the reply does not travel back through the
     /// handler's return value.
-    fn serve_snap<F>(&self, peer: B512, reply: F) -> Option<P2pMessage>
+    fn serve_snap<F>(&self, peer: B512, cost: Cost, reply: F) -> Option<P2pMessage>
     where
         F: FnOnce(&SnapServer) -> Option<RskSubMessage> + Send + 'static,
     {
         let server = self.snap_server()?;
+
+        // Charged before the slot is taken, so a peer over its rate does not
+        // sit on one while it waits.
+        let wait = match cost {
+            Cost::Small => std::time::Duration::ZERO,
+            Cost::Chunk => match server.allowance(peer, server.chunk_cost()) {
+                crate::snap::rate::Allowance::Now => std::time::Duration::ZERO,
+                crate::snap::rate::Allowance::After(d) => d,
+                crate::snap::rate::Allowance::Refuse => {
+                    trace!(
+                        target: "rustock::snap",
+                        "refusing a chunk to {:?}: over its rate", &peer.0[..4]
+                    );
+                    return None;
+                }
+            },
+        };
+
         if !server.admit(peer) {
             trace!(
                 target: "rustock::snap",
@@ -88,6 +117,12 @@ impl SyncHandler {
 
         let peer_store = self.manager.peer_store.clone();
         tokio::spawn(async move {
+            // Backpressure, not an error: a peer over its rate is slowed
+            // rather than told no, which needs nothing of the protocol and
+            // throttles the peer through the slots it is holding.
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
             let serving = server.clone();
             let built = tokio::task::spawn_blocking(move || {
                 let answer = reply(&serving);
@@ -351,19 +386,19 @@ impl P2pHandler for SyncHandler {
                 // --- Snapshot sync ---
                 RskSubMessage::SnapStatusRequest(r) => {
                     let r = r.clone();
-                    return self.serve_snap(id, move |s| {
+                    return self.serve_snap(id, Cost::Small, move |s| {
                         s.status(&r).map(|m| RskSubMessage::SnapStatusResponse(Box::new(m)))
                     });
                 }
                 RskSubMessage::SnapChunkRequest(r) => {
                     let r = r.clone();
-                    return self.serve_snap(id, move |s| {
+                    return self.serve_snap(id, Cost::Chunk, move |s| {
                         s.chunk(&r).map(|m| RskSubMessage::SnapChunkResponse(Box::new(m)))
                     });
                 }
                 RskSubMessage::SnapBlocksRequest(r) => {
                     let r = r.clone();
-                    return self.serve_snap(id, move |s| {
+                    return self.serve_snap(id, Cost::Small, move |s| {
                         s.blocks(&r).map(|m| RskSubMessage::SnapBlocksResponse(Box::new(m)))
                     });
                 }

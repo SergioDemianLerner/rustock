@@ -173,6 +173,16 @@ code, which also established that for the same keys rustock's trie is identical
 to rskj's — same roots, same RSKIP107 sizes, same consensus messages, node for
 node.
 
+Afterwards the canonical `number → hash` index is filled in the background for
+the history below the checkpoint window. Consensus does not need it — every
+execution-path lookup is bounded well inside that window — but RPC about old
+heights does, and so does serving history to other peers, without which the
+node takes history from the network and gives none back. Measured on mainnet:
+415 MB, and a walk that runs at 82,700 headers/s warm against 1,770 cold — two
+minutes or ninety, depending entirely on page cache. It yields between batches
+and records a cursor before each pause, so a node that restarts daily still
+converges rather than starting the hour again each morning.
+
 Off by default on both sides — snapshot sync changes how a node comes to trust
 its state, which is a decision an operator makes rather than one they discover.
 

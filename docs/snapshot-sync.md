@@ -10,6 +10,12 @@ it. The header chain to the snapshot point is verified under the same
 proof-of-work rules a full sync applies, and every chunk of state is proved
 against that chain's state root as it arrives.
 
+Both sides are implemented, and both dialects: rustock serves and reads its own
+chunk format, and serves and reads rskj's. The verification algorithms are
+specified below in enough detail to reimplement, and the costs quoted
+throughout are measured against mainnet state rather than estimated — the tools
+that produced them are in the tree.
+
 ## What the client ends up trusting
 
 Proof-of-work, and nothing else — the same thing a full sync trusts.
@@ -115,13 +121,59 @@ anchors on its first answer and skips the walk entirely.
 
 Every header of the chain, on disk and verified, keyed by hash. State at the
 checkpoint. Bodies for the 6000 blocks behind it. And a canonical
-`number → hash` index covering only that 6400-block window.
+`number → hash` index covering only that ~6400-block window, because building
+the rest where the sync finishes would mean one write batch of nine million
+entries in the middle of the sync loop.
 
-`eth_getBlockByNumber` for an older height therefore finds nothing, even
-though the header is right there. Indexing the whole walk where it finishes
-would mean one write batch of nine million entries in the middle of the sync
-loop; it belongs in a background pass over data already on disk. Tracked as
-**issue #133**.
+**Nothing about consensus needs the rest.** Every `number → hash` lookup on the
+execution path is bounded, and all of them fall inside that window:
+
+| lookup | depth |
+|---|---|
+| `BlockHeader` precompile (RSKIP119) | 4000 — rskj's `MAX_DEPTH` |
+| REMASC sibling scan | a few generations around its maturity |
+| EVM `BLOCKHASH` | 256 |
+
+Two things do need it: RPC about old heights, and **serving history to other
+peers** — `serve_block_hash_request` and `serve_skeleton_request` both resolve
+by height, so without it the node takes history from the network and gives none
+back.
+
+So it is filled in the background, after the sync, and `--snap-index-history`
+turns it off for a node that will never serve or answer about history.
+
+Measured against mainnet at #9274144 (9.27M blocks):
+
+| | |
+|---|---|
+| index size | **415 MB** (44.8 bytes per height) |
+| walk, warm page cache | 82,700 headers/s — **~112 s** |
+| walk, cold | 1,770 headers/s — **~87 min** |
+
+A freshly snap-synced node is the cold case: it has just written ~5.5 GB of
+headers. The writes are not the cost — nine million batched puts is seconds —
+the reads are, and they are genuinely disk-bound rather than merely slow: the
+cold walk sits in `D` state at 10% CPU, ~1,770 read syscalls a second.
+
+Which shapes the pass. It runs 10,000 heights per batch on a blocking thread,
+so it never occupies an async worker, and rests 250 ms between batches so the
+node it runs behind keeps its disk for executing blocks. And it **resumes**:
+the cursor is stored *before* each pause, so a kill during the pause costs
+nothing and a node that restarts daily still converges instead of starting the
+hour again every morning.
+
+Asking whether there is anything to do at all is one lookup at the bottom of
+the chain, not an hour of reads discovering there was not. The gap a snapshot
+sync leaves is at the bottom, so if the bottom is indexed the rest is too.
+
+One rule in here is easy to get backwards, and was: stopping the walk at the
+first height the index already agrees with. That is right for a node that
+indexed downward contiguously, and wrong for a snap-synced one, which is
+indexed at the *top* and bare underneath — the walk stopped at the head having
+written nothing. Agreeing heights are skipped, not stopped at.
+
+`crates/cli/examples/canonical_index_cost.rs` measures both halves on a real
+database, read-only, beside a running node.
 
 ## How a chunk is proved
 
@@ -468,8 +520,8 @@ for peers that cannot speak it.
 
 rskj has snapshot sync, experimental and off by default on both sides, with no
 snap boot nodes configured. It does verify each chunk as it arrives
-(`TrieDTOInOrderRecoverer.verifyChunk`). Three things differ here, all in the
-direction of trusting the peer less or doing less work.
+(`TrieDTOInOrderRecoverer.verifyChunk`). What differs here differs in the
+direction of trusting the peer less, or doing less work, or both.
 
 **Linear replay instead of heuristic reconstruction.** rskj rebuilds the
 chunk's subtree by scanning the range for the largest `children_size` to guess
@@ -495,6 +547,28 @@ root it wants. Peers cannot then disagree about what is being downloaded, which
 is also what makes fetching one state from several unrelated peers
 straightforward. A server whose chain has a different root at that height
 declines rather than answering a different question.
+
+**The header walk is pipelined.** rskj's is serial — about 48,000 round trips,
+one at a time, before any state is asked for. A skeleton request is addressed
+by height rather than hash, which breaks the dependency, and the identifiers it
+returns are never believed: what makes an answer trustworthy is that the runs
+link.
+
+**Cells are cached.** The checkpoint is stable for about 1.7 days, so every
+client in that window wants the same bytes; rskj recomputes them for each.
+
+**A refusal says why.** rskj answers "not this one" with an empty chunk and no
+reason, which leaves a client unable to tell "realign" from "ask someone else".
+
+**Bad data is charged to the peer that sent it.** rskj refuses a failed chunk
+without recording anything against its sender.
+
+Two things rskj does that are not copied. Its client rebuilds a chunk by
+scanning for the largest `children_size` recursively; when rustock reads rskj's
+format it derives the same tree with a linear Cartesian-tree pass instead. And
+its snapshot chunk size is a hard-coded constant rather than something a server
+states, so two implementations with different constants could not agree —
+rustock advertises its grid.
 
 ## Wire protocol
 
@@ -541,8 +615,11 @@ rustock --snap-sync --snap-parallel 8 --snap-chunk-bytes 100000
 | `--snap-chunk-bytes` | 100000 | bytes of state per chunk |
 | `--snap-chunk-grid` | 100000 | the offset grid cells sit on |
 | `--snap-parallel` | 8 | chunk requests in flight, across all peers |
+| `--snap-index-history` | true | fill the canonical index below the checkpoint window afterwards |
+| `--snap-peer-rate` | 8388608 | state bytes per second served to one peer |
+| `--snap-total-rate` | 33554432 | state bytes per second served in total |
 
-All five are settable from the config file too, under `[snapshot]`:
+All eight are settable from the config file too, under `[snapshot]`:
 
 ```toml
 [snapshot]
@@ -550,6 +627,9 @@ server = true
 sync = false
 chunk_grid = 100000
 parallel = 8
+index_history = true
+peer_rate = 8388608
+total_rate = 33554432
 ```
 
 A cached cell is keyed by `state_root || grid || format || index`, so changing
@@ -566,32 +646,73 @@ serving a state it cannot complete.
 
 ## What bounds a request
 
-Serving state is the one place a peer chooses how much work this node does:
+Serving state is the one place a peer chooses how much work this node does, so
+each choice is bounded.
 
-- The chunk size is clamped to 1 MiB, so a peer asking for the whole trie in
-  one message gets a chunk.
-- A chunk request must name a root this node would have offered anyway, so the
-  server is not an oracle for arbitrary historical states.
-- Snap status is cached per checkpoint, because every client asks for the same
-  one and computing it walks 400 blocks.
-- Three requests per peer at a time (rskj's `maxSenderRequests`). A snapshot
-  request is the most expensive thing a stranger can ask this node to do, and
-  a peer that pipelines them would otherwise keep every worker busy on its own
-  behalf.
+### Computing is bounded by the cache
 
-**Serving happens off the network thread.** A chunk is disk-bound — most of a
-second on a cold store — and the handler is called from inside the peer's
-async task, so doing the work there would block every other task sharing that
-runtime worker: a node that serves snapshots would stop following the chain
-while it did. The work goes to a blocking thread and the answer is sent when
-it is ready. This is the PoC report's V5 "dedicated thread", and what rskj
-does with `scheduleJob`.
+A server serves exactly one state — the checkpoint's; a request naming any
+other root is refused — so there are only ever about 9,200 distinct cells. Once
+computed they are on disk and every later request is a read. The most a peer
+can make a server compute is one full cache, and that work then benefits every
+client after it. A bounded cost with a useful side effect, rather than an
+attack.
 
-A client is likewise bounded by what it will read: a chunk more than four
-times the budget it asked for is thrown away unverified, since the transport
-allows 16 MB and verifying that much costs real CPU. A chunk of a single node
-is exempt — a server always sends at least one, and a node larger than the
-budget (a contract's code, say) would otherwise be undownloadable.
+On top of that: the chunk size is clamped to `max_chunk_bytes` (1 MiB), a
+request must name a root the server would have offered anyway, snap status is
+cached per checkpoint, and each peer may have three requests outstanding
+(rskj's `maxSenderRequests`).
+
+### Bytes out are bounded by a rate, because nothing else bounds them
+
+The concurrency limit is not a rate limit. Measured, a peer using its three
+slots can pull cached cells at roughly **300 MB/s**, indefinitely, and egress
+is the one thing here an operator pays for directly. rskj has the same three
+slots and no rate limit either.
+
+So state is metered in bytes:
+
+| | default | reasoning |
+|---|---|---|
+| per peer | 8 MB/s | the whole 0.9 GB state in ~2 minutes from one server; about a fortieth of what a peer could take unthrottled |
+| whole server | 32 MB/s | 256 Mbit — four peers at their limit, and room left on a gigabit host for the block and transaction traffic the node exists to carry |
+
+A peer over its rate is **made to wait**, not told no: backpressure needs
+nothing of the protocol, and a peer being slowed throttles itself through the
+three slots it is holding. Refusal is kept for waits long enough that the peer
+would rather ask elsewhere than hold a slot open — beyond five seconds.
+
+A refused request is not charged. Charging for an answer never sent would let a
+peer dig itself deeper for nothing, and would punish an honest client that
+happened to arrive while the whole-server limit was binding. That also bounds
+the debt at `rate × max_wait`, so the longest a peer can lock itself out is the
+same five seconds.
+
+### Repeated requests are served, and not remembered
+
+A peer asking for the same cell forever is an obvious worry, and the obvious
+defence — remembering which cells each peer has had — costs more than the
+attack. That state is O(peers × cells): 9,200 cells against every connected
+peer, and a peer that asks for many different cells inflates it on purpose.
+Turning a bandwidth problem into a memory problem is a bad trade.
+
+It is also wrong on the merits. Re-requesting is legitimate: a response can be
+lost, a client can re-ask a range after another peer's chunk failed
+verification, and several peers downloading one state will naturally want the
+same cells.
+
+The rate limit subsumes it. A peer asking for one cell forever spends its own
+allowance exactly as if it had asked for different ones, and the state needed
+to know that is **one bucket per peer** — a few dozen bytes, O(peers). The map
+is bounded too: past a cap, full buckets are dropped, which is lossless because
+a full bucket is indistinguishable from a peer that has never asked.
+
+### What a client is bounded by
+
+A chunk more than four times the budget it asked for is thrown away unverified,
+since the transport allows 16 MB and verifying that much costs real CPU. A
+chunk of a single node is exempt — a server always sends at least one, and a
+node larger than the budget would otherwise be undownloadable.
 
 ## Checking it against a real state
 
@@ -620,3 +741,10 @@ holds under that hash.
 | covering the offset space | `crates/sync/src/snap/client.rs` |
 | sequencing a whole sync | `crates/sync/src/snap/session.rs` |
 | peers, request ids, timeouts | `crates/sync/src/snap/driver.rs` |
+| what a peer may pull, and how fast | `crates/sync/src/snap/rate.rs` |
+| the parallel header walk | `crates/sync/src/snap/headers.rs` |
+| filling the canonical index | `crates/sync/src/snap/indexer.rs` |
+| rskj's node encoding, both ways | `crates/trie/src/snapshot_legacy.rs` |
+| vectors from rskj's own code | `crates/trie/tests/rskj-vectors/` |
+| measuring against a real state | `crates/cli/examples/snap_serve_check.rs` |
+| measuring the index | `crates/cli/examples/canonical_index_cost.rs` |
