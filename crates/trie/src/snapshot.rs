@@ -202,6 +202,21 @@ pub fn chunk_from(
     budget: u64,
     store: &dyn TrieStore,
 ) -> Vec<StreamNode> {
+    chunk_from_limited(root, offset, budget, usize::MAX, store)
+}
+
+/// As [`chunk_from`], but stopping after `max_nodes` entries.
+///
+/// The verifier needs this: it replays the traversal over only what a peer
+/// sent, and has to stop where the peer's chunk stopped rather than run off
+/// the end of the data it was given.
+pub fn chunk_from_limited(
+    root: &TrieNode,
+    offset: u64,
+    budget: u64,
+    max_nodes: usize,
+    store: &dyn TrieStore,
+) -> Vec<StreamNode> {
     if root.is_empty_trie() {
         return Vec::new();
     }
@@ -256,7 +271,7 @@ pub fn chunk_from(
         // Budgeted in wire bytes, because that is what the message costs;
         // advanced in span, because that is what the offset space counts.
         let cost = entry.wire_len();
-        if !out.is_empty() && used.saturating_add(cost) > budget {
+        if !out.is_empty() && (used.saturating_add(cost) > budget || out.len() >= max_nodes) {
             break;
         }
         at += entry.span;
