@@ -254,7 +254,9 @@ fn a_chain_back_to_a_foreign_genesis_is_refused() {
     session.on_headers(&[foreign_genesis]);
 
     assert_eq!(session.phase(), Phase::Failed);
-    assert_eq!(session.failure(), Some(&SnapFailure::NoCommonAncestor));
+    // Told apart from merely running out of answers: this one is the peer's
+    // doing, and it is charged for it.
+    assert_eq!(session.failure(), Some(&SnapFailure::ForeignGenesis));
 }
 
 /// **The walk may not vouch for itself.** Headers are written to the store as
@@ -277,6 +279,7 @@ fn the_header_walk_cannot_satisfy_its_own_anchor() {
     session.on_headers(&[blocks[0].header.clone()]);
     session.on_headers(&[foreign_genesis.clone()]);
     assert_eq!(session.phase(), Phase::Failed, "the walk vouched for itself");
+    assert_eq!(session.failure(), Some(&SnapFailure::ForeignGenesis));
 
     // And the chain really is in the store by hash -- which is why the check
     // has to look elsewhere.
@@ -574,4 +577,393 @@ fn a_body_that_does_not_match_its_header_is_refused() {
         "wrong failure: {:?}",
         session.failure()
     );
+}
+
+// ------------------------------------------------------- blaming the peer
+
+use alloy_primitives::B512;
+use crate::snap::driver::{Blame, SnapDriver};
+use rustock_networking::protocol::{P2pMessage, RskSubMessage};
+use rustock_networking::scoring::EventType;
+
+/// What a driver asked for, and under which id, so a test can answer it.
+fn asked(out: &crate::snap::driver::Outbound) -> (u64, &'static str) {
+    let P2pMessage::RskMessage(m) = &out.message else { panic!("not an rsk message") };
+    match &m.sub_message {
+        RskSubMessage::SnapStatusRequest(r) => (r.id, "status"),
+        RskSubMessage::BlockHeadersRequest(r) => (r.id, "headers"),
+        RskSubMessage::SnapChunkRequest(r) => (r.id, "chunk"),
+        RskSubMessage::SnapBlocksRequest(r) => (r.id, "blocks"),
+        other => panic!("unexpected request {other:?}"),
+    }
+}
+
+/// A driver whose session has been driven to the state-download phase, with a
+/// chunk request outstanding. Returns the driver, the peers, and the
+/// (id, offset) of that outstanding request.
+fn driver_awaiting_a_chunk(
+    f: &Fixture,
+    blocks: &[Block],
+    tds: &[U256],
+    peers: &[B512],
+) -> (SnapDriver, u64, u64) {
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let mut out = driver.poll(peers);
+    let (status_id, kind) = asked(&out[0]);
+    assert_eq!(kind, "status");
+    out = driver.on_status(status_id, peers[0], blocks, tds, 8_000, peers);
+
+    // Walk the headers down to genesis, answering from the offered chain.
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        assert!(guard < 100, "header walk did not finish");
+        let (id, kind) = asked(&out[0]);
+        if kind == "chunk" {
+            break;
+        }
+        assert_eq!(kind, "headers");
+        let P2pMessage::RskMessage(m) = &out[0].message else { unreachable!() };
+        let RskSubMessage::BlockHeadersRequest(req) = m.sub_message.clone() else {
+            unreachable!()
+        };
+        let answer: Vec<Header> = blocks
+            .iter()
+            .rev()
+            .map(|b| b.header.clone())
+            .filter(|h| h.hash() == req.query.hash)
+            .collect();
+        out = driver.on_headers(id, peers[0], &answer, peers);
+        assert!(!out.is_empty(), "the walk stalled");
+    }
+
+    let P2pMessage::RskMessage(m) = &out[0].message else { unreachable!() };
+    let RskSubMessage::SnapChunkRequest(req) = &m.sub_message else { unreachable!() };
+    (driver, req.id, req.from)
+}
+
+/// **The point of the whole exercise.** A peer whose chunk fails its proof is
+/// named and charged. Refusing bad data without charging anyone costs the
+/// sender nothing, so it can do it again immediately, forever.
+#[test]
+fn a_peer_whose_chunk_fails_its_proof_is_charged() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    assert!(driver.take_blame().is_empty(), "nobody should owe anything yet");
+
+    // A genuine chunk with one byte flipped, from a peer we can name.
+    let liar = B512::repeat_byte(9);
+    let mut payload = served_chunk(&f, from);
+    tamper(&mut payload);
+    driver.on_chunk(id, liar, &payload, &peers);
+
+    let blame = driver.take_blame();
+    assert_eq!(blame.len(), 1, "expected exactly one charge, got {blame:?}");
+    assert_eq!(blame[0].peer, liar, "charged the wrong peer");
+    assert_eq!(blame[0].event, EventType::InvalidMessage);
+}
+
+/// And the charge lands on whoever *sent* it, not on whoever was asked. Taking
+/// a chunk from any peer is deliberate -- a valid chunk is valid whatever its
+/// route -- but that only works if blame follows the sender.
+#[test]
+fn the_charge_follows_the_sender_not_the_peer_that_was_asked() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let asked_peer = B512::repeat_byte(1);
+    let peers = vec![asked_peer, B512::repeat_byte(2)];
+
+    let (mut driver, id, from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.take_blame();
+
+    let interloper = B512::repeat_byte(77);
+    let mut payload = served_chunk(&f, from);
+    tamper(&mut payload);
+    driver.on_chunk(id, interloper, &payload, &peers);
+
+    let blame = driver.take_blame();
+    assert_eq!(blame.len(), 1);
+    assert_eq!(blame[0].peer, interloper, "blamed the peer we asked, not the one that answered");
+    assert_ne!(blame[0].peer, asked_peer);
+}
+
+/// A peer that serves honestly owes nothing. An implementation that charged on
+/// every answer would ban the network.
+#[test]
+fn an_honest_peer_is_never_charged() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.take_blame();
+
+    driver.on_chunk(id, peers[0], &served_chunk(&f, from), &peers);
+    assert!(driver.take_blame().is_empty(), "charged an honest peer");
+}
+
+/// A peer declining to serve is behaving correctly -- it may have pruned the
+/// state, or be on another chain. It is dropped from the rotation, not
+/// punished: punishing it would teach the network to stop offering.
+#[test]
+fn a_peer_that_declines_is_dropped_not_punished() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, _from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.take_blame();
+
+    let pruned = B512::repeat_byte(5);
+    let declined = ChunkPayload::Proved { entries: Vec::new(), witness: Vec::new() };
+    driver.on_chunk(id, pruned, &declined, &peers);
+
+    assert!(driver.take_blame().is_empty(), "punished a peer for declining");
+    assert!(driver.unhelpful().contains(&pruned), "kept asking a peer that cannot serve");
+}
+
+/// The same for an rskj peer speaking the older chunk format: not a fault, but
+/// not worth asking again either.
+#[test]
+fn an_older_peer_is_dropped_not_punished() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, _from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.take_blame();
+
+    let rskj = B512::repeat_byte(6);
+    driver.on_chunk(id, rskj, &ChunkPayload::Legacy(vec![0xC1, 0x80].into()), &peers);
+
+    assert!(driver.take_blame().is_empty(), "punished an rskj peer for being rskj");
+    assert!(driver.unhelpful().contains(&rskj));
+}
+
+/// A peer that offers a chain which does not link is charged for the status,
+/// not merely ignored.
+#[test]
+fn a_peer_offering_a_broken_chain_is_charged() {
+    let f = fixture(20);
+    let (mut blocks, tds) = chain(1, 4, B256::ZERO, 100, f.state_root);
+    blocks[2] = block(header(3, B256::repeat_byte(0x55), f.state_root, 100));
+
+    let peers = vec![B512::repeat_byte(1)];
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+    let out = driver.poll(&peers);
+    let (id, _) = asked(&out[0]);
+
+    let liar = B512::repeat_byte(3);
+    driver.on_status(id, liar, &blocks, &tds, 5_000, &peers);
+
+    let blame = driver.take_blame();
+    assert_eq!(blame.len(), 1, "got {blame:?}");
+    assert_eq!(blame[0].peer, liar);
+    assert_eq!(blame[0].event, EventType::InvalidMessage);
+}
+
+/// A header that fails proof of work is charged as a bad header, which scores
+/// differently from a merely malformed message.
+#[test]
+fn a_peer_serving_an_unmined_header_is_charged_for_the_header() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let checkpoint = blocks.last().unwrap().header.number;
+    let peers = vec![B512::repeat_byte(1)];
+
+    let mut driver =
+        SnapDriver::new(f.session(HeaderVerifier::new().with_static_rule(RefuseBelow(checkpoint))));
+    let out = driver.poll(&peers);
+    let (status_id, _) = asked(&out[0]);
+    let out = driver.on_status(status_id, peers[0], &blocks, &tds, 5_000, &peers);
+    driver.take_blame();
+
+    let (headers_id, kind) = asked(&out[0]);
+    assert_eq!(kind, "headers");
+    let liar = B512::repeat_byte(4);
+    driver.on_headers(headers_id, liar, &[blocks[blocks.len() - 2].header.clone()], &peers);
+
+    let blame = driver.take_blame();
+    assert_eq!(blame.len(), 1, "got {blame:?}");
+    assert_eq!(blame[0].peer, liar);
+    assert_eq!(blame[0].event, EventType::InvalidHeader);
+}
+
+/// A request nobody answered is the peer's fault too, or a slow peer would
+/// hold work forever at no cost.
+#[test]
+fn a_timed_out_request_is_charged() {
+    let f = fixture(20);
+    let peers = vec![B512::repeat_byte(1)];
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+    driver.poll(&peers);
+
+    let long_after = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    assert_eq!(driver.expire(long_after), 1, "the request should have expired");
+
+    let blame: Vec<Blame> = driver.take_blame();
+    assert_eq!(blame.len(), 1);
+    assert_eq!(blame[0].peer, peers[0]);
+    assert_eq!(blame[0].event, EventType::TimeoutMessage);
+}
+
+/// Serves a real chunk for `from` out of the fixture's trie.
+fn served_chunk(f: &Fixture, from: u64) -> ChunkPayload {
+    let root_message = f.trie.get(f.state_root.as_slice()).expect("root");
+    let root = TrieNode::from_message(&root_message, f.trie.as_ref());
+    let proof = rustock_trie::snapshot_proof::prove_chunk(&root, from, 600, f.trie.as_ref());
+    ChunkPayload::Proved {
+        entries: proof
+            .entries
+            .iter()
+            .map(|e| rustock_networking::protocol::snap::SnapEntry {
+                message: e.message.clone().into(),
+                long_values: e.long_values.iter().map(|v| v.clone().into()).collect(),
+            })
+            .collect(),
+        witness: proof.witness.iter().map(|w| w.clone().into()).collect(),
+    }
+}
+
+/// Flips a bit in the middle of a chunk, so every node is genuine but one.
+fn tamper(payload: &mut ChunkPayload) {
+    let ChunkPayload::Proved { entries, .. } = payload else { panic!("not a proved chunk") };
+    assert!(!entries.is_empty(), "nothing to tamper with");
+    let victim = entries.len() / 2;
+    let mut bytes = entries[victim].message.to_vec();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    entries[victim].message = bytes.into();
+}
+
+/// **One peer must not be able to end snapshot sync.** A malformed status used
+/// to fail the session, and nothing ever started another: a single bad message
+/// from a single peer turned the feature off for the life of the process, at
+/// no cost to the sender.
+#[tokio::test]
+async fn a_bad_peer_does_not_end_snapshot_sync() {
+    use crate::events::SyncEvent;
+    use crate::manager::SyncManager;
+    use crate::snap::session::Phase;
+    use crate::SyncService;
+    use rustock_networking::peers::PeerStore;
+
+    let f = fixture(20);
+    f.with_genesis();
+    // A chain whose blocks do not link: refused on sight.
+    let (mut blocks, tds) = chain(1, 4, B256::ZERO, 100, f.state_root);
+    blocks[2] = block(header(3, B256::repeat_byte(0x55), f.state_root, 100));
+
+    let peers = Arc::new(PeerStore::new());
+    let liar = B512::repeat_byte(9);
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    peers.add_peer(liar, tx).await;
+
+    let manager = Arc::new(SyncManager::new(
+        f.store.clone(),
+        Arc::new(HeaderVerifier::new()),
+        peers.clone(),
+    ));
+    let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peers, event_rx)
+        .with_trie_store_for_test(f.trie.clone() as Arc<dyn TrieStore>);
+
+    service.start_snap_sync(SnapConfig::default(), Arc::new(HeaderVerifier::new()));
+    assert_eq!(service.snap_phase(), Some(Phase::AwaitingStatus));
+
+    // The driver has to have asked before an answer means anything.
+    service.on_tick().await;
+
+    // Answer with the broken chain, as the lying peer.
+    service
+        .handle_event(SyncEvent::SnapStatusResponse {
+            peer: liar,
+            id: service.snap_request_id_for_test().expect("a status request is outstanding"),
+            blocks: blocks.clone(),
+            difficulties: tds.clone(),
+            trie_size: 5_000,
+        })
+        .await;
+
+    // The session failed, and another one took its place rather than the
+    // feature switching itself off.
+    assert!(
+        service.snap_phase().is_some(),
+        "one bad status ended snapshot sync for good"
+    );
+    assert_eq!(service.snap_phase(), Some(Phase::AwaitingStatus));
+    assert!(service.snap_attempts_for_test() >= 2, "no second attempt was made");
+}
+
+/// The charge must actually reach peer scoring. The driver naming a culprit is
+/// only useful if the service hands it to the thing that punishes.
+#[tokio::test]
+async fn a_charge_reaches_peer_scoring() {
+    use crate::events::SyncEvent;
+    use crate::manager::SyncManager;
+    use crate::SyncService;
+    use rustock_networking::peers::PeerStore;
+    use rustock_networking::scoring::ScoringService;
+
+    let f = fixture(20);
+    f.with_genesis();
+    let (mut blocks, tds) = chain(1, 4, B256::ZERO, 100, f.state_root);
+    blocks[2] = block(header(3, B256::repeat_byte(0x55), f.state_root, 100));
+
+    let peers = Arc::new(PeerStore::new());
+    let liar = B512::repeat_byte(9);
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    peers.add_peer(liar, tx).await;
+
+    let scoring = Arc::new(ScoringService::in_memory());
+    let before = scoring.with(|m| m.node_has_good_reputation(liar));
+    assert!(before, "a peer starts in good standing");
+
+    let manager = Arc::new(SyncManager::new(
+        f.store.clone(),
+        Arc::new(HeaderVerifier::new()),
+        peers.clone(),
+    ));
+    let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peers, event_rx)
+        .with_trie_store_for_test(f.trie.clone() as Arc<dyn TrieStore>)
+        .with_scoring(Some(scoring.clone()));
+
+    service.start_snap_sync(SnapConfig::default(), Arc::new(HeaderVerifier::new()));
+    service.on_tick().await;
+
+    let id = service.snap_request_id_for_test().expect("a status request is outstanding");
+    service
+        .handle_event(SyncEvent::SnapStatusResponse {
+            peer: liar,
+            id,
+            blocks,
+            difficulties: tds,
+            trie_size: 5_000,
+        })
+        .await;
+
+    // The peer now carries a recorded InvalidMessage and a negative score.
+    let info = scoring.with(|m| m.information());
+    let entry = info
+        .iter()
+        .find(|i| i.kind == "node" && i.counters.iter().any(|(_, n)| *n > 0))
+        .unwrap_or_else(|| panic!("no peer was scored at all: {info:?}"));
+
+    assert!(
+        entry.counters.iter().any(|(name, n)| *name == "invalidMessages" && *n > 0),
+        "the charge did not land as an invalid message: {:?}",
+        entry.counters
+    );
+    assert!(entry.score < 0, "a charged peer should have lost points: {}", entry.score);
 }

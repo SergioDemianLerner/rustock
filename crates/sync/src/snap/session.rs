@@ -79,8 +79,10 @@ pub enum SnapFailure {
     InvalidHeader { number: u64, reason: String },
     #[error("cumulative difficulty does not increase across the offered blocks")]
     BadDifficulty,
-    #[error("the header walk reached genesis without meeting a block we have")]
+    #[error("the header walk ran out of answers before meeting a block we have")]
     NoCommonAncestor,
+    #[error("the chain leads back to a genesis this node has never seen")]
+    ForeignGenesis,
     #[error("a chunk was refused: {0}")]
     BadChunk(#[from] ChunkError),
     #[error("the downloaded state is not whole: {0}")]
@@ -89,6 +91,25 @@ pub enum SnapFailure {
     NoProgress(u32),
     #[error("block #{number}: the {what} are not the ones its header commits to")]
     BadBody { number: u64, what: &'static str },
+}
+
+/// What an answer revealed about the peer that sent it.
+///
+/// The distinction that matters is between a peer that *misbehaved* and one
+/// that simply could not help. Both end the same way for the download -- the
+/// range goes back in the queue -- but only the first should cost the peer
+/// anything. A pruned node declining to serve state it no longer has is
+/// behaving correctly, and punishing it would teach the network to stop
+/// offering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkFault {
+    /// The chunk failed its proof, or was not an answer to the question asked.
+    Misbehaved(ChunkError),
+    /// The peer cannot serve this range: pruned, or on another chain.
+    Declined,
+    /// The peer speaks rskj's older chunk format, which this node does not
+    /// read. Not a fault, but not worth asking again.
+    Legacy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +155,8 @@ pub struct SnapSession {
     download: Option<StateDownload>,
     /// Chunk answers in a row that added nothing.
     fruitless_chunks: u32,
+    /// What the last chunk answer revealed, until someone reads it.
+    chunk_fault: Option<ChunkFault>,
     /// The oldest block number whose body is still wanted.
     blocks_wanted_to: u64,
     /// The next `SnapBlocks` request to make, walking backwards.
@@ -165,6 +188,7 @@ impl SnapSession {
             empty_header_replies: 0,
             download: None,
             fruitless_chunks: 0,
+            chunk_fault: None,
             blocks_wanted_to: 0,
             blocks_cursor: 0,
             blocks_in_flight: false,
@@ -182,6 +206,14 @@ impl SnapSession {
 
     pub fn checkpoint(&self) -> Option<&Header> {
         self.checkpoint.as_ref()
+    }
+
+    /// What the last chunk answer revealed about its sender, once.
+    ///
+    /// Drained rather than read, so a fault is attributed to exactly one peer:
+    /// the caller knows who answered, and this knows what the answer was worth.
+    pub fn take_chunk_fault(&mut self) -> Option<ChunkFault> {
+        self.chunk_fault.take()
     }
 
     /// Bytes of state covered, and the total once it is known.
@@ -374,7 +406,7 @@ impl SnapSession {
                 return if self.is_ours(0, header.hash()) {
                     self.start_state_download()
                 } else {
-                    self.fail(SnapFailure::NoCommonAncestor)
+                    self.fail(SnapFailure::ForeignGenesis)
                 };
             }
         }
@@ -469,6 +501,10 @@ impl SnapSession {
                 // A peer speaking the wrong dialect is not a reason to abandon
                 // the sync, only that peer: the range goes back in the queue.
                 debug!(target: "rustock::snap", "chunk from offset {from} unusable: {e}");
+                self.chunk_fault = Some(match e {
+                    ChunkError::LegacyFormat => ChunkFault::Legacy,
+                    other => ChunkFault::Misbehaved(other),
+                });
                 return self.fruitless(from);
             }
         };
@@ -476,7 +512,9 @@ impl SnapSession {
         if proof.entries.is_empty() {
             // "I cannot serve this." Hand the range back rather than treat an
             // empty answer as the end of the trie -- only the root says where
-            // that is.
+            // that is. Declining is not misbehaviour: the peer may have pruned
+            // the state, or be on another chain.
+            self.chunk_fault = Some(ChunkFault::Declined);
             return self.fruitless(from);
         }
 
@@ -490,6 +528,7 @@ impl SnapSession {
             }
             Err(e) => {
                 debug!(target: "rustock::snap", "chunk from offset {from} refused: {e}");
+                self.chunk_fault = Some(ChunkFault::Misbehaved(e));
                 return self.fruitless(from);
             }
         }

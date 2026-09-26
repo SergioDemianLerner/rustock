@@ -141,6 +141,16 @@ Measured against mainnet state at #9272510: 2.1 disk reads per node served,
 a 100 KB chunk verified in ~11 ms, witness overhead 2.9%, and a contiguous
 sweep confirming consecutive chunks tile the offset space with no gaps.
 
+Every failure is charged to whoever *sent* the answer rather than whoever was
+asked, which is what lets a chunk be taken from any peer: a proved chunk is
+good whatever its route, and blame following the sender is what keeps that
+safe. Declining to serve and speaking rskj's older format are explicitly not
+faults — a pruned peer is behaving correctly, and punishing it would teach the
+network to stop offering — so those peers are dropped from the rotation
+instead. And one peer's bad data no longer ends the sync: the session is
+abandoned, the peer is charged, and another session starts against someone
+else.
+
 Off by default on both sides — snapshot sync changes how a node comes to trust
 its state, which is a decision an operator makes rather than one they discover.
 
