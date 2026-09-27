@@ -381,13 +381,119 @@ client after. Measured at #9272510:
 
 A cell stores at ~102 KB, so a whole state is ~0.94 GB of cache.
 
-The cells of a state are dropped when the checkpoint rolls past it — they will
-never be asked for again, and there is about a gigabyte of them per state.
+Two generations of cells are kept: the checkpoint now offered and the one
+before it. Anything older is dropped.
+
+The second generation is there because `chunk` does not require a request to
+name the *current* checkpoint — it serves any canonical block whose state
+resolves. A client that took its status just before a roll goes on asking for
+the older block, and goes on being answered. Dropping that generation's cells
+would put it back on the cold path (1.73 s a chunk instead of 0.46 ms) for the
+rest of its download. Two generations cost 2 GB instead of 1 GB, and a
+generation lasts 5000 blocks — about 42 hours — against a download that takes
+about two minutes, so one generation back outlives any client by a wide margin
+and no timer is needed.
 
 The cache is never a source of truth. Every entry can be recomputed from the
 trie, the lookup happens only *after* the state root has been located in the
 store, and a server that has pruned a state refuses rather than serving cells
 it can no longer justify.
+
+## Garbage collection, and a state held only in part
+
+The trie store collects: it is a list of epochs, only the newest is written,
+and a cycle copies what is still reachable out of the oldest and then deletes
+it wholesale. What survives is what the **mark** reaches.
+
+The mark starts from one root — the state at `head − burial_depth`, 4000
+blocks. The checkpoint this server offers is 10,000–15,000 blocks back, three
+to four times deeper. It is not reachable from the collection root, and without
+help it is swept.
+
+Measured on mainnet at #9,274,568, the margin is not there:
+
+| | |
+|---|---|
+| offered checkpoint | #9,260,000 — **14,568 blocks back** |
+| trie writes | ~260 KB/block, so **~3,900 blocks fill a 1 GB epoch** |
+| sweep horizon (`N=4`) | **~12,000 blocks** |
+
+Right after the checkpoint rolls it is inside the window; by the time it is
+15,000 blocks old it is outside. Most of its nodes are shared with the live set
+and are drained forward — the ones *changed* since are not, and a chunk needs
+every node in its range.
+
+### Pinning
+
+`collect_pinned` takes the servable checkpoints as extra mark roots. Three
+things follow from how the mark works.
+
+**The union, not a substitute.** Two states at different heights share most of
+their nodes, but neither contains the other. Marking the checkpoint *instead*
+of the collection root would sweep what is unique to the state the node
+executes on — a failure this store has actually suffered, recorded in
+`collect_inner`.
+
+**One walk, not two.** A child is queued only when `live.insert` reports it
+new, so shared nodes are walked once by whichever root reaches them first. A
+pin costs the **delta**: the nodes changed between it and the collection root.
+
+**The collection root goes first.** A missing entry means different things for
+the two kinds of root, and a merged frontier could not say which one wanted it.
+Under the collection root it is a hard stop — the live set is incomplete and
+the sweep would delete reachable state. Under a pin it means that checkpoint is
+already half-collected: it cannot be served, but refusing to reclaim would turn
+one broken thing into two. Walking the collection root to completion first
+makes the attribution exact; the second phase is cheap because it dedupes
+against a live set that is already almost complete.
+
+With snapshot serving off there are no pins and collection is exactly what it
+was.
+
+Measured with `examples/pin_cost` against mainnet at #9,274,786, with the
+collection root at #9,270,786:
+
+| root | entries added | share | time |
+|---|---|---|---|
+| collection root (#9,270,786) | 10,492,917 nodes → 11,235,294 entries | — | 1657 s |
+| pin #9,260,000 (14,786 blocks back) | +41,649 | 0.37% | 13.0 s |
+| pin #9,255,000 | +23,953 | 0.21% | 9.2 s |
+| | **+65,602** | **+0.58%** | **+22 s (+1.3%)** |
+
+So pinning two checkpoints, the deeper one nearly 15,000 blocks back, costs
+about **4.6 MB retained and 22 seconds of mark**, against a cycle that already
+spends 28 minutes walking 10.5 million nodes. The delta argument is not a
+rounding-error claim made in hope; it is what two states 15,000 blocks apart
+actually differ by.
+
+### Serving half a state
+
+A pin can still arrive too late, so the server must not trust that a state it
+holds the root of is a state it holds.
+
+It cannot check cheaply. `children_size` is varint-encoded *into* the node
+message and hash-committed, so a root reports the size of a subtree that is no
+longer on disk, and proving completeness means walking ten million nodes —
+minutes, which no chunk request can pay.
+
+Worse, the traversal is forgiving in the wrong direction: a node it cannot
+resolve is skipped and the walk carries on **without advancing the offset**. A
+collected subtree turns into a chunk that looks well formed and is not. The
+client replays it, finds it disagrees with the root hash, and scores the peer
+`Misbehaved` — an honest node punished for telling the truth about a state it
+no longer has in full.
+
+So completeness is learned where it bites. The server replays every cell it
+builds against the state root — `verify_chunk`, the same function the client
+runs, on bytes already in hand, once per cell, behind a build that just did
+thousands of disk reads. A cell that does not verify, or that comes back empty
+below the advertised end, means a hole: the state is struck off, the chunk is
+refused as `StateNotStored`, and `status` stops offering that checkpoint. The
+rskj dialect gets the same treatment through `rebuild`, which is what an rskj
+client would run on the bytes.
+
+Refusing is the honest answer and costs the client one round trip. Serving is
+the dishonest-looking one and costs this node its reputation.
 
 ## When a server will not answer
 
@@ -399,7 +505,7 @@ difference decides what the client should do next. So a refusal is named:
 | `OffsetNotOnGrid` | realign and ask again — this is about the request |
 | `PastTheEnd` | our size was wrong; ask again |
 | `StateRootMismatch` | this peer is on another chain; stop asking it |
-| `StateNotStored` | it pruned that state; stop asking it |
+| `StateNotStored` | it does not hold that state in full; stop asking it |
 | `UnknownBlock` | it does not have the block; stop asking it |
 
 None of these is misbehaviour and none is charged. The distinction that

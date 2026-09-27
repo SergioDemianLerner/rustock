@@ -84,6 +84,12 @@ pub struct RpcState {
     pub admin_enabled: bool,
     /// Burial depth used when an admin collection request names no block.
     pub gc_burial: u64,
+    /// States a forced collection must keep beyond the collection root --
+    /// the snapshot checkpoints this node serves, which sit far deeper than
+    /// the burial depth (#143). A closure because the checkpoint moves, and
+    /// the answer has to be the one true at the moment of the cycle. Absent,
+    /// or empty, means nothing to pin.
+    pub gc_pins: Option<Arc<dyn Fn() -> Vec<alloy_primitives::B256> + Send + Sync>>,
     /// Blocks kept below the head when a prune request names no block.
     pub prune_keep_depth: u64,
     /// Most blocks one prune sweep may remove.
@@ -240,7 +246,12 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
             JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found")
         }
         "rsk_collectTrie" => admin::rsk_collect_trie(
-            id, &req.params, &state.store, &state.epoch_store, state.gc_burial,
+            id,
+            &req.params,
+            &state.store,
+            &state.epoch_store,
+            state.gc_burial,
+            state.gc_pins.as_ref().map(|f| f()).unwrap_or_default(),
         ),
         "rsk_collectTrieStatus" => admin::rsk_collect_trie_status(id, &state.epoch_store),
         "rsk_pruneBlocks" => admin::rsk_prune_blocks(

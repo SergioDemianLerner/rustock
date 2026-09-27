@@ -135,6 +135,12 @@ pub struct CollectStats {
     pub mark_secs: f64,
     pub drain_secs: f64,
     pub sweep_secs: f64,
+    /// Extra entries kept alive by pinned roots: the difference between the
+    /// live set and what the collection root alone would have marked.
+    pub pinned: u64,
+    /// Pinned roots that could not be marked in full, so whatever they
+    /// describe is already incomplete and cannot be served.
+    pub unservable: Vec<B256>,
 }
 
 /// A trie store split into epochs, with wholesale reclamation of the oldest.
@@ -462,6 +468,26 @@ impl EpochTrieStore {
     }
 
     pub fn collect(&self, root_hash: B256, root_block: u64, current_block: u64) -> Result<CollectStats> {
+        self.collect_pinned(root_hash, &[], root_block, current_block)
+    }
+
+    /// As [`Self::collect`], but also keeps everything reachable from `pins`.
+    ///
+    /// A pin is a state the node must keep for a reason the chain does not
+    /// express -- currently the snapshot checkpoints it offers, which sit far
+    /// deeper than the burial depth and would otherwise be swept (#143).
+    ///
+    /// A pin that cannot be marked in full is reported in
+    /// [`CollectStats::unservable`] and does not stop the cycle: its state was
+    /// already incomplete, and refusing to reclaim would only turn one broken
+    /// thing into two.
+    pub fn collect_pinned(
+        &self,
+        root_hash: B256,
+        pins: &[B256],
+        root_block: u64,
+        current_block: u64,
+    ) -> Result<CollectStats> {
         // One cycle at a time. Two concurrent cycles would each drain and sweep
         // the oldest epoch, and the second would delete an epoch the first had
         // not finished copying out of.
@@ -472,7 +498,7 @@ impl EpochTrieStore {
         {
             bail!("a collection cycle is already running");
         }
-        let result = self.collect_inner(root_hash, root_block, current_block);
+        let result = self.collect_inner(root_hash, pins, root_block, current_block);
         self.collecting.store(false, Ordering::SeqCst);
         if let Ok(stats) = &result {
             *self.last_collect.write().unwrap() = Some(stats.clone());
@@ -480,7 +506,13 @@ impl EpochTrieStore {
         result
     }
 
-    fn collect_inner(&self, root_hash: B256, root_block: u64, current_block: u64) -> Result<CollectStats> {
+    fn collect_inner(
+        &self,
+        root_hash: B256,
+        pins: &[B256],
+        root_block: u64,
+        current_block: u64,
+    ) -> Result<CollectStats> {
         let mut stats = CollectStats::default();
 
         // Refuse to collect against a root the store cannot resolve.
@@ -552,10 +584,24 @@ impl EpochTrieStore {
             }
         }
 
+        // A pin that is not even rooted in the store is already gone. Say so
+        // and carry on; there is nothing to mark and nothing to protect.
+        let (present, absent): (Vec<B256>, Vec<B256>) =
+            pins.iter().partition(|p| self.get(p.as_slice()).is_some());
+        for pin in &absent {
+            warn!(
+                target: "rustock::gc",
+                "Pinned root {pin:?} is not in the store; it cannot be served"
+            );
+        }
+
         let t = Instant::now();
-        let live = self.mark(root_hash)?;
+        let (live, mut unservable, pinned) = self.mark(root_hash, &present)?;
         stats.marked = live.len() as u64;
+        stats.pinned = pinned;
         stats.mark_secs = t.elapsed().as_secs_f64();
+        unservable.extend(absent);
+        stats.unservable = unservable;
 
         let t = Instant::now();
         let (scanned, drained, bytes) = self.drain(&live)?;
@@ -570,27 +616,102 @@ impl EpochTrieStore {
 
         info!(
             target: "rustock::gc",
-            "Collected: marked {} live, scanned {} in oldest epoch, drained {} ({} MB), \
-             reclaimed {} MB | mark {:.1}s drain {:.1}s sweep {:.2}s",
-            stats.marked, stats.scanned, stats.drained,
+            "Collected: marked {} live ({} held by {} pin(s)), scanned {} in oldest \
+             epoch, drained {} ({} MB), reclaimed {} MB | mark {:.1}s drain {:.1}s \
+             sweep {:.2}s",
+            stats.marked, stats.pinned, pins.len(), stats.scanned, stats.drained,
             stats.drained_bytes / (1 << 20), stats.reclaimed_bytes / (1 << 20),
             stats.mark_secs, stats.drain_secs, stats.sweep_secs
         );
         Ok(stats)
     }
 
-    /// Computes the live set: every key reachable from `root_hash`.
+    /// Computes the live set: every key reachable from the collection root, plus
+    /// every key reachable from a pinned root.
     ///
-    /// Batched breadth-first rather than a recursive descent. A trie traversal
-    /// is a chain of *dependent* reads -- each address is known only once the
-    /// previous read returns -- so a naive walk leaves the device at queue depth
-    /// 1. Keys discovered at the same level are independent and are read
-    /// together. Measured on the mainnet store this was worth ~5x.
-    fn mark(&self, root_hash: B256) -> Result<HashSet<B256>> {
+    /// # Why pins exist
+    ///
+    /// The collection root is one state, buried `burial_depth` below the head.
+    /// Anything the node must keep that is *not* reachable from that state has
+    /// to say so, and the snapshot checkpoint is the case in point: it sits
+    /// 10,000-15,000 blocks back, far deeper than the burial depth, and is
+    /// swept without a pin. See #143.
+    ///
+    /// Marking the checkpoint *instead* is not an alternative. Two states at
+    /// different heights share most of their nodes but neither contains the
+    /// other, so dropping the collection root would sweep what is unique to the
+    /// state the node executes on -- the failure recorded in `collect_inner`.
+    /// The live set has to be the union.
+    ///
+    /// # Why the union is nearly free
+    ///
+    /// A child is queued only when `live.insert` reports it new, so the nodes
+    /// the two states share are walked once, by whichever root reaches them
+    /// first. A pin costs the *delta*: the nodes changed between it and the
+    /// collection root.
+    ///
+    /// # Why the collection root goes first
+    ///
+    /// A missing entry means something different for each kind of root, and
+    /// a merged frontier could not tell which root wanted it. Walking the
+    /// collection root to completion first settles that: once it has finished
+    /// with no misses, anything missing afterwards is reachable only from a
+    /// pin. The second phase is still cheap, because it dedupes against a live
+    /// set that is already almost complete.
+    ///
+    /// Returns the live set, the pins that could not be marked in full, and how
+    /// many entries the pins added that the collection root had not already.
+    fn mark(
+        &self,
+        root_hash: B256,
+        pins: &[B256],
+    ) -> Result<(HashSet<B256>, Vec<B256>, u64)> {
         let mut live: HashSet<B256> = HashSet::new();
+
+        // Phase one: the collection root, strictly. A miss here means the live
+        // set is incomplete and the sweep would delete reachable state.
+        let missing = self.walk(&mut live, vec![root_hash]);
+        if missing > 0 {
+            bail!(
+                "mark found {missing} referenced entries missing from the store; \
+                 the live set is incomplete and collecting on it would delete \
+                 reachable state"
+            );
+        }
+
+        // Phase two: the pins, tolerantly. A miss here means that pin's state
+        // was already partly collected -- it cannot be served, but it is no
+        // reason to stop reclaiming. Whatever did get marked is simply kept,
+        // which is always safe.
+        let base = live.len();
+        let mut unservable = Vec::new();
+        for pin in pins {
+            let missing = self.walk(&mut live, vec![*pin]);
+            if missing > 0 {
+                warn!(
+                    target: "rustock::gc",
+                    "Pinned root {pin:?} is missing {missing} entries; it is already \
+                     incomplete and cannot be served"
+                );
+                unservable.push(*pin);
+            }
+        }
+
+        let pinned = (live.len() - base) as u64;
+        Ok((live, unservable, pinned))
+    }
+
+    /// Breadth-first from `frontier`, adding to `live`, returning how many
+    /// referenced entries were not in the store.
+    ///
+    /// Batched rather than a recursive descent. A trie traversal is a chain of
+    /// *dependent* reads -- each address is known only once the previous read
+    /// returns -- so a naive walk leaves the device at queue depth 1. Keys
+    /// discovered at the same level are independent and are read together.
+    /// Measured on the mainnet store this was worth ~5x.
+    fn walk(&self, live: &mut HashSet<B256>, mut frontier: Vec<B256>) -> u64 {
         let mut missing = 0u64;
-        let mut frontier: Vec<B256> = vec![root_hash];
-        live.insert(root_hash);
+        frontier.retain(|h| live.insert(*h));
 
         while !frontier.is_empty() {
             let keys: Vec<Vec<u8>> = frontier.iter().map(|h| h.as_slice().to_vec()).collect();
@@ -634,14 +755,7 @@ impl EpochTrieStore {
             }
             frontier = next;
         }
-        if missing > 0 {
-            bail!(
-                "mark found {missing} referenced entries missing from the store; \
-                 the live set is incomplete and collecting on it would delete \
-                 reachable state"
-            );
-        }
-        Ok(live)
+        missing
     }
 
     /// Copies every entry of the oldest epoch whose key is live into the newest.
@@ -1029,6 +1143,162 @@ mod tests {
             !survived || old_nodes == 0,
             "old state should not survive collection against a newer root"
         );
+    }
+
+    #[test]
+    fn a_pinned_root_survives_collection_against_a_newer_one() {
+        // The shape of #143: the snapshot checkpoint sits far deeper than the
+        // burial depth, so the collection root does not reach it. Without a
+        // pin it goes the way of any superseded state.
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+
+        let pinned = build(&s, 200, 0);
+        let pinned_nodes = walk(&s, pinned).unwrap();
+        let newer = build(&s, 200, 1_000_000);
+
+        for _ in 0..6 {
+            s.collect_pinned(newer, &[pinned], 1_000_000, 1_000_000).unwrap();
+        }
+
+        walk(&s, newer).expect("the collection root must stay readable");
+        assert_eq!(
+            walk(&s, pinned).expect("the pinned state must stay readable"),
+            pinned_nodes,
+            "every node of the pinned state survived"
+        );
+    }
+
+    #[test]
+    fn pinning_does_not_keep_a_third_state_alive() {
+        // A pin has to be narrow. If pinning one state happened to retain
+        // everything, the test above would pass for the wrong reason and the
+        // collector would have stopped reclaiming.
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+
+        let pinned = build(&s, 200, 0);
+        let unpinned = build(&s, 200, 500_000);
+        let newer = build(&s, 200, 1_000_000);
+
+        for _ in 0..6 {
+            s.collect_pinned(newer, &[pinned], 1_000_000, 1_000_000).unwrap();
+        }
+
+        walk(&s, pinned).expect("pinned");
+        walk(&s, newer).expect("collection root");
+        assert!(
+            walk(&s, unpinned).is_err(),
+            "a state that is neither pinned nor the collection root should be dropped"
+        );
+    }
+
+    #[test]
+    fn the_union_is_walked_once_not_twice() {
+        // The cost argument for pins: the two states share nearly everything,
+        // so marking both must cost the delta, not two full walks.
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+
+        let pinned = build(&s, 400, 0);
+        // One entry different, so the delta is a single root-to-leaf path.
+        let mut root = TrieNode::empty();
+        for i in 0..400u64 {
+            let mut v = vec![0u8; 16];
+            let salt = if i == 399 { 7 } else { 0 };
+            v[..8].copy_from_slice(&(i + salt).to_be_bytes());
+            root = root.put(&TrieKeySlice::from_key(&key(i)), &v, &s);
+        }
+        root.save(&s, true);
+        let newer = root.compute_hash(&s);
+
+        let (_, unservable, added) = s.mark(newer, &[pinned]).unwrap();
+        assert!(unservable.is_empty());
+        let alone = s.mark(pinned, &[]).unwrap().0.len() as u64;
+        assert!(
+            added < alone / 4,
+            "pinning a near-identical state added {added} of {alone} nodes; \
+             the shared nodes should have been walked once"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_pin_is_reported_and_does_not_stop_collection() {
+        // If a pin could halt a cycle, a checkpoint that had already been
+        // partly collected would stop the collector for good -- one broken
+        // thing turned into two.
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+
+        let newer = build(&s, 200, 1_000_000);
+        let absent = B256::repeat_byte(0xAB);
+
+        // Cycle until the store is at full width and a real mark happens;
+        // before that a cycle is only a growth rotation.
+        let mut stats = CollectStats::default();
+        for _ in 0..6 {
+            stats = s
+                .collect_pinned(newer, &[absent], 1_000_000, 1_000_000)
+                .expect("an unusable pin must not fail the cycle");
+        }
+        assert_eq!(stats.unservable, vec![absent]);
+        walk(&s, newer).expect("the collection root is untouched");
+    }
+
+    #[test]
+    fn a_pin_rooted_but_gutted_is_reported_rather_than_bailing() {
+        // Distinct from the case above: the pin's root resolves, so it passes
+        // the cheap check, but a node under it is gone. That is exactly what a
+        // half-collected checkpoint looks like, and it must be reported --
+        // not raised as the hard error the collection root would raise.
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+
+        let pinned = build(&s, 200, 0);
+        let newer = build(&s, 200, 1_000_000);
+
+        // Delete one node under the pin, leaving its root in place.
+        let bytes = s.get(pinned.as_slice()).unwrap();
+        let node = TrieNode::from_message(&bytes, &s);
+        let child = [&node.left, &node.right]
+            .into_iter()
+            .find_map(|c| match c {
+                NodeRef::Hash(h) => Some(*h),
+                _ => None,
+            })
+            .expect("the root of a 200-entry trie has a non-embedded child");
+        {
+            let epochs = s.epochs.read().unwrap();
+            for e in epochs.iter() {
+                let cf = e.db.cf_handle(CF_TRIE).unwrap();
+                e.db.delete_cf(cf, child.as_slice()).unwrap();
+            }
+        }
+
+        let mut stats = CollectStats::default();
+        for _ in 0..6 {
+            stats = s
+                .collect_pinned(newer, &[pinned], 1_000_000, 1_000_000)
+                .expect("a gutted pin must not fail the cycle");
+        }
+        assert_eq!(stats.unservable, vec![pinned], "the pin is struck off");
+    }
+
+    #[test]
+    fn no_pins_collects_exactly_as_before() {
+        // Snapshot serving off means no checkpoint to protect, and collection
+        // must be what it always was.
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+
+        let old = build(&s, 200, 0);
+        let newer = build(&s, 200, 1_000_000);
+
+        for _ in 0..6 {
+            s.collect_pinned(newer, &[], 1_000_000, 1_000_000).unwrap();
+        }
+        walk(&s, newer).expect("collection root");
+        assert!(walk(&s, old).is_err(), "nothing pinned, so nothing extra kept");
     }
 
     #[test]

@@ -1562,6 +1562,18 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
 
+    let snap_config = rustock_sync::SnapConfig {
+        server_enabled: args.snap_server,
+        client_enabled: args.snap_sync,
+        chunk_bytes: args.snap_chunk_bytes,
+        chunk_grid: args.snap_chunk_grid.max(1),
+        index_history: args.snap_index_history,
+        peer_bytes_per_second: args.snap_peer_rate,
+        total_bytes_per_second: args.snap_total_rate,
+        max_in_flight: args.snap_parallel.max(1),
+        ..rustock_sync::SnapConfig::default()
+    };
+
     // Background collection. Kept out of the block-processing path on purpose:
     // mark and drain only read the oldest epoch and write the newest, and block
     // processing also writes the newest, so the two need no coordination beyond
@@ -1570,6 +1582,13 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         let store_for_gc = store.clone();
         let burial = args.gc_burial;
         let every = std::time::Duration::from_secs(args.gc_check_secs.max(1));
+        // The collection root is one state, buried `burial` below the head.
+        // A snapshot server offers a state 10,000-15,000 blocks back, which is
+        // far deeper, so it is not reachable from that root and is swept
+        // without a pin (#143). Recomputed each cycle, because the checkpoint
+        // moves. Empty when serving is off, and then collection is exactly
+        // what it was.
+        let snap_for_gc = snap_config.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
@@ -1611,9 +1630,27 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     );
                     continue;
                 }
-                info!(target: "rustock::gc", "Collecting against #{at} ({root:?})");
-                if let Err(e) = es.collect(root, at, head_now) {
-                    error!(target: "rustock::gc", "Collection failed: {e:?}");
+                let pins = rustock_sync::snap_servable_roots(&store_for_gc, &snap_for_gc);
+                if pins.is_empty() {
+                    info!(target: "rustock::gc", "Collecting against #{at} ({root:?})");
+                } else {
+                    info!(
+                        target: "rustock::gc",
+                        "Collecting against #{at} ({root:?}), pinning {} snapshot state(s)",
+                        pins.len()
+                    );
+                }
+                match es.collect_pinned(root, &pins, at, head_now) {
+                    Ok(stats) => {
+                        for lost in &stats.unservable {
+                            warn!(
+                                target: "rustock::gc",
+                                "Snapshot state {lost:?} is already incomplete; peers asking \
+                                 for it will be refused. Collection continued."
+                            );
+                        }
+                    }
+                    Err(e) => error!(target: "rustock::gc", "Collection failed: {e:?}"),
                 }
             }
         });
@@ -1636,17 +1673,6 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         !args.no_peer_punishment,
     ));
 
-    let snap_config = rustock_sync::SnapConfig {
-        server_enabled: args.snap_server,
-        client_enabled: args.snap_sync,
-        chunk_bytes: args.snap_chunk_bytes,
-        chunk_grid: args.snap_chunk_grid.max(1),
-        index_history: args.snap_index_history,
-        peer_bytes_per_second: args.snap_peer_rate,
-        total_bytes_per_second: args.snap_total_rate,
-        max_in_flight: args.snap_parallel.max(1),
-        ..rustock_sync::SnapConfig::default()
-    };
     if args.snap_server {
         info!(
             "Snapshot server enabled: serving state at #(head - {}) in chunks of up to {} bytes",
@@ -1900,6 +1926,14 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             miner: miner.clone().map(|m| m as Arc<dyn rustock_rpc::mnr::MiningService>),
             admin_enabled: args.rpc_admin,
             gc_burial: args.gc_burial,
+            gc_pins: {
+                // Recomputed per cycle, because the checkpoint moves. Empty
+                // when serving is off, and then a forced collection is
+                // exactly what it always was.
+                let store = store.clone();
+                let snap = snap_config.clone();
+                Some(Arc::new(move || rustock_sync::snap_servable_roots(&store, &snap)))
+            },
             prune_keep_depth: args.prune_keep_depth,
             prune_max_batch: args.prune_max_batch,
             scoring: Some(scoring.clone()),

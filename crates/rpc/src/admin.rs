@@ -33,6 +33,7 @@ pub fn rsk_collect_trie(
     store: &Arc<BlockStore>,
     epoch_store: &Option<Arc<EpochTrieStore>>,
     burial: u64,
+    pins: Vec<B256>,
 ) -> JsonRpcResponse {
     let Some(es) = epoch_store.clone() else {
         return JsonRpcResponse::error(
@@ -86,14 +87,29 @@ pub fn rsk_collect_trie(
         .map(|h| h.number)
         .unwrap_or(at);
     let store_for_task = es.clone();
+    let pin_count = pins.len();
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || store_for_task.collect(root, at, head_now)).await
+        match tokio::task::spawn_blocking(move || {
+            store_for_task.collect_pinned(root, &pins, at, head_now)
+        })
+        .await
         {
-            Ok(Ok(s)) => tracing::info!(
-                target: "rustock::gc",
-                "Forced collection complete: marked {}, drained {}, reclaimed {} MB",
-                s.marked, s.drained, s.reclaimed_bytes / (1 << 20)
-            ),
+            Ok(Ok(s)) => {
+                for lost in &s.unservable {
+                    tracing::warn!(
+                        target: "rustock::gc",
+                        "Snapshot state {lost:?} is already incomplete; peers asking for it \
+                         will be refused"
+                    );
+                }
+                tracing::info!(
+                    target: "rustock::gc",
+                    "Forced collection complete: marked {} ({} held by {} pin(s)), drained {}, \
+                     reclaimed {} MB",
+                    s.marked, s.pinned, pin_count, s.drained,
+                    s.reclaimed_bytes / (1 << 20)
+                )
+            }
             Ok(Err(e)) => tracing::error!(target: "rustock::gc", "Forced collection failed: {e:?}"),
             Err(join) => tracing::error!(target: "rustock::gc", "Forced collection panicked: {join}"),
         }
