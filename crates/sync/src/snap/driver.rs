@@ -269,7 +269,25 @@ impl SnapDriver {
         if peers.is_empty() || self.is_finished() {
             return Vec::new();
         }
-        let actions = self.session.poll();
+        // Ask for at most what the budget has room for **after** what is
+        // already outstanding.
+        //
+        // The session cannot work this out: it knows what work remains, not
+        // what has been sent, and it is polled every tick. Left to itself it
+        // hands back a fresh budget's worth each time, so outstanding requests
+        // grow by `max_in_flight` per tick without bound -- measured at ~3,000
+        // in flight against a budget of 8, every one of them aging out at the
+        // 30s timeout and being reissued. The server answered them all; the
+        // answers arrived long after the client had given up on them. See #185.
+        //
+        // The driver is the only place that knows both numbers, which is why
+        // the cap belongs here.
+        let outstanding = self.in_flight.len();
+        let room = self.session.config().max_in_flight.max(1).saturating_sub(outstanding);
+        if room == 0 {
+            return Vec::new();
+        }
+        let actions = self.session.poll_within(room);
         self.dispatch(actions, peers)
     }
 

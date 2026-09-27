@@ -247,11 +247,28 @@ impl SnapSession {
     /// What to do now. Safe to call as often as the caller likes: it returns
     /// only work that is not already outstanding.
     pub fn poll(&mut self) -> Vec<Action> {
+        self.poll_within(self.config.max_in_flight.max(1))
+    }
+
+    /// The configuration this session was built with, so the driver can read
+    /// the in-flight budget it has to enforce.
+    pub fn config(&self) -> &SnapConfig {
+        &self.config
+    }
+
+    /// As [`Self::poll`], but asking for no more than `budget` new requests.
+    ///
+    /// The caller passes what is left of the budget after subtracting what is
+    /// already outstanding. This type deliberately does not track that: it
+    /// knows what work remains, the driver knows what has been sent, and
+    /// keeping the two apart is what stopped the session from having to model
+    /// the network.
+    pub fn poll_within(&mut self, budget: usize) -> Vec<Action> {
+        let budget = budget.max(1);
         match self.phase {
             Phase::AwaitingStatus => vec![Action::RequestStatus],
 
             Phase::VerifyingHeaders => {
-                let budget = self.config.max_in_flight.max(1);
                 let Some(walk) = self.walk.as_mut() else { return Vec::new() };
                 walk.wants(budget)
                     .into_iter()

@@ -1039,3 +1039,40 @@ async fn a_charge_reaches_peer_scoring() {
     );
     assert!(entry.score < 0, "a charged peer should have lost points: {}", entry.score);
 }
+
+/// **The in-flight budget must bound what is outstanding, not what is issued
+/// per poll.**
+///
+/// The session is polled every tick and knows only what work remains, so left
+/// to itself it hands back a fresh budget's worth each time. Measured against
+/// a real server before this was enforced: ~3,000 requests outstanding against
+/// a budget of 8, every one aging out at the 30s timeout and being reissued
+/// while the server's answers arrived long after the client had given up on
+/// them. See #185.
+#[test]
+fn outstanding_snap_requests_never_exceed_the_budget() {
+    let f = fixture(64);
+    let genesis = f.with_genesis();
+    // A chain deep enough that the walk has far more points to ask for than
+    // the budget allows, which is the condition that grew the queue.
+    let (blocks, tds) = chain(1, 4_000, genesis, 100, f.state_root);
+    let peers: Vec<B512> = (1..=3).map(B512::repeat_byte).collect();
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    // Answer the status so the session enters the header walk, then poll
+    // repeatedly **without answering anything**, as a tick loop would.
+    let out = driver.poll(&peers);
+    let (status_id, kind) = asked(&out[0]);
+    assert_eq!(kind, "status");
+    driver.on_status(status_id, peers[0], &blocks, &tds, 8_000, 0, &peers);
+
+    let budget = 2usize; // `Fixture::session` sets max_in_flight: 2
+    for tick in 0..200 {
+        driver.poll(&peers);
+        assert!(
+            driver.outstanding_ids().len() <= budget,
+            "tick {tick}: {} requests outstanding against a budget of {budget}",
+            driver.outstanding_ids().len()
+        );
+    }
+}
