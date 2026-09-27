@@ -17,14 +17,14 @@
 //! And the **node health alarms** -- stalled, behind the network, ahead of it
 //! -- which share this crate's mail transport and configuration file, because
 //! two mail configurations is how one of them goes stale. See [`health`] and
-//! `docs/node-health-alerts.md`.
+//! `docs/alerts-node-health.md`.
 //!
 //! # A note on names
 //!
 //! The crate is `rustock-alerts`; it was `rustock-pegout-alerts` until the
 //! health alarms arrived and outgrew the name. The **configuration** keeps its
 //! old names on purpose -- the file is still `[pegout_alerts]` and the flag is
-//! still `--pegout-alerts-config` -- because those are deployed. A rename that
+//! still `--alerts-config` -- because those are deployed. A rename that
 //! stops a running node from reading its own configuration is not a tidying.
 //! `--alerts-config` is accepted as an alias so a deployment can migrate when
 //! it suits.

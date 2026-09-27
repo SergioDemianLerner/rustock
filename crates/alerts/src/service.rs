@@ -133,10 +133,10 @@ impl Watcher {
         self.config_seen_mtime = Some(mtime);
 
         let new = match crate::config::Config::load(&path) {
-            Ok(c) => c.pegout_alerts,
+            Ok(c) => c.alerts.pegout,
             Err(e) => {
                 tracing::error!(
-                    target: "rustock::pegout_alerts",
+                    target: "rustock::alerts::pegout",
                     "{} changed but does not load; keeping the running configuration: {e:#}",
                     path.display()
                 );
@@ -147,7 +147,7 @@ impl Watcher {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(
-                    target: "rustock::pegout_alerts",
+                    target: "rustock::alerts::pegout",
                     "{} changed but is unusable; keeping the running configuration: {e:#}",
                     path.display()
                 );
@@ -158,14 +158,14 @@ impl Watcher {
         let (live, restart) = self.cfg.describe_changes(&new);
         if live.is_empty() && restart.is_empty() {
             tracing::info!(
-                target: "rustock::pegout_alerts",
+                target: "rustock::alerts::pegout",
                 "{} changed but no setting differs", path.display()
             );
             return;
         }
         for change in &restart {
             tracing::warn!(
-                target: "rustock::pegout_alerts",
+                target: "rustock::alerts::pegout",
                 "{} changed {change}, which needs a node restart to take effect",
                 path.display()
             );
@@ -174,7 +174,7 @@ impl Watcher {
             self.cfg.adopt_live(&new);
             self.change_scripts = scripts;
             tracing::info!(
-                target: "rustock::pegout_alerts",
+                target: "rustock::alerts::pegout",
                 "reloaded {}: {}", path.display(), live.join(", ")
             );
         }
@@ -184,7 +184,7 @@ impl Watcher {
     /// exits on a transient read failure is worse than one that retries.
     pub async fn run(mut self) {
         tracing::info!(
-            target: "rustock::pegout_alerts",
+            target: "rustock::alerts::pegout",
             "peg-out watcher started at #{}, thresholds: pegout {} BTC, output {} BTC, in transit {} BTC, {} confirmations",
             self.next_block, self.cfg.pegout_alert_btc, self.cfg.output_alert_btc,
             self.cfg.in_transit_alert_btc, self.cfg.confirmations
@@ -195,7 +195,7 @@ impl Watcher {
             self.reload_config_if_changed();
             self.drain_inbox();
             if let Err(e) = self.sweep() {
-                tracing::warn!(target: "rustock::pegout_alerts", "sweep failed, will retry: {e:#}");
+                tracing::warn!(target: "rustock::alerts::pegout", "sweep failed, will retry: {e:#}");
             }
             self.report_in_transit_if_due();
         }
@@ -216,7 +216,7 @@ impl Watcher {
         // cache:", and a line that starts with its own value cannot be grepped
         // for without knowing the value first.
         tracing::info!(
-            target: "rustock::pegout_alerts",
+            target: "rustock::alerts::pegout",
             "Peg-out transit: {} BTC across {} transaction(s) at #{number} \
              ({} waiting, {} confirmations to clear) [{why}]",
             crate::config::sats_to_btc_string(total_sats),
@@ -253,7 +253,7 @@ impl Watcher {
             Ok(None) => return,
             Err(e) => {
                 tracing::warn!(
-                    target: "rustock::pegout_alerts",
+                    target: "rustock::alerts::pegout",
                     "in-transit report: reading the head: {e:#}"
                 );
                 return;
@@ -264,7 +264,7 @@ impl Watcher {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
-                    target: "rustock::pegout_alerts",
+                    target: "rustock::alerts::pegout",
                     "in-transit report: reading Bridge state at #{number}: {e:#}"
                 );
                 return;
@@ -303,7 +303,7 @@ impl Watcher {
             let n = self.next_block;
             if let Err(e) = self.process_block(n) {
                 // Do not advance past a block we failed to read: retry it.
-                tracing::warn!(target: "rustock::pegout_alerts", "block #{n}: {e:#}");
+                tracing::warn!(target: "rustock::alerts::pegout", "block #{n}: {e:#}");
                 return Ok(());
             }
             self.next_block = n + 1;
@@ -334,7 +334,7 @@ impl Watcher {
                     .and_then(|t| names.iter().find(|(topic, _)| topic == t))
                 {
                     tracing::info!(
-                        target: "rustock::pegout_alerts",
+                        target: "rustock::alerts::pegout",
                         block = number, event = name, topics = log.topics.len(),
                         data = %hex::encode(&log.data),
                         "peg-out event"
@@ -349,7 +349,7 @@ impl Watcher {
         let pegouts = watch::pegouts_in_receipts(&receipts, &bridge);
         for p in &pegouts {
             tracing::info!(
-                target: "rustock::pegout_alerts",
+                target: "rustock::alerts::pegout",
                 block = number,
                 // Both: sats is what the event carries and what a script wants;
                 // BTC is what a person reads. `release_requested`'s data field
@@ -382,7 +382,7 @@ impl Watcher {
                     // moment the number goes up and is worth knowing about.
                     let (total, alert) = watch::check_in_transit(number, &in_transit, &self.cfg);
                     tracing::debug!(
-                        target: "rustock::pegout_alerts",
+                        target: "rustock::alerts::pegout",
                         block = number, in_transit_sats = total,
                         waiting_txs = waiting_txs.len(), "bridge peg-out state"
                     );
@@ -404,7 +404,7 @@ impl Watcher {
                     }
                 }
                 Err(e) => tracing::warn!(
-                    target: "rustock::pegout_alerts",
+                    target: "rustock::alerts::pegout",
                     "block #{number}: reading Bridge state: {e:#}"
                 ),
             }
@@ -424,7 +424,7 @@ impl Watcher {
         for sink in &self.sinks {
             if let Err(e) = sink.deliver(&alert) {
                 tracing::error!(
-                    target: "rustock::pegout_alerts",
+                    target: "rustock::alerts::pegout",
                     "sink {} failed to deliver {:?}: {e:#}", sink.name(), alert.subject()
                 );
             }

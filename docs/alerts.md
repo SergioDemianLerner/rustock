@@ -4,10 +4,10 @@ Watches the two-way peg and reports movements above configurable thresholds.
 Off unless configured.
 
 ```
-rustock --pegout-alerts-config ./pegout-alerts.toml ...
+rustock --alerts-config ./pegout-alerts.toml ...
 ```
 
-See [`pegout-alerts.example.toml`](../pegout-alerts.example.toml) for a
+See [`alerts.example.toml`](../alerts.example.toml) for a
 commented file.
 
 ## What it watches
@@ -107,8 +107,8 @@ that keeps watching with the previous thresholds.
 What is logged on a successful reload:
 
 ```
-INFO reloaded /etc/rustock/pegout-alerts.toml: pegout_alert_btc: 100 -> 0.01
-WARN /etc/rustock/pegout-alerts.toml changed email.to: a@b -> c@d, which needs a node restart to take effect
+INFO reloaded /etc/rustock/alerts.toml: pegout_alert_btc: 100 -> 0.01
+WARN /etc/rustock/alerts.toml changed email.to: a@b -> c@d, which needs a node restart to take effect
 ```
 
 ## Credentials
@@ -119,13 +119,13 @@ mode 0600 and refer to them as `${NAME}`:
 
 ```toml
 [pegout_alerts.email]
-env_file = "/etc/rustock/pegout-alerts.env"
+env_file = "/etc/rustock/alerts.env"
 username = "${SMTP_USER}"
 password = "${SMTP_PASSWORD}"
 ```
 
 ```
-# /etc/rustock/pegout-alerts.env, chmod 600
+# /etc/rustock/alerts.env, chmod 600
 SMTP_USER=...
 SMTP_PASSWORD=...
 ```
@@ -146,7 +146,7 @@ Two refusals, both deliberate:
 Validate before restarting the node, without sending anything:
 
 ```
-cargo run --release -p rustock-cli --example check_alerts_config -- /etc/rustock/pegout-alerts.toml
+cargo run --release -p rustock-cli --example check_alerts_config -- /etc/rustock/alerts.toml
 ```
 
 It reports whether each secret resolved and its length — never its value.

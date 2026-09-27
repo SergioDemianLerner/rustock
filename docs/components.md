@@ -345,7 +345,7 @@ recovery does **not** clear the cooldown, because a flapping node is exactly
 where per-occurrence mail is useless. The "behind" alarm additionally stays
 disarmed until the node has been in sync once, so a resync after a restart —
 behind by design, for hours — is not reported as a fault.
-See [docs/node-health-alerts.md](node-health-alerts.md).
+See [docs/alerts-node-health.md](alerts-node-health.md).
 
 ## JSON-RPC surface *(extended: 2,900 → 8,100 lines)*
 

@@ -449,14 +449,17 @@ struct Args {
     #[arg(long)]
     import_auto_compaction: bool,
 
-    /// Path to a TOML configuration file for peg-out monitoring and alerting.
+    /// Path to the alerting configuration: peg-out monitoring and node health.
     ///
-    /// Entirely optional: without it no watcher runs and nothing changes. The
-    /// watcher only reads blocks, receipts and Bridge state the node has
-    /// already committed, so it cannot affect consensus or block processing.
-    /// See `docs/pegout-alerts.md` and `pegout-alerts.example.toml`.
-    #[arg(long, alias = "alerts-config")]
-    pegout_alerts_config: Option<String>,
+    /// Entirely optional: without it nothing watches and nothing changes. The
+    /// watchers only read what the node has already committed, so they cannot
+    /// affect consensus or block processing. See `docs/alerts.md` and
+    /// `alerts.example.toml`.
+    ///
+    /// `--pegout-alerts-config` is accepted as an alias, for deployments
+    /// written before this file covered more than peg-outs.
+    #[arg(long, alias = "pegout-alerts-config")]
+    alerts_config: Option<String>,
 
     /// Background flush/compaction threads during import. 0 uses the CPU count.
     #[arg(long, default_value_t = 0)]
@@ -859,8 +862,8 @@ fn apply_file_config(
     apply(matches, "log_to_stdout", f.log.to_stdout.as_ref(), &mut a.log_to_stdout);
     apply(matches, "log_timezone", f.log.timezone.as_ref(), &mut a.log_timezone);
 
-    apply_opt(matches, "pegout_alerts_config", f.alerts.pegout_alerts_config.as_ref(),
-        &mut a.pegout_alerts_config);
+    apply_opt(matches, "alerts_config", f.alerts.alerts_config.as_ref(),
+        &mut a.alerts_config);
 }
 
 /// Parse `--log-timezone` into a UTC offset.
@@ -1836,7 +1839,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     // Node health alarms share the alert configuration file and its mail
     // transport, because an operator wanting one wants the other and two mail
     // configurations is how one of them goes stale.
-    if let Some(path) = &args.pegout_alerts_config {
+    if let Some(path) = &args.alerts_config {
         match start_health_alerts(path, store.clone(), peer_store.clone()) {
             Ok(true) => info!("Node health alarms started from {path}"),
             Ok(false) => info!("Node health alarms configured but disabled in {path}"),
@@ -1844,7 +1847,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         }
     }
 
-    if let Some(path) = &args.pegout_alerts_config {
+    if let Some(path) = &args.alerts_config {
         match start_pegout_alerts(path, store.clone(), trie_store_for_pool.clone()) {
             Ok(Some(handle)) => {
                 info!("Peg-out alert watcher started from {path}");
@@ -2434,21 +2437,22 @@ fn start_pegout_alerts(
     use rustock_alerts::{AlertSink, Config, LogSink, Watcher};
 
     let config = Config::load(path)?;
-    let cfg = config.pegout_alerts;
+    let email = config.alerts.email;
+    let cfg = config.alerts.pegout;
     if !cfg.enabled {
         return Ok(None);
     }
 
     // The log sink is always present, so the record exists even if mail fails.
     let mut sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(LogSink)];
-    if cfg.email.enabled {
+    if email.enabled {
         #[cfg(feature = "smtp")]
-        sinks.push(Box::new(rustock_alerts::SmtpSink::new(&cfg.email)?));
+        sinks.push(Box::new(rustock_alerts::SmtpSink::new(&email)?));
         #[cfg(not(feature = "smtp"))]
         return Err(rustock_alerts::sink::smtp_unavailable());
         info!(
             "Peg-out alerts will be emailed to {} via {}:{}",
-            cfg.email.to.join(", "), cfg.email.smtp_host, cfg.email.smtp_port
+            email.to.join(", "), email.smtp_host, email.smtp_port
         );
     } else {
         info!("Peg-out alerts will be logged only (email disabled)");
@@ -2892,7 +2896,7 @@ fn start_health_alerts(
     use rustock_alerts::{AlertSink, Config, LogSink};
 
     let config = Config::load(path)?;
-    let health = config.node_health;
+    let health = config.alerts.node_health;
     if !health.enabled {
         return Ok(false);
     }
@@ -2901,7 +2905,7 @@ fn start_health_alerts(
     // The log sink is always present, so the record exists even if mail fails.
     // Mail reuses the peg-out transport: one configuration, one credential.
     let mut sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(LogSink)];
-    let email = config.pegout_alerts.email;
+    let email = config.alerts.email;
     if email.enabled {
         #[cfg(feature = "smtp")]
         sinks.push(Box::new(rustock_alerts::SmtpSink::new(&email)?));

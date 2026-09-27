@@ -601,13 +601,13 @@ pub async fn run(
 
         for alert in monitor.observe(sample, Instant::now()) {
             tracing::warn!(
-                target: "rustock::health",
+                target: "rustock::alerts::health",
                 "node health alert: {}", alert.subject()
             );
             for sink in sinks.iter() {
                 if let Err(e) = sink.deliver(&alert) {
                     tracing::error!(
-                        target: "rustock::health",
+                        target: "rustock::alerts::health",
                         "sink {} could not deliver {:?}: {e:#}", sink.name(), alert.subject()
                     );
                 }

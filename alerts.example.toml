@@ -1,13 +1,62 @@
-# Peg-out monitoring and alerting.
+# Alerting for a rustock node.
 #
-#   rustock --pegout-alerts-config ./pegout-alerts.toml ...
+#   rustock --alerts-config /etc/rustock/alerts.toml ...
 #
-# Entirely optional. The watcher reads blocks, receipts and Bridge state the
-# node has already committed; it is not wired into execution or sync, so it
-# cannot affect consensus or slow block processing. If the mail server is
-# unreachable the node does not notice.
+# One file, one mail transport, one section per kind of alert. Adding a kind
+# means adding a section here, not a second file with a second credential that
+# drifts out of date.
+#
+# Entirely optional, and entirely an observer. Nothing here is wired into
+# execution or sync, so it cannot affect consensus or slow block processing.
+# If the mail server is unreachable the node does not notice.
 
-[pegout_alerts]
+[alerts.email]
+# Until this is true, alerts are logged and nothing is sent.
+enabled = false
+
+# Secrets do NOT belong in this file. Put them in a root-owned file with mode
+# 0600 and refer to them below as ${NAME}; they are resolved at startup and
+# never logged. The node refuses to start the watcher if this file is readable
+# by group or others.
+#
+#   /etc/rustock/alerts.env
+#     SMTP_USER=...
+#     SMTP_PASSWORD=...
+#
+# env_file = "/etc/rustock/alerts.env"
+
+to = ["you@example.com"]
+from = "rustock-node@example.com"
+
+smtp_host = "smtp.example.com"
+smtp_port = 587
+
+# username = "${SMTP_USER}"
+# password = "${SMTP_PASSWORD}"
+
+# none | starttls | implicit
+tls = "starttls"
+
+# Prefix subjects with "[rustock peg-out] " so they filter easily.
+subject_prefix_enabled = true
+
+# ── Node health alarms ───────────────────────────────────────────────────────
+#
+# Three conditions, each of which means the node is not doing its job:
+#
+#   1. stalled      -- the executed head has not moved
+#   2. behind       -- the best peer is more than `block_gap` blocks ahead
+#   3. ahead        -- this node is more than `block_gap` ahead of EVERY peer
+#
+# Condition 3 is not a humblebrag. Being ahead of the whole network means
+# either that this node is following a chain the network rejected, or that all
+# of its peers are stale and it is effectively blind. Both look like health
+# from inside.
+#
+# Mail goes through the [alerts.email] transport above: one
+# configuration, one credential.
+
+[alerts.pegout]
 enabled = true
 
 # How often to look for newly executed blocks.
@@ -51,53 +100,7 @@ federation_change_scripts = [
   # "a914...87",
 ]
 
-[pegout_alerts.email]
-# Until this is true, alerts are logged and nothing is sent.
-enabled = false
-
-# Secrets do NOT belong in this file. Put them in a root-owned file with mode
-# 0600 and refer to them below as ${NAME}; they are resolved at startup and
-# never logged. The node refuses to start the watcher if this file is readable
-# by group or others.
-#
-#   /etc/rustock/pegout-alerts.env
-#     SMTP_USER=...
-#     SMTP_PASSWORD=...
-#
-# env_file = "/etc/rustock/pegout-alerts.env"
-
-to = ["you@example.com"]
-from = "rustock-node@example.com"
-
-smtp_host = "smtp.example.com"
-smtp_port = 587
-
-# username = "${SMTP_USER}"
-# password = "${SMTP_PASSWORD}"
-
-# none | starttls | implicit
-tls = "starttls"
-
-# Prefix subjects with "[rustock peg-out] " so they filter easily.
-subject_prefix_enabled = true
-
-# ── Node health alarms ───────────────────────────────────────────────────────
-#
-# Three conditions, each of which means the node is not doing its job:
-#
-#   1. stalled      -- the executed head has not moved
-#   2. behind       -- the best peer is more than `block_gap` blocks ahead
-#   3. ahead        -- this node is more than `block_gap` ahead of EVERY peer
-#
-# Condition 3 is not a humblebrag. Being ahead of the whole network means
-# either that this node is following a chain the network rejected, or that all
-# of its peers are stale and it is effectively blind. Both look like health
-# from inside.
-#
-# Mail goes through the [pegout_alerts.email] transport above: one
-# configuration, one credential.
-
-[node_health]
+[alerts.node_health]
 enabled = false
 
 # How often to take a reading. Must not exceed for_secs, or a condition could
