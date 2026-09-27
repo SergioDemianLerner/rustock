@@ -4529,6 +4529,70 @@ async fn net_hashrate_counts_uncle_difficulty_and_answers_with_a_number() {
     assert_eq!(value.as_u64().unwrap(), 2_500_000 / 3600);
 }
 
+/// **A non-mining node answering zero is rskj's answer, not a placeholder.**
+/// `HashRateCalculatorNonMining.calculateNodeHashRate` returns
+/// `BigInteger.ZERO`, so this is correct rather than unimplemented. See #176.
+#[tokio::test]
+async fn hashrate_is_zero_without_a_miner_and_counts_only_our_blocks_with_one() {
+    use alloy_primitives::Address;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let ours = Address::repeat_byte(0xAA);
+    let theirs = Address::repeat_byte(0xBB);
+
+    // Two blocks in the window: one mined by us, one by somebody else.
+    let mut parent = B256::ZERO;
+    for (number, miner) in [(0u64, theirs), (1u64, ours)] {
+        let header = Header {
+            parent_hash: parent,
+            timestamp: now - 60 + number,
+            difficulty: U256::from(3_600_000u64),
+            beneficiary: miner,
+            ..test_header(number)
+        };
+        store.put_header(&header).unwrap();
+        store.put_canonical_hash(number, header.hash()).unwrap();
+        store.put_total_difficulty(header.hash(), U256::from(1u64)).unwrap();
+        store.put_body(header.hash(), &[], &[]).unwrap();
+        store.set_head(header.hash()).unwrap();
+        parent = header.hash();
+    }
+
+    let (mut state, _t) = setup_state();
+    state.store = store;
+
+    // No miner configured: zero, and as a hex string rather than the number
+    // eth_netHashrate answers with -- the two disagree upstream and here.
+    let resp = dispatch_for_test(&state, make_request("eth_hashrate", json!([]))).await;
+    assert_eq!(resp.result.unwrap(), json!("0x0"));
+
+    // The network figure counts both blocks whatever the miner.
+    let net = dispatch_for_test(&state, make_request("eth_netHashrate", json!([]))).await;
+    assert_eq!(
+        net.result.unwrap().as_u64().unwrap(),
+        7_200_000 / 3600,
+        "the network figure counts every block in the window"
+    );
+
+    // With our coinbase, only the block we mined counts.
+    let mine = crate::eth::eth_hashrate_for(json!(1), &state.store, Some(ours));
+    assert_eq!(
+        mine.result.unwrap(),
+        json!(format!("0x{:x}", 3_600_000u64 / 3600)),
+        "only blocks paying our coinbase are ours"
+    );
+
+    // A coinbase that mined nothing in the window earns nothing.
+    let none = crate::eth::eth_hashrate_for(json!(1), &state.store, Some(Address::repeat_byte(0xCC)));
+    assert_eq!(none.result.unwrap(), json!("0x0"));
+}
+
 /// Administrative methods are reported as unknown rather than forbidden, so a
 /// node without them looks the same as one that never had them.
 #[tokio::test]
