@@ -397,3 +397,4 @@ mod tests {
         assert_eq!(parse_b256("not_a_hash"), None);
     }
 }
+
