@@ -7,10 +7,15 @@ fn dummy_header(number: u64, parent: B256, difficulty: U256) -> Header {
     Header {
         number,
         parent_hash: parent,
-        ommers_hash: B256::ZERO,
+        // The real empty-body commitments, not zeroes. Bodies are now checked
+        // against the header at receipt (#114), so a header claiming
+        // `B256::ZERO` describes a body no peer could ever supply -- and a
+        // fixture that cannot be satisfied tests the rejection path by
+        // accident rather than whatever the test meant.
+        ommers_hash: rustock_execution::processor::compute_ommers_hash(&[]),
         beneficiary: Address::ZERO,
         state_root: B256::ZERO,
-        transactions_root: B256::ZERO,
+        transactions_root: rustock_core::ordered_tx_trie_root(&[], true),
         receipts_root: B256::ZERO,
         logs_bloom: Default::default(),
         extension_data: None,
@@ -1008,7 +1013,7 @@ async fn test_skeleton_round_transitions_to_next_skeleton() {
     if let SyncState::DownloadingBodies { id_index, .. } = &service.state {
         let req_ids: Vec<u64> = id_index.keys().copied().collect();
         for req_id in req_ids {
-            service.on_body_response(req_id, vec![], vec![]).await;
+            service.on_body_response(B512::repeat_byte(9), req_id, vec![], vec![]).await;
         }
     }
 
@@ -1021,6 +1026,176 @@ async fn test_skeleton_round_transitions_to_next_skeleton() {
     }
 
     drop(event_tx);
+}
+
+/// How many times `event` has been recorded against `peer`.
+///
+/// Read through `information()`, the same view `sco_reputationSummary` serves,
+/// rather than a test-only accessor -- if the counter is not visible there it
+/// is not visible to an operator either.
+fn scored(
+    scoring: &rustock_networking::scoring::ScoringService,
+    peer: B512,
+    event: rustock_networking::scoring::EventType,
+) -> u32 {
+    let label: String =
+        peer.as_slice().iter().take(4).map(|b| format!("{b:02x}")).collect();
+    scoring.with(|m| {
+        m.information()
+            .into_iter()
+            .find(|e| e.id == label && e.kind == "node")
+            .and_then(|e| {
+                e.counters
+                    .iter()
+                    .find(|(n, _)| *n == event.report_name())
+                    .map(|(_, c)| *c)
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// **A body that does not match its header is charged to whoever sent it.**
+///
+/// Receipt is the only moment the sender is unambiguous -- by execution time
+/// the block has been through a store and a buffer. Two hashes settle it, and
+/// the request must stay in flight so the retry asks somebody else rather than
+/// the block being stranded. See #114.
+#[tokio::test]
+async fn a_body_that_does_not_match_its_header_is_charged_and_refetched() {
+    use rustock_networking::scoring::{EventType, ScoringService};
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+
+    let scoring = Arc::new(ScoringService::in_memory());
+    let mut service = make_service(store.clone());
+    service = service.with_scoring(Some(scoring.clone()));
+
+    let peer = B512::repeat_byte(0x01);
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    service.peer_store_for_test().add_peer(peer, tx).await;
+
+    let mut in_flight = std::collections::HashMap::new();
+    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now(), peer });
+    let mut id_index = std::collections::HashMap::new();
+    id_index.insert(7u64, 0usize);
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 10,
+        pending_headers: vec![(b1.hash(), b1.clone())],
+        next_request: 1,
+        in_flight,
+        id_index,
+    };
+
+    // b1's header commits to an empty body. Send an uncle it never had.
+    let bogus_uncle = dummy_header(0, B256::repeat_byte(0xEE), U256::from(1));
+    service
+        .on_body_response(peer, 7, vec![], vec![bogus_uncle])
+        .await;
+
+    assert_eq!(
+        scored(&scoring, peer, EventType::InvalidBlock),
+        1,
+        "the sender must be charged for a body that is not the header's"
+    );
+    assert!(
+        store.body(b1.hash()).unwrap().is_none(),
+        "a mismatched body must not be stored"
+    );
+    match &service.state {
+        SyncState::DownloadingBodies { in_flight, id_index, .. } => {
+            assert_eq!(in_flight.len(), 1, "the request must stay in flight for retry");
+            assert!(id_index.contains_key(&7), "and stay routable by its id");
+        }
+        other => panic!("expected DownloadingBodies, got {other:?}"),
+    }
+}
+
+/// The matching case: a correct body is accepted, stored, and its supplier
+/// remembered so the credit can be paid when the block executes.
+#[tokio::test]
+async fn a_matching_body_is_stored_and_its_supplier_remembered() {
+    use rustock_networking::scoring::{EventType, ScoringService};
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+
+    let scoring = Arc::new(ScoringService::in_memory());
+    let mut service = make_service(store.clone());
+    service = service.with_scoring(Some(scoring.clone()));
+
+    let peer = B512::repeat_byte(0x02);
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    service.peer_store_for_test().add_peer(peer, tx).await;
+
+    let mut in_flight = std::collections::HashMap::new();
+    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now(), peer });
+    let mut id_index = std::collections::HashMap::new();
+    id_index.insert(7u64, 0usize);
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 10,
+        pending_headers: vec![(b1.hash(), b1.clone())],
+        next_request: 1,
+        in_flight,
+        id_index,
+    };
+
+    service.on_body_response(peer, 7, vec![], vec![]).await;
+
+    assert_eq!(
+        scored(&scoring, peer, EventType::InvalidBlock),
+        0,
+        "a correct body is not a fault"
+    );
+    assert_eq!(
+        service.body_providers.get(&1).copied(),
+        Some(peer),
+        "the supplier must survive receipt, or no credit can be paid later"
+    );
+
+    // Nothing is credited until a block actually executes -- copying a body
+    // correctly is not evidence that it is a real block.
+    assert_eq!(scored(&scoring, peer, EventType::ValidBlock), 0);
+    service.credit_executed_bodies(1);
+    assert_eq!(
+        scored(&scoring, peer, EventType::ValidBlock),
+        1,
+        "executing to the header's state root is what earns the credit"
+    );
+    assert!(
+        service.body_providers.is_empty(),
+        "a credited block must not be credited twice"
+    );
+}
+
+/// Provenance cannot grow without bound. A halt strands entries above the
+/// executed head that will never be credited, and nothing else prunes them.
+#[tokio::test]
+async fn stranded_provenance_is_bounded() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let mut service = make_service(store);
+
+    for n in 0..25_000u64 {
+        service.body_providers.insert(n, B512::repeat_byte(1));
+    }
+    // Credit nothing: every entry is above the executed head.
+    service.credit_executed_bodies(0);
+    assert!(
+        service.body_providers.len() <= 20_000,
+        "stranded provenance must be capped, got {}",
+        service.body_providers.len()
+    );
 }
 
 #[tokio::test]
@@ -1063,7 +1238,7 @@ async fn test_failed_body_send_stays_tracked_for_retry() {
     // send fails (dead peer). The request must stay tracked so the stalled
     // retry re-attempts it — dropping it would orphan b2 forever and the
     // batch could never complete.
-    service.on_body_response(7, vec![], vec![]).await;
+    service.on_body_response(B512::repeat_byte(9), 7, vec![], vec![]).await;
 
     match &service.state {
         SyncState::DownloadingBodies { in_flight, .. } => {
@@ -1272,7 +1447,7 @@ async fn test_late_body_response_on_superseded_id_still_applies() {
     assert_ne!(new_id, 7, "retry must issue a fresh request id");
 
     // Late response on the SUPERSEDED id 7 must still store b1.
-    service.on_body_response(7, vec![], vec![]).await;
+    service.on_body_response(B512::repeat_byte(9), 7, vec![], vec![]).await;
     assert!(
         store.body(b1.hash()).unwrap().is_some(),
         "late response on a superseded id must still apply its body"
@@ -1287,7 +1462,7 @@ async fn test_late_body_response_on_superseded_id_still_applies() {
 
     // Duplicate: the retried id now arrives too — must be ignored, no panic,
     // batch state unchanged (b2 still the only thing outstanding).
-    service.on_body_response(new_id, vec![], vec![]).await;
+    service.on_body_response(B512::repeat_byte(9), new_id, vec![], vec![]).await;
     match &service.state {
         SyncState::DownloadingBodies { in_flight, .. } => {
             assert!(!in_flight.contains_key(&0));
@@ -1973,7 +2148,7 @@ async fn test_follow_mode_buffers_out_of_order_body() {
     // Body for #102 arrives while #101 is still missing.
     let req_id = 42u64;
     service.pending_follow_bodies.insert(req_id, (h102_hash, h102, std::time::Instant::now()));
-    service.on_body_response(req_id, vec![], vec![]).await;
+    service.on_body_response(B512::repeat_byte(9), req_id, vec![], vec![]).await;
 
     // #102 must remain buffered (parent #101 is not our head), not executed.
     assert!(service.follow_buffer.contains_key(&102),
@@ -3373,7 +3548,7 @@ async fn test_body_download_state_machine() {
     // Simulate receiving the body response
     if let SyncState::DownloadingBodies { id_index, .. } = &service.state {
         let req_id = *id_index.keys().next().unwrap();
-        service.on_body_response(req_id, vec![], vec![]).await;
+        service.on_body_response(B512::repeat_byte(9), req_id, vec![], vec![]).await;
     }
 
     assert!(matches!(service.state, SyncState::Following),

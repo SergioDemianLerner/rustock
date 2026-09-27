@@ -275,11 +275,12 @@ Rustock executes blocks and maintains full state, but it is not yet feature-comp
   transaction's block from its parent's state, so they answer only within the
   GC burial depth (4,000 blocks by default) and return an error past it.
   `trace_filter` recomputes rather than reading an index, as rskj does.
-- **Peer scoring does not yet see block validity.** Handshakes,
-  disconnections, timeouts, invalid headers and transaction-pool rejections
-  all feed the scoring table; `VALID_BLOCK` and `INVALID_BLOCK` do not,
-  because rustock does not carry the supplying peer through to where blocks
-  are validated. See [docs/peer-scoring.md](docs/peer-scoring.md).
+- **Peer scoring credits blocks on execution, not on arrival.** A body is
+  checked against its header the moment it arrives — the only moment the
+  sender is unambiguous — and a mismatch is charged as `INVALID_BLOCK` and
+  re-fetched from somebody else. `VALID_BLOCK` waits until the block executes
+  to the state root its header claims, which is stricter than rskj, whose
+  credit comes from validation. See [docs/peer-scoring.md](docs/peer-scoring.md).
 - **No wallet / account management.** `eth_sendTransaction`, `eth_sign`, and the `personal_*` namespace are intentionally not supported — sign transactions externally and submit them via `eth_sendRawTransaction`.
 
 ## License
