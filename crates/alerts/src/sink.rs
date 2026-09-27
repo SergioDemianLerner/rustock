@@ -6,6 +6,10 @@
 //! outage drops alerts rather than growing without limit.
 
 use crate::alert::Alert;
+// Only the SMTP sink names this type, so the import is feature-gated: without
+// it the default build warns, and removing it outright breaks the build that
+// actually sends mail. The plain `cargo check` cannot see either problem.
+#[cfg(feature = "smtp")]
 use crate::config::EmailConfig;
 #[cfg(feature = "smtp")]
 use crate::config::TlsMode;
@@ -24,8 +28,8 @@ pub struct LogSink;
 
 impl AlertSink for LogSink {
     fn deliver(&self, alert: &Alert) -> anyhow::Result<()> {
-        tracing::warn!(target: "rustock::pegout_alerts", "ALERT: {}", alert.subject());
-        tracing::info!(target: "rustock::pegout_alerts", "{}", alert.body());
+        tracing::warn!(target: "rustock::alerts::pegout", "ALERT: {}", alert.subject());
+        tracing::info!(target: "rustock::alerts::pegout", "{}", alert.body());
         Ok(())
     }
     fn name(&self) -> &'static str { "log" }

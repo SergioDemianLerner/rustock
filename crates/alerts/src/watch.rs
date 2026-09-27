@@ -81,7 +81,7 @@ pub fn parse_waiting_txs(raw: impl IntoIterator<Item = Vec<u8>>) -> Vec<WaitingT
     for bytes in raw {
         let mut slice = bytes.as_slice();
         let Ok(tx) = bitcoin::Transaction::consensus_decode(&mut slice) else {
-            tracing::warn!(target: "rustock::pegout_alerts", "skipping unparseable peg-out transaction");
+            tracing::warn!(target: "rustock::alerts::pegout", "skipping unparseable peg-out transaction");
             continue;
         };
         out.push(WaitingTx {

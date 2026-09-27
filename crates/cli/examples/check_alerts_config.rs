@@ -7,7 +7,9 @@
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args().nth(1).expect("usage: check_alerts_config <config.toml>");
-    let cfg = rustock_pegout_alerts::Config::load(&path)?.pegout_alerts;
+    let all = rustock_alerts::Config::load(&path)?.alerts;
+    let cfg = &all.pegout;
+    let health = &all.node_health;
 
     println!("configuration {path} is valid\n");
     println!("  enabled              {}", cfg.enabled);
@@ -18,11 +20,17 @@ fn main() -> anyhow::Result<()> {
     println!("  confirmations        {}", cfg.confirmations);
     println!("  change scripts       {}", cfg.federation_change_scripts.len());
 
-    println!("\n  email                {}", if cfg.email.enabled { "enabled" } else { "disabled (log only)" });
-    if cfg.email.enabled {
-        println!("  smtp                 {}:{} ({:?})", cfg.email.smtp_host, cfg.email.smtp_port, cfg.email.tls);
-        println!("  from                 {}", cfg.email.from);
-        println!("  to                   {}", cfg.email.to.join(", "));
+    println!("\n  node health          {}", if health.enabled { "enabled" } else { "disabled" });
+    if health.enabled {
+        println!("    gap                {} blocks", health.block_gap);
+        println!("    sustained for      {}s", health.for_secs);
+        println!("    cooldown           {}s", health.cooldown_secs);
+    }
+    println!("\n  email                {}", if all.email.enabled { "enabled" } else { "disabled (log only)" });
+    if all.email.enabled {
+        println!("  smtp                 {}:{} ({:?})", all.email.smtp_host, all.email.smtp_port, all.email.tls);
+        println!("  from                 {}", all.email.from);
+        println!("  to                   {}", all.email.to.join(", "));
         // Report resolution without disclosing the value.
         let shown = |o: &Option<String>| match o {
             Some(v) if v.is_empty() => "resolved but EMPTY".to_string(),
@@ -30,11 +38,11 @@ fn main() -> anyhow::Result<()> {
             Some(v) => format!("resolved, {} chars", v.len()),
             None => "not set".to_string(),
         };
-        println!("  username             {}", shown(&cfg.email.username));
-        println!("  password             {}", shown(&cfg.email.password));
+        println!("  username             {}", shown(&all.email.username));
+        println!("  password             {}", shown(&all.email.password));
         #[cfg(feature = "smtp")]
         {
-            rustock_pegout_alerts::SmtpSink::new(&cfg.email)?;
+            rustock_alerts::SmtpSink::new(&all.email)?;
             println!("\n  SMTP transport builds. No mail was sent.");
         }
         #[cfg(not(feature = "smtp"))]

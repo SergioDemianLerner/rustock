@@ -23,9 +23,140 @@ fn default_smtp_port() -> u16 { 587 }
 fn default_queue() -> usize { 256 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
-    pub pegout_alerts: PegoutAlerts,
+    pub alerts: Alerts,
+}
+
+/// Everything this node alerts about, and the one transport it alerts through.
+///
+/// Shaped so a third kind of alert is a new section rather than a second file:
+/// `[alerts.email]` is the shared delivery, and each `[alerts.<kind>]` decides
+/// what to watch. One transport means one credential, which is one thing to
+/// keep current instead of several that drift.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Alerts {
+    /// How alerts are delivered. Shared by every kind below.
+    #[serde(default)]
+    pub email: EmailConfig,
+    /// Peg-outs above a threshold, and the value in transit.
+    #[serde(default)]
+    pub pegout: PegoutAlerts,
+    /// Stalled, behind the network, or ahead of every peer.
+    #[serde(default)]
+    pub node_health: NodeHealth,
+}
+
+fn default_health_gap() -> u64 { 10 }
+fn default_health_for_secs() -> u64 { 600 }
+fn default_health_cooldown_secs() -> u64 { 86_400 }
+fn default_health_poll_secs() -> u64 { 30 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeHealth {
+    /// Off by default, like every other alerting surface here.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often to take a reading. Well below `for_secs`, or a condition
+    /// could come and go between polls unseen.
+    #[serde(default = "default_health_poll_secs")]
+    pub poll_interval_secs: u64,
+    /// Blocks of difference before "behind" or "ahead" is true at all.
+    #[serde(default = "default_health_gap")]
+    pub block_gap: u64,
+    /// How long a condition must hold continuously before it is reported.
+    #[serde(default = "default_health_for_secs")]
+    pub for_secs: u64,
+    /// How long that alarm stays quiet after firing. Not reset by recovery.
+    #[serde(default = "default_health_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+impl Default for NodeHealth {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_secs: default_health_poll_secs(),
+            block_gap: default_health_gap(),
+            for_secs: default_health_for_secs(),
+            cooldown_secs: default_health_cooldown_secs(),
+        }
+    }
+}
+
+impl Alerts {
+    /// Reject a transport that cannot deliver, at startup rather than at the
+    /// moment an alert needs to go out.
+    pub fn validate_email(&self) -> anyhow::Result<()> {
+        if !self.email.enabled {
+            return Ok(());
+        }
+        if self.email.to.is_empty() {
+            anyhow::bail!("alerts.email.enabled is true but `to` is empty");
+        }
+        if self.email.from.trim().is_empty() {
+            anyhow::bail!("alerts.email.enabled is true but `from` is empty");
+        }
+        if self.email.smtp_host.trim().is_empty() {
+            anyhow::bail!("alerts.email.enabled is true but `smtp_host` is empty");
+        }
+        Ok(())
+    }
+
+    /// Load the referenced env file and expand every `${NAME}` in the email
+    /// section. Runs before validation, so a reference resolving to an empty
+    /// string is caught as a missing setting rather than as a working one.
+    pub fn resolve_secrets(&mut self) -> anyhow::Result<()> {
+        let vars = match &self.email.env_file {
+            Some(p) => read_env_file(Path::new(p))?,
+            None => std::collections::HashMap::new(),
+        };
+        self.email.from = expand(&self.email.from, &vars)?;
+        self.email.smtp_host = expand(&self.email.smtp_host, &vars)?;
+        for t in self.email.to.iter_mut() {
+            *t = expand(t, &vars)?;
+        }
+        if let Some(u) = &self.email.username {
+            self.email.username = Some(expand(u, &vars)?);
+        }
+        if let Some(p) = &self.email.password {
+            self.email.password = Some(expand(p, &vars)?);
+        }
+        Ok(())
+    }
+}
+
+impl NodeHealth {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.poll_interval_secs == 0 {
+            anyhow::bail!("node_health.poll_interval_secs must be greater than zero");
+        }
+        if self.for_secs == 0 {
+            anyhow::bail!("node_health.for_secs must be greater than zero");
+        }
+        // A poll slower than the window means a condition can hold for its
+        // full duration between two readings and never be seen.
+        if self.poll_interval_secs > self.for_secs {
+            anyhow::bail!(
+                "node_health.poll_interval_secs ({}) exceeds for_secs ({}); a condition \
+                 could hold for its whole window between two readings and go unseen",
+                self.poll_interval_secs,
+                self.for_secs
+            );
+        }
+        Ok(())
+    }
+
+    pub fn thresholds(&self) -> crate::health::HealthThresholds {
+        crate::health::HealthThresholds {
+            block_gap: self.block_gap,
+            for_secs: self.for_secs,
+            cooldown_secs: self.cooldown_secs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,8 +213,6 @@ pub struct PegoutAlerts {
     /// real transfer. Fill this in to silence the change output precisely.
     #[serde(default)]
     pub federation_change_scripts: Vec<String>,
-    #[serde(default)]
-    pub email: EmailConfig,
 }
 
 impl Default for PegoutAlerts {
@@ -99,7 +228,6 @@ impl Default for PegoutAlerts {
             confirmations: default_confirmations(),
             max_queued_alerts: default_queue(),
             federation_change_scripts: Vec::new(),
-            email: EmailConfig::default(),
         }
     }
 }
@@ -153,27 +281,6 @@ impl PegoutAlerts {
     pub fn output_alert_sats(&self) -> u64 { btc_to_sats(self.output_alert_btc) }
     pub fn in_transit_alert_sats(&self) -> u64 { btc_to_sats(self.in_transit_alert_btc) }
 
-    /// Load the referenced env file and expand every `${NAME}` in the email
-    /// section. Runs before `validate`, so a reference that resolves to an
-    /// empty string is caught as a missing setting.
-    pub fn resolve_secrets(&mut self) -> anyhow::Result<()> {
-        let vars = match &self.email.env_file {
-            Some(p) => read_env_file(Path::new(p))?,
-            None => std::collections::HashMap::new(),
-        };
-        self.email.from = expand(&self.email.from, &vars)?;
-        self.email.smtp_host = expand(&self.email.smtp_host, &vars)?;
-        for t in self.email.to.iter_mut() {
-            *t = expand(t, &vars)?;
-        }
-        if let Some(u) = &self.email.username {
-            self.email.username = Some(expand(u, &vars)?);
-        }
-        if let Some(p) = &self.email.password {
-            self.email.password = Some(expand(p, &vars)?);
-        }
-        Ok(())
-    }
 
     /// Decode `federation_change_scripts` from hex.
     pub fn change_scripts(&self) -> anyhow::Result<Vec<Vec<u8>>> {
@@ -217,10 +324,6 @@ impl PegoutAlerts {
         f("enabled", self.enabled.to_string(), new.enabled.to_string(), false);
         f("start_block", format!("{:?}", self.start_block), format!("{:?}", new.start_block), false);
         f("max_queued_alerts", self.max_queued_alerts.to_string(), new.max_queued_alerts.to_string(), false);
-        f("email.enabled", self.email.enabled.to_string(), new.email.enabled.to_string(), false);
-        f("email.smtp_host", self.email.smtp_host.clone(), new.email.smtp_host.clone(), false);
-        f("email.smtp_port", self.email.smtp_port.to_string(), new.email.smtp_port.to_string(), false);
-        f("email.to", self.email.to.join(","), new.email.to.join(","), false);
         (live, restart)
     }
 
@@ -238,19 +341,8 @@ impl PegoutAlerts {
     /// Reject a configuration that cannot do what it claims, at startup rather
     /// than at the moment an alert needs to go out.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.email.enabled {
-            if self.email.to.is_empty() {
-                anyhow::bail!("pegout_alerts.email.enabled is true but `to` is empty");
-            }
-            if self.email.from.trim().is_empty() {
-                anyhow::bail!("pegout_alerts.email.enabled is true but `from` is empty");
-            }
-            if self.email.smtp_host.trim().is_empty() {
-                anyhow::bail!("pegout_alerts.email.enabled is true but `smtp_host` is empty");
-            }
-        }
         if self.poll_interval_secs == 0 {
-            anyhow::bail!("pegout_alerts.poll_interval_secs must be greater than zero");
+            anyhow::bail!("alerts.pegout.poll_interval_secs must be greater than zero");
         }
         Ok(())
     }
@@ -273,8 +365,10 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
         let mut cfg: Config = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
-        cfg.pegout_alerts.resolve_secrets()?;
-        cfg.pegout_alerts.validate()?;
+        cfg.alerts.resolve_secrets()?;
+        cfg.alerts.validate_email()?;
+        cfg.alerts.pegout.validate()?;
+        cfg.alerts.node_health.validate()?;
         Ok(cfg)
     }
 }
@@ -356,15 +450,18 @@ mod tests {
         let mut new = old.clone();
         new.pegout_alert_btc = 0.01;
         new.confirmations = 10;
-        new.email.smtp_host = "elsewhere.example".into();
         new.enabled = !old.enabled;
 
         let (live, restart) = old.describe_changes(&new);
         assert!(live.iter().any(|c| c.starts_with("pegout_alert_btc")), "{live:?}");
         assert!(live.iter().any(|c| c.starts_with("confirmations")), "{live:?}");
-        assert!(restart.iter().any(|c| c.starts_with("email.smtp_host")), "{restart:?}");
         assert!(restart.iter().any(|c| c.starts_with("enabled")), "{restart:?}");
-        assert!(!live.iter().any(|c| c.starts_with("email")), "mail must never be live: {live:?}");
+        // Mail cannot appear here at all: the transport is `[alerts.email]`,
+        // which this type does not own, so a live reload structurally cannot
+        // reach it. That used to be a rule enforced by a test; it is now a
+        // property of the shape.
+        assert!(!live.iter().any(|c| c.starts_with("email")), "{live:?}");
+        assert!(!restart.iter().any(|c| c.starts_with("email")), "{restart:?}");
     }
 
     #[test]
@@ -374,22 +471,40 @@ mod tests {
         assert!(live.is_empty() && restart.is_empty(), "{live:?} {restart:?}");
     }
 
+    /// **A live reload cannot reach the resolved credentials**, because the
+    /// transport is not part of what gets reloaded.
+    ///
+    /// The watcher re-reads `[alerts.pegout]` and adopts its threshold fields.
+    /// `[alerts.email]` is a sibling, so a re-read carrying an unexpanded
+    /// `${SMTP_PASSWORD}` has no path to the running transport at all.
     #[test]
-    fn adopting_live_fields_leaves_the_resolved_credentials_alone() {
+    fn a_live_reload_carries_thresholds_and_nothing_else() {
         let mut running = PegoutAlerts::default();
-        running.email.password = Some("already-resolved-secret".into());
-        running.email.smtp_host = "smtp.live".into();
-
-        // A file re-read has the unexpanded placeholder, not the secret.
         let mut from_disk = PegoutAlerts::default();
         from_disk.pegout_alert_btc = 0.01;
-        from_disk.email.password = Some("${SMTP_PASSWORD}".into());
-        from_disk.email.smtp_host = "smtp.other".into();
+        from_disk.confirmations = 17;
 
         running.adopt_live(&from_disk);
         assert_eq!(running.pegout_alert_btc, 0.01);
-        assert_eq!(running.email.password.as_deref(), Some("already-resolved-secret"));
-        assert_eq!(running.email.smtp_host, "smtp.live");
+        assert_eq!(running.confirmations, 17);
+    }
+
+    /// Secrets are expanded on the transport, once, at load.
+    #[test]
+    fn secrets_are_expanded_on_the_shared_transport() {
+        let mut alerts = Alerts::default();
+        alerts.email.enabled = true;
+        alerts.email.to = vec!["ops@example.com".into()];
+        alerts.email.from = "node@example.com".into();
+        alerts.email.smtp_host = "smtp.example".into();
+        // No env_file, so a plain value passes through untouched...
+        alerts.resolve_secrets().expect("no placeholders to expand");
+        assert_eq!(alerts.email.smtp_host, "smtp.example");
+        alerts.validate_email().expect("a complete transport validates");
+
+        // ...and an incomplete one is refused at load rather than at send.
+        alerts.email.to.clear();
+        assert!(alerts.validate_email().is_err(), "no recipient must be rejected");
     }
 
     use super::*;
@@ -402,23 +517,23 @@ mod tests {
         assert_eq!(c.in_transit_alert_sats(), 200 * SATOSHIS_PER_BTC);
         assert_eq!(c.confirmations, 4_000);
         assert!(!c.enabled, "must be off unless asked for");
-        assert!(!c.email.enabled, "must not mail unless asked for");
+        assert!(!Alerts::default().email.enabled, "must not mail unless asked for");
     }
 
     #[test]
     fn a_minimal_file_parses() {
-        let c: Config = toml::from_str("[pegout_alerts]\nenabled = true\n").unwrap();
-        assert!(c.pegout_alerts.enabled);
-        assert_eq!(c.pegout_alerts.pegout_alert_sats(), 100 * SATOSHIS_PER_BTC);
+        let c: Config = toml::from_str("[alerts.pegout]\nenabled = true\n").unwrap();
+        assert!(c.alerts.pegout.enabled);
+        assert_eq!(c.alerts.pegout.pegout_alert_sats(), 100 * SATOSHIS_PER_BTC);
     }
 
     #[test]
     fn thresholds_are_overridable() {
         let c: Config = toml::from_str(
-            "[pegout_alerts]\nenabled = true\npegout_alert_btc = 12.5\nin_transit_alert_btc = 0.5\n",
+            "[alerts.pegout]\nenabled = true\npegout_alert_btc = 12.5\nin_transit_alert_btc = 0.5\n",
         ).unwrap();
-        assert_eq!(c.pegout_alerts.pegout_alert_sats(), 1_250_000_000);
-        assert_eq!(c.pegout_alerts.in_transit_alert_sats(), 50_000_000);
+        assert_eq!(c.alerts.pegout.pegout_alert_sats(), 1_250_000_000);
+        assert_eq!(c.alerts.pegout.in_transit_alert_sats(), 50_000_000);
     }
 
     #[test]
@@ -426,16 +541,26 @@ mod tests {
         // deny_unknown_fields: a misspelled threshold must not silently keep
         // the default and leave the operator believing it took effect.
         let r: Result<Config, _> =
-            toml::from_str("[pegout_alerts]\nenabled = true\npegout_alert_bt = 5.0\n");
+            toml::from_str("[alerts.pegout]\nenabled = true\npegout_alert_bt = 5.0\n");
         assert!(r.is_err());
     }
 
     #[test]
     fn email_without_a_recipient_is_rejected() {
         let c: Config = toml::from_str(
-            "[pegout_alerts]\nenabled = true\n[pegout_alerts.email]\nenabled = true\nfrom = \"a@b\"\nsmtp_host = \"h\"\n",
+            "[alerts.pegout]\nenabled = true\n[alerts.email]\nenabled = true\nfrom = \"a@b\"\nsmtp_host = \"h\"\n",
         ).unwrap();
-        assert!(c.pegout_alerts.validate().is_err());
+        assert!(c.alerts.validate_email().is_err());
+    }
+
+    /// **A file in the old shape must fail loudly.** `[pegout_alerts]` was the
+    /// section name until the health alarms arrived; a node silently ignoring
+    /// such a file would run with alerting off while its operator believed
+    /// otherwise, which is the worst outcome available here.
+    #[test]
+    fn a_file_in_the_old_shape_is_refused() {
+        let r: Result<Config, _> = toml::from_str("[pegout_alerts]\nenabled = true\n");
+        assert!(r.is_err(), "the old section name must not parse as nothing");
     }
 
     #[test]
@@ -452,11 +577,13 @@ mod example_file_tests {
     /// worse than none.
     #[test]
     fn the_shipped_example_parses_and_validates() {
-        let text = include_str!("../../../pegout-alerts.example.toml");
+        let text = include_str!("../../../alerts.example.toml");
         let cfg: super::Config = toml::from_str(text).expect("example must parse");
-        cfg.pegout_alerts.validate().expect("example must validate");
-        assert!(cfg.pegout_alerts.enabled);
-        assert!(!cfg.pegout_alerts.email.enabled, "example must not mail by default");
+        cfg.alerts.pegout.validate().expect("example must validate");
+        cfg.alerts.node_health.validate().expect("health section must validate");
+        cfg.alerts.validate_email().expect("transport must validate");
+        assert!(cfg.alerts.pegout.enabled);
+        assert!(!cfg.alerts.email.enabled, "example must not mail by default");
     }
 }
 
@@ -479,7 +606,7 @@ mod secret_tests {
     #[test]
     fn secrets_come_from_the_env_file_not_the_config() {
         let f = env_file("SMTP_USER=someuser\nSMTP_PASSWORD=s3cr3t\n", 0o600);
-        let mut c = PegoutAlerts {
+        let mut c = Alerts {
             email: EmailConfig {
                 enabled: true,
                 env_file: Some(f.path().display().to_string()),
@@ -500,7 +627,7 @@ mod secret_tests {
     #[test]
     fn a_world_readable_env_file_is_refused() {
         let f = env_file("SMTP_PASSWORD=s3cr3t\n", 0o644);
-        let mut c = PegoutAlerts {
+        let mut c = Alerts {
             email: EmailConfig {
                 enabled: true,
                 env_file: Some(f.path().display().to_string()),
@@ -516,7 +643,7 @@ mod secret_tests {
     #[test]
     fn an_unresolved_reference_is_an_error_not_a_literal_password() {
         let f = env_file("SMTP_USER=someuser\n", 0o600);
-        let mut c = PegoutAlerts {
+        let mut c = Alerts {
             email: EmailConfig {
                 enabled: true,
                 env_file: Some(f.path().display().to_string()),

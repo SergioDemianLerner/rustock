@@ -188,7 +188,7 @@ pub struct LogSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertsSection {
-    pub pegout_alerts_config: Option<String>,
+    pub alerts_config: Option<String>,
 }
 
 impl FileConfig {
@@ -322,7 +322,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "snap_index_history",
     "snap_peer_rate",
     "snap_total_rate",
-    "pegout_alerts_config",
+    "alerts_config",
 ];
 
 #[cfg(test)]
