@@ -4529,6 +4529,65 @@ async fn net_hashrate_counts_uncle_difficulty_and_answers_with_a_number() {
     assert_eq!(value.as_u64().unwrap(), 2_500_000 / 3600);
 }
 
+/// **Mainnet overflows `u64`, and the first version of this clamped.**
+///
+/// At the difficulty observed on 2026-09-27 the network figure is ~2.4e20 —
+/// thirteen times `u64::MAX` — so a clamped implementation returned the same
+/// wrong constant on every call. It must also not render as `2.443e+20`,
+/// which a strict integer parser rejects where rskj's plain digits are taken.
+#[tokio::test]
+async fn net_hashrate_survives_mainnet_magnitude_exactly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Real mainnet difficulty (block #9,276,959). One block over an hour is
+    // only ~2e18 per second, which is *under* u64::MAX -- the overflow comes
+    // from the ~120 blocks an hour actually holds, so the fixture needs a run
+    // of them. Twenty is enough to clear the ceiling with margin.
+    let difficulty = U256::from_str_radix("7328367705921302411990", 10).unwrap();
+    const BLOCKS: u64 = 20;
+    let mut parent = B256::ZERO;
+    for number in 0..BLOCKS {
+        let header = Header {
+            parent_hash: parent,
+            timestamp: now - 600 + number,
+            difficulty,
+            ..test_header(number)
+        };
+        store.put_header(&header).unwrap();
+        store.put_canonical_hash(number, header.hash()).unwrap();
+        store.put_total_difficulty(header.hash(), U256::from(1u64)).unwrap();
+        store.put_body(header.hash(), &[], &[]).unwrap();
+        store.set_head(header.hash()).unwrap();
+        parent = header.hash();
+    }
+
+    let (mut state, _t) = setup_state();
+    state.store = store;
+    let resp = dispatch_for_test(&state, make_request("eth_netHashrate", json!([]))).await;
+    let value = resp.result.unwrap();
+
+    assert!(value.is_number(), "rskj answers with a number here");
+    let rendered = value.to_string();
+    assert_eq!(
+        rendered,
+        (difficulty * U256::from(BLOCKS) / U256::from(3600u64)).to_string(),
+        "the exact quotient, not a clamp and not a float"
+    );
+    assert!(
+        !rendered.contains('e') && !rendered.contains('E'),
+        "must be plain digits, not exponent notation: {rendered}"
+    );
+    assert!(
+        rendered.parse::<u128>().unwrap() > u64::MAX as u128,
+        "the fixture must actually exceed u64, or this proves nothing"
+    );
+}
+
 /// **A non-mining node answering zero is rskj's answer, not a placeholder.**
 /// `HashRateCalculatorNonMining.calculateNodeHashRate` returns
 /// `BigInteger.ZERO`, so this is correct rather than unimplemented. See #176.

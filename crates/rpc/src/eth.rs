@@ -613,11 +613,23 @@ pub fn eth_net_hashrate(id: Value, store: &BlockStore) -> JsonRpcResponse {
     // a real difference in the wire format and is reproduced, because a client
     // written against rskj parses a number here.
     //
-    // Clamped at `u64::MAX` for want of arbitrary-precision JSON. Reaching it
-    // would need a network hash rate some seven orders of magnitude above
-    // anything observed, and a wrong huge number is better than a panic.
-    let rate: u64 = hashrate_over_window(store, None).try_into().unwrap_or(u64::MAX);
-    JsonRpcResponse::success(id, json!(rate))
+    // It must be the **exact** integer, which is why this crate builds
+    // serde_json with `arbitrary_precision`. Two cheaper representations were
+    // tried and are both wrong: a `u64` clamps, and an `f64` renders as
+    // `2.443e+20`, which a strict integer parser (Go's `big.Int`, Java's
+    // `BigInteger`) rejects where rskj's plain digits are accepted.
+    JsonRpcResponse::success(id, exact_number(hashrate_over_window(store, None)))
+}
+
+/// A `U256` as an exact JSON number.
+///
+/// Mainnet needs this: at the difficulty observed on 2026-09-27 the network
+/// figure is about 2.4e20, **thirteen times `u64::MAX`**. An earlier version
+/// clamped to `u64::MAX` on the reasoning that the ceiling was orders of
+/// magnitude away; it was not, and the method returned that same wrong
+/// constant on every call.
+fn exact_number(v: alloy_primitives::U256) -> Value {
+    serde_json::from_str::<Value>(&v.to_string()).unwrap_or_else(|_| json!(0))
 }
 
 /// `eth_hashrate()` — **this node's** share of recent work, not the network's.
