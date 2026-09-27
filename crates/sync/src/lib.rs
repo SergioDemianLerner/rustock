@@ -24,7 +24,7 @@ pub use state::{InFlightBody, SyncState};
 pub use invariant::{Scope, Violation};
 pub use tracker::PeerChunkTracker;
 pub use watchdog::{Escalation, Phi, ProgressWatchdog};
-pub use snap::{client::StateDownload, server::SnapServer, SnapConfig};
+pub use snap::{client::StateDownload, server::servable_roots as snap_servable_roots, server::SnapServer, SnapConfig};
 pub use tx_relay::TxRelay;
 pub use txpool::TransactionPool;
 
