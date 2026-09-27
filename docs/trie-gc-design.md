@@ -192,12 +192,61 @@ damaged, and proceeding compounds it.
 
 ### 4.4 Mark
 
-Computes `L`, the set of keys reachable from `root(H)`.
+Computes `L`, the set of keys reachable from `root(H)` **and from each pinned
+root**.
 
 The straightforward implementation is a recursive (or explicit-stack) traversal
 following references. This is correct but has poor I/O behaviour; see
 [§10](#10-suggested-refinement-sequential-mark) for an alternative with the same
 result and much better locality.
+
+#### Pinned roots
+
+`H` is one state, buried `D` below the head. Anything the node must keep that
+is not reachable from `H` has to say so. The case in practice is the snapshot
+checkpoint a server offers: it sits 10,000–15,000 blocks back, far deeper than
+`D`, so it is swept without a pin. See #143.
+
+```
+mark(root(H), pins):
+    L = {}
+    missing = walk(L, [root(H)])
+    if missing > 0: abort the cycle          # I3 is violated; see §8
+    for p in pins:
+        if walk(L, [p]) > 0:
+            report p as unservable           # do not abort
+    return L
+```
+
+Three properties matter.
+
+**The union, not a substitute.** Two states at different heights share most of
+their nodes, but neither contains the other. Marking a pin *instead* of `H`
+would sweep what is unique to `H` — the state the node executes on — which is
+[I3](#5-invariants) violated by construction.
+
+**Cost is the delta.** A key is queued only when it is new to `L`, so nodes
+shared between `H` and a pin are walked once, by whichever root reaches them
+first. A pin costs only the nodes changed between it and `H`.
+
+**`H` goes first, and that ordering is load-bearing.** A missing entry means
+different things for the two kinds of root, and a merged frontier could not say
+which root wanted it:
+
+| missing under | meaning | response |
+|---|---|---|
+| `root(H)` | `L` is incomplete; the sweep would delete reachable state | abort the cycle |
+| a pin | that state is already half-collected | report it, continue |
+
+Walking `H` to completion first makes the attribution exact: once it has
+finished with no misses, anything missing afterwards is reachable only from a
+pin. A pin that could abort a cycle would be worse than no pin at all — a
+checkpoint that had already been partly collected would stop the collector
+permanently, turning one broken thing into two.
+
+A pin whose root is not in the store at all is reported without being walked.
+
+With no pins, collection is exactly what it was.
 
 ### 4.5 Drain
 
@@ -254,6 +303,12 @@ from a drain, go to `E_{N-1}`.
 
 **I3 — Read totality.** For any key referenced by any entry reachable from the
 state root of any block in `[H, head]`, `read(key)` succeeds.
+
+*Pins extend the set, not the guarantee.* A pinned root that was complete when
+a cycle began is complete after it, by the same argument as `H`. A pin that was
+already incomplete is reported and left that way: the cycle cannot restore what
+an earlier one removed, and pretending otherwise would stop collection for
+good.
 
 **I4 — Unconditional write.** The write path never skips a write because the
 key exists in an older epoch.

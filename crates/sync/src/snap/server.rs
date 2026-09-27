@@ -28,10 +28,11 @@ use rustock_core::Block;
 use rustock_storage::BlockStore;
 use rustock_trie::snapshot::total_size;
 use rustock_trie::snapshot_legacy::{encode_blob as encode_legacy_blob, legacy_chunk};
-use rustock_trie::snapshot_proof::prove_cell;
+use rustock_trie::snapshot_legacy::rebuild as rebuild_legacy;
+use rustock_trie::snapshot_proof::{prove_cell, verify_chunk};
 use rustock_trie::{TrieNode, TrieStore};
 use alloy_primitives::B512;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, trace, warn};
 
@@ -43,6 +44,7 @@ const FORMAT_LEGACY: u8 = 1;
 /// A snap status answer, kept so the hundredth client to ask costs nothing.
 struct CachedStatus {
     checkpoint: B256,
+    state_root: B256,
     response: SnapStatusResponse,
 }
 
@@ -55,6 +57,15 @@ pub struct SnapServer {
     serving: Mutex<HashMap<B512, usize>>,
     /// How fast state may leave, per peer and in total.
     rate: super::rate::RateLimiter,
+    /// States this node holds only in part, so cannot serve.
+    ///
+    /// Not a cache of a slow answer -- there is no cheap way to ask the
+    /// question. Proving a state complete means walking all ten million of its
+    /// nodes, which is minutes, and a peer asking for a chunk must not pay
+    /// that. So completeness is learned where it bites: a cell that does not
+    /// verify against its own root means some node under it is gone, and the
+    /// whole state is struck off. See #143.
+    unservable: Mutex<HashSet<B256>>,
 }
 
 impl SnapServer {
@@ -64,6 +75,7 @@ impl SnapServer {
             trie,
             status_cache: Mutex::new(None),
             serving: Mutex::new(HashMap::new()),
+            unservable: Mutex::new(HashSet::new()),
             rate: super::rate::RateLimiter::new(
                 config.peer_bytes_per_second,
                 config.total_bytes_per_second,
@@ -133,6 +145,38 @@ impl SnapServer {
         &self.config
     }
 
+    /// Strike a state off: this node holds it only in part.
+    ///
+    /// Serving half a state is worse than serving none of it: the client's
+    /// replay disagrees with the root hash, it cannot tell an incomplete
+    /// server from a lying one, and it scores an honest peer as malicious.
+    ///
+    /// Reached from the chunk path, which is where the evidence is. The
+    /// collector reports the same thing about a pinned root it could not mark
+    /// in full, but only to the log: it has no cheaper knowledge than this
+    /// does, and one place deciding is better than two.
+    pub fn mark_unservable(&self, root: B256) {
+        let fresh = self.unservable.lock().map(|mut u| u.insert(root)).unwrap_or(false);
+        if !fresh {
+            return;
+        }
+        warn!(
+            target: "rustock::snap",
+            "state {root:?} is incomplete; this node will not serve snapshots of it"
+        );
+        // The status answer names a checkpoint, so it has to be recomputed
+        // before anyone is told about this one again.
+        if let Ok(mut cache) = self.status_cache.lock() {
+            if cache.as_ref().is_some_and(|c| c.state_root == root) {
+                *cache = None;
+            }
+        }
+    }
+
+    fn is_unservable(&self, root: &B256) -> bool {
+        self.unservable.lock().map(|u| u.contains(root)).unwrap_or(false)
+    }
+
     /// What this node can currently offer, for reporting at startup.
     ///
     /// A pruned node holds no state at its checkpoint and so serves nothing.
@@ -157,10 +201,19 @@ impl SnapServer {
         let hash = self.store.canonical_hash(number).ok()??;
         let block = self.store.block(hash).ok()??;
 
-        // The state has to be here in full. Holding the root is not proof of
-        // that, but it is the cheap half of the question; the rest surfaces
-        // per chunk, where a missing node simply ends the traversal early.
+        // The root has to be here. That is the cheap half of the question and
+        // nowhere near the whole of it: `children_size` is hash-committed
+        // inside the root's own message, so a root alone will happily report
+        // the size of a subtree that is no longer on disk.
+        //
+        // The other half is learned rather than proved. Walking ten million
+        // nodes to answer a status request is not an option, so a state is
+        // offered until a cell built from it fails to verify, and struck off
+        // from then on.
         self.trie.get(block.header.state_root.as_slice())?;
+        if self.is_unservable(&block.header.state_root) {
+            return None;
+        }
         Some(block)
     }
 
@@ -238,26 +291,46 @@ impl SnapServer {
         };
         if let Ok(mut cache) = self.status_cache.lock() {
             let rolled = cache.as_ref().is_some_and(|c| c.checkpoint != hash);
-            *cache = Some(CachedStatus { checkpoint: hash, response: response.clone() });
+            *cache = Some(CachedStatus {
+                checkpoint: hash,
+                state_root: checkpoint.header.state_root,
+                response: response.clone(),
+            });
             if rolled {
-                // The checkpoint moved, so the cells of every state but this
-                // one will never be asked for again -- and there is about a
-                // gigabyte of them.
-                self.drop_stale_cells(checkpoint.header.state_root);
+                // The checkpoint moved. Keep this generation and the one
+                // before it; drop anything older.
+                self.drop_stale_cells(&self.servable_roots());
             }
         }
         Some(response)
     }
 
-    /// Forget the cached cells of every state but the one now being offered.
+    /// The states this server will still answer for: the checkpoint it now
+    /// offers, and the one before it.
+    ///
+    /// The previous generation is kept because `chunk` does not require a
+    /// request to name the current checkpoint -- it serves any canonical block
+    /// whose state resolves -- so a client that took its status just before a
+    /// roll goes on asking for the older block and goes on being answered.
+    /// Dropping that state's cells would put it on the cold path for the rest
+    /// of its download, and letting the state itself be collected would end the
+    /// download outright. See #144.
+    ///
+    /// Oldest last, so callers that want just the current one take the first.
+    pub fn servable_roots(&self) -> Vec<B256> {
+        servable_roots(&self.store, &self.config)
+    }
+
+    /// Forget the cached cells of every state this server no longer answers
+    /// for.
     ///
     /// Cells are a cache, so losing them costs only recomputation; keeping
-    /// them costs a gigabyte per checkpoint, and the checkpoint moves every
-    /// 5000 blocks.
-    fn drop_stale_cells(&self, keep: B256) {
+    /// them costs about a gigabyte per generation, and the checkpoint moves
+    /// every 5000 blocks.
+    pub(crate) fn drop_stale_cells(&self, keep: &[B256]) {
         let Ok(roots) = self.store.cached_snap_roots() else { return };
         for root in roots {
-            if root == keep {
+            if keep.contains(&root) {
                 continue;
             }
             match self.store.clear_snap_chunks(root) {
@@ -331,6 +404,9 @@ impl SnapServer {
             }
         }
 
+        if self.is_unservable(&header.state_root) {
+            return refuse(Refusal::StateNotStored);
+        }
         let Some(root_message) = self.trie.get(header.state_root.as_slice()) else {
             return refuse(Refusal::StateNotStored);
         };
@@ -375,7 +451,32 @@ impl SnapServer {
 
         let proof = prove_cell(&root, from, to, self.trie.as_ref());
         if proof.entries.is_empty() {
-            return refuse(Refusal::PastTheEnd);
+            // Not past the end -- that was settled above, against a size the
+            // root's own message commits to. An empty cell below the end means
+            // the traversal could not resolve a node, which is a hole in the
+            // state, not a question about the offset.
+            self.mark_unservable(header.state_root);
+            return refuse(Refusal::StateNotStored);
+        }
+
+        // Replay our own chunk before anyone else does.
+        //
+        // The traversal skips a node it cannot resolve and carries on without
+        // advancing the offset, so a collected subtree turns into a chunk that
+        // looks well formed and is not. The client would replay it, find it
+        // disagrees with the root hash, and score this node as malicious --
+        // for telling the truth about a state it no longer has in full.
+        //
+        // The verifier is already here, and this runs once per cell, on bytes
+        // in hand, behind a build that just did thousands of disk reads.
+        if let Err(e) = verify_chunk(header.state_root, from, &proof) {
+            debug!(
+                target: "rustock::snap",
+                "cell {index} of {:?} does not verify against its own root: {e:?}",
+                header.state_root
+            );
+            self.mark_unservable(header.state_root);
+            return refuse(Refusal::StateNotStored);
         }
 
         let entries: Vec<SnapEntry> = proof
@@ -468,6 +569,25 @@ impl SnapServer {
             });
         };
 
+        // Same check as the proved path, by the same argument; `rebuild` is
+        // what an rskj client will run on these bytes.
+        if let Err(e) = rebuild_legacy(&chunk, *state_root) {
+            debug!(
+                target: "rustock::snap",
+                "rskj-format cell {index} of {state_root:?} does not rebuild: {e:?}"
+            );
+            self.mark_unservable(*state_root);
+            return Some(SnapChunkResponse {
+                id: request.id,
+                payload: ChunkPayload::Legacy(Vec::new().into()),
+                block_number: request.block_number,
+                from,
+                to: from,
+                complete: false,
+                refusal: Refusal::StateNotStored,
+            });
+        }
+
         let blob = encode_legacy_blob(&chunk);
         if let Err(e) =
             self.store.put_snap_chunk(*state_root, grid, FORMAT_LEGACY, index, &blob)
@@ -503,4 +623,36 @@ impl SnapServer {
         );
         Some(SnapBlocksResponse { id: request.id, blocks, difficulties })
     }
+}
+
+/// The states a snapshot server would answer for: the checkpoint it offers and
+/// the one before it.
+///
+/// A free function because the collector needs the same list and runs before
+/// the server exists. Empty when snapshot serving is off -- there is then no
+/// checkpoint to protect and no reason for the collector to retain the delta.
+///
+/// Oldest last, so callers that want just the current one take the first.
+pub fn servable_roots(store: &BlockStore, config: &SnapConfig) -> Vec<B256> {
+    if !config.server_enabled {
+        return Vec::new();
+    }
+    let Ok(Some(head_hash)) = store.head() else { return Vec::new() };
+    let Ok(Some(head)) = store.header(head_hash) else { return Vec::new() };
+
+    let current = config.checkpoint_for(head.number);
+    let previous = current.saturating_sub(config.checkpoint_rounding.max(1));
+
+    let mut roots = Vec::new();
+    for number in [current, previous] {
+        if number == 0 {
+            continue;
+        }
+        let Ok(Some(hash)) = store.canonical_hash(number) else { continue };
+        let Ok(Some(header)) = store.header(hash) else { continue };
+        if !roots.contains(&header.state_root) {
+            roots.push(header.state_root);
+        }
+    }
+    roots
 }

@@ -1037,8 +1037,8 @@ fn a_short_cell_does_not_stall_the_download() {
     assert!(offsets.len() > 2, "the fixture should need several answers");
 }
 
-/// When the checkpoint moves, the previous state's cells are dropped. They
-/// will never be asked for again and there is about a gigabyte of them.
+/// When the checkpoint moves, cells older than the two generations this server
+/// still answers for are dropped -- about a gigabyte per generation.
 #[test]
 fn a_rolled_checkpoint_drops_the_old_cells() {
     let (store, peer, _) = server_fixture(200);
@@ -1070,6 +1070,229 @@ fn a_rolled_checkpoint_drops_the_old_cells() {
     assert!(
         store.snap_chunk(peer.root_hash, 4096, 0, 0).expect("readable").is_some(),
         "clearing one state took another with it"
+    );
+}
+
+
+/// A canonical header at `number` whose state root is `root`, so the server
+/// can be asked about a checkpoint the fixture does not otherwise have.
+fn put_checkpoint(store: &Arc<rustock_storage::BlockStore>, number: u64, root: B256) {
+    use alloy_primitives::{Address, U256};
+    use rustock_core::Header;
+
+    let header = Header {
+        parent_hash: B256::repeat_byte(2),
+        ommers_hash: B256::ZERO,
+        beneficiary: Address::ZERO,
+        state_root: root,
+        transactions_root: B256::ZERO,
+        receipts_root: B256::ZERO,
+        logs_bloom: Default::default(),
+        extension_data: None,
+        difficulty: U256::from(1u64),
+        number,
+        gas_limit: U256::from(6_800_000u64),
+        gas_used: 0,
+        timestamp: 1_700_000_000,
+        extra_data: Default::default(),
+        paid_fees: U256::ZERO,
+        minimum_gas_price: U256::ZERO,
+        uncle_count: 0,
+        umm_root: None,
+        bitcoin_merged_mining_header: None,
+        bitcoin_merged_mining_merkle_proof: None,
+        bitcoin_merged_mining_coinbase_transaction: None,
+        cached_hash: None,
+        cached_hash_for_merged_mining: None,
+    };
+    let hash = header.hash();
+    store.put_header(&header).expect("put header");
+    store.put_canonical_hash(number, hash).expect("index height");
+}
+
+/// **Two generations, not one.** `chunk` serves any canonical block whose
+/// state resolves, so a client that took its status just before a roll goes on
+/// asking for the older checkpoint. Both have to stay answerable: the cells,
+/// so it does not fall onto the cold path, and -- through these same roots
+/// handed to the collector -- the state behind them. See #143, #144.
+#[test]
+fn the_server_answers_for_the_current_checkpoint_and_the_one_before_it() {
+    let (store, peer, head) = server_fixture(50);
+    let cfg = SnapConfig { server_enabled: true, ..config(4, 4096) };
+
+    let current = cfg.checkpoint_for(head);
+    let previous = current - cfg.checkpoint_rounding;
+    let older = previous - cfg.checkpoint_rounding;
+
+    let current_root = B256::repeat_byte(0xC1);
+    let previous_root = B256::repeat_byte(0xB2);
+    let older_root = B256::repeat_byte(0xA3);
+    for (number, root) in
+        [(current, current_root), (previous, previous_root), (older, older_root)]
+    {
+        put_checkpoint(&store, number, root);
+    }
+
+    let server = SnapServer::new(
+        store.clone(),
+        peer.store.clone() as Arc<dyn TrieStore>,
+        cfg,
+    );
+
+    assert_eq!(
+        server.servable_roots(),
+        vec![current_root, previous_root],
+        "the current checkpoint and the one before it, current first"
+    );
+}
+
+/// With serving off there is no checkpoint to protect, so the collector is
+/// handed nothing and retains nothing extra.
+#[test]
+fn a_node_that_does_not_serve_pins_nothing() {
+    let (store, peer, head) = server_fixture(50);
+    let cfg = SnapConfig { server_enabled: false, ..config(4, 4096) };
+    put_checkpoint(&store, cfg.checkpoint_for(head), B256::repeat_byte(0xC1));
+
+    let server =
+        SnapServer::new(store.clone(), peer.store.clone() as Arc<dyn TrieStore>, cfg.clone());
+    assert!(server.servable_roots().is_empty());
+    assert!(crate::snap::server::servable_roots(&store, &cfg).is_empty());
+}
+
+/// A generation older than the two kept loses its cells; the two kept do not.
+#[test]
+fn rolling_keeps_two_generations_of_cells_and_drops_the_third() {
+    let (store, peer, head) = server_fixture(50);
+    let cfg = SnapConfig { server_enabled: true, ..config(4, 4096) };
+
+    let current = cfg.checkpoint_for(head);
+    let previous = current - cfg.checkpoint_rounding;
+    let older = previous - cfg.checkpoint_rounding;
+
+    // The current checkpoint is the state the server actually holds, so
+    // `status` can be computed for it.
+    put_checkpoint(&store, current, peer.root_hash);
+    let previous_root = B256::repeat_byte(0xB2);
+    let older_root = B256::repeat_byte(0xA3);
+    put_checkpoint(&store, previous, previous_root);
+    put_checkpoint(&store, older, older_root);
+
+    for root in [peer.root_hash, previous_root, older_root] {
+        store.put_snap_chunk(root, 4096, 0, 0, b"cell").expect("put");
+    }
+
+    let server =
+        SnapServer::new(store.clone(), peer.store.clone() as Arc<dyn TrieStore>, cfg);
+    server.drop_stale_cells(&server.servable_roots());
+
+    assert!(store.snap_chunk(peer.root_hash, 4096, 0, 0).expect("read").is_some());
+    assert!(
+        store.snap_chunk(previous_root, 4096, 0, 0).expect("read").is_some(),
+        "the previous generation is still being served and must keep its cells"
+    );
+    assert!(
+        store.snap_chunk(older_root, 4096, 0, 0).expect("read").is_none(),
+        "a generation nobody can still be downloading should be reclaimed"
+    );
+}
+
+/// A store that has lost one node, as a collected state has.
+struct Gutted {
+    inner: Arc<MemoryTrieStore>,
+    hidden: B256,
+}
+
+impl TrieStore for Gutted {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if key == self.hidden.as_slice() {
+            return None;
+        }
+        self.inner.get(key)
+    }
+    fn put(&self, key: &[u8], value: &[u8]) {
+        self.inner.put(key, value)
+    }
+}
+
+/// **A half-collected state is refused, not served.**
+///
+/// The traversal skips a node it cannot resolve and carries on without
+/// advancing the offset, so a collected subtree becomes a chunk that looks
+/// well formed and is not. A client would replay it, find it disagrees with
+/// the root hash, and score an honest node as malicious. So the server replays
+/// its own chunk first, refuses, and strikes the state off. See #143.
+#[test]
+fn a_chunk_that_does_not_verify_is_refused_and_the_state_struck_off() {
+    use rustock_networking::protocol::snap::{Refusal, SnapChunkRequest};
+
+    let (store, peer, head) = server_fixture(400);
+    let cfg = SnapConfig { server_enabled: true, ..config(4, 4096) };
+
+    // Hide one non-embedded node under the root.
+    let root_message = peer.store.get(peer.root_hash.as_slice()).expect("root");
+    let root_node = TrieNode::from_message(&root_message, peer.store.as_ref());
+    let hidden = [&root_node.left, &root_node.right]
+        .into_iter()
+        .find_map(|c| match c {
+            rustock_trie::NodeRef::Hash(h) => Some(*h),
+            _ => None,
+        })
+        .expect("a 400-entry trie has a non-embedded child under its root");
+
+    // The checkpoint this server would offer is the gutted state.
+    put_checkpoint(&store, cfg.checkpoint_for(head), peer.root_hash);
+
+    let gutted = Arc::new(Gutted { inner: peer.store.clone(), hidden }) as Arc<dyn TrieStore>;
+    let server = SnapServer::new(store.clone(), gutted, cfg);
+
+    // The root still resolves, so the cheap check passes and the state is
+    // offered -- which is exactly the trap.
+    assert!(server.offer().is_some(), "a rooted but gutted state looks servable");
+
+    let ask = |from: u64| SnapChunkRequest {
+        id: 1,
+        block_number: head,
+        from,
+        chunk_size: 4096,
+        state_root: Some(peer.root_hash),
+    };
+
+    // Walk the grid until a cell needs the hidden subtree. It must come
+    // before the end of the trie: the size the root commits to is unchanged by
+    // the gutting, so running off the end would mean the hole went unnoticed.
+    let total = rustock_trie::snapshot::total_size(&root_node, peer.store.as_ref());
+    let mut refused = None;
+    for cell in 0..total.div_ceil(4096) {
+        let response = server.chunk(&ask(cell * 4096)).expect("an answer");
+        if response.refusal != Refusal::None {
+            refused = Some(response.refusal);
+            break;
+        }
+        // Anything actually served must verify, or we shipped corruption.
+        let arrived =
+            crate::snap::client::chunk_from_payload(&response.payload, peer.root_hash)
+                .expect("the server served a payload the client cannot even parse");
+        let crate::snap::client::Arrived::Proved(proof) = arrived else {
+            panic!("expected the proved dialect");
+        };
+        rustock_trie::snapshot_proof::verify_chunk(peer.root_hash, response.from, &proof)
+            .expect("the server served a chunk that does not verify");
+    }
+
+    assert_eq!(
+        refused,
+        Some(Refusal::StateNotStored),
+        "a cell over the missing subtree must be refused"
+    );
+    assert!(
+        server.offer().is_none(),
+        "once struck off, the state must not be offered again"
+    );
+    assert_eq!(
+        server.chunk(&ask(0)).expect("an answer").refusal,
+        Refusal::StateNotStored,
+        "and every later chunk request is declined, whatever the offset"
     );
 }
 
