@@ -450,6 +450,22 @@ against a live set that is already almost complete.
 With snapshot serving off there are no pins and collection is exactly what it
 was.
 
+Measured with `examples/pin_cost` against mainnet at #9,274,786, with the
+collection root at #9,270,786:
+
+| root | entries added | share | time |
+|---|---|---|---|
+| collection root (#9,270,786) | 10,492,917 nodes → 11,235,294 entries | — | 1657 s |
+| pin #9,260,000 (14,786 blocks back) | +41,649 | 0.37% | 13.0 s |
+| pin #9,255,000 | +23,953 | 0.21% | 9.2 s |
+| | **+65,602** | **+0.58%** | **+22 s (+1.3%)** |
+
+So pinning two checkpoints, the deeper one nearly 15,000 blocks back, costs
+about **4.6 MB retained and 22 seconds of mark**, against a cycle that already
+spends 28 minutes walking 10.5 million nodes. The delta argument is not a
+rounding-error claim made in hope; it is what two states 15,000 blocks apart
+actually differ by.
+
 ### Serving half a state
 
 A pin can still arrive too late, so the server must not trust that a state it

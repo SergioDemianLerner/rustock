@@ -229,6 +229,12 @@ would sweep what is unique to `H` — the state the node executes on — which i
 shared between `H` and a pin are walked once, by whichever root reaches them
 first. A pin costs only the nodes changed between it and `H`.
 
+Measured on mainnet at #9,274,786 (`cli/examples/pin_cost`): marking `H` at
+#9,270,786 gave an `L` of 11,235,294 entries in 1657 s. Pinning the snapshot
+checkpoint at #9,260,000 — 14,786 blocks deeper — added **41,649 entries
+(0.37%) in 13 s**, and a second pin at #9,255,000 another 23,953 (0.21%).
+Two pins: **+0.58% of `L`, about 4.6 MB, and +1.3% of the mark.**
+
 **`H` goes first, and that ordering is load-bearing.** A missing entry means
 different things for the two kinds of root, and a merged frontier could not say
 which root wanted it:
