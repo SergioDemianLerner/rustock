@@ -1,8 +1,8 @@
 # Major components
 
-What was built in this repository between **2026-06-05 and 2026-09-25**: 474
-commits, and the codebase grown from ~38,000 to ~105,100 lines of Rust with
-the test count going from 819 to 1,591. Components marked *extended* existed
+What was built in this repository between **2026-06-05 and 2026-09-27**: 528
+commits, and the codebase grown from ~38,000 to ~117,700 lines of Rust with
+the test count going from 819 to 1,741. Components marked *extended* existed
 in outline before that window; the rest are new.
 
 The organising constraint throughout is that rustock must agree with rskj
@@ -78,6 +78,28 @@ only a recent window is reachable. The epoch design lets the collector mark
 from one deep root and sweep whole epochs, which is what makes the collection
 affordable on a 130 GB store.
 
+One root turned out not to be enough. A node that serves snapshots must also
+keep the checkpoint it offers, which sits 10,000-15,000 blocks back -- three to
+four times deeper than the burial depth, and so not reachable from the
+collection root. Measured, the margin was not there: ~3,900 blocks fill a 1 GB
+epoch, so with four epochs the sweep horizon is ~12,000 blocks against a
+checkpoint up to 15,000 old. The collector now takes **pinned roots**.
+
+Marking the checkpoint *instead* is not an alternative: two states at different
+heights share most of their nodes but neither contains the other, so dropping
+the collection root would sweep what the node executes on -- a failure this
+store has actually suffered. The live set has to be the union, and the union is
+nearly free, because a key is queued only when it is new: measured on mainnet,
+pinning two checkpoints added **0.58% of the live set and 1.3% of the mark**.
+
+The collection root is walked first, and that ordering is load-bearing rather
+than incidental. A missing entry means opposite things for the two kinds of
+root -- under the collection root the live set is incomplete and the sweep
+would destroy reachable state, so the cycle aborts; under a pin it means that
+checkpoint is already half-collected, which is reported and does not stop
+anything. A pin that could abort a cycle would stop the collector permanently
+the first time a checkpoint slipped, turning one broken thing into two.
+
 ## Segmented trie tooling
 
 Splits the trie into self-contained chunks that can be distributed and read
@@ -141,7 +163,11 @@ Chunks sit on a fixed offset grid, which is what makes a server's work
 reusable: the checkpoint moves only every 5000 blocks — about 1.7 days — so
 every client syncing in that window wants the same bytes, and off a grid they
 would each ask at different boundaries. Cells are cached under
-`state_root || index` and dropped when the checkpoint rolls past them.
+`state_root || index`, and **two generations are kept** — the checkpoint now
+offered and the one before it. A chunk request need not name the current
+checkpoint, so a client that took its status just before a roll goes on asking
+for the older block and goes on being answered; dropping that generation would
+put it on the cold path for the rest of its download.
 
 Measured against mainnet state at #9272510: 2.1 disk reads per node served,
 a 100 KB chunk verified in ~11 ms, witness overhead 2.9%, and a contiguous
@@ -182,6 +208,41 @@ node takes history from the network and gives none back. Measured on mainnet:
 minutes or ninety, depending entirely on page cache. It yields between batches
 and records a cursor before each pause, so a node that restarts daily still
 converges rather than starting the hour again each morning.
+
+What a server will spend on a stranger is bounded in **bytes**, because bytes
+is what is actually scarce. Computing cells is not: a server answers for
+exactly one state, so there are only ~9,200 distinct cells, and the worst a
+peer can do is make the server compute a cache that every later client reuses.
+Egress has no such ceiling — a peer holding the three concurrent requests it is
+allowed pulls cached cells at ~300 MB/s indefinitely. Two token buckets, one
+per peer and one for the whole server, meter it at 8 and 32 MB/s.
+
+A peer over its rate is made to **wait** rather than refused: waiting needs no
+protocol support, and with only three slots a slowed peer throttles itself.
+Refusals are not charged, so a peer cannot dig itself deeper for an answer it
+never received. Repeated requests for the same cell are deliberately *not*
+tracked — that state is O(peers × cells) and a peer inflates it on purpose by
+asking widely, which turns a bandwidth problem into a memory one. It is also
+wrong on the merits: responses get lost, clients re-ask after another peer's
+chunk failed verification, and several peers syncing one state want the same
+cells. The rate limit covers the case with one bucket per peer.
+
+Finally, a server must never serve a state it holds only in part. It cannot
+check cheaply — `children_size` is hash-committed inside the root's own
+message, so a root reports the size of a subtree that is no longer on disk, and
+proving completeness means walking ten million nodes. Worse, the traversal
+skips a node it cannot resolve and carries on *without advancing the offset*,
+so a collected subtree becomes a chunk that looks well formed and is not: the
+client's replay disagrees with the root hash and it scores an honest peer as
+malicious. So the server replays every cell it builds against the state root
+before sending it, using the same verifier the client runs. A cell that fails
+strikes the state off, and the checkpoint stops being offered. Refusing costs
+the client one round trip; serving costs the node its reputation.
+
+How long all this should take for a node starting from nothing is worked out
+in [docs/snapshot-sync-estimates.md](snapshot-sync-estimates.md) — a prediction
+recorded before the fact, ~30 minutes to an hour and a half against days for a
+full sync, so that a real run can prove it wrong.
 
 Off by default on both sides — snapshot sync changes how a node comes to trust
 its state, which is a decision an operator makes rather than one they discover.
@@ -314,12 +375,20 @@ punished, because a node that excludes peers rskj keeps ends up partitioned.
 
 ## Read-only diagnostics
 
-Thirty-eight command-line tools over a live database, seventeen of which open
+Forty-two command-line tools over a live database, twenty-one of which open
 it **read-only** — no lock, no WAL replay, no writes, so they can be pointed
 at the production store while it is running or wedged. `resume_point` answers
 "where would execution resume" by applying the very function the node applies;
 `height_peek` lists every block stored at a height, canonical or not;
 `diff_roots` and `diff_state` locate where two state roots disagree.
+
+Some exist to keep a design claim honest rather than to debug anything.
+`pin_cost` walks the collector's mark from two roots and reports what the
+second one added, which is how "pinning costs only the delta" became 0.58%
+instead of an argument. `header_verify_bench` measures header verification
+under the full consensus rules — and carries a **negative control**, tampering
+with a header's merged-mining field and requiring rejection, because a
+throughput number from a rule that quietly no-ops is worse than no number.
 
 They exist because a wedged node is a bad place to learn things. On
 2026-09-24 the node was stopped mid-stall and both fixes were checked against
