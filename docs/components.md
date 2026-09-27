@@ -324,7 +324,7 @@ than by re-scanning receipts.
 Peg activity is the thing operators most need to see, and it is the part
 hardest to reconstruct after the fact.
 
-## Peg-out monitoring and alerting
+## Alerting: peg-outs and node health
 
 Watches the Bridge for peg-outs above a threshold, reports the total value in
 transit on a schedule, and emails alerts.
@@ -332,6 +332,20 @@ transit on a schedule, and emails alerts.
 A peg-out is the only operation on this chain where a bug loses real BTC. This
 is the component that means a human finds out within minutes rather than from
 someone else's incident report.
+
+The same crate carries three **node health alarms** — the executed head has
+stopped, the network is more than a configurable gap ahead, or this node is
+that far ahead of *every* peer. The third is the one worth naming: being ahead
+of the whole network means either following a chain it rejected, or holding
+only stale peers, and both look like health from inside.
+
+Each must hold continuously before it is sent, because each is momentarily
+true in normal operation; after firing, an alarm is quiet for a day and
+recovery does **not** clear the cooldown, because a flapping node is exactly
+where per-occurrence mail is useless. The "behind" alarm additionally stays
+disarmed until the node has been in sync once, so a resync after a restart —
+behind by design, for hours — is not reported as a fault.
+See [docs/node-health-alerts.md](node-health-alerts.md).
 
 ## JSON-RPC surface *(extended: 2,900 → 8,100 lines)*
 

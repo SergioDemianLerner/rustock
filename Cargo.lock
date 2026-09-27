@@ -3214,6 +3214,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustock-alerts"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "async-trait",
+ "bitcoin",
+ "hex",
+ "lettre",
+ "rustock-core",
+ "rustock-execution",
+ "rustock-storage",
+ "rustock-trie",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "rustock-cli"
 version = "0.1.0"
 dependencies = [
@@ -3227,10 +3248,10 @@ dependencies = [
  "libc",
  "rand 0.8.6",
  "rocksdb",
+ "rustock-alerts",
  "rustock-core",
  "rustock-execution",
  "rustock-networking",
- "rustock-pegout-alerts",
  "rustock-rpc",
  "rustock-storage",
  "rustock-sync",
@@ -3314,27 +3335,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.22",
  "uuid",
-]
-
-[[package]]
-name = "rustock-pegout-alerts"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "anyhow",
- "async-trait",
- "bitcoin",
- "hex",
- "lettre",
- "rustock-core",
- "rustock-execution",
- "rustock-storage",
- "rustock-trie",
- "serde",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
 ]
 
 [[package]]

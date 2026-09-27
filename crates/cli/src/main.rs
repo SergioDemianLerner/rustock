@@ -455,7 +455,7 @@ struct Args {
     /// watcher only reads blocks, receipts and Bridge state the node has
     /// already committed, so it cannot affect consensus or block processing.
     /// See `docs/pegout-alerts.md` and `pegout-alerts.example.toml`.
-    #[arg(long)]
+    #[arg(long, alias = "alerts-config")]
     pegout_alerts_config: Option<String>,
 
     /// Background flush/compaction threads during import. 0 uses the CPU count.
@@ -2431,7 +2431,7 @@ fn start_pegout_alerts(
     store: Arc<BlockStore>,
     trie: Arc<dyn rustock_trie::TrieStore>,
 ) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
-    use rustock_pegout_alerts::{AlertSink, Config, LogSink, Watcher};
+    use rustock_alerts::{AlertSink, Config, LogSink, Watcher};
 
     let config = Config::load(path)?;
     let cfg = config.pegout_alerts;
@@ -2443,9 +2443,9 @@ fn start_pegout_alerts(
     let mut sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(LogSink)];
     if cfg.email.enabled {
         #[cfg(feature = "smtp")]
-        sinks.push(Box::new(rustock_pegout_alerts::SmtpSink::new(&cfg.email)?));
+        sinks.push(Box::new(rustock_alerts::SmtpSink::new(&cfg.email)?));
         #[cfg(not(feature = "smtp"))]
-        return Err(rustock_pegout_alerts::sink::smtp_unavailable());
+        return Err(rustock_alerts::sink::smtp_unavailable());
         info!(
             "Peg-out alerts will be emailed to {} via {}:{}",
             cfg.email.to.join(", "), cfg.email.smtp_host, cfg.email.smtp_port
@@ -2468,7 +2468,7 @@ fn start_pegout_alerts(
             .collect();
         // send() fails only once the watcher is gone; nothing to do about it
         // here, and the violation is already in the log.
-        let _ = tx.send(rustock_pegout_alerts::Alert::SupplyNotConserved {
+        let _ = tx.send(rustock_alerts::Alert::SupplyNotConserved {
             block: v.block,
             created: v.created,
             amount_wei: v.amount.to_string(),
@@ -2482,7 +2482,7 @@ fn start_pegout_alerts(
     // intend to remove. Block processing must not block on mail, so it pushes
     // into the same queue the watcher drains.
     if let Err(e) = rustock_execution::bridge::rskj_sender_compat::set_observer(move |s| {
-        let _ = tx2.send(rustock_pegout_alerts::Alert::LegacyMultisigPegin {
+        let _ = tx2.send(rustock_alerts::Alert::LegacyMultisigPegin {
             block: s.block,
             btc_txid: s.btc_txid.clone(),
             shape: s.shape.to_string(),
@@ -2836,8 +2836,8 @@ struct NodeHealthSource {
 }
 
 #[async_trait::async_trait]
-impl rustock_pegout_alerts::health::HealthSource for NodeHealthSource {
-    async fn sample(&self) -> Option<rustock_pegout_alerts::health::Sample> {
+impl rustock_alerts::health::HealthSource for NodeHealthSource {
+    async fn sample(&self) -> Option<rustock_alerts::health::Sample> {
         // The executed head is what the stall alarm watches: a node fetching
         // blocks it never executes is stalled in every way that matters.
         let executed = self
@@ -2873,7 +2873,7 @@ impl rustock_pegout_alerts::health::HealthSource for NodeHealthSource {
             }
         }
 
-        Some(rustock_pegout_alerts::health::Sample {
+        Some(rustock_alerts::health::Sample {
             executed,
             best,
             best_peer,
@@ -2889,7 +2889,7 @@ fn start_health_alerts(
     store: Arc<BlockStore>,
     peers: Arc<rustock_networking::peers::PeerStore>,
 ) -> anyhow::Result<bool> {
-    use rustock_pegout_alerts::{AlertSink, Config, LogSink};
+    use rustock_alerts::{AlertSink, Config, LogSink};
 
     let config = Config::load(path)?;
     let health = config.node_health;
@@ -2904,9 +2904,9 @@ fn start_health_alerts(
     let email = config.pegout_alerts.email;
     if email.enabled {
         #[cfg(feature = "smtp")]
-        sinks.push(Box::new(rustock_pegout_alerts::SmtpSink::new(&email)?));
+        sinks.push(Box::new(rustock_alerts::SmtpSink::new(&email)?));
         #[cfg(not(feature = "smtp"))]
-        return Err(rustock_pegout_alerts::sink::smtp_unavailable());
+        return Err(rustock_alerts::sink::smtp_unavailable());
         info!(
             "Node health alarms will be emailed to {} (gap {} blocks, after {} min, \
              then quiet for {} h)",
@@ -2922,7 +2922,7 @@ fn start_health_alerts(
     let source = Arc::new(NodeHealthSource { store, peers });
     let thresholds = health.thresholds();
     let poll = std::time::Duration::from_secs(health.poll_interval_secs);
-    tokio::spawn(rustock_pegout_alerts::health::run(
+    tokio::spawn(rustock_alerts::health::run(
         source,
         thresholds,
         poll,

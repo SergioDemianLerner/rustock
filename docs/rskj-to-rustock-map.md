@@ -265,7 +265,7 @@ implementation and needs to prove it agrees with the first.
 | **rskj database import** | `crates/storage/src/rskj_import.rs` | Reads a running rskj node's RocksDB and converts it to rustock's layout. |
 | **Segmented trie tooling** | `crates/storage/src/trie_tool.rs`, `cli/examples/build_segments.rs`, `audit_chunk.rs` | Splits the trie into self-contained, independently readable chunks. |
 | **Bridge event index** | `crates/execution/src/bridge/events.rs` + `cli/examples/bridge_events.rs` | Peg activity queryable by height and type rather than by re-scanning receipts. |
-| **Peg-out alerting** | `crates/pegout-alerts/` | Watches for peg-outs above a threshold and emails. |
+| **Alerting** | `crates/alerts/` | Peg-outs above a threshold, and node health: stalled, behind, or ahead of every peer. Emails. |
 | **Read-only diagnostics** | `crates/cli/examples/` (38 tools, 17 read-only) | `resume_point`, `height_peek`, `diff_state` and friends, openable against a live or wedged production database with no lock and no WAL replay. |
 | **The compatibility catalogue** | `docs/` (33 documents) | Every place rustock had to reproduce something that is in no specification, with rskj source citations. |
 

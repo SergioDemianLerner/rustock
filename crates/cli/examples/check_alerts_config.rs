@@ -7,7 +7,7 @@
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args().nth(1).expect("usage: check_alerts_config <config.toml>");
-    let cfg = rustock_pegout_alerts::Config::load(&path)?.pegout_alerts;
+    let cfg = rustock_alerts::Config::load(&path)?.pegout_alerts;
 
     println!("configuration {path} is valid\n");
     println!("  enabled              {}", cfg.enabled);
@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
         println!("  password             {}", shown(&cfg.email.password));
         #[cfg(feature = "smtp")]
         {
-            rustock_pegout_alerts::SmtpSink::new(&cfg.email)?;
+            rustock_alerts::SmtpSink::new(&cfg.email)?;
             println!("\n  SMTP transport builds. No mail was sent.");
         }
         #[cfg(not(feature = "smtp"))]

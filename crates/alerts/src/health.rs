@@ -29,6 +29,30 @@
 //! `for_secs` before anything is sent. Any reading that clears the condition
 //! resets the timer — the requirement is *sustained*, not *cumulative*.
 //!
+//! # "Behind" is disarmed until the node has been in sync once
+//!
+//! A node catching up after a restart is behind the network by design, often
+//! by millions of blocks and for hours. Mailing an operator about that is
+//! mailing them about a node doing exactly what they asked it to do.
+//!
+//! So the behind alarm starts **disarmed** and is armed the first time this
+//! node is observed within `block_gap` of the best peer — the first moment it
+//! has demonstrably caught up. Its timer does not run while disarmed either,
+//! or the accumulated catch-up time would fire an alert the instant it armed.
+//!
+//! The flag is per-process and resets on restart, which is the point: the
+//! question it answers is "has this node been in sync *since it started*".
+//!
+//! **Only** the behind alarm is gated this way. A node that stalls while
+//! syncing, or that is somehow ahead of every peer while syncing, is worth
+//! hearing about immediately — neither is explained by catching up.
+//!
+//! The accepted cost: a node that restarts and *never* manages to sync stays
+//! silent on this alarm forever. That case is left to the stall alarm, which
+//! fires if execution stops, and to the operator noticing a node that never
+//! came up. Alerting on it would mean alerting on every legitimate resync,
+//! which is the noise this gate exists to remove.
+//!
 //! # The cooldown deliberately survives recovery
 //!
 //! After an alert is sent that alarm goes quiet for `cooldown_secs`, and the
@@ -149,6 +173,13 @@ pub struct HealthMonitor {
     /// The executed height last seen, and when it last changed.
     last_executed: Option<u64>,
     executed_since: Option<Instant>,
+    /// Whether this node has been within `block_gap` of the best peer at least
+    /// once since the process started.
+    ///
+    /// Until it has, the behind alarm is disarmed: a node catching up after a
+    /// restart is behind by design, and reporting that is reporting a node
+    /// doing its job. See the module docs.
+    caught_up_once: bool,
 }
 
 impl HealthMonitor {
@@ -160,7 +191,14 @@ impl HealthMonitor {
             ahead: AlarmState::default(),
             last_executed: None,
             executed_since: None,
+            caught_up_once: false,
         }
+    }
+
+    /// Has this node been in sync since it started? Until it has, the behind
+    /// alarm cannot fire.
+    pub fn has_caught_up(&self) -> bool {
+        self.caught_up_once
     }
 
     /// Feed one reading and collect whatever should be mailed.
@@ -211,7 +249,17 @@ impl HealthMonitor {
             None => (false, false),
         };
 
-        if self.behind.step(behind_now, now, &t) {
+        // Within the gap of the best peer is "in sync", and the first time it
+        // happens the behind alarm arms for the life of the process.
+        if s.best_peer.is_some() && !behind_now {
+            self.caught_up_once = true;
+        }
+
+        // Disarmed reads as "condition not holding" rather than being skipped,
+        // so the timer is reset rather than paused -- an hour of catching up
+        // must not become an alert the moment the node arrives.
+        let behind_armed = behind_now && self.caught_up_once;
+        if self.behind.step(behind_armed, now, &t) {
             out.push(Alert::NodeBehindPeers {
                 best: s.best,
                 executed: s.executed,
@@ -348,7 +396,12 @@ mod tests {
             m.observe(sample(ours, ours, Some(ours + gap)), at(t0, secs))
         };
 
-        assert!(!has_behind(&tick(&mut m, 0, 11)));
+        // In sync first: the alarm is disarmed until this node has caught up
+        // once, so a test that starts behind is testing a resync.
+        assert!(!has_behind(&tick(&mut m, 0, 0)));
+        assert!(m.has_caught_up());
+
+        assert!(!has_behind(&tick(&mut m, 10, 11)));
         assert!(!has_behind(&tick(&mut m, 300, 11)));
 
         // Caught up briefly -- the timer restarts, because the requirement is
@@ -416,6 +469,77 @@ mod tests {
         }
     }
 
+    /// **A node catching up after a restart must not be reported.** It is
+    /// behind by design, often for hours, and mailing an operator about it is
+    /// mailing them about a node doing what they asked.
+    #[test]
+    fn a_resync_after_restart_never_raises_the_behind_alarm() {
+        let mut m = HealthMonitor::new(thresholds());
+        let t0 = Instant::now();
+
+        // Two hours of catching up from a long way back, advancing steadily.
+        for step in 0..24u64 {
+            let ours = 1_000 + step * 500;
+            let alerts = m.observe(sample(ours, ours, Some(20_000)), at(t0, step * 300));
+            assert!(
+                !has_behind(&alerts),
+                "a syncing node alerted as behind at step {step}"
+            );
+        }
+        assert!(!m.has_caught_up(), "it never actually caught up");
+    }
+
+    /// …but once it has been in sync, falling behind is real news.
+    #[test]
+    fn the_behind_alarm_arms_the_first_time_the_node_is_in_sync() {
+        let mut m = HealthMonitor::new(thresholds());
+        let t0 = Instant::now();
+
+        // Catching up: disarmed, and no timer accumulating.
+        for step in 0..5u64 {
+            assert!(!has_behind(&m.observe(sample(100, 100, Some(9_000)), at(t0, step * 300))));
+        }
+        assert!(!m.has_caught_up());
+
+        // Arrives. Being in sync is what arms it.
+        assert!(!has_behind(&m.observe(sample(9_000, 9_000, Some(9_000)), at(t0, 1_500))));
+        assert!(m.has_caught_up());
+
+        // The accumulated catch-up time must NOT count: falling behind now
+        // starts a fresh timer rather than firing at once.
+        assert!(
+            !has_behind(&m.observe(sample(9_000, 9_000, Some(9_100)), at(t0, 1_501))),
+            "arming must not fire on time accumulated while disarmed"
+        );
+        assert!(!has_behind(&m.observe(sample(9_010, 9_010, Some(9_200)), at(t0, 2_000))));
+
+        // Sustained past the window from the moment it fell behind.
+        let fired = m.observe(sample(9_020, 9_020, Some(9_300)), at(t0, 2_102));
+        assert!(has_behind(&fired), "a node that was in sync and fell behind must alert");
+    }
+
+    /// The gate is for the behind alarm only. A node that stalls while still
+    /// syncing is worth hearing about at once -- catching up does not explain
+    /// execution stopping.
+    #[test]
+    fn stalling_while_still_syncing_still_alerts() {
+        let mut m = HealthMonitor::new(thresholds());
+        let t0 = Instant::now();
+
+        // Far behind and never in sync, so the behind alarm is disarmed...
+        m.observe(sample(500, 500, Some(9_000)), t0);
+        assert!(!m.has_caught_up());
+
+        // ...but the executed head has stopped, and that is not explained by
+        // catching up.
+        let fired = m.observe(sample(500, 500, Some(9_000)), at(t0, 601));
+        assert!(
+            fired.iter().any(|a| matches!(a, Alert::NodeStalled { .. })),
+            "a stall during sync must still be reported"
+        );
+        assert!(!has_behind(&fired), "but not as behind");
+    }
+
     /// The three alarms hold separate cooldowns.
     #[test]
     fn the_alarms_do_not_share_a_cooldown() {
@@ -423,6 +547,8 @@ mod tests {
         let t0 = Instant::now();
 
         // Behind while still advancing, so only the behind alarm is in play.
+        // In sync first, or the alarm is disarmed.
+        m.observe(sample(100, 100, Some(100)), t0);
         m.observe(sample(80, 80, Some(100)), t0);
         let fired = m.observe(sample(90, 90, Some(110)), at(t0, 601));
         assert!(has_behind(&fired), "sustained 20 behind must alert");

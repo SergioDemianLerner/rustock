@@ -64,11 +64,31 @@ Two different heights, deliberately:
   advertised best is comparable to. Comparing a peer's download head against
   *our* executed head would read as permanently behind during any catch-up.
 
-## What it will not tell you apart
+## "Behind" is disarmed until the node has been in sync once
 
-**A deliberate resync trips the "behind" alarm.** The alarm cannot distinguish
-a node catching up on purpose from one that is stuck, and it will fire once
-during any long sync. The cooldown bounds that to one message; the body says so.
+A node catching up after a restart is behind the network by design, often by
+millions of blocks and for hours. Mailing an operator about that is mailing
+them about a node doing exactly what they asked it to do.
+
+So the behind alarm starts **disarmed**, and arms the first time this node is
+seen within `block_gap` of the best peer — the first moment it has demonstrably
+caught up. Its timer does not run while disarmed either, or the accumulated
+catch-up time would fire an alert the instant it armed.
+
+The flag is per-process and resets on restart, which is the point: the question
+it answers is "has this node been in sync *since it started*".
+
+**Only** the behind alarm is gated. A node that stalls while syncing, or that
+is somehow ahead of every peer while syncing, is worth hearing about
+immediately — neither is explained by catching up.
+
+**The accepted cost:** a node that restarts and *never* manages to sync stays
+silent on this alarm forever. That case is left to the stall alarm, which fires
+if execution stops, and to an operator noticing a node that never came up.
+Alerting on it would mean alerting on every legitimate resync, which is the
+noise this gate exists to remove.
+
+## What it will not tell you apart
 
 **A peerless node raises neither comparison.** With no peer reporting a height,
 neither condition is decidable, and both timers stand still rather than reading
