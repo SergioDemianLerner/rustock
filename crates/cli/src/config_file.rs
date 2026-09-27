@@ -84,6 +84,9 @@ pub struct RpcSection {
     pub ws: Option<bool>,
     /// WebSocket port (rskj `providers.web.ws.port`, default 4445).
     pub ws_port: Option<u16>,
+    /// Widest block range an `eth_getLogs` may span (rskj
+    /// `rpc.logs.maxBlocksToQuery`, whose default is 5000).
+    pub logs_max_blocks: Option<u64>,
 }
 
 /// Snapshot sync, off on both sides by default (rskj ships it the same way).
@@ -295,6 +298,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "gc_check_secs",
     "prune_keep_depth",
     "prune_max_batch",
+    "rpc_logs_max_blocks",
     "mine",
     "mining_coinbase",
     "mining_extra_data",
@@ -481,6 +485,7 @@ mod tests {
         // reference for the settings it omits.
         assert!(cfg.node.port.is_some(), "[node]");
         assert!(cfg.rpc.port.is_some(), "[rpc]");
+        assert!(cfg.rpc.logs_max_blocks.is_some(), "[rpc] logs_max_blocks");
         assert!(cfg.peers.max_peers.is_some(), "[peers]");
         assert!(cfg.trie.backend.is_some(), "[trie]");
         assert!(cfg.gc.burial.is_some(), "[gc]");

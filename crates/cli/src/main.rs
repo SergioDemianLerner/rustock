@@ -669,6 +669,14 @@ struct Args {
     #[arg(long, default_value_t = 50_000)]
     prune_max_batch: u64,
 
+    /// Widest block range an `eth_getLogs` request may span.
+    ///
+    /// rskj's `rpc.logs.maxBlocksToQuery`, whose default is 5000. A wider
+    /// range is rejected rather than served slowly, because the cost is paid
+    /// by the node and the caller can always page.
+    #[arg(long, default_value_t = rustock_rpc::logs::DEFAULT_MAX_BLOCK_RANGE, value_name = "BLOCKS")]
+    rpc_logs_max_blocks: u64,
+
     /// Rate-limit accounts that broadcast transactions consuming large amounts
     /// of shared resources (rskj `transaction.accountTxRateLimit.enabled`).
     ///
@@ -808,6 +816,12 @@ fn apply_file_config(
 
     apply(matches, "prune_keep_depth", f.prune.keep_depth.as_ref(), &mut a.prune_keep_depth);
     apply(matches, "prune_max_batch", f.prune.max_batch.as_ref(), &mut a.prune_max_batch);
+    apply(
+        matches,
+        "rpc_logs_max_blocks",
+        f.rpc.logs_max_blocks.as_ref(),
+        &mut a.rpc_logs_max_blocks,
+    );
 
     apply(matches, "mine", f.mining.enabled.as_ref(), &mut a.mine);
     apply_opt(matches, "mining_coinbase", f.mining.coinbase.as_ref(), &mut a.mining_coinbase);
@@ -1936,6 +1950,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             },
             prune_keep_depth: args.prune_keep_depth,
             prune_max_batch: args.prune_max_batch,
+            logs_max_blocks: args.rpc_logs_max_blocks,
             scoring: Some(scoring.clone()),
             events: events.clone(),
         };

@@ -8,7 +8,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-const MAX_BLOCK_RANGE: u64 = 10_000;
+/// Block range an `eth_getLogs` may span when the operator has set no limit.
+///
+/// rskj's equivalent is `rpc.logs.maxBlocksToQuery`, default 5000. Ours is
+/// more generous, which is safe in the direction that matters: a client that
+/// works against rskj works against this node. Operators who want rskj's
+/// number, or a tighter one on a public endpoint, set it.
+///
+/// Measured at #9,275,036 with a 10,000-block span: 0.16 s when the bloom
+/// rejects every block, 2.9 s when the query genuinely matches. The cap is
+/// what bounds this query -- see #122.
+pub const DEFAULT_MAX_BLOCK_RANGE: u64 = 10_000;
 
 /// In-memory filter storage for eth_newFilter / eth_getFilterChanges.
 #[derive(Clone)]
@@ -85,8 +95,13 @@ pub fn eth_get_logs(id: Value, params: &Value, state: &RpcState) -> JsonRpcRespo
     let from = filter.from_block.unwrap_or(head_num);
     let to = filter.to_block.unwrap_or(head_num);
 
-    if to > from + MAX_BLOCK_RANGE {
-        return JsonRpcResponse::error(id, INVALID_PARAMS, "Block range exceeds maximum (10000)");
+    let max_range = state.logs_max_blocks.max(1);
+    if to > from + max_range {
+        return JsonRpcResponse::error(
+            id,
+            INVALID_PARAMS,
+            format!("Block range exceeds maximum ({max_range})"),
+        );
     }
 
     let logs = collect_logs(from, to, &filter, state);
