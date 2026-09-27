@@ -29,6 +29,7 @@ port = 4444
 admin = false                      # enables rsk_collectTrie, rsk_pruneBlocks, …
 disabled = false                   # true is the same as --no-rpc
 logs_max_blocks = 10000            # widest eth_getLogs span; rskj's rpc.logs.maxBlocksToQuery is 5000
+dev = false                        # evm_* namespace: snapshot/revert/mine — development chains only
 
 [peers]
 max_peers = 25

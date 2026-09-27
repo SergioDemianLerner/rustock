@@ -669,6 +669,16 @@ struct Args {
     #[arg(long, default_value_t = 50_000)]
     prune_max_batch: u64,
 
+    /// Enable the `evm_*` namespace: snapshot, revert, reset, mine on demand
+    /// and move the clock.
+    ///
+    /// For a development chain only. Every method in it rewrites or extends
+    /// the chain on request, so a node running with this reachable from a
+    /// network can be told to discard its own history. rskj ships the
+    /// namespace on by default; this does not.
+    #[arg(long)]
+    dev_rpc: bool,
+
     /// Widest block range an `eth_getLogs` request may span.
     ///
     /// rskj's `rpc.logs.maxBlocksToQuery`, whose default is 5000. A wider
@@ -816,6 +826,7 @@ fn apply_file_config(
 
     apply(matches, "prune_keep_depth", f.prune.keep_depth.as_ref(), &mut a.prune_keep_depth);
     apply(matches, "prune_max_batch", f.prune.max_batch.as_ref(), &mut a.prune_max_batch);
+    apply(matches, "dev_rpc", f.rpc.dev.as_ref(), &mut a.dev_rpc);
     apply(
         matches,
         "rpc_logs_max_blocks",
@@ -1951,6 +1962,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             prune_keep_depth: args.prune_keep_depth,
             prune_max_batch: args.prune_max_batch,
             logs_max_blocks: args.rpc_logs_max_blocks,
+            snapshots: args
+                .dev_rpc
+                .then(|| Arc::new(rustock_rpc::evm::SnapshotManager::new())),
             scoring: Some(scoring.clone()),
             events: events.clone(),
         };

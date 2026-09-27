@@ -1,5 +1,6 @@
 use crate::helpers::{
-    parse_b256, parse_block_number, parse_hex_u32, to_hex_u256, to_hex_u64, BlockResultDto,
+    parse_b256, parse_block_number, parse_hex_u32, to_hex_b256, to_hex_u256, to_hex_u64,
+    BlockResultDto,
 };
 use crate::server::TxSubmitter;
 use crate::types::*;
@@ -522,4 +523,145 @@ pub fn eth_bridge_state(id: Value, state: &crate::server::RpcState) -> JsonRpcRe
             "btcBlockchainBestChainHeight": height,
         }),
     )
+}
+
+/// `eth_getBlocksByNumber(number)` — every block stored at a height, canonical
+/// and not, each flagged with which it is.
+///
+/// rskj-specific (`Web3Impl.eth_getBlocksByNumber`), and it exists because on
+/// a merged-mining chain competing blocks at one height are routine rather
+/// than exceptional. It is also the question that is hardest to answer from
+/// outside: a client that missed a reorg cannot reconstruct the sibling from
+/// canonical data, because canonical data is exactly what no longer mentions
+/// it.
+///
+/// Unlike every other block-taking method here, rskj parses this parameter
+/// with `HexUtils.stringNumberAsBigInt`, which accepts a **decimal** height as
+/// well as `0x`-prefixed hex — and accepts no tags. Its own doc-coverage test
+/// calls that out as a property of the retrieval path rather than of the
+/// parameter type, so it is reproduced rather than tidied.
+pub fn eth_get_blocks_by_number(
+    id: Value,
+    params: &Value,
+    store: &BlockStore,
+) -> JsonRpcResponse {
+    let Some(raw) = params.get(0).and_then(|v| v.as_str()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block number");
+    };
+
+    let trimmed = raw.trim();
+    let parsed = match trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => trimmed.parse::<u64>().ok(),
+    };
+    let Some(number) = parsed else {
+        return JsonRpcResponse::error(
+            id,
+            INVALID_PARAMS,
+            format!("invalid blocknumber {raw}"),
+        );
+    };
+
+    let Ok(hashes) = store.hashes_at_height(number) else {
+        return JsonRpcResponse::success(id, json!([]));
+    };
+    let canonical = store.canonical_hash(number).ok().flatten();
+
+    let mut out = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        // Total difficulty is per block rather than per height: siblings sit
+        // on different chains and a caller comparing them is exactly the point
+        // of this method.
+        let Ok(Some(td)) = store.total_difficulty(hash) else { continue };
+        out.push(json!({
+            "hash": to_hex_b256(&hash),
+            "totalDifficulty": format!("0x{td:x}"),
+            "inMainChain": Some(hash) == canonical,
+        }));
+    }
+
+    JsonRpcResponse::success(id, Value::Array(out))
+}
+
+/// How long a window `eth_netHashrate` averages over. rskj uses one hour
+/// (`Duration.ofHours(1)` in `Web3Impl.eth_netHashrate`), and the figure is
+/// meaningless unless both nodes use the same one — people compare it across
+/// clients.
+const NET_HASHRATE_WINDOW_SECS: u64 = 3600;
+
+/// `eth_netHashrate()` — the **network's** hash rate, not this node's.
+///
+/// Under merged mining this is the number that says how much Bitcoin hash
+/// power is currently securing the chain, which is why it is worth having
+/// even on a node that mines nothing.
+///
+/// Reproduces rskj's `HashRateCalculator.calculateNetHashRate`:
+///
+/// - walk back from the best block by parent hash;
+/// - **stop at the first block whose timestamp falls outside the window** —
+///   not skip it, stop. A block timestamped in the future therefore ends the
+///   walk immediately, which is rskj's behaviour and is reproduced rather
+///   than corrected;
+/// - sum each counted block's own difficulty **plus its uncles'** — rskj sums
+///   `Block.getCumulativeDifficulty()`, which despite the name is the block's
+///   difficulty plus the sum of its uncles', not the chain total;
+/// - divide by the window in seconds.
+///
+/// Counting uncle difficulty is not incidental: an uncle is real work that
+/// secured the chain, and on a merged-mining network there are a lot of them.
+pub fn eth_net_hashrate(id: Value, store: &BlockStore) -> JsonRpcResponse {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let from = now.saturating_sub(NET_HASHRATE_WINDOW_SECS);
+
+    let mut total = alloy_primitives::U256::ZERO;
+    let mut cursor = match store.head() {
+        Ok(Some(hash)) => Some(hash),
+        // rskj returns zero when there is no best block rather than erroring.
+        _ => return JsonRpcResponse::success(id, json!(0)),
+    };
+
+    // Bounded so a corrupt parent chain cannot spin here. One hour is ~120
+    // blocks at 30s; the cap is far above any honest window and is a
+    // stop-loss, not a policy.
+    let mut budget = 10_000u32;
+    while let Some(hash) = cursor {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+
+        // The body is needed for the uncles' difficulties, which the header
+        // does not carry -- it records only `uncle_count`.
+        let Ok(Some(block)) = store.block(hash) else { break };
+        let ts = block.header.timestamp;
+        if ts < from || ts > now {
+            break;
+        }
+
+        total = total.saturating_add(block.header.difficulty);
+        for uncle in &block.ommers {
+            total = total.saturating_add(uncle.difficulty);
+        }
+
+        if block.header.number == 0 {
+            break;
+        }
+        cursor = Some(block.header.parent_hash);
+    }
+
+    let per_second = total / alloy_primitives::U256::from(NET_HASHRATE_WINDOW_SECS);
+
+    // rskj declares this `BigInteger` and so answers with a JSON **number**,
+    // not the `0x` quantity string every neighbouring method returns. That is
+    // a real difference in the wire format and is reproduced, because a client
+    // written against rskj parses a number here.
+    //
+    // Clamped at `u64::MAX` for want of arbitrary-precision JSON. Reaching it
+    // would need a network hash rate some seven orders of magnitude above
+    // anything observed, and a wrong huge number is better than a panic.
+    let value: u64 = per_second.try_into().unwrap_or(u64::MAX);
+    JsonRpcResponse::success(id, json!(value))
 }

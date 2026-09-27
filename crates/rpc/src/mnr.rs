@@ -44,9 +44,24 @@ pub trait MiningService: Send + Sync {
         merkle_hashes: &str,
         block_tx_count: u32,
     ) -> Result<SubmittedBlockInfo, SubmitError>;
+
+    /// Mine one block locally and return its height, for `evm_mine`.
+    ///
+    /// Only reachable on a development chain: it brute-forces a Bitcoin nonce,
+    /// which succeeds immediately at a trivial target and gives up at a real
+    /// one.
+    fn mine_one_now(&self) -> Result<u64, String>;
 }
 
 impl MiningService for rustock_execution::MinerServer {
+    fn mine_one_now(&self) -> Result<u64, String> {
+        // 1 << 18 nonces per extra-nonce: instant on a development target,
+        // and a bounded give-up on anything harder.
+        rustock_execution::mining::dev::mine_one(self, 1 << 18)
+            .map(|info| info.block_included_height)
+            .map_err(|e| e.to_string())
+    }
+
     fn coinbase(&self) -> [u8; 20] {
         self.coinbase_address().into_array()
     }
