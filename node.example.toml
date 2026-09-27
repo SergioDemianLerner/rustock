@@ -37,6 +37,7 @@ max_inbound_peers = 10
 max_inbound_per_ip = 2
 max_inbound_per_cidr = 4
 inbound_cidr_prefix = 24
+# bootnodes = ["127.0.0.1:30304"]   # replaces the chain's built-in list; port is listen+1
 
 [trie]
 backend = "epoch"                  # epoch | single

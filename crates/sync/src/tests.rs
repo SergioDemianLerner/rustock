@@ -5131,3 +5131,81 @@ async fn the_watchdog_retreat_stops_at_genesis() {
     assert_eq!(after.validated_head.number, 0, "clamped to genesis");
     assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
 }
+
+// ── snapshot sync owns the peer set while it runs (#185) ─────────────────────
+
+/// **Header sync first, then state — never the reverse.**
+///
+/// A snapshot is only trustworthy because the header walk vouches for the
+/// checkpoint it hangs from, so the walk must own the peer set until it is
+/// done. Measured before this was enforced: on a single peer the ordinary
+/// sync's header requests were served, the snapshot session's queued behind
+/// them and timed out 12,094 times, and not one state chunk was requested.
+#[tokio::test]
+async fn opening_a_snapshot_session_stands_the_ordinary_sync_down() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let mut service = make_service(store.clone()).with_trie_store_for_test(Arc::new(
+        rustock_trie::MemoryTrieStore::new(),
+    ));
+    // A round already in flight, as there would be if a snapshot session were
+    // opened after ordinary sync had started.
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 100,
+        pending_headers: vec![(genesis.hash(), genesis.clone())],
+        next_request: 1,
+        in_flight: std::collections::HashMap::new(),
+        id_index: std::collections::HashMap::new(),
+    };
+
+    service.start_snap_sync(
+        crate::snap::SnapConfig { client_enabled: true, ..Default::default() },
+        Arc::new(HeaderVerifier::new()),
+    );
+
+    assert!(service.is_suspended_for_snap_for_test(), "the session must take the peer set");
+    assert!(
+        matches!(service.state, SyncState::Idle),
+        "an in-flight round must be abandoned, not parked: its answers would be \
+         matched against a state machine that is no longer driving"
+    );
+
+    // A tick must drive the snapshot session and nothing else.
+    service.on_tick().await;
+    assert!(
+        matches!(service.state, SyncState::Idle),
+        "the ordinary state machine must not start a round while suspended"
+    );
+}
+
+/// The peer set comes back when the session ends, whichever way it ends.
+#[tokio::test]
+async fn the_ordinary_sync_resumes_when_the_snapshot_session_gives_up() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let mut service = make_service(store.clone()).with_trie_store_for_test(Arc::new(
+        rustock_trie::MemoryTrieStore::new(),
+    ));
+    service.start_snap_sync(
+        crate::snap::SnapConfig { client_enabled: true, ..Default::default() },
+        Arc::new(HeaderVerifier::new()),
+    );
+    assert!(service.is_suspended_for_snap_for_test());
+
+    // A session that vanishes by any route other than the handover must not
+    // leave the node suspended: that failure is silent and permanent, so the
+    // tick carries a guard for it.
+    service.fail_snap_for_test();
+    service.on_tick().await;
+
+    assert!(
+        !service.is_suspended_for_snap_for_test(),
+        "a session that gives up must return the peer set, or the node never syncs again"
+    );
+}
