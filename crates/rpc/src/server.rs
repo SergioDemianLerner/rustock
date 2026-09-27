@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
+use crate::evm;
 use crate::txpool;
 use crate::types::*;
 use crate::{admin, call, debug, eth, logs, mnr, net, rsk, sco, state, trace, tx, web3};
@@ -77,6 +78,9 @@ pub struct RpcState {
     pub gas_price: Option<Arc<dyn GasPriceSource>>,
     /// Present only when the node runs the epoch trie backend.
     pub epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>>,
+    /// Snapshot bookkeeping for the `evm_` namespace. `None` means the
+    /// namespace is off, which is the default -- see `crate::evm`.
+    pub snapshots: Option<Arc<crate::evm::SnapshotManager>>,
     /// The miner, present only when the node was started with mining enabled.
     /// Absent, the `mnr_*` namespace answers as it always did.
     pub miner: Option<Arc<dyn mnr::MiningService>>,
@@ -237,6 +241,18 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
             id, params, state.miner.as_ref().expect("miner present"),
         ),
 
+        "eth_getBlocksByNumber" => eth::eth_get_blocks_by_number(id, &req.params, &state.store),
+        "eth_netHashrate" => eth::eth_net_hashrate(id, &state.store),
+
+        // -- evm: development chain control, off unless --dev-rpc --
+        "evm_snapshot" => evm::evm_snapshot(id, state),
+        "evm_revert" => evm::evm_revert(id, &req.params, state),
+        "evm_reset" => evm::evm_reset(id, state),
+        "evm_mine" => evm::evm_mine(id, state),
+        "evm_increaseTime" => evm::evm_increase_time(id, &req.params, state),
+        "evm_startMining" => evm::evm_set_mining(id, state, true),
+        "evm_stopMining" => evm::evm_set_mining(id, state, false),
+
         // -- rsk --
         "rsk_protocolVersion" => rsk::rsk_protocol_version(id),
 
@@ -244,6 +260,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         // reported as unknown rather than forbidden so that a node without them
         // looks the same as one that never had them.
         "rsk_collectTrie" | "rsk_collectTrieStatus" | "rsk_pruneBlocks" | "rsk_storageStatus"
+        | "rsk_flush" | "rsk_shutdown"
             if !state.admin_enabled =>
         {
             JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found")
@@ -257,6 +274,8 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
             state.gc_pins.as_ref().map(|f| f()).unwrap_or_default(),
         ),
         "rsk_collectTrieStatus" => admin::rsk_collect_trie_status(id, &state.epoch_store),
+        "rsk_flush" => admin::rsk_flush(id, state),
+        "rsk_shutdown" => admin::rsk_shutdown(id, state),
         "rsk_pruneBlocks" => admin::rsk_prune_blocks(
             id, &req.params, &state.store, state.prune_keep_depth, state.prune_max_batch,
         ),

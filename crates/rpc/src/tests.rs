@@ -64,6 +64,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -610,6 +611,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -661,6 +663,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -745,6 +748,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -881,6 +885,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -982,6 +987,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -1171,6 +1177,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -1435,6 +1442,7 @@ async fn test_receipt_dto_failed_status() {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -1584,6 +1592,10 @@ mod mnr_tests {
     }
 
     impl MiningService for FakeMiner {
+        fn mine_one_now(&self) -> Result<u64, String> {
+            Err("the fake miner does not mine".into())
+        }
+
         fn coinbase(&self) -> [u8; 20] {
             [0x5Au8; 20]
         }
@@ -2288,6 +2300,7 @@ fn setup_state_with_receipts(
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -2558,6 +2571,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -3505,6 +3519,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 1_000,
@@ -3937,6 +3952,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        snapshots: None,
         logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
@@ -4383,4 +4399,224 @@ async fn an_unknown_subscription_type_is_rejected() {
     let reply = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let reply: Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(reply["error"]["code"], json!(INVALID_PARAMS));
+}
+
+// ── rskj parity: eth_getBlocksByNumber, eth_netHashrate, rsk_*, evm_* ──────
+
+/// A chain of `n` linked headers, plus one sibling at `fork_at` that is stored
+/// but not canonical.
+fn chain_with_sibling(n: u64, fork_at: u64) -> (Arc<BlockStore>, tempfile::TempDir, B256) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+
+    let mut parent = B256::ZERO;
+    for number in 0..=n {
+        let header = Header { parent_hash: parent, ..test_header(number) };
+        let hash = header.hash();
+        store.put_header(&header).unwrap();
+        store.put_canonical_hash(number, hash).unwrap();
+        store.put_total_difficulty(hash, U256::from((number + 1) * 1000)).unwrap();
+        store.put_body(hash, &[], &[]).unwrap();
+        store.set_head(hash).unwrap();
+        parent = hash;
+    }
+
+    // A sibling at `fork_at`: same height, different content, never canonical.
+    let canonical_parent = store.canonical_hash(fork_at - 1).unwrap().unwrap();
+    let sibling = Header {
+        parent_hash: canonical_parent,
+        timestamp: test_header(fork_at).timestamp + 7,
+        ..test_header(fork_at)
+    };
+    let sibling_hash = sibling.hash();
+    store.put_header(&sibling).unwrap();
+    store.put_total_difficulty(sibling_hash, U256::from(999u64)).unwrap();
+
+    (store, tmp, sibling_hash)
+}
+
+/// **Siblings are the point.** A client that missed a reorg cannot reconstruct
+/// the block that lost from canonical data, because canonical data is exactly
+/// what no longer mentions it.
+#[tokio::test]
+async fn get_blocks_by_number_returns_siblings_flagged() {
+    let (store, _tmp, sibling) = chain_with_sibling(5, 3);
+    let (mut state, _t) = setup_state();
+    state.store = store.clone();
+
+    let resp = dispatch_for_test(&state, make_request("eth_getBlocksByNumber", json!(["0x3"]))).await;
+    let blocks = resp.result.unwrap();
+    let blocks = blocks.as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "canonical block and its sibling");
+
+    let canonical = store.canonical_hash(3).unwrap().unwrap();
+    let on_chain: Vec<_> = blocks.iter().filter(|b| b["inMainChain"] == json!(true)).collect();
+    let off_chain: Vec<_> = blocks.iter().filter(|b| b["inMainChain"] == json!(false)).collect();
+    assert_eq!(on_chain.len(), 1, "exactly one block is canonical at a height");
+    assert_eq!(on_chain[0]["hash"], json!(crate::helpers::to_hex_b256(&canonical)));
+    assert_eq!(off_chain[0]["hash"], json!(crate::helpers::to_hex_b256(&sibling)));
+
+    // Total difficulty is per block: comparing the two is why a caller asks.
+    assert_ne!(on_chain[0]["totalDifficulty"], off_chain[0]["totalDifficulty"]);
+}
+
+/// rskj parses this parameter with `stringNumberAsBigInt`, which takes a
+/// decimal height as well as hex — unlike every other block-taking method.
+/// Reproduced rather than tidied, because a client written against rskj may
+/// send either.
+#[tokio::test]
+async fn get_blocks_by_number_accepts_decimal_as_rskj_does() {
+    let (store, _tmp, _) = chain_with_sibling(5, 3);
+    let (mut state, _t) = setup_state();
+    state.store = store;
+
+    let hex = dispatch_for_test(&state, make_request("eth_getBlocksByNumber", json!(["0x3"]))).await;
+    let dec = dispatch_for_test(&state, make_request("eth_getBlocksByNumber", json!(["3"]))).await;
+    assert_eq!(hex.result, dec.result, "0x3 and 3 name the same height");
+
+    let bad = dispatch_for_test(&state, make_request("eth_getBlocksByNumber", json!(["latest"]))).await;
+    assert!(bad.error.is_some(), "this method takes no tags, unlike its neighbours");
+}
+
+/// **Uncle difficulty counts.** rskj sums `Block.getCumulativeDifficulty()`,
+/// which despite its name is the block's own difficulty plus its uncles' — and
+/// an uncle is real work that secured the chain.
+#[tokio::test]
+async fn net_hashrate_counts_uncle_difficulty_and_answers_with_a_number() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Two blocks inside the window; the second carries an uncle.
+    let mut parent = B256::ZERO;
+    for number in 0..2u64 {
+        let header = Header {
+            parent_hash: parent,
+            timestamp: now - 60 + number,
+            difficulty: U256::from(1_000_000u64),
+            ..test_header(number)
+        };
+        let uncles: Vec<Header> = if number == 1 {
+            vec![Header { difficulty: U256::from(500_000u64), ..test_header(0) }]
+        } else {
+            vec![]
+        };
+        let header = Header {
+            ommers_hash: rustock_execution::processor::compute_ommers_hash(&uncles),
+            ..header
+        };
+        store.put_header(&header).unwrap();
+        store.put_canonical_hash(number, header.hash()).unwrap();
+        store.put_total_difficulty(header.hash(), U256::from(1u64)).unwrap();
+        store.put_body(header.hash(), &[], &uncles).unwrap();
+        store.set_head(header.hash()).unwrap();
+        parent = header.hash();
+    }
+
+    let (mut state, _t) = setup_state();
+    state.store = store;
+    let resp = dispatch_for_test(&state, make_request("eth_netHashrate", json!([]))).await;
+    let value = resp.result.unwrap();
+
+    // rskj declares this BigInteger, so the wire form is a JSON number, not
+    // the `0x` quantity string every neighbouring method returns.
+    assert!(value.is_number(), "rskj answers with a number here, got {value}");
+
+    // (1,000,000 + 1,000,000 + 500,000 uncle) / 3600
+    assert_eq!(value.as_u64().unwrap(), 2_500_000 / 3600);
+}
+
+/// Administrative methods are reported as unknown rather than forbidden, so a
+/// node without them looks the same as one that never had them.
+#[tokio::test]
+async fn flush_and_shutdown_are_invisible_without_rpc_admin() {
+    let (state, _tmp) = setup_state();
+    assert!(!state.admin_enabled);
+    for method in ["rsk_flush", "rsk_shutdown"] {
+        let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+        let err = resp.error.expect("must not be served");
+        assert_eq!(err.message, "Method not found", "{method} leaked its existence");
+    }
+}
+
+/// The whole `evm_` namespace stays invisible unless the node was started for
+/// a development chain. A node that can be told to discard its own history has
+/// no business advertising that on a network.
+#[tokio::test]
+async fn the_evm_namespace_is_off_by_default() {
+    let (state, _tmp) = setup_state();
+    assert!(state.snapshots.is_none());
+    for method in [
+        "evm_snapshot", "evm_revert", "evm_reset", "evm_mine",
+        "evm_increaseTime", "evm_startMining", "evm_stopMining",
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, json!(["0x1"]))).await;
+        assert!(resp.error.is_some(), "{method} answered with the namespace off");
+    }
+}
+
+/// **A snapshot is a height, and reverting is a head move.** rskj's
+/// `SnapshotManager` records `getBestBlock().getNumber()` and nothing else,
+/// so taking one is free and reverting discards the heights above it.
+#[tokio::test]
+async fn evm_snapshot_and_revert_move_the_head_back() {
+    let (store, _tmp, _) = chain_with_sibling(5, 3);
+    let (mut state, _t) = setup_state();
+    state.store = store.clone();
+    state.snapshots = Some(Arc::new(crate::evm::SnapshotManager::new()));
+
+    // Snapshot while the head is at #3.
+    store.set_head(store.canonical_hash(3).unwrap().unwrap()).unwrap();
+    let snap = dispatch_for_test(&state, make_request("evm_snapshot", json!([]))).await;
+    assert_eq!(snap.result.unwrap(), json!("0x1"), "ids are 1-based");
+
+    // The chain moves on to #5, then the test reverts.
+    store.set_head(store.canonical_hash(5).unwrap().unwrap()).unwrap();
+    let reverted = dispatch_for_test(&state, make_request("evm_revert", json!(["0x1"]))).await;
+    assert_eq!(reverted.result.unwrap(), json!(true));
+
+    let head = store.head().unwrap().unwrap();
+    assert_eq!(
+        store.header(head).unwrap().unwrap().number,
+        3,
+        "the head must be back at the snapshotted height"
+    );
+    assert!(
+        store.canonical_hash(4).unwrap().is_none() && store.canonical_hash(5).unwrap().is_none(),
+        "heights above the snapshot must no longer resolve"
+    );
+
+    // Reverting again to an id the truncation removed is false, not an error.
+    let missing = dispatch_for_test(&state, make_request("evm_revert", json!(["0x9"]))).await;
+    assert_eq!(missing.result.unwrap(), json!(false));
+}
+
+/// `evm_reset` returns to genesis and discards every snapshot and the clock
+/// offset, so one test cannot leak into the next.
+#[tokio::test]
+async fn evm_reset_returns_to_genesis_and_clears_the_clock() {
+    let (store, _tmp, _) = chain_with_sibling(5, 3);
+    let (mut state, _t) = setup_state();
+    state.store = store.clone();
+    state.snapshots = Some(Arc::new(crate::evm::SnapshotManager::new()));
+
+    let bumped = dispatch_for_test(&state, make_request("evm_increaseTime", json!(["0x64"]))).await;
+    // Read what the call returned rather than the process-wide offset: the
+    // offset is a static and other tests share it.
+    assert!(bumped.result.is_some(), "increaseTime must answer with the new offset");
+
+    let resp = dispatch_for_test(&state, make_request("evm_reset", json!([]))).await;
+    assert_eq!(resp.result.unwrap(), json!(true));
+
+    let head = store.head().unwrap().unwrap();
+    assert_eq!(store.header(head).unwrap().unwrap().number, 0, "back to genesis");
+    assert!(store.canonical_hash(5).unwrap().is_none(), "heights above are gone");
+    assert_eq!(
+        rustock_execution::mining::dev::time_offset(),
+        0,
+        "a clock offset must not survive a reset"
+    );
 }

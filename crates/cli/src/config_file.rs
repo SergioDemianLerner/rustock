@@ -87,6 +87,8 @@ pub struct RpcSection {
     /// Widest block range an `eth_getLogs` may span (rskj
     /// `rpc.logs.maxBlocksToQuery`, whose default is 5000).
     pub logs_max_blocks: Option<u64>,
+    /// Enable the `evm_*` development-chain namespace. Off by default.
+    pub dev: Option<bool>,
 }
 
 /// Snapshot sync, off on both sides by default (rskj ships it the same way).
@@ -299,6 +301,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "prune_keep_depth",
     "prune_max_batch",
     "rpc_logs_max_blocks",
+    "dev_rpc",
     "mine",
     "mining_coinbase",
     "mining_extra_data",

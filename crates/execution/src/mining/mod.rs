@@ -16,6 +16,7 @@
 //! -- fork-detection data, transaction selection, the work cache -- it is
 //! ported from rskj and the source class is named at the definition.
 
+pub mod dev;
 pub mod coinbase;
 pub mod fork_detection;
 pub mod merkle;

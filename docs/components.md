@@ -247,6 +247,24 @@ full sync, so that a real run can prove it wrong.
 Off by default on both sides — snapshot sync changes how a node comes to trust
 its state, which is a decision an operator makes rather than one they discover.
 
+## Development-chain control — the `evm_*` namespace
+
+Seven methods that let a contract test suite drive the node: snapshot, revert,
+reset, mine on demand, and move the clock. A suite written against a regtest
+rskj node asks for these by name and fails on the first call without them.
+
+The thing worth knowing is that a snapshot is a **height**, not a state copy —
+rskj's `SnapshotManager` records the best block's number and nothing else — so
+taking one is free and reverting is a head move. Mining on demand is real
+merged mining: build the work, commit to it in a Bitcoin block, brute-force the
+nonce. The search is bounded and gives up, which is why it cannot be turned
+against a real chain's difficulty.
+
+Off by default, unlike rskj, which ships it enabled. Every method rewrites or
+extends the chain on request, and a node that can be told to discard its own
+history over RPC has no business being reachable from a network.
+See [docs/evm-namespace.md](evm-namespace.md).
+
 ## Transaction pool and account rate limiter
 
 A mempool with nonce-gap handling and pending/queued separation, plus a port of

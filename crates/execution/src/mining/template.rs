@@ -14,7 +14,6 @@ use rustock_core::{Block, Header, Transaction, ordered_tx_trie_root};
 use rustock_trie::{AccountState, TrieKeySlice, TrieNode, TrieStore, account_key};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::hardfork::RskHardforkConfig;
 use crate::mining::fork_detection;
@@ -439,10 +438,10 @@ pub fn remasc_transaction(block_number: u64) -> Transaction {
 /// before the parent -- a header with a timestamp not strictly greater than
 /// its parent's is rejected outright.
 fn timestamp_for_child(parent_timestamp: u64) -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // `dev::now_with_offset` is wall clock plus whatever `evm_increaseTime`
+    // has accumulated -- zero unless a development chain moved it, so this is
+    // the same wall clock everywhere else.
+    let now = crate::mining::dev::now_with_offset();
     now.max(parent_timestamp + 1)
 }
 

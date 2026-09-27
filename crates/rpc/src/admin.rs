@@ -6,6 +6,7 @@
 //! not an access control decision; a method that deletes a database should
 //! require the operator to have asked for it.
 
+use crate::server::RpcState;
 use crate::types::*;
 use alloy_primitives::B256;
 use rustock_storage::epoch_store::EpochTrieStore;
@@ -286,4 +287,65 @@ pub fn rsk_storage_status(
         id,
         json!({ "head": head, "blockPruning": pruning, "trieCollection": collection }),
     )
+}
+
+/// `rsk_flush()` — force buffered writes to disk.
+///
+/// rskj's `RskModuleImpl.flush` calls `flusher.forceFlush()`. Here the same
+/// thing means flushing the trie store, which is the one that buffers: the
+/// block store's writes go through RocksDB's WAL and are already durable.
+///
+/// Useful before copying the database, and before pointing a read-only tool at
+/// a live store — such a tool sees what has been written, not what is still
+/// buffered.
+pub fn rsk_flush(id: Value, state: &RpcState) -> JsonRpcResponse {
+    match &state.trie_store {
+        Some(trie) => {
+            trie.flush();
+            tracing::info!(target: "rustock::rpc", "rsk_flush: trie store flushed");
+            JsonRpcResponse::success(id, json!(true))
+        }
+        // Answer truthfully rather than claiming a flush that did not happen.
+        None => JsonRpcResponse::error(
+            id,
+            INVALID_PARAMS,
+            "node has no trie store to flush",
+        ),
+    }
+}
+
+/// `rsk_shutdown()` — stop the node cleanly.
+///
+/// rskj's `RskModuleImpl.shutdown` calls `nodeStopper.stop(0)`, which is
+/// `System::exit`. The same is done here, with one addition that matters more
+/// on this node than on rskj: the trie store is flushed **first**.
+///
+/// That ordering is the whole point of offering this at all. Stopping this
+/// node by killing it discards unflushed memtables, so the operating
+/// procedure is "SIGTERM and wait, never SIGKILL". This gives automation the
+/// same ordered stop without needing signal access to the process — useful for
+/// orchestration, and for anything that can reach the RPC port but not the
+/// process table.
+///
+/// The response is sent before the process exits, because a caller that gets
+/// no reply cannot tell "shut down" from "crashed".
+pub fn rsk_shutdown(id: Value, state: &RpcState) -> JsonRpcResponse {
+    if let Some(trie) = &state.trie_store {
+        trie.flush();
+    }
+    tracing::warn!(
+        target: "rustock::rpc",
+        "rsk_shutdown: stopping the node on RPC request"
+    );
+
+    // Exit after the response has had a chance to leave. A short detached
+    // delay is crude, but the alternative -- threading a shutdown channel
+    // through every task -- is a larger change than this method is worth, and
+    // rskj itself simply calls System.exit.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::process::exit(0);
+    });
+
+    JsonRpcResponse::success(id, json!(true))
 }
