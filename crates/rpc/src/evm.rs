@@ -34,7 +34,6 @@
 
 use crate::server::RpcState;
 use crate::types::*;
-use alloy_primitives::B256;
 use serde_json::{json, Value};
 use std::sync::Mutex;
 

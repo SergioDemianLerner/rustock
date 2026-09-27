@@ -95,9 +95,7 @@ pub fn eth_mining(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(id, json!(false))
 }
 
-pub fn eth_hashrate(id: Value) -> JsonRpcResponse {
-    JsonRpcResponse::success(id, json!("0x0"))
-}
+
 
 pub fn eth_accounts(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(id, json!([]))
@@ -610,6 +608,57 @@ const NET_HASHRATE_WINDOW_SECS: u64 = 3600;
 /// Counting uncle difficulty is not incidental: an uncle is real work that
 /// secured the chain, and on a merged-mining network there are a lot of them.
 pub fn eth_net_hashrate(id: Value, store: &BlockStore) -> JsonRpcResponse {
+    // rskj declares this `BigInteger` and so answers with a JSON **number**,
+    // not the `0x` quantity string every neighbouring method returns. That is
+    // a real difference in the wire format and is reproduced, because a client
+    // written against rskj parses a number here.
+    //
+    // Clamped at `u64::MAX` for want of arbitrary-precision JSON. Reaching it
+    // would need a network hash rate some seven orders of magnitude above
+    // anything observed, and a wrong huge number is better than a panic.
+    let rate: u64 = hashrate_over_window(store, None).try_into().unwrap_or(u64::MAX);
+    JsonRpcResponse::success(id, json!(rate))
+}
+
+/// `eth_hashrate()` — **this node's** share of recent work, not the network's.
+///
+/// rskj chooses between two calculators at startup on whether the miner server
+/// is enabled (`RskContext:709-715`):
+///
+/// - `HashRateCalculatorNonMining` returns `BigInteger.ZERO`;
+/// - `HashRateCalculatorMining` runs the same walk as the network figure with
+///   one extra predicate, `coinbaseAddress.equals(header.getCoinbase())`.
+///
+/// So a node that does not mine answering zero is not a placeholder — it is
+/// what rskj answers. See #176.
+///
+/// Unlike its neighbour this returns a `0x` quantity **string**: rskj declares
+/// `eth_hashrate` as `String` via `toQuantityJsonHex` and `eth_netHashrate` as
+/// `BigInteger`, one line apart. The two disagree upstream and the disagreement
+/// is reproduced, because clients parse each the way rskj sends it.
+pub fn eth_hashrate_for(
+    id: Value,
+    store: &BlockStore,
+    coinbase: Option<alloy_primitives::Address>,
+) -> JsonRpcResponse {
+    let Some(coinbase) = coinbase else {
+        // No miner configured: rskj's non-mining calculator, exactly.
+        return JsonRpcResponse::success(id, json!("0x0"));
+    };
+    let rate = hashrate_over_window(store, Some(coinbase));
+    JsonRpcResponse::success(id, json!(format!("0x{rate:x}")))
+}
+
+/// Difficulty produced per second over the window, optionally counting only
+/// blocks mined to `coinbase`.
+///
+/// rskj's `HashRateCalculator.calculateHashRate` with its `countCondition`
+/// predicate: `b -> true` for the network figure, an ownership test for this
+/// node's. One walk, two callers, because two walks would eventually disagree.
+fn hashrate_over_window(
+    store: &BlockStore,
+    coinbase: Option<alloy_primitives::Address>,
+) -> alloy_primitives::U256 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -620,7 +669,7 @@ pub fn eth_net_hashrate(id: Value, store: &BlockStore) -> JsonRpcResponse {
     let mut cursor = match store.head() {
         Ok(Some(hash)) => Some(hash),
         // rskj returns zero when there is no best block rather than erroring.
-        _ => return JsonRpcResponse::success(id, json!(0)),
+        _ => return alloy_primitives::U256::ZERO,
     };
 
     // Bounded so a corrupt parent chain cannot spin here. One hour is ~120
@@ -641,9 +690,16 @@ pub fn eth_net_hashrate(id: Value, store: &BlockStore) -> JsonRpcResponse {
             break;
         }
 
-        total = total.saturating_add(block.header.difficulty);
-        for uncle in &block.ommers {
-            total = total.saturating_add(uncle.difficulty);
+        // The window decides which blocks are walked; the predicate decides
+        // which are counted. An uncle is credited to the block that included
+        // it, as rskj does -- `getCumulativeDifficulty` sums them into the
+        // including block and the ownership test is applied to that block.
+        let counts = coinbase.is_none_or(|want| block.header.beneficiary == want);
+        if counts {
+            total = total.saturating_add(block.header.difficulty);
+            for uncle in &block.ommers {
+                total = total.saturating_add(uncle.difficulty);
+            }
         }
 
         if block.header.number == 0 {
@@ -652,16 +708,5 @@ pub fn eth_net_hashrate(id: Value, store: &BlockStore) -> JsonRpcResponse {
         cursor = Some(block.header.parent_hash);
     }
 
-    let per_second = total / alloy_primitives::U256::from(NET_HASHRATE_WINDOW_SECS);
-
-    // rskj declares this `BigInteger` and so answers with a JSON **number**,
-    // not the `0x` quantity string every neighbouring method returns. That is
-    // a real difference in the wire format and is reproduced, because a client
-    // written against rskj parses a number here.
-    //
-    // Clamped at `u64::MAX` for want of arbitrary-precision JSON. Reaching it
-    // would need a network hash rate some seven orders of magnitude above
-    // anything observed, and a wrong huge number is better than a panic.
-    let value: u64 = per_second.try_into().unwrap_or(u64::MAX);
-    JsonRpcResponse::success(id, json!(value))
+    total / alloy_primitives::U256::from(NET_HASHRATE_WINDOW_SECS)
 }

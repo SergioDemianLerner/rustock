@@ -1,4 +1,4 @@
-use crate::helpers::{parse_b256, parse_block_number, to_hex_bytes, to_hex_u256};
+use crate::helpers::{parse_b256, parse_block_number, parse_storage_slot, to_hex_bytes, to_hex_u256};
 use crate::server::RpcState;
 use crate::types::*;
 use alloy_primitives::{Address, B256};
@@ -81,7 +81,10 @@ pub fn eth_get_storage_at(id: Value, params: &Value, state: &RpcState) -> JsonRp
     let Some(addr) = params.get(0).and_then(|v| v.as_str()).and_then(|s| s.parse::<Address>().ok()) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid address");
     };
-    let Some(slot) = params.get(1).and_then(|v| v.as_str()).and_then(parse_b256) else {
+    // A slot is a quantity, not a hash: `0x0` is what clients send for slot
+    // zero, and demanding all 64 hex characters made this method unusable from
+    // any ordinary wallet. See #179.
+    let Some(slot) = params.get(1).and_then(|v| v.as_str()).and_then(parse_storage_slot) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid storage slot");
     };
     let block_param = params.get(2).and_then(|v| v.as_str()).unwrap_or("latest");

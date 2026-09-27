@@ -31,17 +31,89 @@ pub fn parse_b256(s: &str) -> Option<B256> {
     s.parse::<B256>().ok()
 }
 
-/// Parses a block number from a hex string or special values ("latest", "earliest", "pending").
-/// Returns the resolved block number or None.
-pub fn parse_block_number(s: &str, head_number: u64) -> Option<u64> {
-    match s {
-        "latest" | "pending" => Some(head_number),
-        "earliest" => Some(0),
-        hex_str => {
-            let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-            u64::from_str_radix(stripped, 16).ok()
-        }
+/// Parses a storage slot: any `0x`-prefixed hex quantity up to 32 bytes,
+/// left-padded into a full word.
+///
+/// Distinct from [`parse_b256`], which demands all 64 hex characters. That
+/// strictness is right for a hash -- a 32-byte hash is always written in full
+/// -- and wrong for a slot, which is a **quantity**: EIP-1474 quantities are
+/// minimal-length, so every client sends `0x0` for slot zero and `0x1` for
+/// slot one. Rejecting those made `eth_getStorageAt` unusable from any
+/// ordinary wallet or library. See #179.
+///
+/// An odd number of hex digits is accepted and padded, as rskj's
+/// `stringHexToByteArray` does.
+///
+/// **Unprefixed decimal is refused**, and that is a deliberate difference from
+/// rskj rather than an oversight. rskj reads an unprefixed slot as decimal
+/// (`strHexOrStrNumberToByteArray` falls through to `new BigInteger(s)`) while
+/// reading an unprefixed *transaction index* as hex (`HexIndexParam` always
+/// parses base 16) -- so `"10"` is slot 10 in one method and index 16 in its
+/// neighbour, silently. Reproducing that means importing the trap; refusing
+/// means a caller gets an error rather than the wrong slot. #179 tracks the
+/// question and the upstream report recommends rskj converge the two.
+pub fn parse_storage_slot(s: &str) -> Option<B256> {
+    let trimmed = s.trim();
+    let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))?;
+    if hex.is_empty() || hex.len() > 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
     }
+    // Right-align into the word: a quantity's value sits at the low end.
+    let mut padded = [0u8; 64];
+    padded[..64 - hex.len()].fill(b'0');
+    padded[64 - hex.len()..].copy_from_slice(hex.as_bytes());
+    let text = std::str::from_utf8(&padded).ok()?;
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(B256::from(out))
+}
+
+/// Resolves a block parameter: a tag, or a `0x`-prefixed hex height.
+///
+/// # The `0x` prefix is required, and that is the whole point
+///
+/// This used to strip an optional prefix and then parse base 16 regardless, so
+/// an unprefixed decimal height was read as hex: `"100"` resolved to block
+/// **256**, silently, with no error. A caller asking about one block was
+/// answered about another. See #177.
+///
+/// rskj rejects an unprefixed height for every method that reaches
+/// `Web3InformationRetriever` -- `HexUtils.stringHexToBigInteger` demands the
+/// prefix and answers `-32602 invalid blocknumber` -- so rejecting matches it
+/// for the large majority of the namespace, and errs in the safe direction
+/// everywhere else: a client gets an error rather than a wrong block.
+///
+/// Two deliberate differences from rskj remain, both of them rskj accepting
+/// what this rejects:
+///
+/// - `eth_call` and `eth_estimateGas` resolve through `ExecutionBlockRetriever`
+///   there, which parses a decimal height too. Whether a method takes decimal
+///   is therefore a property of its retrieval path rather than of the
+///   parameter, which is an upstream accident this does not reproduce.
+/// - `eth_getBlocksByNumber` takes a decimal height, and does so here as well
+///   -- it parses its own parameter (see `eth::eth_get_blocks_by_number`).
+///
+/// Tags are matched case-insensitively. rskj is inconsistent about this --
+/// `BlockTag.fromString` uses `equalsIgnoreCase` while `BlockRefParam` matches
+/// exactly -- so `"LATEST"` works for half its methods. Accepting it
+/// everywhere is the permissive half of that split and cannot break a caller
+/// that works against either.
+pub fn parse_block_number(s: &str, head_number: u64) -> Option<u64> {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("latest") || trimmed.eq_ignore_ascii_case("pending") {
+        return Some(head_number);
+    }
+    if trimmed.eq_ignore_ascii_case("earliest") {
+        return Some(0);
+    }
+    // No prefix, no answer. Guessing the base is what produced #177.
+    let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))?;
+    if hex.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
 }
 
 /// Parses a 0x-prefixed hex index. Returns None on anything malformed, which
@@ -243,6 +315,78 @@ mod tests {
         assert_eq!(parse_block_number("pending", 100), Some(100));
         assert_eq!(parse_block_number("0x0", 100), Some(0));
         assert_eq!(parse_block_number("0xff", 100), Some(255));
+    }
+
+    /// **An unprefixed height must not be guessed at.** It used to be parsed
+    /// as hex, so `"100"` answered about block 256 -- a plausible answer about
+    /// the wrong block, which is worse than any error. See #177.
+    #[test]
+    fn an_unprefixed_block_number_is_refused_rather_than_read_as_hex() {
+        assert_eq!(parse_block_number("100", 999), None, "must not resolve to 256");
+        assert_eq!(parse_block_number("64", 999), None);
+        assert_eq!(parse_block_number("0", 999), None);
+        // The prefixed forms still mean what they always meant.
+        assert_eq!(parse_block_number("0x100", 999), Some(256));
+        assert_eq!(parse_block_number("0x64", 999), Some(100));
+    }
+
+    /// rskj matches tags case-insensitively for half its methods and exactly
+    /// for the other half. Accepting either is the half that cannot break a
+    /// caller written against the other. See #178.
+    #[test]
+    fn block_tags_are_case_insensitive() {
+        assert_eq!(parse_block_number("LATEST", 100), Some(100));
+        assert_eq!(parse_block_number("Earliest", 100), Some(0));
+        assert_eq!(parse_block_number("PENDING", 100), Some(100));
+    }
+
+    /// Neither a bare prefix nor rubbish resolves to a block.
+    #[test]
+    fn malformed_block_numbers_resolve_to_nothing() {
+        assert_eq!(parse_block_number("0x", 100), None);
+        assert_eq!(parse_block_number("", 100), None);
+        assert_eq!(parse_block_number("finalized", 100), None);
+        assert_eq!(parse_block_number("0xzz", 100), None);
+    }
+
+    /// **A slot is a quantity.** Clients send `0x0`, not 64 zeros, and
+    /// rejecting the short form made `eth_getStorageAt` unusable from any
+    /// ordinary wallet. See #179.
+    #[test]
+    fn a_storage_slot_accepts_the_short_hex_every_client_sends() {
+        assert_eq!(parse_storage_slot("0x0"), Some(B256::ZERO));
+        assert_eq!(
+            parse_storage_slot("0x1"),
+            Some(B256::from(alloy_primitives::U256::from(1u64)))
+        );
+        // Odd digit counts are padded, as rskj's stringHexToByteArray does.
+        assert_eq!(
+            parse_storage_slot("0xabc"),
+            Some(B256::from(alloy_primitives::U256::from(0xabcu64)))
+        );
+        // The long form still means what it meant.
+        assert_eq!(
+            parse_storage_slot(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            ),
+            Some(B256::from(alloy_primitives::U256::from(1u64)))
+        );
+        // Value sits at the low end of the word, not the high end.
+        assert_eq!(parse_storage_slot("0xff").unwrap()[31], 0xff);
+        assert_eq!(parse_storage_slot("0xff").unwrap()[0], 0x00);
+    }
+
+    /// Unprefixed decimal is refused on purpose: rskj reads it as decimal here
+    /// but as hex for a transaction index, so accepting it would import the
+    /// ambiguity. Refusing gives an error rather than the wrong slot. See #179.
+    #[test]
+    fn an_unprefixed_storage_slot_is_refused() {
+        assert_eq!(parse_storage_slot("10"), None);
+        assert_eq!(parse_storage_slot("0"), None);
+        assert_eq!(parse_storage_slot("0x"), None);
+        assert_eq!(parse_storage_slot("0xzz"), None);
+        // Wider than a word is not a slot.
+        assert_eq!(parse_storage_slot(&format!("0x{}", "1".repeat(65))), None);
     }
 
     #[test]

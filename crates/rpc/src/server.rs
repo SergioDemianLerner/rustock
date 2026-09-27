@@ -197,7 +197,11 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_blockNumber" => eth::eth_block_number(id, &state.store),
         "eth_gasPrice" => eth::eth_gas_price(id, state),
         "eth_mining" => eth::eth_mining(id),
-        "eth_hashrate" => eth::eth_hashrate(id),
+        "eth_hashrate" => eth::eth_hashrate_for(
+            id,
+            &state.store,
+            state.miner.as_ref().map(|m| alloy_primitives::Address::from(m.coinbase())),
+        ),
         "eth_accounts" => eth::eth_accounts(id),
         "eth_pendingTransactions" => eth::eth_pending_transactions(id),
         "eth_bridgeState" => eth::eth_bridge_state(id, &state),
