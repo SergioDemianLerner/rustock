@@ -64,6 +64,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -609,6 +610,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -659,6 +661,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -742,6 +745,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -877,6 +881,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -977,6 +982,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1165,6 +1171,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -1184,6 +1191,40 @@ async fn test_eth_get_logs_by_range() {
     let logs = resp.result.unwrap();
     let logs = logs.as_array().unwrap();
     assert_eq!(logs.len(), 3);
+}
+
+/// **The range cap is the operator's, not a constant.**
+///
+/// rskj exposes the same limit as `rpc.logs.maxBlocksToQuery` and defaults it
+/// to 5000; ours defaulted to a hard-coded 10,000 with no way to change it.
+/// The cap is what actually bounds a wide `eth_getLogs` -- measured, the bloom
+/// skip costs only 0.16 s over 10,000 blocks -- so it is the knob that matters
+/// (#122).
+#[tokio::test]
+async fn the_get_logs_range_cap_is_configurable() {
+    let (mut state, _tmp) = setup_state_with_logs();
+    state.logs_max_blocks = 1;
+
+    let too_wide = make_request("eth_getLogs", json!([{
+        "fromBlock": "0x1",
+        "toBlock": "0x3",
+    }]));
+    let resp = dispatch_for_test(&state, too_wide).await;
+    let message = resp.error.expect("a span of 3 must be refused at a cap of 1").message;
+    assert!(
+        message.contains('1') && message.contains("exceeds"),
+        "the refusal should name the configured cap, got: {message}"
+    );
+
+    // And the same request is served once the cap allows it, so the cap is
+    // doing the refusing rather than something else about the query.
+    state.logs_max_blocks = crate::logs::DEFAULT_MAX_BLOCK_RANGE;
+    let ok = make_request("eth_getLogs", json!([{
+        "fromBlock": "0x1",
+        "toBlock": "0x3",
+    }]));
+    let resp = dispatch_for_test(&state, ok).await;
+    assert_eq!(resp.result.unwrap().as_array().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -1394,6 +1435,7 @@ async fn test_receipt_dto_failed_status() {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -2246,6 +2288,7 @@ fn setup_state_with_receipts(
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -2515,6 +2558,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,
@@ -3461,6 +3505,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 1_000,
         scoring: None,
@@ -3892,6 +3937,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
+        logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
         prune_keep_depth: 100_000,
         prune_max_batch: 50_000,
         scoring: None,

@@ -207,20 +207,35 @@ The buffer therefore carries the supplier alongside the headers, and
 produces would ban an arbitrary peer — the exact failure the scoring tests are
 built around. `drained_chunks_carry_the_peer_that_sent_them` pins it.
 
-### What does not feed it yet, and why
+### Block provenance
 
-`VALID_BLOCK` and `INVALID_BLOCK` are **not** recorded. Both need the peer
-that supplied a block, and rustock does not carry that provenance to where
-blocks are validated: `process_single_block` reads from `follow_buffer`, which
-holds `(hash, header, transactions, ommers)` and no peer. Threading it through
-is a change to the follow path — the path responsible for three separate
-mainnet stalls on 2026-09-24 — and does not belong in the same change as the
-scoring machinery. Tracked separately.
+`INVALID_BLOCK` and `VALID_BLOCK` are recorded, and the two are earned at
+different moments on purpose.
 
-The practical effect is that `INVALID_HEADER` is currently the only *punishing*
-event this node produces. That is narrower than rskj but not unsafe: a peer
-serving a chain we cannot validate is caught at the header stage, before its
-blocks are ever requested.
+**`INVALID_BLOCK` at receipt.** A body arrives with transactions and uncles and
+nothing tying them to the header they were asked for — but the header commits
+to both, so the tie is two hashes away. That check runs the moment the body
+arrives, which is the **only** moment the supplying peer is unambiguous: by
+the time a block reaches execution it has been through a store and a buffer,
+and "who sent this" is gone. The mismatched body is not stored and the request
+is left outstanding, so the ordinary retry path asks somebody else.
+
+The charge follows whoever *sent* the answer rather than whoever was asked.
+That is what makes a body safely retriable from any peer: the body is good
+whatever its route, so blame has to follow the sender.
+
+**`VALID_BLOCK` on execution.** A body that merely matches its header proves
+the peer copied correctly, not that it gave us a real block. The credit waits
+until the block executes to the state root its header claims. Provenance
+survives that gap in one map keyed by block number, drained in one place — in
+preference to threading a peer id through `follow_buffer`, which is the code
+responsible for three separate mainnet stalls on 2026-09-24 and which this
+does not need to touch. The map is capped, because a halt strands entries
+above the executed head that will never be credited.
+
+rskj records `VALID_BLOCK` from `MessageVisitor.apply(BlockMessage)`, which is
+validation rather than execution — so this node's credit is **stricter** than
+rskj's, in the direction that costs a peer nothing and proves more.
 
 ## The `sco_*` namespace
 

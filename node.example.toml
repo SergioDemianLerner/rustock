@@ -28,6 +28,7 @@ host = "127.0.0.1"
 port = 4444
 admin = false                      # enables rsk_collectTrie, rsk_pruneBlocks, …
 disabled = false                   # true is the same as --no-rpc
+logs_max_blocks = 10000            # widest eth_getLogs span; rskj's rpc.logs.maxBlocksToQuery is 5000
 
 [peers]
 max_peers = 25

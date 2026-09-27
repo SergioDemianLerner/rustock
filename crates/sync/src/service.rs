@@ -507,6 +507,16 @@ pub struct SyncService {
     /// and would simply trip the lag disconnect; subscriptions are a tip
     /// feature and the tip is where they are fed.
     pub(crate) events: Option<rustock_core::events::EventSender>,
+    /// Who supplied the body of each block we have accepted but not yet
+    /// executed, keyed by block number.
+    ///
+    /// Provenance has to outlive receipt to credit a peer for a block that
+    /// *executes*, and by execution time the block has been through a store
+    /// and a buffer with no peer attached. One map, drained in one place,
+    /// rather than threading a peer id through the follow buffer -- that is
+    /// the code responsible for three mainnet stalls on 2026-09-24, and this
+    /// does not need to touch it. See #114.
+    pub(crate) body_providers: HashMap<u64, B512>,
     /// Peer scoring, when the node was built with it.
     ///
     /// The sidelining below **feeds** this rather than being replaced by it.
@@ -564,6 +574,7 @@ impl SyncService {
             blocks_since_flush: 0,
             sidelined: HashMap::new(),
             events: None,
+            body_providers: HashMap::new(),
             scoring: None,
             last_prefetch_start: None,
             block_source: None,
@@ -2627,8 +2638,8 @@ impl SyncService {
                 }
                 self.on_headers_response(peer, headers).await;
             }
-            SyncEvent::BodyResponse { id, transactions, uncles, .. } => {
-                self.on_body_response(id, transactions, uncles).await;
+            SyncEvent::BodyResponse { peer, id, transactions, uncles } => {
+                self.on_body_response(peer, id, transactions, uncles).await;
             }
             SyncEvent::SnapStatusResponse {
                 peer,
@@ -3149,6 +3160,16 @@ impl SyncService {
             return;
         }
 
+        // The batch executed cleanly, so every body in it was a real block.
+        // Credited here rather than inside the executor: that runs on its own
+        // thread over a range, and reaping it on the main loop is where the
+        // outcome and the scoring table are both in hand.
+        if let Ok(Some((hash, _))) = self.manager.store.exec_head() {
+            if let Ok(Some(header)) = self.manager.store.header(hash) {
+                self.credit_executed_bodies(header.number);
+            }
+        }
+
         // The batch executed cleanly. If a next batch was parked, execute it
         // now (and only now may downloading resume past the cap). Otherwise
         // continue the normal download flow if we weren't already mid-round.
@@ -3382,8 +3403,61 @@ impl SyncService {
         );
     }
 
+    /// A peer sent a body that is not the one its header commits to.
+    ///
+    /// Charged to whoever *sent* it rather than whoever was asked: a body is
+    /// good whatever its route, so blame has to follow the sender for a
+    /// request to be safely retried elsewhere. The body is not stored and the
+    /// request is left outstanding, so the ordinary retry path asks somebody
+    /// else.
+    fn charge_bad_body(&self, peer: B512, number: u64, what: &str) {
+        warn!(
+            target: "rustock::sync",
+            "Peer {peer:?} sent a body for #{number} whose {what} do not match the \
+             header; not storing it"
+        );
+        if let Some(scoring) = &self.scoring {
+            scoring.record_peer(peer, rustock_networking::scoring::EventType::InvalidBlock);
+        }
+    }
+
+    /// Credit every peer whose body has now executed, up to and including
+    /// `through`.
+    ///
+    /// Called from both execution paths, because "the block executed to the
+    /// state root its header claims" is the only evidence that is worth a
+    /// credit -- a body that merely matched its header proves the peer copied
+    /// correctly, not that it gave us a real block.
+    pub(crate) fn credit_executed_bodies(&mut self, through: u64) {
+        let done: Vec<u64> = self
+            .body_providers
+            .keys()
+            .copied()
+            .filter(|n| *n <= through)
+            .collect();
+        for number in done {
+            let Some(peer) = self.body_providers.remove(&number) else { continue };
+            if let Some(scoring) = &self.scoring {
+                scoring.record_peer(peer, rustock_networking::scoring::EventType::ValidBlock);
+            }
+        }
+        // A halt can leave entries above the executed head that will never be
+        // credited, so the map cannot be allowed to grow on its own. It is
+        // naturally the size of the download window; well past that, the
+        // oldest are stale by definition.
+        const MAX_TRACKED: usize = 20_000;
+        if self.body_providers.len() > MAX_TRACKED {
+            let mut numbers: Vec<u64> = self.body_providers.keys().copied().collect();
+            numbers.sort_unstable();
+            for number in numbers.iter().take(self.body_providers.len() - MAX_TRACKED) {
+                self.body_providers.remove(number);
+            }
+        }
+    }
+
     pub(crate) async fn on_body_response(
         &mut self,
+        peer: B512,
         request_id: u64,
         transactions: Vec<Transaction>,
         uncles: Vec<Header>,
@@ -3424,7 +3498,29 @@ impl SyncService {
                 if let Some(req) = in_flight.remove(&idx) {
                     // The peer answered → it's responsive, clear its strikes.
                     self.body_peer_strikes.remove(&req.peer);
-                    let (hash, _header) = &pending_headers[idx];
+                    let (hash, header) = &pending_headers[idx];
+
+                    // Does this body belong to that header? Receipt is the one
+                    // moment the sender is unambiguous, and two hashes settle
+                    // it. A mismatch is not stored and the request goes back
+                    // in flight, so the stall path asks somebody else.
+                    if let Some(what) =
+                        crate::body_check::body_mismatch(header, &transactions, &uncles)
+                    {
+                        self.charge_bad_body(peer, header.number, what);
+                        in_flight.insert(idx, req);
+                        id_index.insert(request_id, idx);
+                        self.state = SyncState::DownloadingBodies {
+                            peer_best,
+                            pending_headers,
+                            next_request,
+                            in_flight,
+                            id_index,
+                        };
+                        return;
+                    }
+                    self.body_providers.insert(header.number, peer);
+
                     if let Err(e) = self.manager.store.put_body(*hash, &transactions, &uncles) {
                         error!(
                             target: "rustock::sync",
@@ -3476,7 +3572,20 @@ impl SyncService {
             }
             SyncState::Following => {
                 self.state = SyncState::Following;
-                if let Some((hash, header, _sent)) = self.pending_follow_bodies.remove(&request_id) {
+                if let Some((hash, header, sent)) = self.pending_follow_bodies.remove(&request_id) {
+                    // Same check as the batch path, same reason.
+                    if let Some(what) =
+                        crate::body_check::body_mismatch(&header, &transactions, &uncles)
+                    {
+                        self.charge_bad_body(peer, header.number, what);
+                        // Put it back so the follow-mode retry re-requests it;
+                        // dropping the entry would strand the block instead.
+                        self.pending_follow_bodies
+                            .insert(request_id, (hash, header, sent));
+                        return;
+                    }
+                    self.body_providers.insert(header.number, peer);
+
                     if let Err(e) = self.manager.store.put_body(hash, &transactions, &uncles) {
                         error!(
                             target: "rustock::sync",
@@ -3685,6 +3794,7 @@ impl SyncService {
         // Already executed by this node? Adopt the result instead of redoing it.
         if let Some(node) = fast_forward_state(&processor, &trie_store, header, hash) {
             record_execution(&self.manager.store, hash, header.state_root);
+            self.credit_executed_bodies(header.number);
             self.current_state_root = Some(node);
             info!(
                 target: "rustock::sync",
@@ -3728,6 +3838,9 @@ impl SyncService {
                     "Executed block #{}, state root: {:?}",
                     header.number, result.state_root_hash
                 );
+                // It executed to the root its header claims, which is the only
+                // evidence worth a credit.
+                self.credit_executed_bodies(header.number);
                 self.gas_price.on_block(header, &block.transactions);
                 self.gas_price.on_best_block(header);
                 self.publish_block(hash, header, &block.transactions, false);

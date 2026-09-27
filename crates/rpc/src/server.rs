@@ -94,6 +94,9 @@ pub struct RpcState {
     pub prune_keep_depth: u64,
     /// Most blocks one prune sweep may remove.
     pub prune_max_batch: u64,
+    /// Widest block range an `eth_getLogs` may span. rskj's
+    /// `rpc.logs.maxBlocksToQuery`; see `logs::DEFAULT_MAX_BLOCK_RANGE`.
+    pub logs_max_blocks: u64,
     /// Peer scoring and banning. Absent, the `sco_*` namespace reports itself
     /// as unavailable rather than answering from an empty table.
     pub scoring: Option<Arc<rustock_networking::scoring::ScoringService>>,
