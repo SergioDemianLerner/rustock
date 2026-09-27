@@ -56,6 +56,32 @@ pub enum Alert {
         threshold_sats: u64,
         pegout_count: usize,
     },
+    /// The executed head has not moved for `stalled_secs`.
+    NodeStalled {
+        executed: u64,
+        best: u64,
+        stalled_secs: u64,
+        peer_count: usize,
+        best_peer: Option<u64>,
+    },
+    /// A peer is well ahead, and has been for a while.
+    NodeBehindPeers {
+        best: u64,
+        executed: u64,
+        best_peer: u64,
+        behind_by: u64,
+        peer_count: usize,
+        for_secs: u64,
+    },
+    /// This node is well ahead of every peer it has.
+    NodeAheadOfPeers {
+        best: u64,
+        executed: u64,
+        best_peer: u64,
+        ahead_by: u64,
+        peer_count: usize,
+        for_secs: u64,
+    },
 }
 
 impl Alert {
@@ -77,6 +103,16 @@ impl Alert {
             ),
             Alert::LegacyMultisigPegin { block, shape, .. } => format!(
                 "Peg-in from a {shape} sender at block #{block} (path scheduled for removal)"
+            ),
+            Alert::NodeStalled { executed, stalled_secs, .. } => format!(
+                "Node stalled at #{executed} for {} minutes",
+                stalled_secs / 60
+            ),
+            Alert::NodeBehindPeers { behind_by, best_peer, .. } => format!(
+                "Node is {behind_by} blocks behind the network (best peer #{best_peer})"
+            ),
+            Alert::NodeAheadOfPeers { ahead_by, peer_count, .. } => format!(
+                "Node is {ahead_by} blocks ahead of all {peer_count} peers"
             ),
             Alert::InTransitAboveThreshold { total_sats, block, .. } => format!(
                 "Peg-outs in transit: {} BTC at block #{block}",
@@ -162,6 +198,75 @@ that proposal is adopted, a peg-in like this one would no longer be refunded
 automatically, so this message is a data point about who that would affect."
                 )
             }
+            Alert::NodeStalled { executed, best, stalled_secs, peer_count, best_peer } => {
+                let network = match best_peer {
+                    Some(p) => format!("#{p}"),
+                    None => "unknown (no peer has reported a height)".to_string(),
+                };
+                let downloading = if best > executed {
+                    format!(
+                        "\n\nBlocks ARE still arriving -- the best block held is #{best}, {} ahead of\nwhat has executed -- so this is execution stopping rather than the network\ngoing quiet.",
+                        best - executed
+                    )
+                } else {
+                    "\n\nNo new blocks are arriving either, so this may be the network rather than\nthis node. Check peer count and connectivity before assuming a local fault."
+                        .to_string()
+                };
+                format!(
+"The executed head has not moved for {} minutes.
+
+  executed       #{executed}
+  best held      #{best}
+  best peer      {network}
+  peers          {peer_count}{downloading}
+
+This alarm will not fire again for 24 hours, whether or not the node recovers.",
+                    stalled_secs / 60
+                )
+            }
+            Alert::NodeBehindPeers { best, executed, best_peer, behind_by, peer_count, for_secs } => {
+                format!(
+"This node has been {behind_by} blocks behind the network for {} minutes.
+
+  best held      #{best}
+  executed       #{executed}
+  best peer      #{best_peer}
+  behind by      {behind_by} blocks
+  peers          {peer_count}
+
+A node that is catching up on purpose will trip this too -- the alarm cannot
+tell an intentional resync from a stuck one. If this node was restarted or
+reseeded recently, that is the likely cause.
+
+This alarm will not fire again for 24 hours, whether or not the node recovers.",
+                    for_secs / 60
+                )
+            }
+            Alert::NodeAheadOfPeers { best, executed, best_peer, ahead_by, peer_count, for_secs } => {
+                format!(
+"This node has been more than {ahead_by} blocks ahead of EVERY peer for {} minutes.
+
+  best held      #{best}
+  executed       #{executed}
+  best peer      #{best_peer}
+  ahead by       {ahead_by} blocks
+  peers          {peer_count}
+
+Being ahead of the whole network is not good news. It means one of two things,
+and both look like health from inside this node:
+
+  - it is following a chain the network rejected, in which case its state is
+    diverging and every answer it gives is about a fork; or
+  - every peer it has is stale, in which case it is effectively blind and its
+    own height says nothing about where the chain is.
+
+Compare the block at #{best_peer} against a public node before trusting either
+reading.
+
+This alarm will not fire again for 24 hours, whether or not the node recovers.",
+                    for_secs / 60
+                )
+            }
             Alert::InTransitAboveThreshold { block, total_sats, threshold_sats, pegout_count } => {
                 format!(
 "The total value of peg-outs in transit is above the configured threshold.
@@ -193,6 +298,16 @@ handed to the signers.",
             // alert per new peg-out, never a re-alert as the total drifts.
             Alert::InTransitAboveThreshold { block, .. } =>
                 format!("intransit:{block}"),
+            // The monitor's own cooldown decides when these repeat, so the key
+            // must not also suppress them: a second stall a week later is news.
+            // Including the height keeps that true without disabling dedup for
+            // two identical readings in one poll.
+            Alert::NodeStalled { executed, stalled_secs, .. } =>
+                format!("stalled:{executed}:{stalled_secs}"),
+            Alert::NodeBehindPeers { best, best_peer, .. } =>
+                format!("behind:{best}:{best_peer}"),
+            Alert::NodeAheadOfPeers { best, best_peer, .. } =>
+                format!("ahead:{best}:{best_peer}"),
             // One per block: a block is either conserved or it is not.
             Alert::SupplyNotConserved { block, .. } => format!("supply:{block}"),
             // One per Bitcoin transaction: registering it twice is the same event.

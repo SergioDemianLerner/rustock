@@ -1833,6 +1833,17 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     // Peg-out monitoring. Deliberately not wired into execution or sync: it
     // polls what has already been committed, so a slow mail server or a bug in
     // it cannot delay a block.
+    // Node health alarms share the alert configuration file and its mail
+    // transport, because an operator wanting one wants the other and two mail
+    // configurations is how one of them goes stale.
+    if let Some(path) = &args.pegout_alerts_config {
+        match start_health_alerts(path, store.clone(), peer_store.clone()) {
+            Ok(true) => info!("Node health alarms started from {path}"),
+            Ok(false) => info!("Node health alarms configured but disabled in {path}"),
+            Err(e) => warn!("Node health alarms not started: {e:#}"),
+        }
+    }
+
     if let Some(path) = &args.pegout_alerts_config {
         match start_pegout_alerts(path, store.clone(), trie_store_for_pool.clone()) {
             Ok(Some(handle)) => {
@@ -2813,4 +2824,109 @@ mod log_timezone_tests {
         // loudly rather than being read as some prefix.
         assert!(parse_log_timezone("America/Argentina/Buenos_Aires", None).is_err());
     }
+}
+
+/// Reads the node's own height and its peers' for the health alarms.
+///
+/// Holds only what it reads. It cannot influence sync, execution or peering,
+/// which is the property that makes it safe to poll from a background task.
+struct NodeHealthSource {
+    store: Arc<BlockStore>,
+    peers: Arc<rustock_networking::peers::PeerStore>,
+}
+
+#[async_trait::async_trait]
+impl rustock_pegout_alerts::health::HealthSource for NodeHealthSource {
+    async fn sample(&self) -> Option<rustock_pegout_alerts::health::Sample> {
+        // The executed head is what the stall alarm watches: a node fetching
+        // blocks it never executes is stalled in every way that matters.
+        let executed = self
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| self.store.header(hash).ok().flatten())
+            .map(|h| h.number)?;
+
+        // The best block held is what a peer's advertised best compares
+        // against -- comparing their download head to our *executed* head
+        // would read as permanently behind during any catch-up.
+        let best = self
+            .store
+            .head()
+            .ok()
+            .flatten()
+            .and_then(|hash| self.store.header(hash).ok().flatten())
+            .map(|h| h.number)
+            .unwrap_or(executed);
+
+        let ids = self.peers.peers().await;
+        let mut best_peer: Option<u64> = None;
+        for id in &ids {
+            if let Some(meta) = self.peers.metadata(id).await {
+                // A peer that has not announced a height yet reports zero, and
+                // counting that as a real reading would make every fresh
+                // connection look like a stale one.
+                if meta.best_number > 0 {
+                    best_peer = Some(best_peer.map_or(meta.best_number, |b: u64| b.max(meta.best_number)));
+                }
+            }
+        }
+
+        Some(rustock_pegout_alerts::health::Sample {
+            executed,
+            best,
+            best_peer,
+            peer_count: ids.len(),
+        })
+    }
+}
+
+/// Start the health alarms if the configuration enables them. Returns whether
+/// they were started.
+fn start_health_alerts(
+    path: &str,
+    store: Arc<BlockStore>,
+    peers: Arc<rustock_networking::peers::PeerStore>,
+) -> anyhow::Result<bool> {
+    use rustock_pegout_alerts::{AlertSink, Config, LogSink};
+
+    let config = Config::load(path)?;
+    let health = config.node_health;
+    if !health.enabled {
+        return Ok(false);
+    }
+    health.validate()?;
+
+    // The log sink is always present, so the record exists even if mail fails.
+    // Mail reuses the peg-out transport: one configuration, one credential.
+    let mut sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(LogSink)];
+    let email = config.pegout_alerts.email;
+    if email.enabled {
+        #[cfg(feature = "smtp")]
+        sinks.push(Box::new(rustock_pegout_alerts::SmtpSink::new(&email)?));
+        #[cfg(not(feature = "smtp"))]
+        return Err(rustock_pegout_alerts::sink::smtp_unavailable());
+        info!(
+            "Node health alarms will be emailed to {} (gap {} blocks, after {} min, \
+             then quiet for {} h)",
+            email.to.join(", "),
+            health.block_gap,
+            health.for_secs / 60,
+            health.cooldown_secs / 3600
+        );
+    } else {
+        info!("Node health alarms will be logged only (email disabled)");
+    }
+
+    let source = Arc::new(NodeHealthSource { store, peers });
+    let thresholds = health.thresholds();
+    let poll = std::time::Duration::from_secs(health.poll_interval_secs);
+    tokio::spawn(rustock_pegout_alerts::health::run(
+        source,
+        thresholds,
+        poll,
+        Arc::new(sinks),
+    ));
+    Ok(true)
 }

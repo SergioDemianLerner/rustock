@@ -26,6 +26,80 @@ fn default_queue() -> usize { 256 }
 pub struct Config {
     #[serde(default)]
     pub pegout_alerts: PegoutAlerts,
+    /// Node health alarms: stalled, behind the network, ahead of it. Shares
+    /// this file, and the `[pegout_alerts.email]` transport, because an
+    /// operator wanting one almost always wants the other and maintaining two
+    /// mail configurations is how one of them goes stale.
+    #[serde(default)]
+    pub node_health: NodeHealth,
+}
+
+fn default_health_gap() -> u64 { 10 }
+fn default_health_for_secs() -> u64 { 600 }
+fn default_health_cooldown_secs() -> u64 { 86_400 }
+fn default_health_poll_secs() -> u64 { 30 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeHealth {
+    /// Off by default, like every other alerting surface here.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often to take a reading. Well below `for_secs`, or a condition
+    /// could come and go between polls unseen.
+    #[serde(default = "default_health_poll_secs")]
+    pub poll_interval_secs: u64,
+    /// Blocks of difference before "behind" or "ahead" is true at all.
+    #[serde(default = "default_health_gap")]
+    pub block_gap: u64,
+    /// How long a condition must hold continuously before it is reported.
+    #[serde(default = "default_health_for_secs")]
+    pub for_secs: u64,
+    /// How long that alarm stays quiet after firing. Not reset by recovery.
+    #[serde(default = "default_health_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+impl Default for NodeHealth {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_secs: default_health_poll_secs(),
+            block_gap: default_health_gap(),
+            for_secs: default_health_for_secs(),
+            cooldown_secs: default_health_cooldown_secs(),
+        }
+    }
+}
+
+impl NodeHealth {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.poll_interval_secs == 0 {
+            anyhow::bail!("node_health.poll_interval_secs must be greater than zero");
+        }
+        if self.for_secs == 0 {
+            anyhow::bail!("node_health.for_secs must be greater than zero");
+        }
+        // A poll slower than the window means a condition can hold for its
+        // full duration between two readings and never be seen.
+        if self.poll_interval_secs > self.for_secs {
+            anyhow::bail!(
+                "node_health.poll_interval_secs ({}) exceeds for_secs ({}); a condition \
+                 could hold for its whole window between two readings and go unseen",
+                self.poll_interval_secs,
+                self.for_secs
+            );
+        }
+        Ok(())
+    }
+
+    pub fn thresholds(&self) -> crate::health::HealthThresholds {
+        crate::health::HealthThresholds {
+            block_gap: self.block_gap,
+            for_secs: self.for_secs,
+            cooldown_secs: self.cooldown_secs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

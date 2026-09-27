@@ -13,15 +13,21 @@
 //!   transactions handed to the signers -- alerted above a per-output
 //!   threshold, excluding configured federation change scripts;
 //! - the total value in transit: peg-outs built but not yet confirmed.
+//!
+//! It also carries the **node health alarms** -- stalled, behind the network,
+//! ahead of it -- which are not peg-out concerns but share this crate's mail
+//! transport and configuration file. Two mail configurations is how one of
+//! them goes stale. See [`health`] and `docs/node-health-alerts.md`.
 
 pub mod alert;
 pub mod config;
+pub mod health;
 pub mod service;
 pub mod sink;
 pub mod watch;
 
 pub use alert::Alert;
-pub use config::{Config, PegoutAlerts};
+pub use config::{Config, NodeHealth, PegoutAlerts};
 pub use service::Watcher;
 pub use sink::{AlertSink, LogSink};
 #[cfg(feature = "smtp")]

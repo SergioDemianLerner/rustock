@@ -80,3 +80,45 @@ tls = "starttls"
 
 # Prefix subjects with "[rustock peg-out] " so they filter easily.
 subject_prefix_enabled = true
+
+# ── Node health alarms ───────────────────────────────────────────────────────
+#
+# Three conditions, each of which means the node is not doing its job:
+#
+#   1. stalled      -- the executed head has not moved
+#   2. behind       -- the best peer is more than `block_gap` blocks ahead
+#   3. ahead        -- this node is more than `block_gap` ahead of EVERY peer
+#
+# Condition 3 is not a humblebrag. Being ahead of the whole network means
+# either that this node is following a chain the network rejected, or that all
+# of its peers are stale and it is effectively blind. Both look like health
+# from inside.
+#
+# Mail goes through the [pegout_alerts.email] transport above: one
+# configuration, one credential.
+
+[node_health]
+enabled = false
+
+# How often to take a reading. Must not exceed for_secs, or a condition could
+# hold for its whole window between two readings and never be seen -- the
+# config is rejected if it does.
+poll_interval_secs = 30
+
+# Blocks of difference before "behind" or "ahead" is true at all. The test is
+# strictly greater, so a steady gap of exactly this many does not alert.
+block_gap = 10
+
+# How long a condition must hold CONTINUOUSLY before it is reported. Every one
+# of these is momentarily true in normal operation -- a reorg stalls execution
+# for seconds, a peer announces a block before this node has it -- so any
+# reading that clears the condition restarts the timer.
+for_secs = 600
+
+# How long that alarm stays quiet after firing. NOT reset by recovery: a node
+# that flaps is exactly the case where per-occurrence mail is useless, because
+# the first message already said what is wrong.
+#
+# The three alarms are independent; a cooldown on one says nothing about the
+# others.
+cooldown_secs = 86400
