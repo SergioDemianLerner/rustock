@@ -301,6 +301,13 @@ fn create_skeleton_request(start_number: u64) -> P2pMessage {
     P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonRequest(req)))
 }
 
+/// How many times the same executed head may halt before the node stops
+/// retrying it.
+///
+/// Two is a coincidence; three from an unchanged height is a plan that does
+/// not work.
+const FUTILE_HALTS_BEFORE_GIVING_UP: u32 = 3;
+
 /// Current count of in-flight body requests per connected peer.
 fn peer_body_load(
     peers: &[B512],
@@ -437,6 +444,13 @@ pub struct SyncService {
     /// processor is attached; tests may override it to control timing/outcome.
     exec_fn: Option<ExecFn>,
     pub(crate) last_body_height: u64,
+    /// The executed head that last halted, and how many times in a row.
+    ///
+    /// A halt normally clears: the node retries from the executed head and
+    /// makes progress. A halt that repeats at the *same* height is a plan
+    /// that cannot work, and retrying it costs thousands of body requests a
+    /// round (#192).
+    futile_exec_halts: (u64, u32),
     /// Executed height at the last check, with when it was last seen to move.
     ///
     /// Every other trigger in this service measures the *downloaded* head, which
@@ -571,6 +585,7 @@ impl SyncService {
             pending_exec: None,
             exec_fn: None,
             last_body_height: 0,
+            futile_exec_halts: (0, 0),
             last_exec_height: 0,
             last_exec_progress: Instant::now(),
             watchdog: ProgressWatchdog::default(),
@@ -1680,6 +1695,21 @@ impl SyncService {
     /// path reading the wrong one. The committed root is the authority; this
     /// reloads from it.
     pub(crate) fn resync_state_root_with_exec_head(&mut self) {
+        // Not while execution is in flight. The job commits the executed head
+        // block by block as it goes, but `current_state_root` is only replaced
+        // when the job finishes, so the two are legitimately apart for the
+        // whole of a batch. Checking here reported a disagreement on almost
+        // every tick -- 11 a minute in follow mode -- reloaded a root that was
+        // not wrong, and threw away the follow buffer and any pending
+        // execution each time (#194).
+        //
+        // The condition this guard exists for is a reorg moving the committed
+        // head under a *settled* in-memory root. That is still caught: the
+        // check runs on the next tick after the job lands.
+        if self.executing.is_some() {
+            return;
+        }
+
         let Some(trie_store) = self.trie_store.clone() else { return };
         let Ok(Some((_, committed))) = self.manager.store.exec_head() else { return };
 
@@ -2502,6 +2532,34 @@ impl SyncService {
         // to follow mode without executing anything.
         let downloaded = self.our_head_number();
         if backlog_needs_executing(self.block_processor.is_some(), downloaded, head.number) {
+            // A backlog that has already failed from this exact height will
+            // fail the same way again: nothing the decision depends on has
+            // changed. Retrying is not free -- each pass issues a body request
+            // per block in the range, thousands of them, to real peers (#192).
+            //
+            // The case this was found in: a snapshot sync that failed before
+            // committing its checkpoint leaves headers to #9265000, an
+            // executed head at genesis, and no bodies in between. Ordinary
+            // execution cannot bridge that, however often it tries.
+            if self.futile_exec_halts.0 == head.number
+                && self.futile_exec_halts.1 >= FUTILE_HALTS_BEFORE_GIVING_UP
+            {
+                if self.futile_exec_halts.1 == FUTILE_HALTS_BEFORE_GIVING_UP {
+                    error!(
+                        target: "rustock::sync",
+                        "Executing #{} -> #{} has failed {} times from the same head and \
+                         cannot succeed by retrying: this node holds headers it has no way \
+                         to execute, which is what a snapshot sync that did not finish \
+                         leaves behind. Not retrying. Re-run with --snap-sync to resume \
+                         from the state it already verified, or start from an empty data \
+                         directory.",
+                        head.number, downloaded, FUTILE_HALTS_BEFORE_GIVING_UP
+                    );
+                    // Past the limit, so the message is said once.
+                    self.futile_exec_halts.1 += 1;
+                }
+                return;
+            }
             info!(
                 target: "rustock::sync",
                 "{} block(s) downloaded but not executed (#{} -> #{}); executing before following",
@@ -3300,6 +3358,11 @@ impl SyncService {
             .unwrap_or(0);
         self.last_body_height = exec_number;
         self.pending_exec = None;
+        if self.futile_exec_halts.0 == exec_number {
+            self.futile_exec_halts.1 += 1;
+        } else {
+            self.futile_exec_halts = (exec_number, 1);
+        }
         error!(
             target: "rustock::sync",
             "Sync halted: block execution failed; will retry from executed head #{exec_number}"
