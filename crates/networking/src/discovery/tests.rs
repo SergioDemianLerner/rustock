@@ -17,7 +17,7 @@ async fn test_discovery_service_interaction() {
         id: id1,
     };
     let service1 = Arc::new(
-        DiscoveryService::new("127.0.0.1:0", key1, table1.clone(), 33, local_node1, vec![], Arc::new(crate::peers::PeerStore::new()))
+        DiscoveryService::new("127.0.0.1:0", key1, table1.clone(), 33, local_node1, vec![], Arc::new(crate::peers::PeerStore::new()), false)
             .await
             .unwrap(),
     );
@@ -43,7 +43,7 @@ async fn test_discovery_service_interaction() {
         id: id2,
     };
     let service2 = Arc::new(
-        DiscoveryService::new("127.0.0.1:0", key2, table2.clone(), 33, local_node2, vec![], Arc::new(crate::peers::PeerStore::new()))
+        DiscoveryService::new("127.0.0.1:0", key2, table2.clone(), 33, local_node2, vec![], Arc::new(crate::peers::PeerStore::new()), false)
             .await
             .unwrap(),
     );
@@ -109,4 +109,39 @@ async fn test_discovery_service_interaction() {
             "Service 1 should have learned about the fake node via Neighbors"
         );
     }
+}
+
+/// A closed network takes its peer set from configuration and nowhere else.
+///
+/// The failure this guards against is quiet: discovery hears one Neighbors
+/// reply, learns the public network from it, and a two-node experiment is
+/// silently measuring whoever answered.
+#[tokio::test]
+async fn a_closed_network_learns_only_what_it_was_given() {
+    let key = SigningKey::from_slice(&[0x07; 32]).unwrap();
+    let id = B512::from_slice(&key.verifying_key().to_encoded_point(false).as_bytes()[1..]);
+    let table = Arc::new(RwLock::new(NodeTable::new(id)));
+    let local = DiscoveryNode {
+        ip: Bytes::from(vec![127, 0, 0, 1]),
+        udp_port: 0,
+        tcp_port: 0,
+        id,
+    };
+    let configured: std::net::SocketAddr = "127.0.0.1:30304".parse().unwrap();
+
+    let closed = DiscoveryService::new(
+        "127.0.0.1:0", key.clone(), table.clone(), 33, local.clone(),
+        vec![configured], Arc::new(crate::peers::PeerStore::new()), true,
+    ).await.unwrap();
+
+    let stranger: std::net::SocketAddr = "203.0.113.9:30304".parse().unwrap();
+    assert!(closed.may_learn(configured), "a configured address must be learnable");
+    assert!(!closed.may_learn(stranger), "an address nobody configured must not be");
+
+    // The same service with the flag off is ordinary discovery again.
+    let open = DiscoveryService::new(
+        "127.0.0.1:0", key, table, 33, local,
+        vec![configured], Arc::new(crate::peers::PeerStore::new()), false,
+    ).await.unwrap();
+    assert!(open.may_learn(stranger), "an open network learns from anyone");
 }

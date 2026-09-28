@@ -387,10 +387,28 @@ struct Args {
     /// A node on `--port 30303` is reached at `HOST:30304`.
     ///
     /// Note this does not by itself keep a node off the public network: peers
-    /// found through the one bootstrap address can introduce others. Isolation
-    /// is a job for the firewall, not for this flag.
+    /// found through the one bootstrap address can introduce others. Pair it
+    /// with `--closed-network` to stop that, or use a firewall.
     #[arg(long, value_name = "HOST:PORT")]
     bootnodes: Vec<String>,
+
+    /// Learn no peers beyond the ones `--bootnodes` names.
+    ///
+    /// Discovery exists to find nodes, and it is good at it: a single
+    /// Neighbors reply is enough to pull a node that was pointed at one peer
+    /// onto the whole network. That is right for joining the chain and wrong
+    /// for a controlled test, where the peer set has to stay what the operator
+    /// chose -- otherwise the numbers describe whoever answered rather than
+    /// the node under test.
+    ///
+    /// With this set, a node enters the peer table only if its address was
+    /// configured. Discovery still answers what it is asked, so this is not a
+    /// way to hide; it simply does not act on what it hears.
+    ///
+    /// Has no effect without `--bootnodes`, which is the list it confines the
+    /// node to.
+    #[arg(long)]
+    closed_network: bool,
 
     /// Target number of outbound peer connections to maintain (rskj's
     /// `maxActivePeers` default is 30). Higher values give more headroom to
@@ -1355,6 +1373,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             );
             args.bootnodes.clone()
         },
+        closed_network: args.closed_network,
         secret_key: secret_key_bytes,
         discovery_port: args.port + 1,
         data_dir: args.data_dir.clone(),
