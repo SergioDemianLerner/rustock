@@ -71,6 +71,17 @@ impl MemoryTrieStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Every key held, in no particular order.
+    pub fn keys(&self) -> Vec<Vec<u8>> {
+        self.data.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Drops one node, so a test can produce the corruption this store exists
+    /// to detect: state that was accepted but is not all there.
+    pub fn remove(&self, key: &[u8]) -> bool {
+        self.data.lock().unwrap().remove(key).is_some()
+    }
 }
 
 impl Default for MemoryTrieStore {

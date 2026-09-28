@@ -21,12 +21,45 @@ use alloy_primitives::{B256, U256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use anyhow::{Result, Context, anyhow, bail};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Parallel point lookups when fetching many headers. Sixteen is what
 /// `RocksDbTrieStore` settled on for the same shape of work on this device.
-const HEADER_READ_THREADS: usize = 16;
+/// How many concurrent point lookups the storage device rewards.
+///
+/// This is the one number behind every parallel read in the node: headers by
+/// hash, trie nodes by hash, and the state verification walk. They all ask the
+/// same question -- not "how many cores are there", because these threads
+/// spend most of their time waiting on RocksDB, but "how deep a queue does
+/// this device answer well".
+///
+/// That is why 16 is reasonable on a 4-core machine, and why it is wrong to
+/// derive it from the core count. It is also why it is worth changing:
+///
+/// - a spinning disk has one arm, and 16 concurrent random reads is worse
+///   than four
+/// - network or shared storage is answering for a device that is not this
+///   host's
+/// - a one-core container gets contention and nothing else
+/// - NVMe with deep queues may well reward more than 16
+///
+/// The default is the value that was hardcoded before this was configurable,
+/// so behaviour does not change until an operator changes it. Nobody has
+/// measured the curve between 1 and 16; the two ends are known (#198 measured
+/// 1,000/s against 7,111/s) and the middle is not.
+static READ_THREADS: AtomicUsize = AtomicUsize::new(16);
+
+/// Sets the read concurrency. Call once, at start-up, before any reads.
+pub fn set_read_threads(n: usize) {
+    READ_THREADS.store(n.max(1), Ordering::Relaxed);
+}
+
+/// The configured read concurrency.
+pub fn read_threads() -> usize {
+    READ_THREADS.load(Ordering::Relaxed)
+}
 
 /// Headers frozen in one batch before making them durable.
 ///
@@ -519,11 +552,12 @@ impl BlockStore {
             Header::decode(&mut bytes.as_slice()).ok()
         };
 
-        if hashes.len() < HEADER_READ_THREADS * 2 {
+        let threads = read_threads();
+        if hashes.len() < threads * 2 {
             return hashes.iter().map(one).collect();
         }
         let mut out: Vec<Option<Header>> = vec![None; hashes.len()];
-        let chunk = hashes.len().div_ceil(HEADER_READ_THREADS);
+        let chunk = hashes.len().div_ceil(threads);
         std::thread::scope(|scope| {
             for (keys, slots) in hashes.chunks(chunk).zip(out.chunks_mut(chunk)) {
                 scope.spawn(|| {
@@ -2816,5 +2850,28 @@ mod tests {
         for number in 1..=4 {
             assert_eq!(store.hashes_at_height(number).unwrap().len(), 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod read_threads_tests {
+    /// One test, not two: the setting is process-wide, and cargo runs tests
+    /// in parallel, so two tests touching it would race each other.
+    #[test]
+    fn the_setting_defaults_to_what_was_hardcoded_and_clamps_zero() {
+        // The default is the value that was hardcoded before this was
+        // configurable, so an operator who changes nothing gets the behaviour
+        // that was measured.
+        assert_eq!(super::read_threads(), 16);
+
+        // Zero would divide the work into no pieces. A misconfiguration
+        // should be slow, not a panic.
+        super::set_read_threads(0);
+        assert_eq!(super::read_threads(), 1);
+
+        super::set_read_threads(4);
+        assert_eq!(super::read_threads(), 4);
+
+        super::set_read_threads(16);
     }
 }

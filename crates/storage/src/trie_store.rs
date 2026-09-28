@@ -19,7 +19,8 @@ const CF_TRIE: &str = "trie_nodes";
 /// requests the storage can serve rather than how many cores exist. 16 keeps a
 /// network-attached SSD busy without oversubscribing RocksDB's block cache
 /// locks.
-const READ_THREADS: usize = 16;
+// Read concurrency is one setting for the whole node; see
+// `crate::set_read_threads`.
 
 pub struct RocksDbTrieStore {
     db: Arc<DB>,
@@ -129,11 +130,12 @@ impl TrieStore for RocksDbTrieStore {
     /// Results are written back positionally, so the caller still gets one
     /// entry per key in the order it asked.
     fn get_many(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
-        if keys.len() < READ_THREADS * 2 {
+        let threads = crate::read_threads();
+        if keys.len() < threads * 2 {
             return keys.iter().map(|k| self.get(k)).collect();
         }
         let mut out: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
-        let chunk = keys.len().div_ceil(READ_THREADS);
+        let chunk = keys.len().div_ceil(threads);
         std::thread::scope(|scope| {
             for (key_chunk, out_chunk) in keys.chunks(chunk).zip(out.chunks_mut(chunk)) {
                 scope.spawn(|| {
