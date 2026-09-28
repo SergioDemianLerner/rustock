@@ -28,6 +28,12 @@ use tracing::{debug, warn};
 /// `RocksDbTrieStore` settled on for the same shape of work on this device.
 const HEADER_READ_THREADS: usize = 16;
 
+/// Headers frozen in one batch before making them durable.
+///
+/// Below this the batch is left in the write buffer: see
+/// `BlockStore::freeze_headers_below`.
+const SYNC_AFTER_HEADERS: u64 = 1_000;
+
 const CF_HEADERS: &str = "headers";
 const CF_NUMBERS: &str = "block_numbers";
 const CF_TD: &str = "total_difficulty";
@@ -1055,7 +1061,14 @@ impl BlockStore {
             f.put(start + i as u64, &header)?;
             done += 1;
         }
-        if done > 0 {
+        // Syncing a batch of one -- which is what steady state is, once the
+        // horizon is only moving as fast as the chain -- would be an fsync per
+        // block for a single 1.1 KB header, and would defeat the write buffer
+        // entirely. Bulk batches are worth making durable as they go; the tail
+        // is left to the buffer and to whoever calls `sync` when it runs out
+        // of work. Losing it costs nothing: unsynced headers were never
+        // published, and the next fill writes them again.
+        if done >= SYNC_AFTER_HEADERS {
             f.sync()?;
         }
         Ok(done)
