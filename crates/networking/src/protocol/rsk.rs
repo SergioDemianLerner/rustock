@@ -348,7 +348,9 @@ impl RskSubMessage {
                 // RLP([id, RLP([txs_list, uncles_list])])
                 let mut txs_payload = Vec::new();
                 for tx in &r.transactions {
-                    tx.encode(&mut txs_payload);
+                    // As in `encode_block`: serve the bytes the header commits
+                    // to, not a canonical re-encoding of the parsed fields.
+                    txs_payload.extend_from_slice(&tx.rlp_for_trie());
                 }
                 let mut txs_list = Vec::new();
                 RlpHeader { list: true, payload_length: txs_payload.len() }.encode(&mut txs_list);
@@ -684,6 +686,46 @@ impl Decodable for RskMessage {
 mod tests {
     use super::*;
     use alloy_rlp::{Encodable, Decodable};
+
+
+    /// A REMASC transaction's zero fields are written as literal 0x00 bytes,
+    /// not RLP's empty string. Serving a canonical re-encoding changes the
+    /// transaction root and the receiving peer rejects the body.
+    #[test]
+    fn a_remasc_body_keeps_the_bytes_its_header_commits_to() {
+        use rustock_core::ordered_tx_trie_root;
+
+        let mut inner: Vec<u8> = vec![0x83, 0x8d, 0x5a, 0xd7, 0x00, 0x00, 0x94];
+        inner.extend_from_slice(&[0u8; 19]);
+        inner.push(0x08);
+        inner.extend_from_slice(&[0x00, 0x80, 0x00, 0x00, 0x00]);
+        let mut raw = Vec::new();
+        RlpHeader { list: true, payload_length: inner.len() }.encode(&mut raw);
+        raw.extend_from_slice(&inner);
+
+        let tx = Transaction::decode(&mut raw.as_slice()).unwrap();
+        let before = ordered_tx_trie_root(std::slice::from_ref(&tx), true);
+
+        let mut buf = Vec::new();
+        let msg = RskMessage::new(RskSubMessage::BodyResponse(BodyResponse {
+            id: 7,
+            transactions: vec![tx],
+            uncles: Vec::new(),
+        }));
+        msg.encode(&mut buf);
+        let decoded = RskMessage::decode(&mut buf.as_slice()).expect("decodes");
+
+        match decoded.sub_message {
+            RskSubMessage::BodyResponse(r) => {
+                assert_eq!(
+                    before,
+                    ordered_tx_trie_root(&r.transactions, true),
+                    "the body wire must not change the transaction root"
+                );
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
 
     #[test]
     fn test_rsk_status_rlp() {

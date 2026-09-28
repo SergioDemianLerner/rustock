@@ -213,7 +213,13 @@ pub fn encode_block(block: &Block) -> Vec<u8> {
 
     let mut txs = Vec::new();
     for tx in &block.transactions {
-        tx.encode(&mut txs);
+        // The original bytes, not a re-encoding. rskj writes a zero field as a
+        // literal 0x00 where canonical RLP writes 0x80, and the header commits
+        // to a trie built over the bytes it actually signed. Re-encoding a
+        // REMASC transaction canonically changes the transaction root, and the
+        // peer -- correctly -- rejects the body as not the one its header
+        // commits to.
+        txs.extend_from_slice(&tx.rlp_for_trie());
     }
     let mut uncles = Vec::new();
     for uncle in &block.ommers {
@@ -608,6 +614,45 @@ mod tests {
             cached_hash_for_merged_mining: None,
         }
     }
+
+#[test]
+fn a_remasc_body_survives_the_snap_wire() {
+    use rustock_core::{ordered_tx_trie_root, Transaction};
+    use alloy_rlp::Decodable;
+
+    // The REMASC transaction as rskj puts it on the wire: every numeric field
+    // zero, and gasPrice/gasLimit/value written as a literal 0x00 byte rather
+    // than RLP's empty string. Canonical RLP would write 0x80 for each.
+    // [nonce=0x8d5ad7, gasPrice=0x00, gasLimit=0x00, to=20B, value=0x00,
+    //  data=empty, v=0x00, r=0x00, s=0x00]
+    let mut inner: Vec<u8> = vec![0x83, 0x8d, 0x5a, 0xd7, 0x00, 0x00, 0x94];
+    inner.extend_from_slice(&hex_lit("0000000000000000000000000000000001000008"));
+    inner.extend_from_slice(&[0x00, 0x80, 0x00, 0x00, 0x00]);
+    let mut raw = Vec::new();
+    alloy_rlp::Header { list: true, payload_length: inner.len() }.encode(&mut raw);
+    raw.extend_from_slice(&inner);
+
+    let tx = Transaction::decode(&mut raw.as_slice()).unwrap();
+    assert_eq!(tx.rlp_for_trie(), raw, "decoding keeps the original bytes");
+
+    let before = ordered_tx_trie_root(std::slice::from_ref(&tx), true);
+
+    // Put it through the snap block codec, exactly as the server does.
+    let block = rustock_core::Block {
+        header: header(1),
+        transactions: vec![tx],
+        ommers: Vec::new(),
+    };
+    let encoded = encode_block(&block);
+    let decoded = decode_block(&mut encoded.as_slice()).unwrap();
+
+    let after = ordered_tx_trie_root(&decoded.transactions, true);
+    assert_eq!(before, after, "the snap wire must not change the transaction root");
+}
+
+fn hex_lit(s: &str) -> Vec<u8> {
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+}
 
     fn roundtrip(sub: RskSubMessage) -> RskSubMessage {
         let mut buf = Vec::new();
