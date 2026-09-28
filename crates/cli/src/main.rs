@@ -392,6 +392,26 @@ struct Args {
     #[arg(long, value_name = "HOST:PORT")]
     bootnodes: Vec<String>,
 
+    /// Concurrent point lookups to issue against the storage device.
+    ///
+    /// One setting behind every parallel read in the node: headers by hash,
+    /// trie nodes by hash, and the snapshot state verification walk. They all
+    /// ask the same question, and it is not "how many cores are there" --
+    /// these threads spend most of their time waiting on RocksDB, so what is
+    /// being chosen is how deep a queue the device answers well. That is why
+    /// the default is 16 even on a four-core machine.
+    ///
+    /// Worth changing when the storage is not a local SSD: a spinning disk has
+    /// one arm and does worse with 16 concurrent random reads than with four,
+    /// network storage is answering for a device that is not this host's, and
+    /// a one-core container gets contention and nothing else. NVMe with deep
+    /// queues may reward more.
+    ///
+    /// The default is what was hardcoded before this was configurable, so
+    /// behaviour does not change until it is set.
+    #[arg(long, default_value_t = 16, value_name = "N")]
+    read_threads: usize,
+
     /// Keep old headers in RocksDB instead of moving them to flat files.
     ///
     /// Headers are keyed by hash, and hashes have no order, so serving the 192
@@ -1072,6 +1092,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     }
     let args = args;
 
+    // Before anything opens a store: every parallel read in the node reads
+    // this, and it is meant to be set once.
+    rustock_storage::set_read_threads(args.read_threads);
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
 
@@ -1162,7 +1186,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     );
 
     if args.build_bridge_index {
-        let store = Arc::new(BlockStore::open(&args.data_dir)?);
+    let store = Arc::new(BlockStore::open(&args.data_dir)?);
         rustock_storage::rskj_import::install_signal_handlers();
         run_build_bridge_index(&store, args.receipts_from, args.receipts_to)?;
         return Ok(());
