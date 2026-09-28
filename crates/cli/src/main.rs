@@ -392,6 +392,23 @@ struct Args {
     #[arg(long, value_name = "HOST:PORT")]
     bootnodes: Vec<String>,
 
+    /// Keep old headers in RocksDB instead of moving them to flat files.
+    ///
+    /// Headers are keyed by hash, and hashes have no order, so serving the 192
+    /// headers a peer asks for is 192 unrelated point lookups -- measured at
+    /// 6.5x read amplification on this database, about 7.1 KB read per header
+    /// delivered. Below `head - 20000` a canonical header can no longer
+    /// change, so it is written to a file addressed by block number instead,
+    /// where a run of headers is one contiguous read.
+    ///
+    /// Freezing is on because that is the behaviour a node should have. This
+    /// exists to turn it off: to measure against it, to run on a filesystem
+    /// where the flat files are unwelcome, or to rule it out while diagnosing
+    /// something else. Nothing is deleted from RocksDB either way, so turning
+    /// it off loses the read win and costs nothing else.
+    #[arg(long)]
+    no_freezer: bool,
+
     /// Learn no peers beyond the ones `--bootnodes` names.
     ///
     /// Discovery exists to find nodes, and it is good at it: a single
@@ -1752,6 +1769,103 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         rustock_networking::scoring::DEFAULT_NODE_CAPACITY,
         !args.no_peer_punishment,
     ));
+
+    // Old headers move to flat files addressed by block number, where a run
+    // of them is one contiguous read rather than 192 scattered point lookups.
+    let freezer = if args.no_freezer {
+        info!("Header freezer disabled; old headers stay in the block database");
+        None
+    } else {
+        let dir = std::path::Path::new(&args.data_dir).join("freezer");
+        match rustock_storage::freezer::Freezer::open(&dir) {
+            Ok(f) => {
+                let f = Arc::new(f);
+                info!(
+                    "Header freezer at {}: {} header(s), {} MB, freezing below #(head - {})",
+                    dir.display(),
+                    f.end_number(),
+                    f.data_bytes() / (1 << 20),
+                    rustock_storage::freezer::FREEZE_DEPTH,
+                );
+                Some(f)
+            }
+            // A freezer that will not open is a performance loss, not a
+            // correctness one: every header it would have held is still in
+            // RocksDB. Say so loudly and carry on rather than refusing to
+            // start a node that can serve the chain perfectly well.
+            Err(e) => {
+                warn!(
+                    "Header freezer at {} could not be opened ({e:#}); \
+                     continuing without it",
+                    dir.display()
+                );
+                None
+            }
+        }
+    };
+    if let Some(f) = freezer.clone() {
+        store.set_freezer(f);
+
+        // Fill the freezer from the block database in the background.
+        //
+        // A node that has already synced has every header in RocksDB and an
+        // empty freezer, so there is a one-time catch-up of however many
+        // blocks are below the horizon. It runs on a blocking thread because
+        // each header is a point lookup, and it yields between batches so it
+        // competes with serving rather than starving it.
+        //
+        // Nothing depends on this having finished: until a run is frozen, the
+        // serving path answers it the old way.
+        let fill_store = store.clone();
+        tokio::task::spawn_blocking(move || {
+            const BATCH: u64 = 10_000;
+            let mut announced = false;
+            loop {
+                let head = fill_store
+                    .head()
+                    .ok()
+                    .flatten()
+                    .and_then(|h| fill_store.header(h).ok().flatten())
+                    .map(|h| h.number)
+                    .unwrap_or(0);
+                let horizon = head.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH);
+
+                match fill_store.freeze_headers_below(horizon, BATCH) {
+                    Ok(0) => {
+                        if !announced {
+                            if let Some(f) = fill_store.freezer() {
+                                info!(
+                                    "Header freezer caught up: {} header(s), {} MB",
+                                    f.end_number(),
+                                    f.data_bytes() / (1 << 20)
+                                );
+                            }
+                            announced = true;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                    Ok(n) => {
+                        announced = false;
+                        if let Some(f) = fill_store.freezer() {
+                            let at = f.end_number();
+                            if at % 100_000 < n {
+                                info!(
+                                    "Header freezer: {} of {} header(s) moved to files ({} MB)",
+                                    at,
+                                    horizon,
+                                    f.data_bytes() / (1 << 20)
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Header freezer stopped filling: {e:#}");
+                        return;
+                    }
+                }
+            }
+        });
+    }
 
     if args.snap_server {
         info!(
