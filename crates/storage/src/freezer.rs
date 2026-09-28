@@ -63,6 +63,7 @@
 //! no place in a file addressed by height. Those stay in RocksDB, which is also
 //! where a reorg goes looking for them.
 
+use alloy_primitives::B256;
 use anyhow::{bail, Context, Result};
 use rustock_core::Header;
 use std::fs::{File, OpenOptions};
@@ -167,6 +168,13 @@ struct Writable {
 /// Flat-file storage for canonical headers below the freeze threshold.
 pub struct Freezer {
     dir: PathBuf,
+    /// Prepended to every filename.
+    ///
+    /// Empty for the real freezer. A staging freezer gets one naming the
+    /// checkpoint it is being built against, so its files sit beside the real
+    /// ones without being them, and are recognisable as not-yet-trusted to
+    /// anything that finds them later.
+    prefix: String,
     write: Mutex<Writable>,
 }
 
@@ -180,11 +188,42 @@ impl Freezer {
     /// header the index cannot address, which is worse than losing an append
     /// that can simply be redone.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_prefix(dir, "")
+    }
+
+    /// Opens a staging freezer for a chain that is not yet trusted.
+    ///
+    /// A snapshot sync walks down from a checkpoint a *peer* offered. Each
+    /// header is verified and linked, but the chain is only known to be this
+    /// network's once the walk reaches ground the node already accepted --
+    /// until then a lying peer's well-formed headers look exactly like real
+    /// ones.
+    ///
+    /// Writing them into a separate set of files, named for the checkpoint
+    /// they rest on, means a walk that turns out to be wrong costs only those
+    /// files. [`Freezer::promote`] renames them into place when the walk
+    /// succeeds; [`Freezer::discard_staging`] removes them when it does not,
+    /// and is also what cleans up after a process that died mid-walk.
+    ///
+    /// The alternative -- writing into the real files behind a marker -- would
+    /// have to discard the *whole* freezer on failure, including millions of
+    /// headers frozen legitimately before the walk began.
+    /// The files are named for both the checkpoint's height and its hash.
+    /// The hash alone would be unique, but these files can outlive the process
+    /// that wrote them, and an operator who finds one should be able to tell
+    /// what it is without opening it: which block a walk was resting on, and
+    /// how far up the chain that was.
+    pub fn open_staging(dir: impl AsRef<Path>, number: u64, checkpoint: B256) -> Result<Self> {
+        Self::open_with_prefix(dir, &format!("staging-{number}-{checkpoint:x}-"))
+    }
+
+    fn open_with_prefix(dir: impl AsRef<Path>, prefix: &str) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
+        let prefix = prefix.to_string();
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating freezer directory {}", dir.display()))?;
 
-        let index_path = dir.join("headers.cidx");
+        let index_path = dir.join(format!("{prefix}headers.cidx"));
         let mut index = OpenOptions::new()
             .read(true)
             .write(true)
@@ -208,14 +247,14 @@ impl Freezer {
         // one is being appended to, only where each block landed.
         let mut file_number = 0u16;
         for n in 0..=u16::MAX {
-            if dir.join(format!("headers-{n:04}.cdat")).exists() {
+            if dir.join(format!("{prefix}headers-{n:04}.cdat")).exists() {
                 file_number = n;
             } else if n > 0 {
                 break;
             }
         }
 
-        let data_path = dir.join(format!("headers-{file_number:04}.cdat"));
+        let data_path = dir.join(format!("{prefix}headers-{file_number:04}.cdat"));
         let data = OpenOptions::new()
             .read(true)
             .write(true)
@@ -236,6 +275,7 @@ impl Freezer {
 
         Ok(Self {
             dir,
+            prefix,
             write: Mutex::new(Writable {
                 index,
                 data,
@@ -246,6 +286,78 @@ impl Freezer {
                 pending_index: Vec::new(),
             }),
         })
+    }
+
+    /// Where this freezer's files live.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn index_path(&self) -> PathBuf {
+        self.dir.join(format!("{}headers.cidx", self.prefix))
+    }
+
+    fn data_path(&self, file: u16) -> PathBuf {
+        self.dir.join(format!("{}headers-{file:04}.cdat", self.prefix))
+    }
+
+    /// Whether this freezer holds nothing.
+    ///
+    /// A walk only feeds a freezer that is empty: promotion renames files into
+    /// place, which replaces rather than merges, so anything already frozen
+    /// would be lost. A populated freezer is left to the background fill.
+    pub fn is_empty(&self) -> bool {
+        self.end_number() == 0
+    }
+
+    /// Renames a staging freezer's files into the real ones.
+    ///
+    /// Called once the walk has reached ground this node already accepted,
+    /// which is the point at which the chain stops resting on a peer's word.
+    /// Flushes first: renaming while the last batch is still in memory would
+    /// publish files that do not hold what the index says they do.
+    pub fn promote(&self) -> Result<()> {
+        if self.prefix.is_empty() {
+            return Ok(());
+        }
+        self.sync()?;
+        let w = self.write.lock().unwrap();
+        let files = w.file_number;
+        drop(w);
+
+        // Data before index, as everywhere else here: an index naming data
+        // that has not arrived is unreadable, while data nothing names yet is
+        // merely unreferenced.
+        for f in 0..=files {
+            let from = self.data_path(f);
+            if from.exists() {
+                let to = self.dir.join(format!("headers-{f:04}.cdat"));
+                std::fs::rename(&from, &to)
+                    .with_context(|| format!("promoting {}", from.display()))?;
+            }
+        }
+        let to = self.dir.join("headers.cidx");
+        std::fs::rename(self.index_path(), &to)
+            .with_context(|| format!("promoting {}", to.display()))?;
+        Ok(())
+    }
+
+    /// Removes every staging file in `dir`, whichever checkpoint they name.
+    ///
+    /// Run at start-up: a process that died mid-walk leaves its staging files
+    /// behind, and nothing else will ever come back for them.
+    pub fn discard_staging(dir: impl AsRef<Path>) -> usize {
+        let dir = dir.as_ref();
+        let mut dropped = 0;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().starts_with("staging-") {
+                    let _ = std::fs::remove_file(e.path());
+                    dropped += 1;
+                }
+            }
+        }
+        dropped
     }
 
     /// One past the highest block number ever written.
@@ -262,7 +374,7 @@ impl Freezer {
     }
 
     fn entry(&self, number: u64) -> Option<IndexEntry> {
-        let mut index = File::open(self.dir.join("headers.cidx")).ok()?;
+        let mut index = File::open(self.index_path()).ok()?;
         read_entry_at(&mut index, number).ok().filter(|e| !e.is_absent())
     }
 
@@ -295,7 +407,7 @@ impl Freezer {
                 .file_number
                 .checked_add(1)
                 .context("freezer is out of data files")?;
-            let path = self.dir.join(format!("headers-{next:04}.cdat"));
+            let path = self.data_path(next);
             w.data = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -388,7 +500,7 @@ impl Freezer {
         }
         let available = ((end_number - from) as usize).min(count);
 
-        let mut index = File::open(self.dir.join("headers.cidx"))?;
+        let mut index = File::open(self.index_path())?;
         let mut raw = vec![0u8; available * INDEX_ENTRY_BYTES as usize];
         index.seek(SeekFrom::Start(from * INDEX_ENTRY_BYTES))?;
         // A sparse tail may be shorter than asked for; a short read leaves
@@ -414,7 +526,7 @@ impl Freezer {
             let lo = slots.iter().map(|i| entries[*i].start).min().unwrap();
             let hi = slots.iter().map(|i| entries[*i].end).max().unwrap();
 
-            let path = self.dir.join(format!("headers-{file:04}.cdat"));
+            let path = self.data_path(file);
             let mut data = File::open(&path)
                 .with_context(|| format!("opening {}", path.display()))?;
             let mut buf = vec![0u8; (hi - lo) as usize];
@@ -455,7 +567,7 @@ impl Freezer {
         let w = self.write.lock().unwrap();
         let mut total = w.data_len as u64;
         for f in 0..w.file_number {
-            if let Ok(m) = std::fs::metadata(self.dir.join(format!("headers-{f:04}.cdat"))) {
+            if let Ok(m) = std::fs::metadata(self.data_path(f)) {
                 total += m.len();
             }
         }
@@ -923,5 +1035,129 @@ mod writer_tests {
         assert_eq!(w.horizon(), before, "a shorter head must not lower the horizon");
         w.set_head(1_001_000);
         assert_eq!(w.horizon(), 1_001_000 - FREEZE_DEPTH);
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::tests::test_header;
+    use super::*;
+
+    fn cp(n: u8) -> B256 {
+        B256::repeat_byte(n)
+    }
+
+    /// The name says what the files are, for whoever finds them after a crash.
+    #[test]
+    fn staging_files_name_their_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = Freezer::open_staging(dir.path(), 9_265_000, cp(0xAB)).unwrap();
+        f.put(0, &test_header(0)).unwrap();
+        f.sync().unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("9265000") && n.contains(&"ab".repeat(32))),
+            "expected height and checkpoint in the filenames, got {names:?}"
+        );
+    }
+
+    /// A walk that never finished leaves staging files that nothing will come
+    /// back for. They are removed, and the real freezer is untouched.
+    #[test]
+    fn an_abandoned_walk_costs_only_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Headers already frozen legitimately.
+        let real = Freezer::open(dir.path()).unwrap();
+        for n in 0..100 {
+            real.put(n, &test_header(n)).unwrap();
+        }
+        real.sync().unwrap();
+        drop(real);
+
+        // A walk starts staging against a checkpoint, then the process dies.
+        {
+            let staging = Freezer::open_staging(dir.path(), 500, cp(0xAB)).unwrap();
+            for n in 0..500 {
+                staging.put(n, &test_header(n)).unwrap();
+            }
+            staging.sync().unwrap();
+        }
+
+        let dropped = Freezer::discard_staging(dir.path());
+        assert!(dropped >= 2, "staging index and data should both go");
+
+        let real = Freezer::open(dir.path()).unwrap();
+        assert_eq!(real.end_number(), 100, "the real freezer must be untouched");
+        assert_eq!(real.header(99).unwrap().unwrap().number, 99);
+    }
+
+    /// A walk that reached known ground replaces the real files with its own.
+    #[test]
+    fn a_completed_walk_is_promoted_by_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let staging = Freezer::open_staging(dir.path(), 500, cp(0x07)).unwrap();
+            for n in 0..500 {
+                staging.put(n, &test_header(n)).unwrap();
+            }
+            staging.promote().unwrap();
+        }
+        assert_eq!(
+            Freezer::discard_staging(dir.path()),
+            0,
+            "promotion leaves nothing staged behind"
+        );
+
+        let real = Freezer::open(dir.path()).unwrap();
+        assert_eq!(real.end_number(), 500);
+        assert_eq!(real.header(499).unwrap().unwrap().number, 499);
+    }
+
+    /// Promotion flushes first: renaming while the last batch is still in
+    /// memory would publish an index naming data that never landed.
+    #[test]
+    fn promotion_flushes_what_is_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let staging = Freezer::open_staging(dir.path(), 1, cp(0x11)).unwrap();
+            staging.put(0, &test_header(0)).unwrap();
+            assert!(!staging.contains(0), "still buffered");
+            staging.promote().unwrap();
+        }
+        let real = Freezer::open(dir.path()).unwrap();
+        assert_eq!(real.header(0).unwrap().unwrap().number, 0);
+    }
+
+    /// Two walks against different checkpoints do not collide.
+    #[test]
+    fn staging_is_keyed_by_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Freezer::open_staging(dir.path(), 1, cp(0x01)).unwrap();
+        let b = Freezer::open_staging(dir.path(), 1, cp(0x02)).unwrap();
+        a.put(0, &test_header(0)).unwrap();
+        b.put(0, &test_header(1)).unwrap();
+        a.sync().unwrap();
+        b.sync().unwrap();
+        assert_ne!(a.dir().join("x"), std::path::PathBuf::new());
+        assert_eq!(a.header(0).unwrap().unwrap().number, 0);
+        assert_eq!(b.header(0).unwrap().unwrap().number, 1);
+    }
+
+    /// A freezer with contents is left to the background fill, because
+    /// promotion replaces rather than merges.
+    #[test]
+    fn a_populated_freezer_reports_itself_non_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = Freezer::open(dir.path()).unwrap();
+        assert!(f.is_empty());
+        f.put(0, &test_header(0)).unwrap();
+        f.sync().unwrap();
+        assert!(!f.is_empty());
     }
 }

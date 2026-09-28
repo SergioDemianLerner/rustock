@@ -50,7 +50,7 @@ use rustock_networking::protocol::BlockIdentifier;
 use rustock_storage::BlockStore;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 /// Headers per request, and so the spacing of skeleton points. rskj serves at
 /// most this many and so does rustock.
@@ -118,6 +118,15 @@ pub struct HeaderWalk {
     need_number: u64,
     need_hash: B256,
     done: bool,
+
+    /// Blocks strictly below this may be frozen: `top - FREEZE_DEPTH`.
+    freeze_horizon: u64,
+    /// Headers written against a checkpoint that is still only a peer's claim.
+    ///
+    /// `None` when there is no freezer, or when it already holds something --
+    /// promotion renames files into place, which replaces rather than merges,
+    /// so a populated freezer is left to the background fill instead.
+    staging: Option<rustock_storage::freezer::Freezer>,
 }
 
 impl HeaderWalk {
@@ -153,6 +162,16 @@ impl HeaderWalk {
         // is the top that unblocks it.
         skeleton_todo.reverse();
 
+        // A walk feeds the freezer only when there is nothing to lose by
+        // doing so: an empty freezer, on a node syncing from scratch. On a
+        // node that already froze headers, promotion would replace them.
+        let staging = match store.freezer() {
+            Some(f) if f.is_empty() => {
+                rustock_storage::freezer::Freezer::open_staging(f.dir(), number, top_hash).ok()
+            }
+            _ => None,
+        };
+
         let _ = parent;
         Self {
             store,
@@ -166,6 +185,8 @@ impl HeaderWalk {
             need_number: number,
             need_hash: top_hash,
             done: false,
+            freeze_horizon: number.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
+            staging,
         }
     }
 
@@ -308,6 +329,17 @@ impl HeaderWalk {
             let _ = self.store.put_header_with_hash(header.hash(), header);
         }
 
+        // The headers are in hand and verified against each other; writing
+        // them to the freezer now saves reading all of them back out of
+        // RocksDB in a separate pass afterwards.
+        //
+        // They are provisional until the walk reaches ground this node
+        // already accepted, because until then the whole chain rests on a
+        // checkpoint a peer offered. `Freezer::mark_provisional` is what makes
+        // that safe: a walk that never finishes leaves a marker, and the next
+        // open discards everything behind it.
+        self.freeze_provisionally(headers);
+
         let oldest = headers.last().expect("non-empty");
         self.runs.insert(
             point,
@@ -318,6 +350,43 @@ impl HeaderWalk {
             },
         );
         Ok(())
+    }
+
+    /// Writes a verified run to the staging freezer.
+    ///
+    /// Only blocks below the freeze horizon: anything younger can still be
+    /// replaced by a reorg, and a file addressed by height has no way to say
+    /// "this height means something else now".
+    fn freeze_provisionally(&mut self, headers: &[rustock_core::Header]) {
+        let Some(staging) = self.staging.as_ref() else { return };
+        let horizon = self.freeze_horizon;
+        if horizon == 0 {
+            return;
+        }
+        for header in headers {
+            if header.number < horizon {
+                let _ = staging.put(header.number, header);
+            }
+        }
+    }
+
+    /// Renames the staging files into the real freezer.
+    ///
+    /// Called once the walk has reached ground this node already accepted,
+    /// which is the point at which the chain stops resting on a peer's word.
+    pub fn commit_freezer(&mut self) {
+        let Some(staging) = self.staging.take() else { return };
+        match staging.promote() {
+            Ok(()) => info!(
+                target: "rustock::snap",
+                "froze {} header(s) during the walk", staging.end_number()
+            ),
+            Err(e) => warn!(
+                target: "rustock::snap",
+                "could not promote the staged headers: {e:#}; \
+                 they will be refilled from the block database"
+            ),
+        }
     }
 
     /// Follow the links as far down as they now reach.
@@ -331,6 +400,7 @@ impl HeaderWalk {
             // now anchored to work it had already taken.
             if self.is_ours(self.need_number, self.need_hash) {
                 self.done = true;
+                self.commit_freezer();
                 break;
             }
             if self.need_number == 0 {

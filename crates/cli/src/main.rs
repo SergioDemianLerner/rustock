@@ -1777,6 +1777,15 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None
     } else {
         let dir = std::path::Path::new(&args.data_dir).join("freezer");
+        // A process that died mid-walk leaves staging files nothing will come
+        // back for. They name the checkpoint they were built against, so they
+        // are recognisable, and they are not the real freezer's files.
+        let abandoned = rustock_storage::freezer::Freezer::discard_staging(&dir);
+        if abandoned > 0 {
+            info!(
+                "Discarded {abandoned} staged freezer file(s) from a header walk                  that did not finish"
+            );
+        }
         match rustock_storage::freezer::Freezer::open(&dir) {
             Ok(f) => {
                 let f = Arc::new(f);
