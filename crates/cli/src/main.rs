@@ -1841,20 +1841,32 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 
                 match fill_store.freeze_headers_below(horizon, BATCH) {
                     Ok(0) => {
-                        if !announced {
-                            if let Some(f) = fill_store.freezer() {
+                        if let Some(f) = fill_store.freezer() {
+                            // Nothing left to do is the moment to make the
+                            // tail durable: in steady state the batches are
+                            // one or two headers and are deliberately left in
+                            // the write buffer.
+                            let _ = f.sync();
+                            if !announced {
                                 info!(
                                     "Header freezer caught up: {} header(s), {} MB",
                                     f.end_number(),
                                     f.data_bytes() / (1 << 20)
                                 );
+                                announced = true;
                             }
-                            announced = true;
                         }
                         std::thread::sleep(std::time::Duration::from_secs(60));
                     }
                     Ok(n) => {
-                        announced = false;
+                        // Only a full batch means it is genuinely behind. Once
+                        // caught up the horizon advances with the chain, so
+                        // every round freezes a header or two -- announcing
+                        // "caught up" after each of those said it every 30
+                        // seconds, forever.
+                        if n >= BATCH {
+                            announced = false;
+                        }
                         if let Some(f) = fill_store.freezer() {
                             let at = f.end_number();
                             if at % 100_000 < n {
