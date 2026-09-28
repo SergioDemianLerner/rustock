@@ -12,6 +12,7 @@ pub mod epoch_store;
 pub mod window_store;
 pub mod position;
 pub mod pruner;
+pub mod freezer;
 pub use cached_trie_store::CachedTrieStore;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
@@ -98,6 +99,12 @@ const MAX_REORG_DEPTH: u64 = 1000;
 /// - `default`: Metadata like "head" -> Hash
 pub struct BlockStore {
     db: Arc<DB>,
+    /// Flat-file storage for canonical headers below the freeze horizon.
+    ///
+    /// Optional because a node can run perfectly well without it: every header
+    /// the freezer holds is also in `CF_HEADERS`, so this only ever changes how
+    /// fast a header is found, never whether it is found.
+    freezer: std::sync::RwLock<Option<Arc<crate::freezer::Freezer>>>,
 }
 
 /// RocksDB settings for a bulk import.
@@ -258,7 +265,7 @@ impl BlockStore {
             DB::open_cf_for_read_only(&opts, path.as_ref(), existing, false)
                 .context("Failed to open RocksDB read-only")?
         };
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db: Arc::new(db), freezer: std::sync::RwLock::new(None) })
     }
 
     fn open_with<P: AsRef<Path>>(path: P, tuning: Option<ImportTuning>) -> Result<Self> {
@@ -297,7 +304,7 @@ impl BlockStore {
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs).context("Failed to open RocksDB")?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db: Arc::new(db), freezer: std::sync::RwLock::new(None) })
     }
 
     /// Scans the headers column family for the highest block number.
@@ -947,6 +954,84 @@ impl BlockStore {
         self.db
             .put_cf(self.cf(CF_BODIES)?, hash.as_slice(), &buf)
             .context("Failed to write block body")
+    }
+
+    /// Attaches a freezer, so header runs can be served from flat files.
+    pub fn set_freezer(&self, freezer: Arc<crate::freezer::Freezer>) {
+        *self.freezer.write().unwrap() = Some(freezer);
+    }
+
+    pub fn freezer(&self) -> Option<Arc<crate::freezer::Freezer>> {
+        self.freezer.read().unwrap().clone()
+    }
+
+    /// Canonical headers for a **descending** run of heights, positionally.
+    ///
+    /// This is the shape a peer actually asks for -- "the 192 headers below
+    /// N" -- and the reason the freezer exists. Below the freeze horizon it is
+    /// one index read and one contiguous data read. Above it, or without a
+    /// freezer, it falls back to resolving each height to a hash and fetching
+    /// the headers by hash, which is where the 6.5x read amplification lives.
+    ///
+    /// Returns headers newest first, matching `canonical_hashes_descending`.
+    pub fn canonical_headers_descending(
+        &self,
+        top: u64,
+        count: usize,
+    ) -> Vec<Option<Header>> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let lowest = top.saturating_sub(count as u64 - 1);
+
+        // The whole run has to be frozen for the fast path to answer it; a
+        // partly-frozen run would need both sources stitched together, and the
+        // boundary moves, so the stitch would be the only untested case.
+        if let Some(f) = self.freezer() {
+            if top < f.end_number() && f.contains(lowest) && f.contains(top) {
+                if let Ok(run) = f.run(lowest, count) {
+                    if run.iter().all(|h| h.is_some()) {
+                        let mut out = run;
+                        out.reverse();
+                        return out;
+                    }
+                }
+            }
+        }
+
+        let hashes = self.canonical_hashes_descending(top, count);
+        let resolved: Vec<Option<B256>> = hashes;
+        let present: Vec<B256> = resolved.iter().flatten().copied().collect();
+        if present.len() != count {
+            return vec![None; count];
+        }
+        self.headers_by_hash(&present)
+    }
+
+    /// Moves canonical headers below `horizon` into the freezer.
+    ///
+    /// Ascending and contiguous from wherever the freezer left off, which is
+    /// the order that makes a later run one read. Stops at the first height it
+    /// cannot resolve rather than leaving a hole: a hole would be invisible
+    /// until a peer asked for a run spanning it.
+    ///
+    /// Returns how many headers were frozen. Cheap to call repeatedly -- when
+    /// there is nothing to do it resolves one height and stops.
+    pub fn freeze_headers_below(&self, horizon: u64, max_batch: u64) -> Result<u64> {
+        let Some(f) = self.freezer() else { return Ok(0) };
+        let mut n = f.end_number();
+        let mut done = 0u64;
+        while n < horizon && done < max_batch {
+            let Some(hash) = self.canonical_hash(n)? else { break };
+            let Some(header) = self.header(hash)? else { break };
+            f.put(n, &header)?;
+            n += 1;
+            done += 1;
+        }
+        if done > 0 {
+            f.sync()?;
+        }
+        Ok(done)
     }
 
     /// Reads a block body (transactions + ommers) by hash.

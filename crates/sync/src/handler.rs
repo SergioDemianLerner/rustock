@@ -494,9 +494,9 @@ pub(crate) fn canonical_run(
         return None;
     }
 
-    let hashes = store.canonical_hashes_descending(top, count as usize);
-    let resolved: Vec<alloy_primitives::B256> = hashes.into_iter().collect::<Option<Vec<_>>>()?;
-    let fetched = store.headers_by_hash(&resolved);
+    // One call, so a frozen run is answered from the flat files without
+    // resolving a hash per height.
+    let fetched = store.canonical_headers_descending(top, count as usize);
 
     let mut headers = Vec::with_capacity(count as usize);
     for slot in fetched {
