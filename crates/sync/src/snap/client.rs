@@ -588,6 +588,25 @@ impl StateDownload {
         }
 
         let nodes = nodes.into_inner();
+
+        // The walk above covers the trie by byte range, which proves the
+        // offsets add up and every region is reachable. It does not prove
+        // every *node* is present: the traversal it uses skips a child it
+        // cannot resolve, because its other caller serves chunks to peers and
+        // should hand over what it has. A hole therefore made a chunk shorter
+        // rather than empty, and passed (#204).
+        //
+        // So ask the question directly. This is a plain reachability descent
+        // with no offsets to get right, and it refuses on the first node or
+        // long value that is not in the store.
+        match rustock_trie::snapshot::verify_complete(&root, self.store.as_ref()) {
+            Ok(reached) => debug!(
+                target: "rustock::snap",
+                "reachability reached {reached} nodes; the offset walk counted {nodes}"
+            ),
+            Err(missing) => return Err(missing.to_string()),
+        }
+
         info!(
             target: "rustock::snap",
             "stored state verified: {} nodes, {} MB, {:.0}s across {workers} thread(s)",

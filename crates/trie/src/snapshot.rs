@@ -27,6 +27,7 @@
 //! total_size(left) + stream_size(node) + total_size(right)` -- which is the
 //! in-order decomposition the seek below relies on.
 
+use alloy_primitives::B256;
 use crate::node::{NodeRef, TrieNode};
 use crate::store::TrieStore;
 
@@ -706,4 +707,75 @@ mod tests {
         let root = TrieNode::empty();
         assert!(chunk_from(&root, 0, 4096, &store).is_empty());
     }
+}
+
+/// What a strict walk found missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Missing {
+    /// A child reference that does not resolve to a node in the store.
+    Node(B256),
+    /// A node whose long value is not in the store.
+    Value(B256),
+}
+
+impl std::fmt::Display for Missing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Missing::Node(h) => write!(f, "trie node {h:?} is not in the store"),
+            Missing::Value(h) => write!(f, "long value {h:?} is not in the store"),
+        }
+    }
+}
+
+/// Confirms every node reachable from `root` is present and readable.
+///
+/// # Why this is not `chunk_from`
+///
+/// `collect` skips a child it cannot resolve -- `else { continue }`, `else
+/// { break }` -- and that is right for its other caller. Serving a snapshot
+/// chunk from a store missing a node should hand over what is there; the
+/// client's proof check is what notices the gap.
+///
+/// It is wrong for verification, whose entire job is noticing a missing node.
+/// A hole made the chunk *shorter*, not empty, so the only check on the
+/// walk -- an empty chunk -- never fired, and a state with holes passed
+/// (#204).
+///
+/// This refuses instead. It also has no offsets or budgets to get right:
+/// reachability is the question, so it is a plain descent.
+///
+/// Returns how many nodes were visited.
+pub fn verify_complete(root: &TrieNode, store: &dyn TrieStore) -> Result<u64, Missing> {
+    let mut stack = vec![root.clone()];
+    let mut nodes = 0u64;
+
+    while let Some(node) = stack.pop() {
+        nodes += 1;
+
+        // A long value lives under its own hash, so a node can be present
+        // while the bytes it stands for are not.
+        if node.has_long_value() && node.value.is_none() {
+            if let Some(h) = node.value_hash {
+                if store.get(h.as_slice()).is_none() {
+                    return Err(Missing::Value(h));
+                }
+            }
+        }
+
+        for child in [&node.left, &node.right] {
+            match child {
+                NodeRef::Empty => {}
+                // Embedded children live inside the parent's message, so they
+                // are present by construction -- but their own children may
+                // not be.
+                NodeRef::Node(n) => stack.push((**n).clone()),
+                NodeRef::Hash(h) => match child.resolve(store) {
+                    Some(n) => stack.push(n),
+                    None => return Err(Missing::Node(*h)),
+                },
+            }
+        }
+    }
+
+    Ok(nodes)
 }

@@ -392,6 +392,26 @@ struct Args {
     #[arg(long, value_name = "HOST:PORT")]
     bootnodes: Vec<String>,
 
+    /// Delete headers from the block database once the freezer holds them.
+    ///
+    /// Off by default, and deliberately so. The freezer's measured win is
+    /// read amplification on header serving, and that is banked without
+    /// deleting anything; what deletion buys is space -- roughly 9.6 GB net
+    /// on this chain, after the ~372 MB the hash-to-number index costs.
+    ///
+    /// What it costs is a failure mode duplication currently makes
+    /// impossible: a header that is in neither place. Every lookup by hash
+    /// for a frozen block then depends on an index entry being right, where
+    /// today it depends on nothing.
+    ///
+    /// Deletion is ordered so that cannot happen quietly -- the header is
+    /// read back out of the freezer, and `hash → number` written, *before*
+    /// the database copy goes. But the ordering is a mitigation, not a
+    /// reason to turn it on. Turn it on when disk pressure justifies the
+    /// risk, not before.
+    #[arg(long)]
+    prune_frozen_headers: bool,
+
     /// Concurrent point lookups to issue against the storage device.
     ///
     /// One setting behind every parallel read in the node: headers by hash,
@@ -1850,6 +1870,14 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         // Nothing depends on this having finished: until a run is frozen, the
         // serving path answers it the old way.
         let fill_store = store.clone();
+        let prune_frozen = args.prune_frozen_headers;
+        if prune_frozen {
+            warn!(
+                "Frozen headers will be deleted from the block database once the freezer \
+                 holds them. Every lookup by hash for those blocks then depends on the \
+                 hash-to-number index."
+            );
+        }
         tokio::task::spawn_blocking(move || {
             const BATCH: u64 = 10_000;
             let mut announced = false;
@@ -1878,6 +1906,21 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                                     f.data_bytes() / (1 << 20)
                                 );
                                 announced = true;
+                            }
+                        }
+                        // Nothing left to freeze is the moment to reclaim
+                        // what the freezer has made redundant -- never
+                        // before, and never ahead of the freezer's own
+                        // progress.
+                        if prune_frozen {
+                            match fill_store.delete_frozen_headers(horizon, BATCH) {
+                                Ok(0) => {}
+                                Ok(n) => info!(
+                                    "Reclaimed {n} frozen header(s) from the block database \
+                                     (now at #{})",
+                                    fill_store.frozen_delete_cursor().unwrap_or(0)
+                                ),
+                                Err(e) => warn!("Frozen header reclaim stopped: {e:#}"),
                             }
                         }
                         std::thread::sleep(std::time::Duration::from_secs(60));
