@@ -517,6 +517,16 @@ pub struct SyncService {
     /// the code responsible for three mainnet stalls on 2026-09-24, and this
     /// does not need to touch it. See #114.
     pub(crate) body_providers: HashMap<u64, B512>,
+    /// Ordinary sync is standing down while a snapshot session runs.
+    ///
+    /// Set when a session opens and cleared only by `resume_ordinary_sync`,
+    /// rather than inferred from `self.snap.is_some()`. The two differ at
+    /// exactly the moment that matters: `finish_snap_sync` takes the driver
+    /// out before deciding whether to start another, so an inferred flag would
+    /// let the ordinary sync start a round in that gap and then be interrupted
+    /// by the next session. Making the handover explicit means one place
+    /// decides, and it decides after the outcome is known. See #185.
+    suspended_for_snap: bool,
     /// Peer scoring, when the node was built with it.
     ///
     /// The sidelining below **feeds** this rather than being replaced by it.
@@ -575,6 +585,7 @@ impl SyncService {
             sidelined: HashMap::new(),
             events: None,
             body_providers: HashMap::new(),
+            suspended_for_snap: false,
             scoring: None,
             last_prefetch_start: None,
             block_source: None,
@@ -855,6 +866,7 @@ impl SyncService {
         trie_store: Arc<dyn TrieStore>,
     ) {
         self.snap_attempts += 1;
+        self.suspend_ordinary_sync();
         let session = crate::snap::session::SnapSession::new(
             config,
             self.manager.store.clone(),
@@ -876,6 +888,19 @@ impl SyncService {
     #[cfg(test)]
     pub(crate) fn snap_request_id_for_test(&self) -> Option<u64> {
         self.snap.as_ref()?.outstanding_ids().first().copied()
+    }
+
+    /// Whether ordinary sync is standing down for a snapshot session.
+    #[cfg(test)]
+    pub(crate) fn is_suspended_for_snap_for_test(&self) -> bool {
+        self.suspended_for_snap
+    }
+
+    /// Drop the session as though it had failed, for testing the handover.
+    #[cfg(test)]
+    pub(crate) fn fail_snap_for_test(&mut self) {
+        self.snap = None;
+        self.snap_restart = None;
     }
 
     /// Sessions started so far.
@@ -928,6 +953,51 @@ impl SyncService {
         }
     }
 
+    /// Stand the ordinary sync down for the duration of a snapshot session.
+    ///
+    /// **Header sync first, then state — never the reverse.** A snapshot is
+    /// only trustworthy because the header walk vouches for the checkpoint it
+    /// hangs from, so the walk has to own the peer set until it is done.
+    ///
+    /// Without this the two compete. On a network with many peers that is
+    /// merely wasteful; on one peer it is fatal, and it was measured being
+    /// fatal: the ordinary sync's header requests were served, the snapshot
+    /// session's queued behind them and timed out 12,094 times, their late
+    /// answers arrived at a driver that no longer awaited those ids and were
+    /// dropped, and not one state chunk was ever requested. Meanwhile the
+    /// ordinary sync ran 2.8M blocks ahead of a state that did not exist,
+    /// leaving a node that reported it could not resume. See #185.
+    fn suspend_ordinary_sync(&mut self) {
+        self.suspended_for_snap = true;
+        // Abandon whatever round was in flight rather than leaving it parked:
+        // its requests are outstanding against the same peers the snapshot
+        // session is about to need, and its answers would be matched against a
+        // state machine that is no longer driving.
+        if !matches!(self.state, SyncState::Idle) {
+            debug!(
+                target: "rustock::snap",
+                "standing ordinary sync down (was {:?}) for the duration of the snapshot session",
+                std::mem::discriminant(&self.state)
+            );
+            self.state = SyncState::Idle;
+        }
+        self.follow_buffer.clear();
+        self.pending_follow_bodies.clear();
+    }
+
+    /// Give the peer set back to the ordinary sync.
+    ///
+    /// Called from exactly one place -- the end of `finish_snap_sync`, after
+    /// the outcome is known and after any replacement session has been opened.
+    /// A replacement re-suspends, so the flag ends up true again and the gap
+    /// never opens.
+    fn resume_ordinary_sync(&mut self) {
+        if self.suspended_for_snap {
+            self.suspended_for_snap = false;
+            debug!(target: "rustock::snap", "ordinary sync resumed");
+        }
+    }
+
     /// Hand a completed snapshot over to ordinary sync, or report the failure.
     async fn finish_snap_sync(&mut self) {
         let Some(driver) = self.snap.take() else { return };
@@ -956,6 +1026,10 @@ impl SyncService {
                     }
                 }
                 self.snap_restart = None;
+                // The state is on disk and the executed head points at it, so
+                // ordinary sync can take over from the checkpoint rather than
+                // from genesis.
+                self.resume_ordinary_sync();
             }
             _ => {
                 // One peer's bad data must not end snapshot sync. The peer has
@@ -969,6 +1043,7 @@ impl SyncService {
 
                 let Some((config, verifier)) = self.snap_restart.clone() else {
                     warn!(target: "rustock::snap", "snapshot sync gave up: {why}");
+                    self.resume_ordinary_sync();
                     return;
                 };
                 if self.snap_attempts >= MAX_SNAP_ATTEMPTS {
@@ -977,9 +1052,13 @@ impl SyncService {
                         "snapshot sync gave up after {} attempts: {why}", self.snap_attempts
                     );
                     self.snap_restart = None;
+                    self.resume_ordinary_sync();
                     return;
                 }
-                let Some(trie_store) = self.trie_store.clone() else { return };
+                let Some(trie_store) = self.trie_store.clone() else {
+                    self.resume_ordinary_sync();
+                    return;
+                };
                 warn!(
                     target: "rustock::snap",
                     "snapshot sync attempt {} failed ({why}); starting another",
@@ -1001,6 +1080,27 @@ impl SyncService {
                 driver.expire(now);
             }
             self.drive_snap(|driver, peers| driver.poll(peers)).await;
+        }
+
+        // Suspended with no session to wait for is a bug, and the shape of the
+        // bug is a node that never syncs again -- the worst failure available
+        // here, and a silent one. `finish_snap_sync` resumes on every path it
+        // owns; this catches a path it does not, complains, and recovers.
+        if self.suspended_for_snap && self.snap.is_none() {
+            warn!(
+                target: "rustock::snap",
+                "ordinary sync was suspended with no snapshot session running; resuming"
+            );
+            self.resume_ordinary_sync();
+        }
+
+        // Header sync first, then state. While a snapshot session holds the
+        // peer set, the ordinary state machine does not run at all -- not its
+        // rounds, not its watchdogs, not its coherence repair. Every one of
+        // those reaches for the same peers or the same executed head, and the
+        // session is mid-way through establishing what that head should be.
+        if self.suspended_for_snap {
+            return;
         }
 
         self.expire_stale_follow_bodies();

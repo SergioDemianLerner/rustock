@@ -23,6 +23,10 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+/// Parallel point lookups when fetching many headers. Sixteen is what
+/// `RocksDbTrieStore` settled on for the same shape of work on this device.
+const HEADER_READ_THREADS: usize = 16;
+
 const CF_HEADERS: &str = "headers";
 const CF_NUMBERS: &str = "block_numbers";
 const CF_TD: &str = "total_difficulty";
@@ -478,6 +482,79 @@ impl BlockStore {
         let bytes = self.db.get_cf(self.cf(CF_HEADERS)?, hash.as_slice())
             .context("Failed to read header")?;
         bytes.map(|b| Header::decode(&mut b.as_slice()).map_err(Into::into)).transpose()
+    }
+
+    /// Headers for many hashes at once, positionally.
+    ///
+    /// # Why a thread pool rather than `multi_get_cf`
+    ///
+    /// Measured on this database and recorded in `RocksDbTrieStore::get_many`:
+    /// **`multi_get_cf` does not overlap I/O**. It reuses one pinned
+    /// superversion, but the lookups still run one after another inside
+    /// RocksDB — 517 nodes/s against 2,658 for plain `get`. The batching that
+    /// helps is concurrency, not the batch API.
+    ///
+    /// Header hashes have no locality either — they are uniformly distributed,
+    /// so consecutive blocks share neither a data block nor usually a file —
+    /// which rules out the ordered-cursor trick that works for sorted keys.
+    /// What is left is ordinary point lookups issued in parallel, so the device
+    /// sees a queue depth equal to the pool size instead of one.
+    pub fn headers_by_hash(&self, hashes: &[B256]) -> Vec<Option<Header>> {
+        let one = |h: &B256| -> Option<Header> {
+            let cf = self.cf(CF_HEADERS).ok()?;
+            let bytes = self.db.get_cf(cf, h.as_slice()).ok()??;
+            Header::decode(&mut bytes.as_slice()).ok()
+        };
+
+        if hashes.len() < HEADER_READ_THREADS * 2 {
+            return hashes.iter().map(one).collect();
+        }
+        let mut out: Vec<Option<Header>> = vec![None; hashes.len()];
+        let chunk = hashes.len().div_ceil(HEADER_READ_THREADS);
+        std::thread::scope(|scope| {
+            for (keys, slots) in hashes.chunks(chunk).zip(out.chunks_mut(chunk)) {
+                scope.spawn(|| {
+                    for (h, slot) in keys.iter().zip(slots.iter_mut()) {
+                        *slot = one(h);
+                    }
+                });
+            }
+        });
+        out
+    }
+
+    /// Canonical hashes for a **descending** run of heights, positionally.
+    ///
+    /// Unlike headers these keys *are* local: `CF_NUMBERS` is keyed by the
+    /// big-endian height, so a run of consecutive numbers is a run of adjacent
+    /// keys sharing data blocks. One forward cursor answers the whole range,
+    /// which is why this needs no pool.
+    pub fn canonical_hashes_descending(&self, top: u64, count: usize) -> Vec<Option<B256>> {
+        let mut out = vec![None; count];
+        let Ok(cf) = self.cf(CF_NUMBERS) else { return out };
+        let lowest = top.saturating_sub(count as u64 - 1);
+
+        // Ascending from the bottom of the range, because an iterator reads
+        // forward; results are placed back in descending order.
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&lowest.to_be_bytes(), rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let Ok((k, v)) = item else { break };
+            if k.len() != 8 || v.len() != 32 {
+                continue;
+            }
+            let number = u64::from_be_bytes(k[..8].try_into().unwrap_or([0; 8]));
+            if number > top {
+                break;
+            }
+            let idx = (top - number) as usize;
+            if idx < count {
+                out[idx] = Some(B256::from_slice(&v));
+            }
+        }
+        out
     }
 
     // --- Canonical Chain Operations ---

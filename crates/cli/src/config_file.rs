@@ -126,6 +126,10 @@ pub struct PeersSection {
     /// Addresses or CIDR blocks refused at connection time, as rskj's
     /// `peer.bannedPeerIPs`.
     pub banned_peers: Option<Vec<String>>,
+    /// Discovery bootstrap addresses, `HOST:PORT`. **Replaces** the chain's
+    /// built-in list rather than adding to it, which is what makes a private
+    /// two-node network possible.
+    pub bootnodes: Option<Vec<String>>,
     /// Count scoring events but never punish (rskj
     /// `scoring.punishmentEnabled = false`).
     pub no_peer_punishment: Option<bool>,
@@ -289,6 +293,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "max_inbound_per_cidr",
     "inbound_cidr_prefix",
     "banned_peers",
+    "bootnodes",
     "no_peer_punishment",
     "btc_block_cache_entries",
     "trie_backend",

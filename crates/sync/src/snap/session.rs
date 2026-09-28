@@ -147,6 +147,9 @@ pub struct SnapSession {
     phase: Phase,
     failure: Option<SnapFailure>,
 
+    /// Requests this session has outstanding, as last reported by the driver.
+    /// See [`Self::note_in_flight`].
+    in_flight: usize,
     /// The block whose state is being downloaded, once one has been offered.
     checkpoint: Option<Header>,
     /// Its cumulative difficulty, as offered and then vouched for by the
@@ -189,6 +192,7 @@ impl SnapSession {
             verifier,
             phase: Phase::AwaitingStatus,
             failure: None,
+            in_flight: 0,
             checkpoint: None,
             checkpoint_td: U256::ZERO,
             offered: Vec::new(),
@@ -246,12 +250,36 @@ impl SnapSession {
 
     /// What to do now. Safe to call as often as the caller likes: it returns
     /// only work that is not already outstanding.
+    /// Tell this session how many of its requests are still outstanding.
+    ///
+    /// The session knows what work remains; only the driver knows what has
+    /// been sent. Every path that can produce new requests passes through
+    /// `poll`, so recording the count here -- rather than capping at each of
+    /// the six dispatch sites -- means no path can bypass the budget.
+    ///
+    /// The first attempt capped only `SnapDriver::poll`, and the five response
+    /// handlers went on issuing a fresh budget's worth each: still ~1,100
+    /// outstanding against a budget of 8. See #185.
+    pub fn note_in_flight(&mut self, n: usize) {
+        self.in_flight = n;
+    }
+
     pub fn poll(&mut self) -> Vec<Action> {
+        // What the budget has room for *after* what is already outstanding.
+        //
+        // No floor. An earlier version ended this with `.max(1)` on the
+        // reasoning that a session should always be able to make progress;
+        // that let the budget be exceeded by one on *every* call, which is
+        // unbounded growth wearing a smaller number. When the queue is full
+        // the right answer is to ask for nothing and wait for an answer.
+        let budget = self.config.max_in_flight.max(1).saturating_sub(self.in_flight);
+        if budget == 0 {
+            return Vec::new();
+        }
         match self.phase {
             Phase::AwaitingStatus => vec![Action::RequestStatus],
 
             Phase::VerifyingHeaders => {
-                let budget = self.config.max_in_flight.max(1);
                 let Some(walk) = self.walk.as_mut() else { return Vec::new() };
                 walk.wants(budget)
                     .into_iter()

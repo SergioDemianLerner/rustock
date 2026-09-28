@@ -186,18 +186,8 @@ impl SyncHandler {
         let store = &self.manager.store;
 
         let first = store.header(hash).ok()??;
-        let mut headers = vec![first.clone()];
-        let mut current = first;
-
-        for _ in 1..count {
-            match store.header(current.parent_hash) {
-                Ok(Some(parent)) => {
-                    current = parent.clone();
-                    headers.push(parent);
-                }
-                _ => break,
-            }
-        }
+        let headers = canonical_run(store, &first, count)
+            .unwrap_or_else(|| walk_by_parent(store, first, count));
 
         trace!(
             target: "rustock::sync",
@@ -435,4 +425,90 @@ impl P2pHandler for SyncHandler {
         }
         None
     }
+}
+
+/// The old walk: one dependent point lookup per header.
+///
+/// Still the fallback, and still correct for any chain. It is what
+/// [`canonical_run`] declines to do when the range is not plainly canonical.
+pub(crate) fn walk_by_parent(
+    store: &rustock_storage::BlockStore,
+    first: rustock_core::Header,
+    count: u32,
+) -> Vec<rustock_core::Header> {
+    let mut headers = vec![first.clone()];
+    let mut current = first;
+    for _ in 1..count {
+        match store.header(current.parent_hash) {
+            Ok(Some(parent)) => {
+                current = parent.clone();
+                headers.push(parent);
+            }
+            _ => break,
+        }
+    }
+    headers
+}
+
+/// The same run, fetched in parallel, when the range is canonical.
+///
+/// # Why this exists
+///
+/// Walking by parent hash is a chain of *dependent* reads: the next hash is
+/// not known until the current header has been read, so the device sees one
+/// outstanding request at a time. Measured serving a real snapshot-syncing
+/// client: 933 KB/s over **loopback** with the server CPU at 12% — disk-bound
+/// at queue depth 1. See #185.
+///
+/// Heights are not dependent on each other. `CF_NUMBERS` turns the run into a
+/// set of hashes with one ordered cursor, and those hashes are then fetched
+/// concurrently.
+///
+/// # Why it verifies rather than trusts
+///
+/// The request names a **hash**, not a height, and the chain asked for may be
+/// a sibling rather than the canonical one. Serving canonical headers for a
+/// non-canonical request would answer a question nobody asked, with a chain
+/// the peer cannot link to what it already has.
+///
+/// So this returns `None` — and the caller falls back to the honest walk —
+/// unless every one of these holds:
+///
+/// - the starting hash **is** the canonical block at its own height;
+/// - every height in the range resolved to a hash;
+/// - every header was present;
+/// - and each header's `parent_hash` is the next one down, checked link by
+///   link. The canonical index can be mid-repair, and a gap in it must not
+///   become a gap in what is served.
+pub(crate) fn canonical_run(
+    store: &rustock_storage::BlockStore,
+    first: &rustock_core::Header,
+    count: u32,
+) -> Option<Vec<rustock_core::Header>> {
+    let top = first.number;
+    // Genesis is its own floor; a short run near it is not worth the setup.
+    if count < 8 || top < count as u64 {
+        return None;
+    }
+    if store.canonical_hash(top).ok()?? != first.hash() {
+        return None;
+    }
+
+    let hashes = store.canonical_hashes_descending(top, count as usize);
+    let resolved: Vec<alloy_primitives::B256> = hashes.into_iter().collect::<Option<Vec<_>>>()?;
+    let fetched = store.headers_by_hash(&resolved);
+
+    let mut headers = Vec::with_capacity(count as usize);
+    for slot in fetched {
+        headers.push(slot?);
+    }
+
+    // Link check. Cheap next to the reads, and the only thing standing between
+    // a stale index and a chain that does not join up.
+    for pair in headers.windows(2) {
+        if pair[0].parent_hash != pair[1].hash() || pair[0].number != pair[1].number + 1 {
+            return None;
+        }
+    }
+    Some(headers)
 }

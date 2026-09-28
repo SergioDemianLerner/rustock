@@ -375,6 +375,23 @@ struct Args {
     #[arg(long)]
     import_blocks_db: Option<String>,
 
+    /// Discovery bootstrap addresses, `HOST:PORT`, repeatable.
+    ///
+    /// **Replaces** the chain's built-in list rather than adding to it, which
+    /// is the point: given one address, this node bootstraps from that address
+    /// and nothing else. That is what makes an isolated two-node network
+    /// possible — without it the built-in list is the only way in, and a node
+    /// on a private network has no way to say so.
+    ///
+    /// The port is the **discovery** port, which is the listen port plus one.
+    /// A node on `--port 30303` is reached at `HOST:30304`.
+    ///
+    /// Note this does not by itself keep a node off the public network: peers
+    /// found through the one bootstrap address can introduce others. Isolation
+    /// is a job for the firewall, not for this flag.
+    #[arg(long, value_name = "HOST:PORT")]
+    bootnodes: Vec<String>,
+
     /// Target number of outbound peer connections to maintain (rskj's
     /// `maxActivePeers` default is 30). Higher values give more headroom to
     /// absorb dead/unreachable nodes and recover faster after a network blip.
@@ -807,6 +824,14 @@ fn apply_file_config(
             if !a.banned_peers.contains(entry) {
                 a.banned_peers.push(entry.clone());
             }
+        }
+    }
+    // Unlike `banned_peers` this one **replaces** rather than combines: the
+    // flag exists to say "bootstrap from these and nothing else", and merging
+    // it with a file's list would quietly defeat that.
+    if a.bootnodes.is_empty() {
+        if let Some(b) = &f.peers.bootnodes {
+            a.bootnodes = b.clone();
         }
     }
     apply(matches, "no_peer_punishment", f.peers.no_peer_punishment.as_ref(),
@@ -1321,7 +1346,15 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         best_hash,
         best_block_number: best_number,
         total_difficulty: best_td,
-        bootnodes: config.bootnodes(),
+        bootnodes: if args.bootnodes.is_empty() {
+            config.bootnodes()
+        } else {
+            info!(
+                "Bootstrapping from {} given address(es) instead of the chain's built-in list",
+                args.bootnodes.len()
+            );
+            args.bootnodes.clone()
+        },
         secret_key: secret_key_bytes,
         discovery_port: args.port + 1,
         data_dir: args.data_dir.clone(),
