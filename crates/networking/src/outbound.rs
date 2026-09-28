@@ -112,6 +112,13 @@ impl OutboundConnector {
         let backoff: Arc<Mutex<HashMap<SocketAddr, Backoff>>> = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(DialStats::default());
 
+        // Throttling state for the "no dialable candidates" warning.
+
+        let mut last_starved: Option<(usize, usize, usize, usize)> = None;
+
+        let mut last_starved_at = Instant::now() - STARVED_REPEAT;
+
+
         loop {
             let current_count = self.peer_store.count().await;
             let table_size = self.table.read().await.len();
@@ -222,17 +229,43 @@ impl OutboundConnector {
                 // Everything is connected, in-flight, or backed off. No blanket
                 // clear (that used to re-stampede dead nodes); backoff windows
                 // expire on their own and good nodes return quickly.
-                warn!(
-                    target: "rustock::net",
-                    "Below target ({}/{}) but no dialable candidates ({} nodes, {} pending, {} backed off)",
-                    current_count, self.max_outbound, table_size, pending_snapshot.len(), backoff_snapshot.len()
+                //
+                // This is a standing condition, not an event: a node pinned to
+                // one peer, or one whose table is entirely backed off, is in it
+                // continuously. Logged every round it filled the log with the
+                // same line every ten seconds and buried everything else, so
+                // report a *change* immediately and an unchanged state only
+                // once a minute -- often enough to show the node is still in
+                // it, rare enough to read around.
+                let now = (
+                    current_count,
+                    table_size,
+                    pending_snapshot.len(),
+                    backoff_snapshot.len(),
                 );
+                let changed = last_starved != Some(now);
+                if changed || last_starved_at.elapsed() >= STARVED_REPEAT {
+                    warn!(
+                        target: "rustock::net",
+                        "Below target ({}/{}) but no dialable candidates ({} nodes, {} pending, {} backed off)",
+                        now.0, self.max_outbound, now.1, now.2, now.3
+                    );
+                    last_starved = Some(now);
+                    last_starved_at = Instant::now();
+                }
+            } else {
+                // Out of the condition: say so next time it happens.
+                last_starved = None;
             }
 
             sleep(ACTIVE_INTERVAL).await;
         }
     }
 }
+
+/// How often to repeat the "no dialable candidates" warning while nothing
+/// about the situation changes.
+const STARVED_REPEAT: Duration = Duration::from_secs(60);
 
 /// Outcome of a single outbound dial, used to drive backoff.
 enum DialOutcome {

@@ -39,7 +39,8 @@ use rustock_trie::snapshot::total_size;
 use rustock_trie::snapshot_proof::{verify_chunk, ChunkProof, Entry, VerifyError};
 use rustock_trie::{TrieNode, TrieStore};
 use std::sync::Arc;
-use tracing::{debug, trace};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, trace};
 
 /// A contiguous stretch of the traversal that one worker walks front to back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,6 +466,22 @@ impl StateDownload {
 
         // Walking it chunk by chunk visits every node and resolves every
         // hash, which is exactly the question being asked.
+        //
+        // It also takes about ten minutes on a mainnet state, single-threaded,
+        // and says nothing while it runs. A node that goes silent for ten
+        // minutes is indistinguishable from one that has hung, so report
+        // often enough that the difference is visible. `offset` against
+        // `total` is the exact measure and costs nothing to publish.
+        const REPORT_EVERY: Duration = Duration::from_secs(5);
+        let started = Instant::now();
+        let mut last_report = started;
+
+        info!(
+            target: "rustock::snap",
+            "verifying the stored state: {} MB to walk",
+            total / (1 << 20)
+        );
+
         let mut offset = 0u64;
         let mut nodes = 0u64;
         while offset < total {
@@ -479,7 +496,34 @@ impl StateDownload {
             };
             nodes += chunk.len() as u64;
             offset = last.end();
+
+            if last_report.elapsed() >= REPORT_EVERY {
+                let done = offset as f64 / total as f64;
+                let elapsed = started.elapsed().as_secs_f64();
+                // Past the first report the rate is steady enough to project
+                // from; before that it is noise, so say nothing about it.
+                let eta = if done > 0.0 { elapsed * (1.0 - done) / done } else { 0.0 };
+                info!(
+                    target: "rustock::snap",
+                    "verifying the stored state: {:.1}% ({}/{} MB), {} nodes, {:.0}s elapsed, ~{:.0}s left",
+                    done * 100.0,
+                    offset / (1 << 20),
+                    total / (1 << 20),
+                    nodes,
+                    elapsed,
+                    eta
+                );
+                last_report = Instant::now();
+            }
         }
+
+        info!(
+            target: "rustock::snap",
+            "stored state verified: {} nodes, {} MB, {:.0}s",
+            nodes,
+            total / (1 << 20),
+            started.elapsed().as_secs_f64()
+        );
         Ok(nodes)
     }
 }

@@ -439,7 +439,21 @@ impl SnapDriver {
         // a valid chunk is valid whatever its route, and the download would
         // rather have it. The sender is what matters for what follows.
         self.session.note_in_flight(self.in_flight.len());
-        let actions = self.session.on_chunk(from, payload, refusal);
+
+        // The chunk that completes the download also verifies it, and that
+        // walk takes about ten minutes on a mainnet state: single-threaded,
+        // CPU-bound, and -- until this -- on a runtime worker, where it
+        // stopped every other task on that thread from running. The node
+        // looked hung, peers timed out, and nothing in the log said why
+        // (#187).
+        //
+        // `block_in_place` hands the worker's other tasks to a different
+        // thread for the duration instead of restructuring the session into
+        // an async state machine. It requires the multi-threaded runtime,
+        // which is the one this node builds.
+        let actions = tokio::task::block_in_place(|| {
+            self.session.on_chunk(from, payload, refusal)
+        });
         self.charge_for_chunk(sender);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
