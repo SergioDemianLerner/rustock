@@ -1019,13 +1019,40 @@ impl BlockStore {
     /// there is nothing to do it resolves one height and stops.
     pub fn freeze_headers_below(&self, horizon: u64, max_batch: u64) -> Result<u64> {
         let Some(f) = self.freezer() else { return Ok(0) };
-        let mut n = f.end_number();
+        let start = f.end_number();
+        if start >= horizon {
+            return Ok(0);
+        }
+        let want = max_batch.min(horizon - start) as usize;
+
+        // Resolving the heights is cheap: `CF_NUMBERS` is keyed by big-endian
+        // height, so a run of consecutive numbers is a run of adjacent keys.
+        let mut hashes = Vec::with_capacity(want);
+        for n in start..start + want as u64 {
+            match self.canonical_hash(n)? {
+                Some(h) => hashes.push(h),
+                // Stop at the first height that will not resolve rather than
+                // leaving a hole, which would be invisible until a peer asked
+                // for a run spanning it.
+                None => break,
+            }
+        }
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+
+        // Fetching the headers is the expensive half: hashes are uniformly
+        // distributed, so these are unrelated point lookups with the 6.5x
+        // amplification the freezer exists to remove. Issued through the
+        // thread pool they at least overlap, which is the whole reason
+        // `headers_by_hash` exists -- a serial loop here spent hours on what
+        // the device can do in minutes.
+        let fetched = self.headers_by_hash(&hashes);
+
         let mut done = 0u64;
-        while n < horizon && done < max_batch {
-            let Some(hash) = self.canonical_hash(n)? else { break };
-            let Some(header) = self.header(hash)? else { break };
-            f.put(n, &header)?;
-            n += 1;
+        for (i, slot) in fetched.into_iter().enumerate() {
+            let Some(header) = slot else { break };
+            f.put(start + i as u64, &header)?;
             done += 1;
         }
         if done > 0 {
