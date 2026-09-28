@@ -117,7 +117,7 @@ compatibility question, but it is where the remaining win is.
 Without it, the freezer's body gain is capped by one round trip per block
 whatever the disk does.
 
-## 5a. Separate files, not interleaved
+## 6. Separate files, not interleaved
 
 Headers in one file, bodies in another — **not** header-body-header-body.
 
@@ -163,7 +163,7 @@ replay — gets header and body in one read instead of two. That saves one seek
 per block, on a path that handles one block at a time. Against 2.3× on the
 hottest path in the protocol, it is not close.
 
-## 6. Where this actually pays
+## 7. Where this actually pays
 
 **Not in client sync time, on a real network.** 10 GB of headers at 20 MB/s is
 160 Mbit sustained, which is more than most peers will give. A real sync becomes
@@ -178,7 +178,140 @@ disk serves roughly six times as many.
 That is the argument for #166: not faster syncs, but a network where serving
 them is cheap enough that nodes do it.
 
-## 7. How to check this
+## 8. How geth and reth do it
+
+Both were read from source rather than documentation — `/mnt/import/geth-src`
+and `/mnt/import/reth-src`. Several published descriptions turned out to be
+wrong or silent on the points that matter most, and two of the answers below
+contradict what the docs say.
+
+### geth: the freezer
+
+**Tables** (`core/rawdb/ancient_scheme.go`). Five, each its own file series —
+`headers`, `hashes` (canonical), `bodies`, `receipts`, `bals` (EIP-7928). Every
+one snappy-compressed except `hashes`, which is stored raw.
+
+**Separate per kind, not interleaved.** geth reached the same conclusion §5a
+reaches here, independently.
+
+**Index** (`core/rawdb/freezer_table.go:54`):
+
+```go
+type indexEntry struct {
+    filenum uint32 // stored as uint16 ( 2 bytes )
+    offset  uint32 // stored as uint32 ( 4 bytes )
+}
+const indexEntrySize = 6
+```
+
+Six fixed bytes per item. Locating block *N* is `N * 6` into the `.cidx` file —
+a multiply and a read, no search. Data files (`.cdat`) cap at **2 GB**
+(`freezerTableSize`), which is what the 2-byte file number buys.
+
+**Threshold** — a formula, not a constant (`core/rawdb/chain_freezer.go:132`):
+
+```go
+// max(finality, HEAD-params.FullImmutabilityThreshold)
+```
+
+with `FullImmutabilityThreshold = 90000`. Under proof of stake finality is
+normally well ahead of head−90,000, so **the 90,000 is a floor for when finality
+is unavailable, not the usual case** — the opposite of what the documentation
+implies.
+
+**Frozen data is deleted, not duplicated** — and the ordering is the safety
+argument (`chain_freezer.go:218`):
+
+```go
+// Batch of blocks have been frozen, flush them before wiping from key-value store
+if err := f.SyncAncient(); err != nil { log.Crit(...) }
+// Wipe out all data from the active database
+... DeleteBlockWithoutNumber(batch, ...); DeleteCanonicalHash(batch, ...)
+```
+
+Sync the flat files first, delete from the key-value store second. A crash
+between the two costs duplicated data, never lost data. Genesis is always kept
+in the active database, and dangling side chains are deleted separately.
+
+**Not purely append-only.** `truncateHead` and `truncateTail` both exist
+(`freezer_table.go:607`, `:718`) — the first for reorgs reaching into frozen
+range, the second for pruning from below.
+
+### reth: static files
+
+**Segments**: `Headers` (carrying canonical hashes and terminal difficulties),
+`Transactions`, `Receipts`, `TransactionSenders`, `AccountChangeSets`. Again
+separate per kind.
+
+**`DEFAULT_BLOCKS_PER_STATIC_FILE = 500_000`** (`crates/static-file/types/src/lib.rs:35`).
+Published summaries say 8,192; the source says 500,000.
+
+**Trigger**: the static-file producer works from `last_finalized_block` per
+segment rather than a fixed age — the same idea as geth's formula, expressed
+differently.
+
+**Format**: NippyJar — columnar, memory-mapped, with separate data, offsets and
+config files, compressed with zstd (optionally dictionary-based) or lz4. More
+machinery than geth's fixed six bytes, and more flexibility than headers need.
+
+## 9. What to do here, and why
+
+### Copy geth's shape, not reth's
+
+**Fixed-width index, `N * 6`.** The access pattern that matters is "give me the
+192 headers below *N*", which is one index read and one contiguous data read.
+NippyJar's columnar layout and dictionary compression buy flexibility this does
+not need, at the cost of a format nobody here has debugged.
+
+**One file series per kind**, for the reasons in §6 and because both
+implementations agree.
+
+**Delete after sync, never duplicate.** geth's ordering exactly: write the flat
+files, fsync them, *then* delete from RocksDB. The failure mode is duplicated
+data, which is recoverable and detectable; the alternative failure mode is a
+hole in the chain.
+
+### Where this must differ from both
+
+**The threshold cannot key off finality, because RSK has none.** Both geth and
+reth freeze to the finalized block. There is no finality gadget here, so the
+question is what depth is deep enough that freezing is effectively permanent.
+
+Existing constants to anchor to rather than inventing a number:
+
+| constant | value | what it means |
+|---|---|---|
+| `MAX_REORG_DEPTH` | 1,000 | deepest reorg the canonical index will follow |
+| `MIN_KEEP_DEPTH` (pruner) | 8,000 | the floor block pruning refuses to go below |
+| snapshot `checkpoint_distance` | 10,000 | how far back the state offered to peers sits |
+
+**Proposal: freeze below `head − 8,000`**, reusing the pruner's floor. It is
+already the number this node treats as "old enough to touch", it is eight times
+the deepest reorg the index will follow, and reusing it means one concept to
+reason about instead of two. geth's 90,000 would be ~31 days on RSK — far more
+conservative than our own reorg behaviour justifies.
+
+`truncateHead` still has to exist for the case the threshold is wrong, but at
+8,000 it should never run.
+
+### Order of work
+
+1. **Headers first.** They are the hot path — 192 per request, §4 — and the
+   whole measured benefit is there.
+2. **Receipts second**, if `eth_getLogs` turns out to be read-heavy enough to
+   care. Not measured yet; should be before it is built.
+3. **Bodies last**, because §5 says the protocol caps the win until body
+   requests are batched.
+
+### What not to do yet
+
+**Do not build the general "ancient store" of #166 first.** The measured problem
+is header serving, the fix for it is one file series and one index, and the rest
+of #166 can follow the number it produces. Building the general thing first
+means carrying receipts and bodies through a design decision that headers alone
+would have settled.
+
+## 10. How to check this
 
 Re-run the header phase of #184 against a freezer-backed server, on the same
 machine, same disks, same loopback, and record:
