@@ -5209,3 +5209,100 @@ async fn the_ordinary_sync_resumes_when_the_snapshot_session_gives_up() {
         "a session that gives up must return the peer set, or the node never syncs again"
     );
 }
+
+// ── serving headers: the canonical fast path (#185) ──────────────────────────
+
+/// **The fast path must return exactly what the walk returns.** It is an
+/// optimisation, not a different answer; a peer cannot tell which path served
+/// it and must not need to.
+#[tokio::test]
+async fn the_canonical_fast_path_matches_the_parent_walk_header_for_header() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let mut parent = B256::ZERO;
+    let mut hashes = Vec::new();
+    for number in 0..=64u64 {
+        let h = dummy_header(number, parent, U256::from(1));
+        let hash = h.hash();
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(number, hash).unwrap();
+        hashes.push(hash);
+        parent = hash;
+    }
+
+    let top = store.header(hashes[64]).unwrap().unwrap();
+    let fast = crate::handler::canonical_run(&store, &top, 32).expect("range is canonical");
+    let slow = crate::handler::walk_by_parent(&store, top.clone(), 32);
+
+    assert_eq!(fast.len(), 32);
+    assert_eq!(
+        fast.iter().map(|h| h.hash()).collect::<Vec<_>>(),
+        slow.iter().map(|h| h.hash()).collect::<Vec<_>>(),
+        "the two paths must agree exactly, newest first"
+    );
+    assert_eq!(fast[0].number, 64, "newest first");
+    assert_eq!(fast[31].number, 33);
+}
+
+/// **A non-canonical start must decline the fast path.** The request names a
+/// hash, not a height; answering with canonical headers would serve a chain
+/// the peer did not ask for and cannot link to.
+#[tokio::test]
+async fn a_sibling_start_declines_the_fast_path() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let mut parent = B256::ZERO;
+    for number in 0..=32u64 {
+        let h = dummy_header(number, parent, U256::from(1));
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(number, h.hash()).unwrap();
+        parent = h.hash();
+    }
+
+    // A sibling at the tip: stored, linked to the same parent, never canonical.
+    let canonical_parent = store.canonical_hash(31).unwrap().unwrap();
+    let sibling = Header {
+        timestamp: 999_999,
+        ..dummy_header(32, canonical_parent, U256::from(1))
+    };
+    store.put_header(&sibling).unwrap();
+
+    assert!(
+        crate::handler::canonical_run(&store, &sibling, 16).is_none(),
+        "a hash that is not canonical at its height must fall back to the walk"
+    );
+    // …and the walk still answers it, from the sibling.
+    let walked = crate::handler::walk_by_parent(&store, sibling.clone(), 16);
+    assert_eq!(walked[0].hash(), sibling.hash());
+    assert_eq!(walked.len(), 16);
+}
+
+/// **A gap in the canonical index must not become a gap in what is served.**
+/// The index can be mid-repair; the link check is what catches it.
+#[tokio::test]
+async fn a_broken_canonical_index_declines_the_fast_path() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let mut parent = B256::ZERO;
+    for number in 0..=64u64 {
+        let h = dummy_header(number, parent, U256::from(1));
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(number, h.hash()).unwrap();
+        parent = h.hash();
+    }
+
+    // Point one height at an unrelated block: the hashes still all resolve,
+    // and every header is present, so only the link check can catch this.
+    let stray = dummy_header(50, B256::repeat_byte(0xEE), U256::from(1));
+    store.put_header(&stray).unwrap();
+    store.put_canonical_hash(50, stray.hash()).unwrap();
+
+    let top = store.header(store.canonical_hash(64).unwrap().unwrap()).unwrap().unwrap();
+    assert!(
+        crate::handler::canonical_run(&store, &top, 32).is_none(),
+        "a range whose headers do not link must fall back rather than serve a broken chain"
+    );
+}

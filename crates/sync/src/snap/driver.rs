@@ -269,26 +269,20 @@ impl SnapDriver {
         if peers.is_empty() || self.is_finished() {
             return Vec::new();
         }
-        // Ask for at most what the budget has room for **after** what is
-        // already outstanding.
-        //
-        // The session cannot work this out: it knows what work remains, not
-        // what has been sent, and it is polled every tick. Left to itself it
-        // hands back a fresh budget's worth each time, so outstanding requests
-        // grow by `max_in_flight` per tick without bound -- measured at ~3,000
-        // in flight against a budget of 8, every one of them aging out at the
-        // 30s timeout and being reissued. The server answered them all; the
-        // answers arrived long after the client had given up on them. See #185.
-        //
-        // The driver is the only place that knows both numbers, which is why
-        // the cap belongs here.
-        let outstanding = self.in_flight.len();
-        let room = self.session.config().max_in_flight.max(1).saturating_sub(outstanding);
-        if room == 0 {
-            return Vec::new();
-        }
-        let actions = self.session.poll_within(room);
+        let actions = self.ask();
         self.dispatch(actions, peers)
+    }
+
+    /// Ask the session for work, having first told it how much is already
+    /// outstanding.
+    ///
+    /// Every path that can produce requests goes through here. Capping only
+    /// `poll` left the five response handlers issuing a fresh budget's worth
+    /// each, which is how ~1,100 requests ended up outstanding against a
+    /// budget of 8. See #185.
+    fn ask(&mut self) -> Vec<Action> {
+        self.session.note_in_flight(self.in_flight.len());
+        self.session.poll()
     }
 
     /// The peers worth asking, which is all of them minus the ones that have
@@ -376,6 +370,7 @@ impl SnapDriver {
         if !self.answers(id, |p| matches!(p, Pending::Status)) {
             return Vec::new();
         }
+        self.session.note_in_flight(self.in_flight.len());
         let actions = self.session.on_status(blocks, difficulties, trie_size, grid);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
@@ -395,6 +390,7 @@ impl SnapDriver {
         };
         self.in_flight.remove(&id);
 
+        self.session.note_in_flight(self.in_flight.len());
         let actions = self.session.on_headers(point, headers);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
@@ -411,6 +407,7 @@ impl SnapDriver {
         if !self.answers(id, |p| matches!(p, Pending::Skeleton { .. })) {
             return Vec::new();
         }
+        self.session.note_in_flight(self.in_flight.len());
         let actions = self.session.on_skeleton(identifiers);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
@@ -441,6 +438,7 @@ impl SnapDriver {
         // Taken from whoever sent it, not only from the peer it was asked of:
         // a valid chunk is valid whatever its route, and the download would
         // rather have it. The sender is what matters for what follows.
+        self.session.note_in_flight(self.in_flight.len());
         let actions = self.session.on_chunk(from, payload, refusal);
         self.charge_for_chunk(sender);
         self.charge_for_failure(sender);
@@ -458,6 +456,7 @@ impl SnapDriver {
         if !self.answers(id, |p| matches!(p, Pending::Blocks)) {
             return Vec::new();
         }
+        self.session.note_in_flight(self.in_flight.len());
         let actions = self.session.on_blocks(blocks, difficulties);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)

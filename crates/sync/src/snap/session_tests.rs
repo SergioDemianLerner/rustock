@@ -1067,8 +1067,16 @@ fn outstanding_snap_requests_never_exceed_the_budget() {
     driver.on_status(status_id, peers[0], &blocks, &tds, 8_000, 0, &peers);
 
     let budget = 2usize; // `Fixture::session` sets max_in_flight: 2
+    // Poll *and* feed responses back, so the response handlers are exercised
+    // too -- capping only `poll` left those five paths issuing a fresh
+    // budget's worth each.
     for tick in 0..200 {
         driver.poll(&peers);
+        if let Some(id) = driver.outstanding_ids().first().copied() {
+            // An empty answer: rejected, the request released, the handler's
+            // own asking path taken.
+            driver.on_headers(id, peers[0], &[], &peers);
+        }
         assert!(
             driver.outstanding_ids().len() <= budget,
             "tick {tick}: {} requests outstanding against a budget of {budget}",
