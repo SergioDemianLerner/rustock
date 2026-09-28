@@ -90,6 +90,18 @@ pub struct DiscoveryService {
     /// Bootstrap peer addresses (rskj `peer.discovery.ip.list`). Node IDs are
     /// unknown upfront; we ping these and learn IDs from their signed pongs.
     bootstrap_addrs: Vec<std::net::SocketAddr>,
+    /// Learn no peers beyond `bootstrap_addrs`.
+    ///
+    /// Discovery normally treats every address it hears about as a candidate,
+    /// which is right for a node joining the public network and wrong for a
+    /// controlled experiment: one Neighbors reply is enough to pull a node
+    /// that was pointed at a single peer onto the whole network, and then the
+    /// measurement is of whoever answered rather than of the node under test.
+    ///
+    /// With this set, a node is added only if its address is one that was
+    /// configured. Gossip is still answered -- refusing to reply would be a
+    /// different and ruder thing -- it is simply not believed.
+    closed_network: bool,
     /// Active peer connections, used to detect when we're isolated and should
     /// re-bootstrap aggressively.
     peer_store: Arc<PeerStore>,
@@ -104,6 +116,7 @@ impl DiscoveryService {
         local_node: DiscoveryNode,
         bootstrap_addrs: Vec<std::net::SocketAddr>,
         peer_store: Arc<PeerStore>,
+        closed_network: bool,
     ) -> Result<Self> {
         let socket = UdpSocket::bind(listen_addr).await?;
         Ok(Self {
@@ -118,7 +131,19 @@ impl DiscoveryService {
             local_node,
             bootstrap_addrs,
             peer_store,
+            closed_network,
         })
+    }
+
+    /// Whether a node heard at `addr` may enter the table.
+    ///
+    /// Open networks accept anything; a closed one accepts only what it was
+    /// configured with, so the peer set is exactly what the operator asked for.
+    fn may_learn(&self, addr: std::net::SocketAddr) -> bool {
+        if !self.closed_network {
+            return true;
+        }
+        self.bootstrap_addrs.iter().any(|b| b.ip() == addr.ip() && b.port() == addr.port())
     }
 
     /// Starts the UDP service loop for processing discovery packets.
@@ -257,6 +282,10 @@ impl DiscoveryService {
     }
 
     async fn send_find_node(&self, target: B512, to: std::net::SocketAddr) -> Result<()> {
+        // Nothing a FindNode returns would be believed, so do not ask.
+        if self.closed_network {
+            return Ok(());
+        }
         use uuid::Uuid;
         let payload = DiscoveryPayload::FindNode(message::FindNodeMessage {
             target,
@@ -283,7 +312,9 @@ impl DiscoveryService {
                     tcp_port: ping.from.tcp_port,
                     id: packet.recover_id()?,
                 };
-                self.table.write().await.add_node(node);
+                if self.may_learn(addr) {
+                    self.table.write().await.add_node(node);
+                }
 
                 // Mark this peer as bonded — we replied with Pong, so the
                 // remote will accept our FindNode after processing our Pong.
@@ -354,7 +385,9 @@ impl DiscoveryService {
                     tcp_port,
                     id: packet.recover_id()?,
                 };
-                self.table.write().await.add_node(node);
+                if self.may_learn(addr) {
+                    self.table.write().await.add_node(node);
+                }
             }
             DiscoveryPayload::FindNode(find) => {
                 trace!(target: "rustock::discovery", "Received FindNode from {}", addr);
@@ -434,6 +467,17 @@ impl DiscoveryService {
                     neighbors.nodes.len(),
                     addr
                 );
+                // Gossip is the whole point of discovery and the whole
+                // problem with a controlled test: believing one reply is
+                // enough to leave the network the operator specified.
+                if self.closed_network {
+                    trace!(
+                        target: "rustock::discovery",
+                        "Ignoring {} neighbors from {}: closed network",
+                        neighbors.nodes.len(), addr
+                    );
+                    return Ok(());
+                }
                 let mut table = self.table.write().await;
                 for node in &neighbors.nodes {
                     table.add_node(node.clone());

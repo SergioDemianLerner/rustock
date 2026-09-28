@@ -169,6 +169,7 @@ mod tests {
             best_block_number: 0,
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
+            closed_network: false,
             secret_key: sk,
             discovery_port: 0,
             data_dir: ".".to_string(),

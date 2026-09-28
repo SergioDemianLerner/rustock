@@ -54,6 +54,8 @@ pub struct NodeConfig {
     pub best_block_number: u64,
     pub total_difficulty: U256,
     pub bootnodes: Vec<String>,
+    /// Connect only to `bootnodes`; never learn peers from them.
+    pub closed_network: bool,
     pub secret_key: [u8; 32],
     pub discovery_port: u16,
     pub data_dir: String,
@@ -191,6 +193,7 @@ impl Node {
             local_node,
             bootstrap_addrs,
             self.peer_store.clone(),
+            self.config.closed_network,
         ).await?);
 
         tokio::spawn(discovery.start());
@@ -556,6 +559,7 @@ mod tests {
             best_block_number: 0,
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
+            closed_network: false,
             secret_key: [0x42; 32],
             discovery_port: 0,
             data_dir: ".".to_string(),
@@ -578,6 +582,7 @@ mod tests {
             best_block_number: 0,
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
+            closed_network: false,
             secret_key: [0x43; 32],
             discovery_port: 0,
             data_dir: ".".to_string(),
