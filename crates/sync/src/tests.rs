@@ -5364,3 +5364,64 @@ async fn unlinked_headers_are_all_refused_and_reported() {
         "the head must not move to a header nothing verified"
     );
 }
+
+/// A head that cannot be reached from the executed head is re-seated onto one
+/// that can.
+///
+/// The node used to report this and do nothing about it: the invariant
+/// checker named the break correctly, every tick, while execution asked for
+/// the blocks across it, failed, and retried from the same place. Correct
+/// diagnosis, no recovery — the node stood still and stayed still.
+#[tokio::test]
+async fn a_head_unreachable_from_the_executed_head_is_reseated() {
+    let (store, _dir, headers) = linked_chain(10);
+
+    // Executed to #5, and the chain is intact to #10.
+    let executed = &headers[5];
+    store.set_exec_head(executed.hash(), executed.state_root).unwrap();
+
+    // A head far above, with nothing in between: the canonical index has one
+    // entry up there and a hole the whole way down.
+    let stranded = dummy_header(1_000, B256::repeat_byte(0x99), U256::from(1));
+    store.put_header_with_hash(stranded.hash(), &stranded).unwrap();
+    store.put_canonical_hash(1_000, stranded.hash()).unwrap();
+    store.update_canonical_chain(stranded.hash()).unwrap();
+    assert_eq!(store.head().unwrap(), Some(stranded.hash()), "test setup");
+
+    let mut service = service_over(store.clone());
+    service.verify_coherence();
+
+    let head = store.head().unwrap().expect("a head");
+    assert_ne!(head, stranded.hash(), "the unreachable head must not survive");
+    let seated = store.header(head).unwrap().expect("header for the new head");
+    assert!(
+        (5..=10).contains(&seated.number),
+        "the head must land on the contiguous run above the executed head, got #{}",
+        seated.number
+    );
+}
+
+/// The re-seat never moves the head below what has already been executed:
+/// that would be undoing work, not repairing a break.
+#[tokio::test]
+async fn reseating_never_goes_below_the_executed_head() {
+    let (store, _dir, headers) = linked_chain(10);
+    let executed = &headers[8];
+    store.set_exec_head(executed.hash(), executed.state_root).unwrap();
+
+    let stranded = dummy_header(2_000, B256::repeat_byte(0x55), U256::from(1));
+    store.put_header_with_hash(stranded.hash(), &stranded).unwrap();
+    store.put_canonical_hash(2_000, stranded.hash()).unwrap();
+    store.update_canonical_chain(stranded.hash()).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.verify_coherence();
+
+    let head = store.head().unwrap().expect("a head");
+    let seated = store.header(head).unwrap().expect("header");
+    assert!(
+        seated.number >= 8,
+        "the head must not drop below the executed head #8, got #{}",
+        seated.number
+    );
+}

@@ -1846,6 +1846,16 @@ impl SyncService {
                         );
                         self.roll_execution_back(cursor.executed);
                     }
+                    // I1, I2, I3: the chain between the executed head and
+                    // the head is not contiguous. Reported correctly and acted
+                    // on never, so the node stood still -- execution asks for
+                    // blocks across the break, fails, and retries from the
+                    // same place.
+                    Violation::NoCanonicalEntry { at }
+                    | Violation::CanonicalHeaderMissing { at, .. }
+                    | Violation::ParentMismatch { at, .. } => {
+                        self.reseat_head_above_executed(at);
+                    }
                     _ => {}
                 }
             }
@@ -2313,6 +2323,73 @@ impl SyncService {
     /// with it when it does. Refusing to was the bug: head and executed are
     /// equal on a caught-up node, so a floor at the executed height made the
     /// whole step a no-op for precisely the node that needs it.
+    /// Re-seat the head onto the highest block that is contiguously held
+    /// above the executed head.
+    ///
+    /// The repair for a broken chain *below* the head: a missing canonical
+    /// entry, a canonical entry whose header is absent, or a link that does
+    /// not join. All three mean the same thing — the head is not reachable
+    /// from the executed head — and a head that cannot be walked back to is
+    /// not a usable head. Execution will keep asking for the blocks in
+    /// between, keep failing, and the node stands still while reporting the
+    /// problem correctly.
+    ///
+    /// `reverify_head_lineage` does not cover this: it walks *up* from the
+    /// head looking for something better, and there is nothing above a head
+    /// whose problem is underneath it.
+    ///
+    /// The executed head is the one block known to be sound, so the walk
+    /// starts there. Whatever is contiguous above it is reachable by
+    /// construction, and the head never moves below what has already been
+    /// executed.
+    fn reseat_head_above_executed(&mut self, at: u64) {
+        let store = &self.manager.store;
+        let Ok(Some(cursor)) = store.cursor() else { return };
+        let head = cursor.validated_head;
+        let executed = cursor.executed;
+
+        let Some(top) = canonical_top_held(store, executed.number) else {
+            warn!(
+                target: "rustock::sync",
+                "Chain broken at #{at} and nothing is contiguous above the executed head \
+                 #{}; cannot re-seat", executed.number
+            );
+            return;
+        };
+        if top == head.hash {
+            return; // already where it should be
+        }
+
+        match Validated::prove(store, top) {
+            Ok(proved) => {
+                let to = proved.block();
+                match store.apply(&Transition::Adopt { head: proved }) {
+                    Ok(_) => {
+                        warn!(
+                            target: "rustock::sync",
+                            "Chain broken at #{at}: re-seated the head to {} (was {}), which \
+                             is the highest block reachable from the executed head #{}",
+                            to, head, executed.number
+                        );
+                        // Anything downloaded above the new head was counted
+                        // against a head that no longer exists.
+                        self.last_body_height = self.last_body_height.min(to.number);
+                        self.state = SyncState::Idle;
+                    }
+                    Err(e) => warn!(
+                        target: "rustock::sync",
+                        "Chain broken at #{at}: could not re-seat the head to {to}: {e:?}"
+                    ),
+                }
+            }
+            Err(broken) => warn!(
+                target: "rustock::sync",
+                "Chain broken at #{at}: the block above the executed head does not prove \
+                 either: {broken:?}"
+            ),
+        }
+    }
+
     pub(crate) fn reverify_head_lineage(&mut self, retreat: u64) {
         let store = &self.manager.store;
         let Ok(Some(cursor)) = store.cursor() else { return };
