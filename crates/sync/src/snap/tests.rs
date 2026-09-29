@@ -1459,10 +1459,66 @@ fn a_changed_grid_does_not_reuse_the_old_cells() {
     assert_eq!(serve_with(24_576).payload, wide.payload);
 }
 
-/// Verification reaches the same verdict however many threads walk it.
+
+/// A missing node is caught wherever it falls.
 ///
-/// The walk is split by byte range across threads; this is what says the
-/// split does not change the answer or lose nodes at the boundaries.
+/// This is the property the phase exists for: failing here rather than
+/// during the first block that touches a missing node. Before #204 it did
+/// not hold -- the traversal skipped a child it could not resolve, so a hole
+/// made the chunk shorter rather than empty and the walk went past it.
+#[test]
+fn a_missing_node_is_caught_wherever_it_falls() {
+    let peer = Peer::new(600);
+
+    for cut in [1usize, 7, 20, 33, 47] {
+        let local = Arc::new(MemoryTrieStore::new());
+        let client = download_into(&peer, local.clone(), 4, 512);
+        assert!(client.is_complete(), "cut={cut}: download incomplete");
+        client.verify_stored().expect("whole before a node is removed");
+
+        let mut keys = local.keys();
+        keys.sort();
+        let victim = keys[keys.len() * cut / 50].clone();
+        assert!(local.remove(&victim), "cut={cut}: nothing removed");
+
+        let err = client
+            .verify_stored()
+            .expect_err(&format!("cut={cut}: a missing node went unnoticed"));
+        assert!(
+            err.contains("not in the store") || err.contains("hole") || err.contains("root"),
+            "cut={cut}: unhelpful complaint: {err}"
+        );
+    }
+}
+
+/// A node can be present while the bytes its long value stands for are not,
+/// because a long value is stored under its own hash.
+#[test]
+fn a_missing_long_value_is_caught() {
+    let peer = Peer::new(400);
+    let local = Arc::new(MemoryTrieStore::new());
+    let client = download_into(&peer, local.clone(), 4, 512);
+    client.verify_stored().expect("whole to begin with");
+
+    // toy_state gives every fifth key a 96-byte value, which is long enough
+    // to be stored separately. Find one such record: it parses as no node.
+    let long_value = local
+        .keys()
+        .into_iter()
+        .find(|k| {
+            local
+                .get(k)
+                .map(|v| v.len() == 96)
+                .unwrap_or(false)
+        })
+        .expect("a long value should have been stored");
+
+    assert!(local.remove(&long_value));
+    let err = client.verify_stored().expect_err("a missing long value must be caught");
+    assert!(err.contains("not in the store"), "unhelpful complaint: {err}");
+}
+
+/// Verification reaches the same verdict however many threads walk it.
 #[test]
 fn verification_does_not_depend_on_the_thread_count() {
     let peer = Peer::new(400);
@@ -1479,12 +1535,7 @@ fn verification_does_not_depend_on_the_thread_count() {
     }
 }
 
-/// What verification actually catches: a root that is not there.
-///
-/// It does **not** catch an arbitrary missing interior node -- the traversal
-/// skips a child it cannot resolve rather than complaining, so the walk
-/// advances past the hole. That is a pre-existing gap, unchanged by the walk
-/// being parallel; it fails identically on one thread. Tracked separately.
+/// What it caught before #204, and must still catch.
 #[test]
 fn a_missing_root_is_caught() {
     let peer = Peer::new(300);

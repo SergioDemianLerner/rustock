@@ -633,7 +633,7 @@ fn decode_header(bytes: &[u8]) -> Option<Header> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloy_primitives::{Address, Bytes, B256, U256};
 

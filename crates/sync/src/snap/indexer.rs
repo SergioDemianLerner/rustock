@@ -59,13 +59,32 @@ pub async fn fill_canonical_index(store: Arc<BlockStore>, head: alloy_primitives
     // Is there anything to do? The gap a snapshot sync leaves is at the
     // bottom, so one lookup at the bottom answers it -- rather than an hour of
     // reads discovering there was nothing missing.
+    //
+    // On a node with a freezer this is the usual answer, and it is why the
+    // pass is now normally skipped outright. `canonical_hash` asks the
+    // freezer when `CF_NUMBERS` has no entry, and the freezer holds canonical
+    // headers addressed by number -- so every frozen height already has its
+    // mapping, in a file, reachable by arithmetic. Building `CF_NUMBERS` for
+    // those heights would be writing down what is already known, and it cost
+    // hours of the node not following the chain (#195).
     if store.index_cursor().ok().flatten().is_none()
         && store.canonical_hash(1).ok().flatten().is_some()
     {
-        debug!(
-            target: "rustock::snap",
-            "canonical index already reaches the bottom of the chain; nothing to fill"
-        );
+        let from_freezer = store
+            .freezer()
+            .map(|f| f.contains(1))
+            .unwrap_or(false);
+        if from_freezer {
+            info!(
+                target: "rustock::snap",
+                "canonical index: the freezer answers for the frozen heights; nothing to fill"
+            );
+        } else {
+            debug!(
+                target: "rustock::snap",
+                "canonical index already reaches the bottom of the chain; nothing to fill"
+            );
+        }
         return;
     }
 

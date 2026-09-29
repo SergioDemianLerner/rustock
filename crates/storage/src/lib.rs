@@ -97,6 +97,19 @@ const CF_BRIDGE_EVENTS: &str = "bridge_events";
 /// re-indexing the same block is idempotent.
 const CF_HEIGHT_INDEX: &str = "block_hashes_by_number";
 
+/// Hash to block number, for headers that live only in the freezer.
+///
+/// The freezer is addressed by number, so once a header is deleted from
+/// `CF_HEADERS` there is no way to answer `header(hash)` without knowing the
+/// height first. `CF_HEIGHT_INDEX` maps number to hashes -- the wrong
+/// direction -- so this is the index that makes deletion possible at all
+/// (#201). 32-byte key, 8-byte value: about 372 MB for 9.26 M blocks, which
+/// is the price of reclaiming roughly 10 GB.
+const CF_HEADER_NUMBERS: &str = "header_numbers";
+
+/// How far frozen-header deletion has reached.
+const KEY_FROZEN_DELETE_CURSOR: &[u8] = b"frozen_delete_cursor";
+
 /// Snapshot chunks already computed, keyed `state_root || cell_index`.
 ///
 /// A cache, not a source of truth: every entry can be recomputed from the
@@ -287,6 +300,7 @@ impl BlockStore {
         // exactly the families that are actually there.
         let mut wanted = cfs.clone();
         wanted.push(CF_HEIGHT_INDEX);
+        wanted.push(CF_HEADER_NUMBERS);
 
         let present = DB::list_cf(&opts, path.as_ref()).unwrap_or_default();
         let existing: Vec<&str> = wanted
@@ -338,6 +352,7 @@ impl BlockStore {
             ColumnFamilyDescriptor::new(CF_TX_INDEX, cf_opts()),
             ColumnFamilyDescriptor::new(CF_BRIDGE_EVENTS, cf_opts()),
             ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, cf_opts()),
+            ColumnFamilyDescriptor::new(CF_HEADER_NUMBERS, cf_opts()),
             ColumnFamilyDescriptor::new(CF_SNAP_CHUNKS, cf_opts()),
             ColumnFamilyDescriptor::new("trie_nodes", cf_opts()),
         ];
@@ -527,7 +542,41 @@ impl BlockStore {
     pub fn header(&self, hash: B256) -> Result<Option<Header>> {
         let bytes = self.db.get_cf(self.cf(CF_HEADERS)?, hash.as_slice())
             .context("Failed to read header")?;
-        bytes.map(|b| Header::decode(&mut b.as_slice()).map_err(Into::into)).transpose()
+        if let Some(b) = bytes {
+            return Ok(Some(Header::decode(&mut b.as_slice())?));
+        }
+
+        // Not in the database. It may have been frozen and then deleted, in
+        // which case the hash-to-number index says where to find it. This
+        // costs one extra lookup only when the header is genuinely absent
+        // from `CF_HEADERS`, which on a node that never deletes is the
+        // not-found path anyway.
+        self.frozen_header_by_hash(hash)
+    }
+
+    /// A header that lives only in the freezer, found by hash.
+    fn frozen_header_by_hash(&self, hash: B256) -> Result<Option<Header>> {
+        let Some(f) = self.freezer() else { return Ok(None) };
+        let Some(raw) = self
+            .db
+            .get_cf(self.cf(CF_HEADER_NUMBERS)?, hash.as_slice())
+            .context("Failed to read the header number index")?
+        else {
+            return Ok(None);
+        };
+        if raw.len() != 8 {
+            return Ok(None);
+        }
+        let number = u64::from_be_bytes(raw[..8].try_into().unwrap());
+        Ok(f.header(number).ok().flatten())
+    }
+
+    /// Records `hash → number`, so the header can be found once it is only in
+    /// the freezer.
+    pub fn put_header_number(&self, hash: B256, number: u64) -> Result<()> {
+        self.db
+            .put_cf(self.cf(CF_HEADER_NUMBERS)?, hash.as_slice(), number.to_be_bytes())
+            .context("Failed to write the header number index")
     }
 
     /// Headers for many hashes at once, positionally.
@@ -611,11 +660,33 @@ impl BlockStore {
             .context("Failed to map number to hash")
     }
 
+    /// The canonical hash at a height.
+    ///
+    /// `CF_NUMBERS` is the authority, but it is not the only answer. The
+    /// freezer holds canonical headers addressed by block number, and a
+    /// header's hash is a property of the header -- so for any frozen height
+    /// the mapping is already on disk, in a file, reachable by arithmetic.
+    ///
+    /// That matters because building `CF_NUMBERS` for the whole chain after a
+    /// snapshot sync took hours and left the node unable to follow the chain
+    /// while it ran (#195). Asking the freezer first means the heights it
+    /// covers need no entry at all.
     pub fn canonical_hash(&self, number: u64) -> Result<Option<B256>> {
         let bytes = self.db.get_cf(self.cf(CF_NUMBERS)?, number.to_be_bytes())
             .context("Failed to read canonical hash")?;
+        if let Some(b) = bytes {
+            return Ok(Some(B256::from_slice(&b)));
+        }
 
-        Ok(bytes.map(|b| B256::from_slice(&b)))
+        // Only a frozen header can answer, and only because being in the
+        // freezer is itself the statement that this height is canonical:
+        // nothing else is ever written there.
+        if let Some(f) = self.freezer() {
+            if let Ok(Some(header)) = f.header(number) {
+                return Ok(Some(header.hash()));
+            }
+        }
+        Ok(None)
     }
 
     /// Removes the canonical `number → hash` mapping for a block height.
@@ -1106,6 +1177,75 @@ impl BlockStore {
             f.sync()?;
         }
         Ok(done)
+    }
+
+    /// Deletes headers from the database that the freezer already holds.
+    ///
+    /// The ordering is geth's, and it is not negotiable: a header is read
+    /// back **out of the freezer** before the database copy is removed. The
+    /// failure mode of deleting first is a hole in the chain; the failure
+    /// mode of deleting late is duplicated data, which is recoverable and
+    /// detectable. So every deletion is preceded by proof that the survivor
+    /// can answer.
+    ///
+    /// `hash → number` is written before the delete too, since without it a
+    /// frozen header cannot be found by hash at all.
+    ///
+    /// Returns how many headers were removed. Off unless the operator asks
+    /// for it: see `--prune-frozen-headers`.
+    pub fn delete_frozen_headers(&self, up_to: u64, max_batch: u64) -> Result<u64> {
+        let Some(f) = self.freezer() else { return Ok(0) };
+
+        let start = self.frozen_delete_cursor()?;
+        let end = up_to.min(f.end_number());
+        let mut deleted = 0u64;
+        let mut n = start;
+
+        while n < end && deleted < max_batch {
+            let Some(header) = f.header(n).ok().flatten() else {
+                // The freezer cannot answer for this height, so nothing may
+                // be deleted at it. Stop rather than skip: a gap here means
+                // the freezer is not what it is assumed to be.
+                break;
+            };
+            let hash = header.hash();
+
+            // The index first, so a crash between these two leaves a
+            // findable header rather than a lost one.
+            self.put_header_number(hash, n)?;
+
+            // And only now, with the freezer proven able to answer and the
+            // hash mapped, is the database copy redundant.
+            self.db
+                .delete_cf(self.cf(CF_HEADERS)?, hash.as_slice())
+                .context("Failed to delete a frozen header")?;
+
+            n += 1;
+            deleted += 1;
+        }
+
+        if deleted > 0 {
+            self.set_frozen_delete_cursor(n)?;
+        }
+        Ok(deleted)
+    }
+
+    /// How far frozen-header deletion has reached.
+    pub fn frozen_delete_cursor(&self) -> Result<u64> {
+        let raw = self
+            .db
+            .get(KEY_FROZEN_DELETE_CURSOR)
+            .context("Failed to read the frozen delete cursor")?;
+        Ok(raw
+            .filter(|r| r.len() == 8)
+            .map(|r| u64::from_be_bytes(r[..8].try_into().unwrap()))
+            .unwrap_or(0))
+    }
+
+    fn set_frozen_delete_cursor(&self, number: u64) -> Result<()> {
+        self.db
+            .put(KEY_FROZEN_DELETE_CURSOR, number.to_be_bytes())
+            .context("Failed to write the frozen delete cursor")
     }
 
     /// Reads a block body (transactions + ommers) by hash.
@@ -2873,5 +3013,148 @@ mod read_threads_tests {
         assert_eq!(super::read_threads(), 4);
 
         super::set_read_threads(16);
+    }
+}
+
+#[cfg(test)]
+mod canonical_hash_freezer_tests {
+    use super::*;
+    use crate::freezer::Freezer;
+
+    /// A frozen height answers `canonical_hash` without a `CF_NUMBERS` entry.
+    ///
+    /// This is what lets a snapshot-synced node skip building the index for
+    /// the whole chain -- hours during which it could not follow the tip
+    /// (#195). Being in the freezer *is* the statement that a height is
+    /// canonical: nothing else is ever written there.
+    #[test]
+    fn a_frozen_height_answers_without_a_numbers_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path().join("db").to_str().unwrap()).unwrap();
+
+        let freezer = Arc::new(Freezer::open(dir.path().join("freezer")).unwrap());
+        let header = crate::freezer::tests::test_header(7);
+        let expected = header.hash();
+        freezer.put(7, &header).unwrap();
+        freezer.sync().unwrap();
+
+        // Without the freezer attached there is no answer at all.
+        assert_eq!(store.canonical_hash(7).unwrap(), None);
+
+        store.set_freezer(freezer);
+        assert_eq!(
+            store.canonical_hash(7).unwrap(),
+            Some(expected),
+            "a frozen header should answer for its own height"
+        );
+        assert_eq!(
+            store.canonical_hash(8).unwrap(),
+            None,
+            "a height nobody froze still has no answer"
+        );
+    }
+
+    /// `CF_NUMBERS` stays the authority where it has an entry.
+    #[test]
+    fn the_database_wins_over_the_freezer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path().join("db").to_str().unwrap()).unwrap();
+
+        let freezer = Arc::new(Freezer::open(dir.path().join("freezer")).unwrap());
+        freezer.put(7, &crate::freezer::tests::test_header(7)).unwrap();
+        freezer.sync().unwrap();
+        store.set_freezer(freezer);
+
+        let authoritative = B256::repeat_byte(0xCD);
+        store.put_canonical_hash(7, authoritative).unwrap();
+        assert_eq!(store.canonical_hash(7).unwrap(), Some(authoritative));
+    }
+}
+
+#[cfg(test)]
+mod frozen_delete_tests {
+    use super::*;
+    use crate::freezer::Freezer;
+
+    fn setup() -> (tempfile::TempDir, BlockStore, Arc<Freezer>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path().join("db").to_str().unwrap()).unwrap();
+        let freezer = Arc::new(Freezer::open(dir.path().join("freezer")).unwrap());
+        for n in 0..100 {
+            let h = crate::freezer::tests::test_header(n);
+            store.put_header_with_hash(h.hash(), &h).unwrap();
+            freezer.put(n, &h).unwrap();
+        }
+        freezer.sync().unwrap();
+        store.set_freezer(freezer.clone());
+        (dir, store, freezer)
+    }
+
+    /// A deleted header is still found by hash, through the index the delete
+    /// wrote before removing it.
+    #[test]
+    fn a_deleted_header_is_still_found_by_hash() {
+        let (_d, store, _f) = setup();
+        let wanted = crate::freezer::tests::test_header(42);
+        let hash = wanted.hash();
+        assert!(store.header(hash).unwrap().is_some(), "present to begin with");
+
+        let n = store.delete_frozen_headers(100, 1000).unwrap();
+        assert_eq!(n, 100);
+
+        let got = store
+            .header(hash)
+            .unwrap()
+            .expect("a frozen header must still be findable by hash");
+        assert_eq!(got.number, 42);
+    }
+
+    /// Deletion never runs ahead of the freezer.
+    #[test]
+    fn nothing_is_deleted_that_the_freezer_cannot_answer_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path().join("db").to_str().unwrap()).unwrap();
+        let freezer = Arc::new(Freezer::open(dir.path().join("freezer")).unwrap());
+
+        // Headers 0..50 in both; 50..100 only in the database.
+        for n in 0..100 {
+            let h = crate::freezer::tests::test_header(n);
+            store.put_header_with_hash(h.hash(), &h).unwrap();
+            if n < 50 {
+                freezer.put(n, &h).unwrap();
+            }
+        }
+        freezer.sync().unwrap();
+        store.set_freezer(freezer);
+
+        // Asked to go to 100, it stops where the freezer stops.
+        assert_eq!(store.delete_frozen_headers(100, 1000).unwrap(), 50);
+
+        let unfrozen = crate::freezer::tests::test_header(70);
+        assert!(
+            store.header(unfrozen.hash()).unwrap().is_some(),
+            "an unfrozen header must not be deleted"
+        );
+    }
+
+    /// With no freezer attached, nothing is deleted at all.
+    #[test]
+    fn without_a_freezer_it_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path().join("db").to_str().unwrap()).unwrap();
+        let h = crate::freezer::tests::test_header(1);
+        store.put_header_with_hash(h.hash(), &h).unwrap();
+        assert_eq!(store.delete_frozen_headers(100, 1000).unwrap(), 0);
+        assert!(store.header(h.hash()).unwrap().is_some());
+    }
+
+    /// It resumes rather than restarting.
+    #[test]
+    fn it_resumes_from_its_cursor() {
+        let (_d, store, _f) = setup();
+        assert_eq!(store.delete_frozen_headers(100, 30).unwrap(), 30);
+        assert_eq!(store.frozen_delete_cursor().unwrap(), 30);
+        assert_eq!(store.delete_frozen_headers(100, 30).unwrap(), 30);
+        assert_eq!(store.frozen_delete_cursor().unwrap(), 60);
     }
 }
