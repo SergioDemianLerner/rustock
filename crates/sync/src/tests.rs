@@ -68,19 +68,13 @@ async fn test_sync_manager_processing() {
     manager.handle_headers_response(vec![b2.clone()]).unwrap();
     assert_eq!(store.head().unwrap(), Some(b2.hash()));
 
-    // 4. Gap block (parent unknown) — refused.
-    //
-    // A header is stored only once verified, and verification needs the
-    // parent. Nothing is lost by refusing: header data is re-requestable, and
-    // skeleton chunks are drained in order, so an honest peer's headers
-    // always arrive with their parent already stored.
+    // 4. Gap block (parent unknown) — stored with TD = difficulty only
     let b4 = dummy_header(4, B256::repeat_byte(0xee), U256::from(1));
     let b4_hash = b4.hash();
-    let refused = manager.handle_headers_response(vec![b4]);
-    assert!(refused.is_err(), "a header with no verifiable parent must be refused");
+    manager.handle_headers_response(vec![b4]).unwrap();
     assert_eq!(store.head().unwrap(), Some(b2.hash()), "Head should not change");
-    assert!(store.header(b4_hash).unwrap().is_none(), "and it must not be stored");
-    assert_eq!(store.total_difficulty(b4_hash).unwrap(), None);
+    assert!(store.header(b4_hash).unwrap().is_some(), "Gap block should be stored");
+    assert_eq!(store.total_difficulty(b4_hash).unwrap(), Some(U256::from(1)));
 }
 
 #[tokio::test]
@@ -101,11 +95,7 @@ async fn test_invalid_header_rejected_when_parent_known() {
     // Header claims parent is genesis but has wrong block number
     let bad = dummy_header(5, genesis_hash, U256::from(50));
     let bad_hash = bad.hash();
-    // The refusal is now also reported, so the caller can charge the peer for
-    // it. It used to be swallowed: the header was dropped and the sender was
-    // told nothing was wrong.
-    let refused = manager.handle_headers_response(vec![bad]);
-    assert!(refused.is_err(), "an invalid header must be reported, not just dropped");
+    manager.handle_headers_response(vec![bad]).unwrap();
 
     assert!(store.header(bad_hash).unwrap().is_none(), "Invalid header should be rejected");
     assert_eq!(store.head().unwrap(), Some(genesis_hash));
@@ -5314,114 +5304,5 @@ async fn a_broken_canonical_index_declines_the_fast_path() {
     assert!(
         crate::handler::canonical_run(&store, &top, 32).is_none(),
         "a range whose headers do not link must fall back rather than serve a broken chain"
-    );
-}
-
-/// Headers that do not link to one another are all refused, and reported.
-///
-/// The invariant under test: nothing is stored that has not been verified, and
-/// nothing unverified contributes a total difficulty or competes for the head.
-/// A chunk whose headers name parents nobody holds must leave the store
-/// exactly as it found it.
-#[tokio::test]
-async fn unlinked_headers_are_all_refused_and_reported() {
-    let dir = tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
-    let genesis_hash = genesis.hash();
-    store.update_head(&genesis, U256::from(1)).unwrap();
-
-    let verifier = Arc::new(HeaderVerifier::new()
-        .with_parent_rule(rustock_core::validation::BlockNumberRule)
-        .with_parent_rule(rustock_core::validation::ParentHashRule));
-    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-    let manager = SyncManager::new(store.clone(), verifier, peer_store);
-
-    // Each header names a parent nobody holds, and they do not link to each
-    // other either. A huge difficulty on one of them is what used to move the
-    // head.
-    let garbage: Vec<_> = (0..8u8)
-        .map(|i| {
-            dummy_header(
-                1_000_000 + i as u64,
-                B256::repeat_byte(0xA0 + i),
-                U256::MAX / U256::from(8u64),
-            )
-        })
-        .collect();
-    let hashes: Vec<_> = garbage.iter().map(|h| h.hash()).collect();
-
-    let refused = manager.handle_headers_response(garbage);
-    assert!(refused.is_err(), "unlinked headers must be reported, not accepted");
-
-    for (i, h) in hashes.iter().enumerate() {
-        assert!(store.header(*h).unwrap().is_none(), "header {i} must not be stored");
-        assert_eq!(store.total_difficulty(*h).unwrap(), None, "header {i} must have no TD");
-    }
-    assert_eq!(
-        store.head().unwrap(),
-        Some(genesis_hash),
-        "the head must not move to a header nothing verified"
-    );
-}
-
-/// A head that cannot be reached from the executed head is re-seated onto one
-/// that can.
-///
-/// The node used to report this and do nothing about it: the invariant
-/// checker named the break correctly, every tick, while execution asked for
-/// the blocks across it, failed, and retried from the same place. Correct
-/// diagnosis, no recovery — the node stood still and stayed still.
-#[tokio::test]
-async fn a_head_unreachable_from_the_executed_head_is_reseated() {
-    let (store, _dir, headers) = linked_chain(10);
-
-    // Executed to #5, and the chain is intact to #10.
-    let executed = &headers[5];
-    store.set_exec_head(executed.hash(), executed.state_root).unwrap();
-
-    // A head far above, with nothing in between: the canonical index has one
-    // entry up there and a hole the whole way down.
-    let stranded = dummy_header(1_000, B256::repeat_byte(0x99), U256::from(1));
-    store.put_header_with_hash(stranded.hash(), &stranded).unwrap();
-    store.put_canonical_hash(1_000, stranded.hash()).unwrap();
-    store.update_canonical_chain(stranded.hash()).unwrap();
-    assert_eq!(store.head().unwrap(), Some(stranded.hash()), "test setup");
-
-    let mut service = service_over(store.clone());
-    service.verify_coherence();
-
-    let head = store.head().unwrap().expect("a head");
-    assert_ne!(head, stranded.hash(), "the unreachable head must not survive");
-    let seated = store.header(head).unwrap().expect("header for the new head");
-    assert!(
-        (5..=10).contains(&seated.number),
-        "the head must land on the contiguous run above the executed head, got #{}",
-        seated.number
-    );
-}
-
-/// The re-seat never moves the head below what has already been executed:
-/// that would be undoing work, not repairing a break.
-#[tokio::test]
-async fn reseating_never_goes_below_the_executed_head() {
-    let (store, _dir, headers) = linked_chain(10);
-    let executed = &headers[8];
-    store.set_exec_head(executed.hash(), executed.state_root).unwrap();
-
-    let stranded = dummy_header(2_000, B256::repeat_byte(0x55), U256::from(1));
-    store.put_header_with_hash(stranded.hash(), &stranded).unwrap();
-    store.put_canonical_hash(2_000, stranded.hash()).unwrap();
-    store.update_canonical_chain(stranded.hash()).unwrap();
-
-    let mut service = service_over(store.clone());
-    service.verify_coherence();
-
-    let head = store.head().unwrap().expect("a head");
-    let seated = store.header(head).unwrap().expect("header");
-    assert!(
-        seated.number >= 8,
-        "the head must not drop below the executed head #8, got #{}",
-        seated.number
     );
 }

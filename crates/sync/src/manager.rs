@@ -82,8 +82,7 @@ impl SyncManager {
         let mut prev_in_chunk: Option<(&Header, U256)> = None;
         let mut validated: Vec<(&Header, U256)> = Vec::with_capacity(headers.len());
         let mut skipped = 0u64;
-        // Headers refused because nothing was available to verify them against.
-        let mut no_parent = 0u64;
+        let mut unverified = 0u64;
         // Deduplicate by hash, not by block number. Two different blocks may
         // legitimately share a height -- that is what a fork is -- and dropping
         // the second means dropping whichever of them arrived last, which may be
@@ -120,35 +119,29 @@ impl SyncManager {
                             .total_difficulty(header.parent_hash)?
                             .unwrap_or_default();
                     } else {
-                        // The invariant: a header is stored only once it has
-                        // been verified, and verification needs the parent.
-                        //
-                        // Nothing is lost by refusing. Header data is the most
-                        // replaceable thing in the system, and skeleton chunks
-                        // are drained in order
-                        // (`PeerChunkTracker::drain_ready`), so an honest
-                        // peer's headers arrive with their parent already
-                        // stored. A follow-mode announcement that runs ahead of
-                        // its parent is simply re-requested.
-                        no_parent += 1;
+                        // The named parent is not held. Do not substitute the
+                        // canonical block at `number - 1`: it is a different
+                        // block, and checking against it rejects valid headers.
+                        // Accept the header unverified and let the body/execution
+                        // path reject it if it really does not belong -- losing a
+                        // check is recoverable, discarding valid chain data is not.
+                        parent_ref = None;
+                        parent_td = U256::ZERO;
+                        unverified += 1;
                         debug!(
                             target: "rustock::sync",
-                            "Header #{} ({:?}) refused: parent {:?} not held, so \
-                             nothing verifies it",
+                            "Header #{} ({:?}): parent {:?} not held; storing without \
+                             difficulty verification",
                             header.number, hash, header.parent_hash
                         );
-                        continue;
                     }
                 }
             }
 
             let new_td = parent_td + header.difficulty;
 
-            // Every header reaching this point has a parent, so verification
-            // always runs -- including the static rules, which is where proof
-            // of work lives. Already-stored headers skip it because they
-            // passed it when first stored, which is now true without
-            // exception.
+            // For NEW headers with a known parent, run full verification.
+            // Already-stored headers skip verification (they were validated on first store).
             if !already_stored {
                 if let Some(p) = parent_ref {
                     if let Err(e) = self.verifier.verify(header, Some(p)) {
@@ -174,32 +167,33 @@ impl SyncManager {
         // Commit all validated headers in a single atomic batch
         let _new_head = self.store.store_headers_batch(&validated, current_head_hash, current_td)?;
 
-        if skipped > 0 || no_parent > 0 {
-            // Both are refusals, and both leave a hole at that height. A hole
-            // in the canonical index halts execution when it is reached, so
-            // neither is routine.
-            //
-            // `no_parent` in particular is what an honest peer does not
-            // produce during skeleton sync: chunks are drained in order, so a
-            // parent is always already stored. It is expected only in follow
-            // mode, where an announcement can run ahead of its parent and the
-            // caller ignores the error.
+        if skipped > 0 {
+            // A rejection is worth a warning: it leaves no canonical entry at
+            // that height, and a hole in the canonical index halts execution
+            // when it is reached.
             warn!(
                 target: "rustock::sync",
-                "Stored {} headers (#{} -> #{}), refused {} invalid and {} with \
-                 no parent to verify against",
-                stored, first_num, last_num, skipped, no_parent
+                "Stored {} headers (#{} -> #{}), rejected {} invalid, {} stored \
+                 without a parent to verify against",
+                stored, first_num, last_num, skipped, unverified
             );
-            return Err(anyhow::anyhow!(
-                "{skipped} invalid header(s) and {no_parent} with no verifiable parent"
-            ));
+        } else if unverified > 0 {
+            // Storing a header whose named parent we do not hold is ordinary: a
+            // chunk routinely begins above our head, and the node re-requests
+            // the same range every few seconds while catching up. Warning about
+            // it produced a line every five seconds.
+            debug!(
+                target: "rustock::sync",
+                "Stored {} headers (#{} -> #{}), {} without a parent to verify against",
+                stored, first_num, last_num, unverified
+            );
+        } else {
+            trace!(
+                target: "rustock::sync",
+                "Stored {} headers (#{} -> #{})",
+                stored, first_num, last_num
+            );
         }
-
-        trace!(
-            target: "rustock::sync",
-            "Stored {} headers (#{} -> #{})",
-            stored, first_num, last_num
-        );
         Ok(())
     }
 

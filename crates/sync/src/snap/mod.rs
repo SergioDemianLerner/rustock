@@ -68,17 +68,6 @@ pub struct SnapConfig {
     /// Far enough back that the state is settled and unlikely to be reorged
     /// out from under the download.
     pub checkpoint_distance: u64,
-    /// Bounds a peer's claimed cumulative difficulty before the header walk
-    /// is committed to. `None` on a chain with no checkpoint, where the walk
-    /// simply runs as before.
-    pub checkpoint: Option<rustock_core::checkpoint::DifficultyCheckpoint>,
-    /// The retarget divisor for the sampled window. That window sits entirely
-    /// above the checkpoint, which is itself far above RSKIP156, so it is the
-    /// post-RSKIP156 value -- but it is configuration rather than a constant
-    /// because a wrong value here is a wrong verdict about a peer.
-    pub difficulty_divisor: u64,
-    /// The difficulty floor, which clamps the falling side of that bound.
-    pub min_difficulty: alloy_primitives::U256,
     /// Checkpoints are rounded down to a multiple of this, so that every
     /// server picks the same one and their chunks are interchangeable
     /// (rskj `BLOCK_NUMBER_CHECKPOINT`).
@@ -174,13 +163,6 @@ impl Default for SnapConfig {
             client_enabled: false,
 
             checkpoint_distance: 10_000,
-            checkpoint: None,
-            // Post-RSKIP156, which is what the sampled window is by
-            // construction.
-            difficulty_divisor: 400,
-            min_difficulty: alloy_primitives::U256::from_limbs([
-                7_000_000_000_000_000u64, 0, 0, 0,
-            ]),
             checkpoint_rounding: 5_000,
 
             chunk_grid: 100_000,
