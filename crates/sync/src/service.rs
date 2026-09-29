@@ -4048,13 +4048,22 @@ fn identify_chunk_by_content(
         return None;
     }
 
-    // Find the highest block number in the response
-    let max_number = headers.iter().map(|h| h.number).max().unwrap();
-
-    // Find the skeleton entry whose number matches
-    skeleton
+    // The newest header must *be* a skeleton entry, by hash and not merely by
+    // height: a chunk is the answer to a specific question, and matching on
+    // the number alone does not establish that it is.
+    let newest = headers.iter().max_by_key(|h| h.number)?;
+    let idx = skeleton
         .iter()
-        .position(|entry| entry.number == max_number)
+        .position(|entry| entry.number == newest.number && entry.hash == newest.hash())?;
+
+    // A chunk covers a contiguous run ending at that entry. Anything else is
+    // not the answer to the question that was asked.
+    let oldest = headers.iter().map(|h| h.number).min()?;
+    if newest.number.checked_sub(oldest)? + 1 != headers.len() as u64 {
+        return None;
+    }
+
+    Some(idx)
 }
 
 /// Execute a downloaded batch (headers + bodies) in order, applying state

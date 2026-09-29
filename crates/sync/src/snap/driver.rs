@@ -88,6 +88,10 @@ fn blame_for(failure: &SnapFailure) -> Option<EventType> {
         | SnapFailure::BadDifficulty
         | SnapFailure::ForeignGenesis
         | SnapFailure::BadChunk(_) => Some(EventType::InvalidMessage),
+        // Claiming more work than the chain it served can carry is a lie about
+        // the chain, not a malformed message, and the peer is answerable for
+        // it.
+        SnapFailure::OverstatedDifficulty { .. } => Some(EventType::InvalidBlock),
         SnapFailure::NoCommonAncestor
         | SnapFailure::NoProgress(_)
         | SnapFailure::IncompleteState(_) => None,

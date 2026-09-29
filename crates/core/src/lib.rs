@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod bloom;
 pub mod events;
 pub mod types;

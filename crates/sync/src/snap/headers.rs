@@ -43,7 +43,7 @@
 //! of work included, exactly as before. Pipelining changes when the questions
 //! are asked, not which answers are accepted.
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
 use rustock_core::validation::HeaderVerifier;
 use rustock_core::Header;
 use rustock_networking::protocol::BlockIdentifier;
@@ -119,6 +119,14 @@ pub struct HeaderWalk {
     need_hash: B256,
     done: bool,
 
+    /// Difficulty summed over every header the walk has verified.
+    ///
+    /// The checkpoint's total difficulty arrives as a claim and is written to
+    /// the store as this node's own, so it is worth establishing against the
+    /// chain actually walked. The walk reads every header anyway; adding them
+    /// up costs nothing and makes the claim checkable.
+    walked_difficulty: U256,
+
     /// Blocks strictly below this may be frozen: `top - FREEZE_DEPTH`.
     freeze_horizon: u64,
     /// Headers written against a checkpoint that is still only a peer's claim.
@@ -185,9 +193,19 @@ impl HeaderWalk {
             need_number: number,
             need_hash: top_hash,
             done: false,
+            walked_difficulty: U256::ZERO,
             freeze_horizon: number.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
             staging,
         }
+    }
+
+    /// Difficulty summed across every header verified so far.
+    ///
+    /// Once the walk is done this is the work of the whole chain below the
+    /// checkpoint, and a peer's claimed cumulative difficulty may not exceed
+    /// it by more than the checkpoint block's own difficulty.
+    pub fn walked_difficulty(&self) -> U256 {
+        self.walked_difficulty
     }
 
     /// The height the walk started from.
@@ -340,6 +358,7 @@ impl HeaderWalk {
         })?;
 
         for header in headers {
+            self.walked_difficulty = self.walked_difficulty.saturating_add(header.difficulty);
             let _ = self.store.put_header_with_hash(header.hash(), header);
         }
 
