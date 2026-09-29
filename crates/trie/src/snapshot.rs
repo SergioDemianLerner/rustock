@@ -28,6 +28,7 @@
 //! in-order decomposition the seek below relies on.
 
 use alloy_primitives::B256;
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use crate::node::{NodeRef, TrieNode};
@@ -768,44 +769,70 @@ pub fn verify_complete(
 ) -> Result<u64, Missing> {
     let workers = threads.max(1);
 
-    // Phase one: enough subtrees to keep every worker fed, found by widening
-    // one level at a time. Nodes visited here are counted here, because no
-    // worker will see them again.
-    let target = workers * 8;
-    let mut frontier = vec![root.clone()];
+    // Phase one: split the trie into pieces small enough that no single one
+    // can dominate the tail.
+    //
+    // The previous version widened breadth-first until it had `workers * 8`
+    // pieces and stopped. That counts pieces and ignores their size, and the
+    // subtrees at a given frontier of a unitrie are wildly uneven -- so the
+    // small ones finished at once and one worker ground through a giant one
+    // while the rest idled. 1.53x from 16 threads, with one runnable thread
+    // sampled mid-walk (#210). Independence of the work items is what makes
+    // the split correct; it is not what makes it fast.
+    //
+    // No new information is needed to do better: every node commits
+    // `children_size`, so `total_size` gives a subtree's exact byte size. Take
+    // the largest piece and split it, repeatedly, until the largest is under
+    // a quarter of a worker's fair share. Then no straggler can dominate,
+    // because the tail is bounded by construction rather than by luck.
+    let total = total_size(root, store);
+    let bound = (total / (workers as u64 * 4)).max(1);
+    // A ceiling on splitting, so a pathological shape cannot turn phase one
+    // into the whole walk done serially.
+    let max_pieces = workers * 64;
+
+    let mut pieces: Vec<TrieNode> = Vec::new();
+    let mut heap: BinaryHeap<(u64, usize)> = BinaryHeap::new();
+    pieces.push(root.clone());
+    heap.push((total, 0));
     let mut counted = 0u64;
 
-    while frontier.len() < target {
-        let mut next = Vec::with_capacity(frontier.len() * 2);
-        let mut widened = false;
-        for node in &frontier {
-            counted += 1;
-            if let Some(m) = check_value(node, store) {
-                return Err(m);
-            }
-            for child in [&node.left, &node.right] {
-                match child {
-                    NodeRef::Empty => {}
-                    NodeRef::Node(n) => {
-                        next.push((**n).clone());
-                        widened = true;
-                    }
-                    NodeRef::Hash(h) => match child.resolve(store) {
-                        Some(n) => {
-                            next.push(n);
-                            widened = true;
-                        }
-                        None => return Err(Missing::Node(*h)),
-                    },
-                }
+    while let Some(&(size, _)) = heap.peek() {
+        if size <= bound || heap.len() >= max_pieces {
+            break;
+        }
+        let (_, idx) = heap.pop().expect("peeked");
+        let node = pieces[idx].clone();
+
+        // The node being split is visited here; only its children go back in.
+        counted += 1;
+        if let Some(m) = check_value(&node, store) {
+            return Err(m);
+        }
+        for child in [&node.left, &node.right] {
+            let resolved = match child {
+                NodeRef::Empty => None,
+                NodeRef::Node(n) => Some((**n).clone()),
+                NodeRef::Hash(h) => match child.resolve(store) {
+                    Some(n) => Some(n),
+                    None => return Err(Missing::Node(*h)),
+                },
+            };
+            if let Some(n) = resolved {
+                let sz = total_size(&n, store);
+                pieces.push(n);
+                heap.push((sz, pieces.len() - 1));
             }
         }
-        if !widened {
-            // The whole trie fit in the frontier; it is already verified.
-            progress(counted);
-            return Ok(counted);
-        }
-        frontier = next;
+    }
+
+    // Whatever is left in the heap is the work, in no particular order.
+    let frontier: Vec<TrieNode> =
+        heap.into_iter().map(|(_, i)| pieces[i].clone()).collect();
+
+    if frontier.is_empty() {
+        progress(counted);
+        return Ok(counted);
     }
 
     // Phase two: the subtrees, taken dynamically.
@@ -995,5 +1022,105 @@ mod verify_complete_tests {
         };
         verify_complete(&root, &store, 4, &seen).expect("whole");
         assert!(calls.load(Ordering::Relaxed) > 0, "progress was never reported");
+    }
+}
+
+#[cfg(test)]
+mod split_balance_tests {
+    use super::tests::toy_trie;
+    use super::*;
+    use crate::store::MemoryTrieStore;
+
+    fn noop(_: u64) {}
+
+    fn reloaded(n: usize) -> (TrieNode, MemoryTrieStore) {
+        let (built, store) = toy_trie(n);
+        let hash = built.compute_hash(&store);
+        let message = store.get(hash.as_slice()).expect("root saved");
+        let root = TrieNode::try_from_message(&message, &store).expect("parses");
+        (root, store)
+    }
+
+    /// The split bounds the largest piece, which is what stops one worker
+    /// deciding how long the whole walk takes.
+    ///
+    /// Splitting by *count* -- the previous behaviour -- left pieces of wildly
+    /// different sizes and gave 1.53x from 16 threads (#210).
+    #[test]
+    fn no_piece_is_large_enough_to_dominate() {
+        let (root, store) = reloaded(4000);
+        let total = total_size(&root, &store);
+
+        for workers in [2usize, 4, 16] {
+            let pieces = split_for_test(&root, &store, workers);
+            assert!(!pieces.is_empty());
+
+            let bound = (total / (workers as u64 * 4)).max(1);
+            let largest = pieces.iter().copied().max().unwrap_or(0);
+            let unsplittable_floor = pieces.len() >= workers * 64;
+            assert!(
+                largest <= bound || unsplittable_floor,
+                "workers={workers}: largest piece {largest} exceeds the bound {bound} \
+                 with only {} pieces",
+                pieces.len()
+            );
+        }
+    }
+
+    /// More workers means finer pieces, which is the whole point of keying
+    /// the bound on the worker count.
+    #[test]
+    fn more_workers_means_smaller_pieces() {
+        let (root, store) = reloaded(4000);
+        let few = split_for_test(&root, &store, 2);
+        let many = split_for_test(&root, &store, 16);
+        assert!(
+            many.len() > few.len(),
+            "16 workers produced {} pieces, 2 workers produced {}",
+            many.len(),
+            few.len()
+        );
+    }
+
+    /// The split must not lose or duplicate work: however it is cut, the walk
+    /// visits the same nodes.
+    #[test]
+    fn the_split_does_not_change_what_is_visited() {
+        let (root, store) = reloaded(4000);
+        let one = verify_complete(&root, &store, 1, &noop).expect("whole");
+        for workers in [2usize, 3, 4, 8, 16, 32] {
+            assert_eq!(
+                verify_complete(&root, &store, workers, &noop).expect("whole"),
+                one,
+                "workers={workers} visited a different number of nodes"
+            );
+        }
+    }
+
+    /// Mirrors phase one, so the balance property can be asserted directly
+    /// rather than inferred from a wall-clock measurement.
+    fn split_for_test(root: &TrieNode, store: &MemoryTrieStore, workers: usize) -> Vec<u64> {
+        let total = total_size(root, store);
+        let bound = (total / (workers as u64 * 4)).max(1);
+        let max_pieces = workers * 64;
+        let mut pieces = vec![root.clone()];
+        let mut heap: BinaryHeap<(u64, usize)> = BinaryHeap::new();
+        heap.push((total, 0));
+
+        while let Some(&(size, _)) = heap.peek() {
+            if size <= bound || heap.len() >= max_pieces {
+                break;
+            }
+            let (_, idx) = heap.pop().unwrap();
+            let node = pieces[idx].clone();
+            for child in [&node.left, &node.right] {
+                if let Some(n) = child.resolve(store) {
+                    let sz = total_size(&n, store);
+                    pieces.push(n);
+                    heap.push((sz, pieces.len() - 1));
+                }
+            }
+        }
+        heap.into_iter().map(|(s, _)| s).collect()
     }
 }
