@@ -392,6 +392,18 @@ struct Args {
     #[arg(long, value_name = "HOST:PORT")]
     bootnodes: Vec<String>,
 
+    /// Walk the state under a root and confirm every node is present, then
+    /// exit.
+    ///
+    /// The same check a snapshot sync runs before it accepts a downloaded
+    /// state, available on demand: it answers "is this node's state actually
+    /// all here" without syncing anything. Pass a state root, or leave it
+    /// empty to use the executed head's.
+    ///
+    /// Reads only. Uses `--read-threads` workers.
+    #[arg(long, value_name = "ROOT", num_args = 0..=1, default_missing_value = "head")]
+    verify_state: Option<String>,
+
     /// Delete headers from the block database once the freezer holds them.
     ///
     /// Off by default, and deliberately so. The freezer's measured win is
@@ -1565,6 +1577,62 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let detached_for_readers: Option<Arc<dyn rustock_trie::TrieStore>> =
         if backend.is_detached() { Some(trie_store_for_exec.clone()) } else { None };
 
+
+    if let Some(which) = args.verify_state.clone() {
+        let root_hash = if which == "head" {
+            store
+                .exec_head()?
+                .map(|(_, root)| root)
+                .ok_or_else(|| anyhow::anyhow!("this node has no executed head to verify"))?
+        } else {
+            which.trim_start_matches("0x").parse::<alloy_primitives::B256>()
+                .map_err(|e| anyhow::anyhow!("not a state root: {e}"))?
+        };
+
+        // Same rule as the sync path: verification follows the cores.
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(rustock_storage::read_threads())
+            .max(1);
+        info!("Verifying the state under {root_hash:?} with {workers} thread(s)");
+        let message = trie_store_for_exec
+            .get(root_hash.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("state root {root_hash:?} is not in the trie store"))?;
+        let root = rustock_trie::TrieNode::try_from_message(&message, trie_store_for_exec.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("the stored state root does not parse"))?;
+
+        let started = std::time::Instant::now();
+        let last = std::sync::Mutex::new(std::time::Instant::now());
+        let report = |seen: u64| {
+            let mut l = last.lock().unwrap();
+            if l.elapsed() < std::time::Duration::from_secs(5) {
+                return;
+            }
+            *l = std::time::Instant::now();
+            let secs = started.elapsed().as_secs_f64();
+            info!("verifying: {seen} nodes, {secs:.0}s elapsed, {:.0} nodes/s", seen as f64 / secs.max(0.001));
+        };
+
+        match rustock_trie::snapshot::verify_complete(
+            &root,
+            trie_store_for_exec.as_ref(),
+            workers,
+            &report,
+        ) {
+            Ok(nodes) => {
+                let secs = started.elapsed().as_secs_f64();
+                info!(
+                    "State verified: {nodes} nodes in {secs:.1}s ({:.0} nodes/s)",
+                    nodes as f64 / secs.max(0.001)
+                );
+                return Ok(());
+            }
+            Err(missing) => {
+                anyhow::bail!("state under {root_hash:?} is incomplete: {missing}");
+            }
+        }
+    }
 
     let trie_store_for_pool: Arc<dyn rustock_trie::TrieStore> = match &detached_for_readers {
         Some(t) => t.clone(),
