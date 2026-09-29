@@ -1,5 +1,6 @@
 pub mod trie_store;
 pub mod cached_trie_store;
+pub mod counting_trie_store;
 pub mod rskj_import;
 pub use position::{
     BlockRef, Cursor, LineageBreak, Transition, Validated, verify_local_coherence,

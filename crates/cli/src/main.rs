@@ -392,6 +392,28 @@ struct Args {
     #[arg(long, value_name = "HOST:PORT")]
     bootnodes: Vec<String>,
 
+    /// Re-execute the last N blocks and report what each one read from the
+    /// trie, then exit.
+    ///
+    /// Sizes a stateless witness with a measurement rather than an estimate:
+    /// which nodes a block needs depends on the accounts and storage slots
+    /// its transactions reach and on how much their paths overlap, and no
+    /// amount of reasoning about the trie's shape produces that number.
+    ///
+    /// Opens both databases **read-only** and keeps every write in memory, so
+    /// it can be pointed at a node that is running.
+    #[arg(long, value_name = "N")]
+    measure_block_reads: Option<u64>,
+
+    /// With `--verify-state`, report the trie's shape instead of verifying it.
+    ///
+    /// Measures what sizing a stateless witness needs and the node does not
+    /// otherwise record: how deep a value sits, which is how many sibling
+    /// hashes a proof for it carries, and how many values there are to share
+    /// the upper levels between.
+    #[arg(long)]
+    trie_shape: bool,
+
     /// Walk the state under a root and confirm every node is present, then
     /// exit.
     ///
@@ -1218,7 +1240,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     );
 
     if args.build_bridge_index {
-    let store = Arc::new(BlockStore::open(&args.data_dir)?);
+        let store = Arc::new(BlockStore::open(&args.data_dir)?);
         rustock_storage::rskj_import::install_signal_handlers();
         run_build_bridge_index(&store, args.receipts_from, args.receipts_to)?;
         return Ok(());
@@ -1379,7 +1401,16 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         );
     }
 
-    let store = Arc::new(BlockStore::open(&args.data_dir)?);
+    // Profiling modes attach to a database another process may own, so they
+    // take the read-only path: it does not take RocksDB's lock and cannot
+    // write. Everything else opens normally.
+    let read_only = args.measure_block_reads.is_some() || args.verify_state.is_some();
+    let store = Arc::new(if read_only {
+        info!("Opening {} READ-ONLY for profiling", args.data_dir);
+        BlockStore::open_read_only(&args.data_dir)?
+    } else {
+        BlockStore::open(&args.data_dir)?
+    });
 
     let genesis_hash = setup_genesis(&store, &config)?;
     info!("Genesis Hash: {:?}", genesis_hash);
@@ -1546,10 +1577,14 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 
     let epoch_store: Option<Arc<rustock_storage::epoch_store::EpochTrieStore>> = match &backend {
         rustock_storage::epoch_store::TrieBackend::Epochs(cfg) => {
-            Some(Arc::new(rustock_storage::epoch_store::EpochTrieStore::open(
-                &trie_dir,
-                cfg.clone(),
-            )?))
+            Some(Arc::new(if read_only {
+                rustock_storage::epoch_store::EpochTrieStore::open_read_only(
+                    &trie_dir,
+                    cfg.clone(),
+                )?
+            } else {
+                rustock_storage::epoch_store::EpochTrieStore::open(&trie_dir, cfg.clone())?
+            }))
         }
         _ => None,
     };
@@ -1613,6 +1648,32 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             let secs = started.elapsed().as_secs_f64();
             info!("verifying: {seen} nodes, {secs:.0}s elapsed, {:.0} nodes/s", seen as f64 / secs.max(0.001));
         };
+
+        if args.trie_shape {
+            let started = std::time::Instant::now();
+            let shape = rustock_trie::snapshot::measure_shape(&root, trie_store_for_exec.as_ref());
+            info!(
+                "Trie shape under {root_hash:?} ({:.0}s):\n\
+                 \x20 nodes              {}\n\
+                 \x20 value nodes        {}\n\
+                 \x20 mean value depth   {:.2}\n\
+                 \x20 max value depth    {}\n\
+                 \x20 hash children      {}\n\
+                 \x20 embedded children  {}\n\
+                 \x20 inline value bytes {}\n\
+                 \x20 long value bytes   {}",
+                started.elapsed().as_secs_f64(),
+                shape.nodes,
+                shape.value_nodes,
+                shape.mean_value_depth(),
+                shape.max_depth,
+                shape.hash_children,
+                shape.embedded_children,
+                shape.inline_value_bytes,
+                shape.long_value_bytes,
+            );
+            return Ok(());
+        }
 
         match rustock_trie::snapshot::verify_complete(
             &root,
@@ -1767,6 +1828,136 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         block_processor = block_processor.with_btc_block_cache(cache.clone());
     }
     info!("Block processor wired (hardfork config: {:?})", hardfork_cfg);
+
+    if let Some(count) = args.measure_block_reads {
+        // Re-execute recent blocks and record what each one had to be given.
+        //
+        // Both databases are already open here; what makes this safe against a
+        // running node is that the trie store is wrapped so every write stays
+        // in memory, and that the operator points --data-dir at a node they
+        // are content to read. Nothing here writes.
+        let counting = Arc::new(
+            rustock_storage::counting_trie_store::CountingTrieStore::new(
+                trie_store_for_exec.clone(),
+            ),
+        );
+
+        let head = store
+            .head()?
+            .and_then(|h| store.header(h).ok().flatten())
+            .ok_or_else(|| anyhow::anyhow!("no chain head to measure from"))?;
+        let from = head.number.saturating_sub(count).max(1);
+
+        info!(
+            "Measuring trie reads for blocks #{from}..#{} ({count} requested)",
+            head.number
+        );
+
+        let mut blocks = 0u64;
+        let mut txs = 0u64;
+        let mut distinct = 0u64;
+        let mut calls = 0u64;
+        let mut bytes = 0u64;
+        let mut failed = 0u64;
+        let mut worst = (0u64, 0u64);
+        // The mean says little about a design sized by a threshold: what
+        // matters is how many blocks fall under it, and how much of the work
+        // the ones above it represent.
+        let mut per_block: Vec<u64> = Vec::new();
+
+        for number in from..=head.number {
+            let Some(hash) = store.canonical_hash(number)? else { continue };
+            let Some(block) = store.block(hash)? else { continue };
+            let Some(parent) = store.header(block.header.parent_hash)? else { continue };
+
+            // The pre-state is the parent's root. A node that has collected
+            // past it simply cannot answer, which is why this only works on
+            // recent blocks.
+            let Some(message) = counting.get(parent.state_root.as_slice()) else {
+                failed += 1;
+                continue;
+            };
+            let Some(pre) = rustock_trie::TrieNode::try_from_message(&message, counting.as_ref())
+            else {
+                failed += 1;
+                continue;
+            };
+
+            counting.clear_overlay();
+            let _ = counting.take();
+
+            match block_processor.process_block(&block, &pre, counting.clone()) {
+                Ok(_) => {
+                    let s = counting.take();
+                    blocks += 1;
+                    txs += block.transactions.len() as u64;
+                    distinct += s.distinct;
+                    calls += s.calls;
+                    bytes += s.bytes;
+                    per_block.push(s.bytes);
+                    if s.distinct > worst.1 {
+                        worst = (number, s.distinct);
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    debug!("block #{number} did not re-execute: {e:?}");
+                }
+            }
+        }
+
+        if blocks == 0 {
+            anyhow::bail!(
+                "no block re-executed ({failed} could not be); the pre-state for this \
+                 range is not in the trie store"
+            );
+        }
+
+        per_block.sort_unstable();
+        let pct = |p: usize| -> u64 {
+            if per_block.is_empty() {
+                return 0;
+            }
+            per_block[(per_block.len() - 1) * p / 100]
+        };
+        // How a threshold would actually behave, rather than how the mean
+        // suggests it would.
+        let mut thresholds = String::new();
+        for limit in [16_384u64, 32_768, 51_200, 131_072] {
+            let under = per_block.iter().filter(|b| **b <= limit).count();
+            let carried: u64 = per_block.iter().filter(|b| **b <= limit).sum();
+            thresholds.push_str(&format!(
+                "\n\x20 <= {:>3} KB              {:>5.1}% of blocks, {:>5.1}% of their bytes",
+                limit / 1024,
+                under as f64 / per_block.len() as f64 * 100.0,
+                carried as f64 / bytes.max(1) as f64 * 100.0,
+            ));
+        }
+
+        info!(
+            "Trie reads over {blocks} block(s), {txs} transaction(s), {failed} skipped:\n\
+             \x20 bytes p50 / p90 / p99   {} / {} / {}\n\
+             \x20 bytes min / max         {} / {}\
+             {thresholds}\n\
+             \x20 distinct nodes / block   {:.1}\n\
+             \x20 get calls / block        {:.1}\n\
+             \x20 node bytes / block       {:.0}\n\
+             \x20 distinct nodes / tx      {:.1}\n\
+             \x20 busiest block            #{} with {} nodes\n\
+             \x20 totals                   {distinct} nodes, {bytes} bytes",
+            pct(50), pct(90), pct(99),
+            per_block.first().copied().unwrap_or(0),
+            per_block.last().copied().unwrap_or(0),
+            distinct as f64 / blocks as f64,
+            calls as f64 / blocks as f64,
+            bytes as f64 / blocks as f64,
+            if txs > 0 { distinct as f64 / txs as f64 } else { 0.0 },
+            worst.0,
+            worst.1,
+        );
+        return Ok(());
+    }
+
 
     let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
