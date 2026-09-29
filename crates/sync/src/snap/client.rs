@@ -43,7 +43,7 @@ use rustock_trie::snapshot::total_size;
 use rustock_trie::snapshot_proof::{verify_chunk, ChunkProof, Entry, VerifyError};
 use rustock_trie::{TrieNode, TrieStore};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace};
@@ -470,146 +470,60 @@ impl StateDownload {
             }
         }
 
-        // Walking it chunk by chunk visits every node and resolves every
-        // hash, which is exactly the question being asked.
+        // One walk, strict and parallel.
         //
-        // Byte ranges are independent of each other -- `chunk_until` says so
-        // next door: a cell "depends on nothing but the trie and the two
-        // numbers", which is what lets the snapshot *server* answer arbitrary
-        // cells for different peers at once. So the walk splits: worker `k`
-        // takes `[k*total/N, (k+1)*total/N)`.
+        // It used to be two: a parallel walk over byte ranges, which proved
+        // the offsets added up, and then a sequential reachability descent
+        // added to catch the missing nodes the first one skipped (#204).
+        // Two passes over 10.6 million nodes, the stricter one single
+        // threaded, which gave back most of what parallelising the first had
+        // won.
         //
-        // Splitting by bytes rather than by key space keeps the workers
-        // balanced, because bytes traversed is what the work is proportional
-        // to. A node straddling a boundary is emitted whole into both
-        // neighbouring cells, so nothing falls between two workers.
+        // Reachability subsumes coverage -- a node that can be reached is a
+        // node that is there -- so the byte-range walk proved nothing this
+        // does not, and `total_size` above already checked the arithmetic.
         const REPORT_EVERY: Duration = Duration::from_secs(5);
-        let workers = rustock_storage::read_threads().max(1);
+        let threads = rustock_storage::read_threads().max(1);
         let started = Instant::now();
 
         info!(
             target: "rustock::snap",
-            "verifying the stored state: {} MB to walk across {workers} thread(s)",
+            "verifying the stored state: {} MB across {threads} thread(s)",
             total / (1 << 20)
         );
 
-        let covered = AtomicU64::new(0);
-        let nodes = AtomicU64::new(0);
-        let finished = AtomicBool::new(false);
-        let failure: Mutex<Option<String>> = Mutex::new(None);
-
-        std::thread::scope(|scope| {
-            // One thread does nothing but say how it is going. Ten minutes of
-            // silence is indistinguishable from a hang (#187), and with the
-            // walk spread over several threads no single one of them knows
-            // the whole picture.
-            let reporter = scope.spawn(|| {
-                // Checked often, reported rarely: the workers are joined
-                // before `finished` is set, so a long sleep here would hold
-                // the whole walk open waiting for this thread to notice.
-                while !finished.load(Ordering::Relaxed) {
-                    let mut waited = Duration::ZERO;
-                    while waited < REPORT_EVERY && !finished.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(100));
-                        waited += Duration::from_millis(100);
-                    }
-                    if finished.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let done_bytes = covered.load(Ordering::Relaxed);
-                    let fraction = done_bytes as f64 / total as f64;
-                    let elapsed = started.elapsed().as_secs_f64();
-                    let eta = if fraction > 0.0 {
-                        elapsed * (1.0 - fraction) / fraction
-                    } else {
-                        0.0
-                    };
-                    info!(
-                        target: "rustock::snap",
-                        "verifying the stored state: {:.1}% ({}/{} MB), {} nodes, {:.0}s elapsed, ~{:.0}s left",
-                        fraction * 100.0,
-                        done_bytes / (1 << 20),
-                        total / (1 << 20),
-                        nodes.load(Ordering::Relaxed),
-                        elapsed,
-                        eta
-                    );
-                }
-            });
-
-            let mut handles = Vec::with_capacity(workers);
-            for k in 0..workers {
-                let root = &root;
-                let covered = &covered;
-                let nodes = &nodes;
-                let failure = &failure;
-                let store = self.store.as_ref();
-                handles.push(scope.spawn(move || {
-                    let lo = total * k as u64 / workers as u64;
-                    let hi = total * (k as u64 + 1) / workers as u64;
-                    let mut offset = lo;
-                    while offset < hi {
-                        let chunk =
-                            rustock_trie::snapshot::chunk_from(root, offset, 1 << 20, store);
-                        let Some(last) = chunk.last() else {
-                            // A hole must still stop the sync. Skipping one
-                            // quietly would be far worse than a slow verify:
-                            // the whole point of this phase is failing here
-                            // rather than during the first block that touches
-                            // a missing node.
-                            let mut slot = failure.lock().unwrap();
-                            if slot.is_none() {
-                                *slot = Some(format!(
-                                    "the stored trie has a hole at offset {offset}"
-                                ));
-                            }
-                            return;
-                        };
-                        nodes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                        let end = last.end();
-                        covered.fetch_add(end.saturating_sub(offset), Ordering::Relaxed);
-                        offset = end;
-                    }
-                }));
+        // Ten minutes of silence is indistinguishable from a hang (#187), and
+        // no single worker knows the whole picture. The node count is not
+        // known in advance, so progress is reported as a rate rather than a
+        // percentage -- honest about what is knowable.
+        let last_report = Mutex::new(Instant::now());
+        let report = move |seen: u64| {
+            let mut last = last_report.lock().unwrap();
+            if last.elapsed() < REPORT_EVERY {
+                return;
             }
-
-            // Join the workers here, not at the end of the scope: the
-            // reporter runs until `finished`, and the scope will not return
-            // until the reporter has, so setting it afterwards would deadlock.
-            for h in handles {
-                let _ = h.join();
-            }
-            finished.store(true, Ordering::Relaxed);
-            let _ = reporter.join();
-        });
-
-        if let Some(why) = failure.into_inner().unwrap() {
-            return Err(why);
-        }
-
-        let nodes = nodes.into_inner();
-
-        // The walk above covers the trie by byte range, which proves the
-        // offsets add up and every region is reachable. It does not prove
-        // every *node* is present: the traversal it uses skips a child it
-        // cannot resolve, because its other caller serves chunks to peers and
-        // should hand over what it has. A hole therefore made a chunk shorter
-        // rather than empty, and passed (#204).
-        //
-        // So ask the question directly. This is a plain reachability descent
-        // with no offsets to get right, and it refuses on the first node or
-        // long value that is not in the store.
-        match rustock_trie::snapshot::verify_complete(&root, self.store.as_ref()) {
-            Ok(reached) => debug!(
+            *last = Instant::now();
+            let elapsed = started.elapsed().as_secs_f64();
+            info!(
                 target: "rustock::snap",
-                "reachability reached {reached} nodes; the offset walk counted {nodes}"
-            ),
-            Err(missing) => return Err(missing.to_string()),
-        }
+                "verifying the stored state: {} nodes, {:.0}s elapsed, {:.0} nodes/s",
+                seen,
+                elapsed,
+                seen as f64 / elapsed.max(0.001)
+            );
+        };
+
+        let nodes = rustock_trie::snapshot::verify_complete(
+            &root,
+            self.store.as_ref(),
+            threads,
+            &report,
+        )
+        .map_err(|missing| missing.to_string())?;
 
         info!(
             target: "rustock::snap",
-            "stored state verified: {} nodes, {} MB, {:.0}s across {workers} thread(s)",
+            "stored state verified: {} nodes, {} MB, {:.0}s across {threads} thread(s)",
             nodes,
             total / (1 << 20),
             started.elapsed().as_secs_f64()
