@@ -64,7 +64,7 @@
 //! where a reorg goes looking for them.
 
 use alloy_primitives::B256;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use rustock_core::Header;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

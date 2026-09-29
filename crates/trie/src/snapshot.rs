@@ -28,6 +28,8 @@
 //! in-order decomposition the seek below relies on.
 
 use alloy_primitives::B256;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use crate::node::{NodeRef, TrieNode};
 use crate::store::TrieStore;
 
@@ -370,7 +372,7 @@ fn is_embedded(child: &NodeRef, store: &dyn TrieStore) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// A grid covers the trie exactly: every node lands in the cell its start
     /// offset falls in, and nothing is missed.
     #[test]
@@ -457,7 +459,7 @@ mod tests {
 
     /// A trie with `n` keys, plus some long values so the external-value
     /// accounting is exercised rather than assumed away.
-    fn toy_trie(n: usize) -> (TrieNode, MemoryTrieStore) {
+    pub(crate) fn toy_trie(n: usize) -> (TrieNode, MemoryTrieStore) {
         let store = MemoryTrieStore::new();
         let mut root = TrieNode::empty();
         for i in 0..n {
@@ -737,45 +739,261 @@ impl std::fmt::Display for Missing {
 /// client's proof check is what notices the gap.
 ///
 /// It is wrong for verification, whose entire job is noticing a missing node.
-/// A hole made the chunk *shorter*, not empty, so the only check on the
+/// A hole made the chunk *shorter*, not empty, so the only check on that
 /// walk -- an empty chunk -- never fired, and a state with holes passed
 /// (#204).
 ///
-/// This refuses instead. It also has no offsets or budgets to get right:
-/// reachability is the question, so it is a plain descent.
+/// This refuses instead, and it is the only walk verification needs:
+/// reachability subsumes coverage, so there is no second pass over byte
+/// ranges to pay for.
+///
+/// # Parallelism
+///
+/// A breadth-first descent first, cheap and shallow, until there are several
+/// subtrees per worker; then each worker takes subtrees from a shared counter
+/// and walks one to the bottom. Taking them dynamically rather than dealing
+/// them out in advance is what keeps the workers busy when subtrees differ in
+/// size, and with keys as uniformly distributed as these they do not differ by
+/// much.
+///
+/// `progress` is called with the running node count, often enough to be worth
+/// reporting and not so often as to matter.
 ///
 /// Returns how many nodes were visited.
-pub fn verify_complete(root: &TrieNode, store: &dyn TrieStore) -> Result<u64, Missing> {
-    let mut stack = vec![root.clone()];
-    let mut nodes = 0u64;
+pub fn verify_complete(
+    root: &TrieNode,
+    store: &dyn TrieStore,
+    threads: usize,
+    progress: &(dyn Fn(u64) + Sync),
+) -> Result<u64, Missing> {
+    let workers = threads.max(1);
 
-    while let Some(node) = stack.pop() {
-        nodes += 1;
+    // Phase one: enough subtrees to keep every worker fed, found by widening
+    // one level at a time. Nodes visited here are counted here, because no
+    // worker will see them again.
+    let target = workers * 8;
+    let mut frontier = vec![root.clone()];
+    let mut counted = 0u64;
 
-        // A long value lives under its own hash, so a node can be present
-        // while the bytes it stands for are not.
-        if node.has_long_value() && node.value.is_none() {
-            if let Some(h) = node.value_hash {
-                if store.get(h.as_slice()).is_none() {
-                    return Err(Missing::Value(h));
+    while frontier.len() < target {
+        let mut next = Vec::with_capacity(frontier.len() * 2);
+        let mut widened = false;
+        for node in &frontier {
+            counted += 1;
+            if let Some(m) = check_value(node, store) {
+                return Err(m);
+            }
+            for child in [&node.left, &node.right] {
+                match child {
+                    NodeRef::Empty => {}
+                    NodeRef::Node(n) => {
+                        next.push((**n).clone());
+                        widened = true;
+                    }
+                    NodeRef::Hash(h) => match child.resolve(store) {
+                        Some(n) => {
+                            next.push(n);
+                            widened = true;
+                        }
+                        None => return Err(Missing::Node(*h)),
+                    },
                 }
             }
         }
+        if !widened {
+            // The whole trie fit in the frontier; it is already verified.
+            progress(counted);
+            return Ok(counted);
+        }
+        frontier = next;
+    }
 
-        for child in [&node.left, &node.right] {
-            match child {
-                NodeRef::Empty => {}
-                // Embedded children live inside the parent's message, so they
-                // are present by construction -- but their own children may
-                // not be.
-                NodeRef::Node(n) => stack.push((**n).clone()),
-                NodeRef::Hash(h) => match child.resolve(store) {
-                    Some(n) => stack.push(n),
-                    None => return Err(Missing::Node(*h)),
-                },
+    // Phase two: the subtrees, taken dynamically.
+    let next_subtree = AtomicUsize::new(0);
+    let nodes = AtomicU64::new(counted);
+    let failure: Mutex<Option<Missing>> = Mutex::new(None);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let frontier = &frontier;
+            let next_subtree = &next_subtree;
+            let nodes = &nodes;
+            let failure = &failure;
+            scope.spawn(move || {
+                loop {
+                    if failure.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let i = next_subtree.fetch_add(1, Ordering::Relaxed);
+                    let Some(subtree) = frontier.get(i) else { return };
+
+                    let mut stack = vec![subtree.clone()];
+                    let mut local = 0u64;
+                    while let Some(node) = stack.pop() {
+                        local += 1;
+                        if let Some(m) = check_value(&node, store) {
+                            // First finder wins; the rest stop on the next
+                            // turn of the loop.
+                            let mut slot = failure.lock().unwrap();
+                            if slot.is_none() {
+                                *slot = Some(m);
+                            }
+                            return;
+                        }
+                        for child in [&node.left, &node.right] {
+                            match child {
+                                NodeRef::Empty => {}
+                                NodeRef::Node(n) => stack.push((**n).clone()),
+                                NodeRef::Hash(h) => match child.resolve(store) {
+                                    Some(n) => stack.push(n),
+                                    None => {
+                                        let mut slot = failure.lock().unwrap();
+                                        if slot.is_none() {
+                                            *slot = Some(Missing::Node(*h));
+                                        }
+                                        return;
+                                    }
+                                },
+                            }
+                        }
+                        // Reported against the running total, not against
+                        // this subtree: subtrees vary in size, and a small one
+                        // would otherwise never report at all.
+                        if local >= 4096 {
+                            let seen = nodes.fetch_add(local, Ordering::Relaxed) + local;
+                            progress(seen);
+                            local = 0;
+                        }
+                    }
+                    let seen = nodes.fetch_add(local, Ordering::Relaxed) + local;
+                    progress(seen);
+                }
+            });
+        }
+    });
+
+    if let Some(m) = failure.into_inner().unwrap() {
+        return Err(m);
+    }
+    Ok(nodes.into_inner())
+}
+
+/// A node can be present while the bytes its long value stands for are not,
+/// because a long value is stored under its own hash.
+fn check_value(node: &TrieNode, store: &dyn TrieStore) -> Option<Missing> {
+    if node.has_long_value() && node.value.is_none() {
+        if let Some(h) = node.value_hash {
+            if store.get(h.as_slice()).is_none() {
+                return Some(Missing::Value(h));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod verify_complete_tests {
+    use super::tests::toy_trie;
+    use super::*;
+    use crate::store::MemoryTrieStore;
+
+    fn noop(_: u64) {}
+
+    /// Every child the trie reaches by hash rather than by embedding, deepest
+    /// last.
+    fn hash_referenced(root: &TrieNode, store: &MemoryTrieStore) -> Vec<B256> {
+        let mut out = Vec::new();
+        let mut level = vec![root.clone()];
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for node in &level {
+                for child in [&node.left, &node.right] {
+                    match child {
+                        NodeRef::Hash(h) => {
+                            out.push(*h);
+                            if let Some(n) = child.resolve(store) {
+                                next.push(n);
+                            }
+                        }
+                        NodeRef::Node(n) => next.push((**n).clone()),
+                        NodeRef::Empty => {}
+                    }
+                }
+            }
+            level = next;
+        }
+        out
+    }
+
+    /// A trie big enough that the workers do most of the walking, and a root
+    /// **reloaded from the store** rather than the one that was built.
+    ///
+    /// This matters more than the size. A root straight out of `put` holds
+    /// every child in memory as `NodeRef::Node`, so a walk over it never
+    /// touches the store and removing a record proves nothing. Production
+    /// rebuilds the root from its stored message, where children are
+    /// `NodeRef::Hash` and have to be resolved -- which is the thing being
+    /// tested.
+    fn big() -> (TrieNode, MemoryTrieStore) {
+        let (built, store) = toy_trie(4000);
+        let hash = built.compute_hash(&store);
+        let message = store.get(hash.as_slice()).expect("root was saved");
+        let root = TrieNode::try_from_message(&message, &store).expect("root parses");
+        (root, store)
+    }
+
+    #[test]
+    fn a_whole_trie_verifies_at_any_thread_count() {
+        let (root, store) = big();
+        let expected = verify_complete(&root, &store, 1, &noop).expect("whole");
+        assert!(expected > 1000, "expected a trie worth parallelising, got {expected}");
+        for threads in [2usize, 3, 4, 8, 16] {
+            assert_eq!(
+                verify_complete(&root, &store, threads, &noop).expect("whole"),
+                expected,
+                "thread count must not change the node count"
+            );
+        }
+    }
+
+    /// The case the phase-one descent does not cover: a node deep inside a
+    /// subtree, found only by the worker walking it.
+    #[test]
+    fn a_node_missing_deep_in_a_subtree_is_caught() {
+        for threads in [1usize, 2, 4, 16] {
+            let (root, store) = big();
+            verify_complete(&root, &store, threads, &noop).expect("whole to begin with");
+
+            // Must be a node the trie reaches *by hash*. A small node is
+            // embedded in its parent's message, so its separate record is
+            // redundant and removing it proves nothing.
+            let referenced = hash_referenced(&root, &store);
+            assert!(
+                referenced.len() > 8,
+                "expected a trie with hash-linked children, got {}",
+                referenced.len()
+            );
+            let victim = referenced[referenced.len() - 1];
+            assert!(store.remove(victim.as_slice()));
+
+            match verify_complete(&root, &store, threads, &noop) {
+                Err(Missing::Node(_)) | Err(Missing::Value(_)) => {}
+                Ok(n) => panic!("threads={threads}: a missing node went unnoticed ({n} seen)"),
             }
         }
     }
 
-    Ok(nodes)
+    /// Progress is reported as the walk runs, not only at the end -- ten
+    /// minutes of silence is indistinguishable from a hang.
+    #[test]
+    fn progress_is_reported_during_the_walk() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (root, store) = big();
+        let calls = AtomicU64::new(0);
+        let seen = |_n: u64| {
+            calls.fetch_add(1, Ordering::Relaxed);
+        };
+        verify_complete(&root, &store, 4, &seen).expect("whole");
+        assert!(calls.load(Ordering::Relaxed) > 0, "progress was never reported");
+    }
 }
