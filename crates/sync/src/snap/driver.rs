@@ -92,6 +92,9 @@ fn blame_for(failure: &SnapFailure) -> Option<EventType> {
         // the chain, not a malformed message, and the peer is answerable for
         // it.
         SnapFailure::OverstatedDifficulty { .. } => Some(EventType::InvalidBlock),
+        // Not answering is the peer's choice and its problem. Treating
+        // silence as blameless would make stalling a free way past the gate.
+        SnapFailure::UnsubstantiatedClaim { .. } => Some(EventType::InvalidMessage),
         SnapFailure::NoCommonAncestor
         | SnapFailure::NoProgress(_)
         | SnapFailure::IncompleteState(_) => None,
