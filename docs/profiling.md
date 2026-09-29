@@ -102,6 +102,19 @@ This only works on recent blocks: the epoch collector keeps `--gc-burial`
 blocks of history (4,000 by default), so a range older than that will report
 skips rather than quietly averaging over fewer blocks.
 
+### The distribution, and why the mean misleads
+
+Over 2,001 blocks and 4,764 transactions:
+
+```
+bytes p50 / p90 / p99   28,018 / 125,594 / 363,280
+bytes min / max          2,826 / 672,918
+node bytes / block       55,003 (mean)
+```
+
+The mean is nearly **twice the median**. Any design sized on the average is
+sized for a block that does not exist.
+
 ### Sizing a stateless witness
 
 This is the measurement the question "how much data does a block need to be
@@ -130,10 +143,56 @@ So, at the measured rate:
 | per day (2,880 blocks) | ~130 MB |
 | per year | **~48 GB** |
 
-The tail matters more than the mean. A design sized on 46 KB stalls on a block
-needing half a megabyte, and the ratio above is from a thousand blocks — a
-longer sample would very likely find worse. Percentiles are the thing to
-measure next, not a larger average.
+The tail matters more than the mean, and the percentiles say how much.
+
+### Shipping the witness with the block
+
+A natural proposal: have a peer send the read set alongside a block when it is
+under some threshold, so the receiver can validate without touching its own
+trie. The measurement bears on three parts of it.
+
+**The premise holds, but only for cold reads.**
+
+| | rate | 305 nodes |
+|---|---|---|
+| warm, following the tip | ~107,000 nodes/s single-thread | ~2.9 ms |
+| cold random trie reads | ~2,658 nodes/s | ~115 ms |
+
+The witness rides on a transfer that is already happening, so it costs no
+extra round trip — only bytes. Against a cold read it wins easily. Against a
+warm one, no network beats 2.9 ms.
+
+**A threshold inverts the benefit.** What a cap actually selects:
+
+| cap | blocks under it | of the read work |
+|---|---|---|
+| 16 KB | 40.4% | 4.7% |
+| 32 KB | 54.3% | 11.0% |
+| **50 KB** | **61.9%** | **16.7%** |
+| 128 KB | 90.7% | 59.1% |
+
+At 50 KB the rule covers most blocks and almost none of the work: the 38% of
+blocks above the cap hold 83% of the nodes, and those are exactly the blocks
+where skipping a local read would save the most. A cap has to be around
+**128 KB** before it covers a majority of the work, and even then 9.3% of
+blocks carry 41% of it — which bounds any speedup in read time at about 2.4x.
+
+**The totals rule it out for catching up.** At the measured mean, a full chain
+of 9.28 M blocks carries **~510 GB** of witness, against a state of **875 MB**
+and a complete snapshot sync of ~10.6 GB including every header. Roughly 580x
+the thing it replaces, and 48x the sync that replaces it today.
+
+That is the tension worth stating plainly: the benefit is largest when reads
+are cold, which is during catch-up, and the bandwidth cost is also largest
+then. Following the tip is the opposite — 55 KB per 30 s is about 15 kbps,
+nothing — but there the local state is warm and a read costs 2.9 ms, so there
+is little to save.
+
+Where it does earn its place is a node that holds **no state at all**: it
+trades 130 MB a day for not storing 875 MB and not maintaining it. That is a
+bandwidth-for-storage trade that pays only if storage is the binding
+constraint, and the reason to want it is usually not the economics but the
+property — verification without maintaining state at all.
 
 ### What it is not
 

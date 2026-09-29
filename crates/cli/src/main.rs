@@ -1860,6 +1860,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         let mut bytes = 0u64;
         let mut failed = 0u64;
         let mut worst = (0u64, 0u64);
+        // The mean says little about a design sized by a threshold: what
+        // matters is how many blocks fall under it, and how much of the work
+        // the ones above it represent.
+        let mut per_block: Vec<u64> = Vec::new();
 
         for number in from..=head.number {
             let Some(hash) = store.canonical_hash(number)? else { continue };
@@ -1890,6 +1894,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     distinct += s.distinct;
                     calls += s.calls;
                     bytes += s.bytes;
+                    per_block.push(s.bytes);
                     if s.distinct > worst.1 {
                         worst = (number, s.distinct);
                     }
@@ -1908,14 +1913,41 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             );
         }
 
+        per_block.sort_unstable();
+        let pct = |p: usize| -> u64 {
+            if per_block.is_empty() {
+                return 0;
+            }
+            per_block[(per_block.len() - 1) * p / 100]
+        };
+        // How a threshold would actually behave, rather than how the mean
+        // suggests it would.
+        let mut thresholds = String::new();
+        for limit in [16_384u64, 32_768, 51_200, 131_072] {
+            let under = per_block.iter().filter(|b| **b <= limit).count();
+            let carried: u64 = per_block.iter().filter(|b| **b <= limit).sum();
+            thresholds.push_str(&format!(
+                "\n\x20 <= {:>3} KB              {:>5.1}% of blocks, {:>5.1}% of their bytes",
+                limit / 1024,
+                under as f64 / per_block.len() as f64 * 100.0,
+                carried as f64 / bytes.max(1) as f64 * 100.0,
+            ));
+        }
+
         info!(
             "Trie reads over {blocks} block(s), {txs} transaction(s), {failed} skipped:\n\
+             \x20 bytes p50 / p90 / p99   {} / {} / {}\n\
+             \x20 bytes min / max         {} / {}\
+             {thresholds}\n\
              \x20 distinct nodes / block   {:.1}\n\
              \x20 get calls / block        {:.1}\n\
              \x20 node bytes / block       {:.0}\n\
              \x20 distinct nodes / tx      {:.1}\n\
              \x20 busiest block            #{} with {} nodes\n\
              \x20 totals                   {distinct} nodes, {bytes} bytes",
+            pct(50), pct(90), pct(99),
+            per_block.first().copied().unwrap_or(0),
+            per_block.last().copied().unwrap_or(0),
             distinct as f64 / blocks as f64,
             calls as f64 / blocks as f64,
             bytes as f64 / blocks as f64,
