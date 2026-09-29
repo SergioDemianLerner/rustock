@@ -28,6 +28,7 @@
 //! whatever a stranger sent it; one that verifies first spends the hour only
 //! on a chain with real work behind it.
 
+use std::time::{Duration, Instant};
 use super::client::{ChunkError, StateDownload};
 use super::SnapConfig;
 use alloy_primitives::{B256, U256};
@@ -174,6 +175,9 @@ pub struct SnapSession {
     /// The next `SnapBlocks` request to make, walking backwards.
     blocks_cursor: u64,
     blocks_in_flight: bool,
+    /// When the current phase began, and when it last said so.
+    phase_started: Instant,
+    last_report: Instant,
     /// Block answers in a row that added nothing.
     fruitless_blocks: u32,
 }
@@ -204,6 +208,8 @@ impl SnapSession {
             blocks_wanted_to: 0,
             blocks_cursor: 0,
             blocks_in_flight: false,
+            phase_started: Instant::now(),
+            last_report: Instant::now(),
             fruitless_blocks: 0,
         }
     }
@@ -244,7 +250,7 @@ impl SnapSession {
     fn fail(&mut self, why: SnapFailure) -> Vec<Action> {
         warn!(target: "rustock::snap", "snapshot sync failed: {why}");
         self.failure = Some(why);
-        self.phase = Phase::Failed;
+        self.set_phase(Phase::Failed);
         Vec::new()
     }
 
@@ -264,7 +270,91 @@ impl SnapSession {
         self.in_flight = n;
     }
 
+    /// Moves to a new phase, restarting the clock the progress lines report
+    /// against.
+    fn set_phase(&mut self, phase: Phase) {
+        if self.phase != phase {
+            self.phase_started = Instant::now();
+            // Report the new phase promptly rather than up to five seconds
+            // later: the first line is the one that says what is happening.
+            self.last_report = Instant::now() - Duration::from_secs(5);
+        }
+        self.phase = phase;
+    }
+
+    /// Say how the current phase is going, at most every five seconds.
+    ///
+    /// Every phase that can run for minutes reports. The header walk ran for
+    /// twenty-five minutes and the state download for ten, both in silence,
+    /// and silence is indistinguishable from a hang -- which is how #187 was
+    /// found, twice, before the same lesson was applied here (#208).
+    fn report_progress(&mut self) {
+        const EVERY: Duration = Duration::from_secs(5);
+        if self.last_report.elapsed() < EVERY {
+            return;
+        }
+        self.last_report = Instant::now();
+        let elapsed = self.phase_started.elapsed().as_secs_f64();
+
+        match self.phase {
+            Phase::VerifyingHeaders => {
+                let Some(walk) = self.walk.as_ref() else { return };
+                let top = walk.top_number();
+                let at = walk.frontier();
+                if top == 0 {
+                    return;
+                }
+                let done = (top - at) as f64 / top as f64;
+                let eta = if done > 0.0 { elapsed * (1.0 - done) / done } else { 0.0 };
+                info!(
+                    target: "rustock::snap",
+                    "walking the header chain: {:.1}% (at #{at} of #{top}), {} frozen, \
+                     {:.0}s elapsed, ~{:.0}s left",
+                    done * 100.0,
+                    walk.staged(),
+                    elapsed,
+                    eta
+                );
+            }
+            Phase::DownloadingState => {
+                let Some(download) = self.download.as_ref() else { return };
+                let (covered, total) = download.progress();
+                let Some(total) = total.filter(|t| *t > 0) else { return };
+                let done = covered as f64 / total as f64;
+                let eta = if done > 0.0 { elapsed * (1.0 - done) / done } else { 0.0 };
+                info!(
+                    target: "rustock::snap",
+                    "downloading the state: {:.1}% ({}/{} MB), {:.0}s elapsed, ~{:.0}s left",
+                    done * 100.0,
+                    covered / (1 << 20),
+                    total / (1 << 20),
+                    elapsed,
+                    eta
+                );
+            }
+            Phase::DownloadingBlocks => {
+                let floor = self.blocks_floor();
+                let from = self.checkpoint.as_ref().map_or(0, |h| h.number);
+                if from <= floor {
+                    return;
+                }
+                let done = (from - self.blocks_cursor) as f64 / (from - floor) as f64;
+                info!(
+                    target: "rustock::snap",
+                    "downloading block bodies: {:.1}% (at #{} of #{}..#{}), {:.0}s elapsed",
+                    done * 100.0,
+                    self.blocks_cursor,
+                    floor,
+                    from,
+                    elapsed
+                );
+            }
+            _ => {}
+        }
+    }
+
     pub fn poll(&mut self) -> Vec<Action> {
+        self.report_progress();
         // What the budget has room for *after* what is already outstanding.
         //
         // No floor. An earlier version ended this with `.max(1)` on the
@@ -388,7 +478,7 @@ impl SnapSession {
         ));
 
         self.checkpoint = Some(header);
-        self.phase = Phase::VerifyingHeaders;
+        self.set_phase(Phase::VerifyingHeaders);
         self.poll()
     }
 
@@ -531,7 +621,7 @@ impl SnapSession {
             self.walk.as_ref().map_or(0, |w| w.frontier()),
             checkpoint.as_ref().map_or(0, |h| h.number)
         );
-        self.phase = Phase::DownloadingState;
+        self.set_phase(Phase::DownloadingState);
         self.poll()
     }
 
@@ -657,7 +747,7 @@ impl SnapSession {
                     "state complete: {nodes} nodes, {covered} bytes, root {:?}",
                     download.root_hash()
                 );
-                self.phase = Phase::DownloadingBlocks;
+                self.set_phase(Phase::DownloadingBlocks);
                 self.poll()
             }
             // Every chunk verified against the root, so this is not about the
@@ -717,7 +807,7 @@ impl SnapSession {
                 self.checkpoint.as_ref().map_or(0, |h| h.number),
                 self.blocks_cursor
             );
-            self.phase = Phase::Done;
+            self.set_phase(Phase::Done);
             return Vec::new();
         }
         self.poll()

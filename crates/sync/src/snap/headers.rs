@@ -190,6 +190,20 @@ impl HeaderWalk {
         }
     }
 
+    /// The height the walk started from.
+    ///
+    /// With `frontier`, this is how far it has descended -- the walk runs for
+    /// twenty-five minutes on a mainnet chain, so whatever drives it needs
+    /// something exact to report.
+    pub fn top_number(&self) -> u64 {
+        self.top.number
+    }
+
+    /// Headers written to the staging freezer so far, if there is one.
+    pub fn staged(&self) -> u64 {
+        self.staging.as_ref().map(|f| f.end_number()).unwrap_or(0)
+    }
+
     pub fn is_done(&self) -> bool {
         self.done
     }

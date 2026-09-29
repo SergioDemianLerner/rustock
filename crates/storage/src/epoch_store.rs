@@ -710,10 +710,32 @@ impl EpochTrieStore {
     /// discovered at the same level are independent and are read together.
     /// Measured on the mainnet store this was worth ~5x.
     fn walk(&self, live: &mut HashSet<B256>, mut frontier: Vec<B256>) -> u64 {
+        // Marking a mainnet live set takes minutes and said nothing while it
+        // ran. Anything that long without a sign of life is indistinguishable
+        // from a hang, which is the lesson #187 and #208 were about; the live
+        // set has no known total, so report the rate rather than invent a
+        // percentage.
+        const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let mut last_report = started;
+
         let mut missing = 0u64;
         frontier.retain(|h| live.insert(*h));
 
         while !frontier.is_empty() {
+            if last_report.elapsed() >= REPORT_EVERY {
+                last_report = std::time::Instant::now();
+                let secs = started.elapsed().as_secs_f64();
+                info!(
+                    target: "rustock::gc",
+                    "marking the live set: {} entries, {} in the frontier, {:.0}s elapsed, \
+                     {:.0} entries/s",
+                    live.len(),
+                    frontier.len(),
+                    secs,
+                    live.len() as f64 / secs.max(0.001)
+                );
+            }
             let keys: Vec<Vec<u8>> = frontier.iter().map(|h| h.as_slice().to_vec()).collect();
             let values = self.get_many(&keys);
             let mut next = Vec::new();
