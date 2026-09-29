@@ -174,8 +174,27 @@ impl BlockStore {
         let cf_receipts = self.cf_receipts()?;
         let cf_tx_index = self.cf_tx_index()?;
 
+        // A prune can span thousands of blocks and said nothing until it
+        // finished. Same rule as everywhere else: nothing that runs for
+        // minutes goes without a sign of life.
+        const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let mut last_report = started;
+
         let mut batch = WriteBatch::default();
         for number in from..=to {
+            if last_report.elapsed() >= REPORT_EVERY {
+                last_report = std::time::Instant::now();
+                let span = (to - from + 1) as f64;
+                info!(
+                    target: "rustock::prune",
+                    "pruning: {:.1}% (at #{number} of #{from}..#{to}), {} block(s) removed, \
+                     {:.0}s elapsed",
+                    (number - from) as f64 / span * 100.0,
+                    stats.blocks,
+                    started.elapsed().as_secs_f64()
+                );
+            }
             let Some(hash) = self.canonical_hash(number)? else {
                 continue;
             };
