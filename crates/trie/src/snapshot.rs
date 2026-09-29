@@ -1124,3 +1124,79 @@ mod split_balance_tests {
         heap.into_iter().map(|(s, _)| s).collect()
     }
 }
+
+/// What a trie looks like, for sizing things that depend on its shape.
+#[derive(Debug, Default, Clone)]
+pub struct TrieShape {
+    /// Every node reachable from the root.
+    pub nodes: u64,
+    /// Nodes that carry a value. These are what a block actually reads.
+    pub value_nodes: u64,
+    /// Sum of the depths of the value-bearing nodes, root = 0.
+    pub value_depth_sum: u64,
+    /// The deepest value node.
+    pub max_depth: u32,
+    /// Children reached by hash. Only these cost a sibling hash in a proof;
+    /// an embedded child travels inside its parent's message.
+    pub hash_children: u64,
+    /// Children embedded in their parent's message.
+    pub embedded_children: u64,
+    /// Bytes of value held directly, and separately.
+    pub inline_value_bytes: u64,
+    pub long_value_bytes: u64,
+}
+
+impl TrieShape {
+    /// Mean depth of a value-bearing node, which is the length of the Merkle
+    /// path a proof for it has to carry.
+    pub fn mean_value_depth(&self) -> f64 {
+        if self.value_nodes == 0 {
+            return 0.0;
+        }
+        self.value_depth_sum as f64 / self.value_nodes as f64
+    }
+}
+
+/// Walks the trie and measures its shape.
+///
+/// Sizing a stateless witness needs two things the node does not otherwise
+/// record: how deep a value sits, which is how many sibling hashes its proof
+/// carries, and how many values there are to divide the shared upper levels
+/// between.
+pub fn measure_shape(root: &TrieNode, store: &dyn TrieStore) -> TrieShape {
+    let mut shape = TrieShape::default();
+    let mut stack = vec![(root.clone(), 0u32)];
+
+    while let Some((node, depth)) = stack.pop() {
+        shape.nodes += 1;
+
+        if node.has_long_value() || node.value.is_some() {
+            shape.value_nodes += 1;
+            shape.value_depth_sum += depth as u64;
+            shape.max_depth = shape.max_depth.max(depth);
+            if node.has_long_value() {
+                shape.long_value_bytes += node.value_length() as u64;
+            } else if let Some(v) = node.value.as_ref() {
+                shape.inline_value_bytes += v.len() as u64;
+            }
+        }
+
+        for child in [&node.left, &node.right] {
+            match child {
+                NodeRef::Empty => {}
+                NodeRef::Node(n) => {
+                    shape.embedded_children += 1;
+                    stack.push(((**n).clone(), depth + 1));
+                }
+                NodeRef::Hash(_) => {
+                    shape.hash_children += 1;
+                    if let Some(n) = child.resolve(store) {
+                        stack.push((n, depth + 1));
+                    }
+                }
+            }
+        }
+    }
+
+    shape
+}
