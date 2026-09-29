@@ -68,13 +68,19 @@ async fn test_sync_manager_processing() {
     manager.handle_headers_response(vec![b2.clone()]).unwrap();
     assert_eq!(store.head().unwrap(), Some(b2.hash()));
 
-    // 4. Gap block (parent unknown) — stored with TD = difficulty only
+    // 4. Gap block (parent unknown) — refused.
+    //
+    // A header is stored only once verified, and verification needs the
+    // parent. Nothing is lost by refusing: header data is re-requestable, and
+    // skeleton chunks are drained in order, so an honest peer's headers
+    // always arrive with their parent already stored.
     let b4 = dummy_header(4, B256::repeat_byte(0xee), U256::from(1));
     let b4_hash = b4.hash();
-    manager.handle_headers_response(vec![b4]).unwrap();
+    let refused = manager.handle_headers_response(vec![b4]);
+    assert!(refused.is_err(), "a header with no verifiable parent must be refused");
     assert_eq!(store.head().unwrap(), Some(b2.hash()), "Head should not change");
-    assert!(store.header(b4_hash).unwrap().is_some(), "Gap block should be stored");
-    assert_eq!(store.total_difficulty(b4_hash).unwrap(), Some(U256::from(1)));
+    assert!(store.header(b4_hash).unwrap().is_none(), "and it must not be stored");
+    assert_eq!(store.total_difficulty(b4_hash).unwrap(), None);
 }
 
 #[tokio::test]
@@ -95,7 +101,11 @@ async fn test_invalid_header_rejected_when_parent_known() {
     // Header claims parent is genesis but has wrong block number
     let bad = dummy_header(5, genesis_hash, U256::from(50));
     let bad_hash = bad.hash();
-    manager.handle_headers_response(vec![bad]).unwrap();
+    // The refusal is now also reported, so the caller can charge the peer for
+    // it. It used to be swallowed: the header was dropped and the sender was
+    // told nothing was wrong.
+    let refused = manager.handle_headers_response(vec![bad]);
+    assert!(refused.is_err(), "an invalid header must be reported, not just dropped");
 
     assert!(store.header(bad_hash).unwrap().is_none(), "Invalid header should be rejected");
     assert_eq!(store.head().unwrap(), Some(genesis_hash));
@@ -5304,5 +5314,53 @@ async fn a_broken_canonical_index_declines_the_fast_path() {
     assert!(
         crate::handler::canonical_run(&store, &top, 32).is_none(),
         "a range whose headers do not link must fall back rather than serve a broken chain"
+    );
+}
+
+/// Headers that do not link to one another are all refused, and reported.
+///
+/// The invariant under test: nothing is stored that has not been verified, and
+/// nothing unverified contributes a total difficulty or competes for the head.
+/// A chunk whose headers name parents nobody holds must leave the store
+/// exactly as it found it.
+#[tokio::test]
+async fn unlinked_headers_are_all_refused_and_reported() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new()
+        .with_parent_rule(rustock_core::validation::BlockNumberRule)
+        .with_parent_rule(rustock_core::validation::ParentHashRule));
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    // Each header names a parent nobody holds, and they do not link to each
+    // other either. A huge difficulty on one of them is what used to move the
+    // head.
+    let garbage: Vec<_> = (0..8u8)
+        .map(|i| {
+            dummy_header(
+                1_000_000 + i as u64,
+                B256::repeat_byte(0xA0 + i),
+                U256::MAX / U256::from(8u64),
+            )
+        })
+        .collect();
+    let hashes: Vec<_> = garbage.iter().map(|h| h.hash()).collect();
+
+    let refused = manager.handle_headers_response(garbage);
+    assert!(refused.is_err(), "unlinked headers must be reported, not accepted");
+
+    for (i, h) in hashes.iter().enumerate() {
+        assert!(store.header(*h).unwrap().is_none(), "header {i} must not be stored");
+        assert_eq!(store.total_difficulty(*h).unwrap(), None, "header {i} must have no TD");
+    }
+    assert_eq!(
+        store.head().unwrap(),
+        Some(genesis_hash),
+        "the head must not move to a header nothing verified"
     );
 }

@@ -1,3 +1,4 @@
+pub mod sampler;
 mod body_check;
 mod events;
 mod handler;

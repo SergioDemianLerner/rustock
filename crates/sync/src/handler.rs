@@ -306,17 +306,45 @@ impl P2pHandler for SyncHandler {
                         s.best_block_number,
                         s.total_difficulty
                     );
-                    let metadata = rustock_networking::peers::PeerMetadata {
-                        best_number: s.best_block_number,
-                        best_hash: s.best_block_hash,
-                        total_difficulty: s.total_difficulty.unwrap_or_default(),
-                        client_id: "".to_string(),
-                        address: None,
-                    };
-                    let peer_store = self.manager.peer_store.clone();
-                    tokio::spawn(async move {
-                        peer_store.update_metadata(&id, metadata).await;
-                    });
+                    let claimed = s.total_difficulty.unwrap_or_default();
+
+                    // The cheapest check there is: a peer claiming more work
+                    // than the shipped checkpoint allows, for a height at or
+                    // below the checkpoint, is refuted by arithmetic. No
+                    // requests, no sampling, no round trips.
+                    //
+                    // Recorded rather than acted on beyond a warning: the
+                    // metadata is what peer selection reads, so refusing to
+                    // store it is enough to stop this node syncing from the
+                    // peer. Disconnecting is the scoring layer's decision.
+                    if rustock_sync_checkpoint_refuted(claimed, s.best_block_number) {
+                        warn!(
+                            target: "rustock::sync",
+                            "Peer {:?} claims total difficulty {} at #{}, which is more than \
+                             the checkpoint at #{} permits; not syncing from it",
+                            &id.0[..4],
+                            claimed,
+                            s.best_block_number,
+                            rustock_core::checkpoint::MAINNET_CHECKPOINT.number
+                        );
+                        // Refusing to record the metadata is what stops this
+                        // node syncing from the peer: peer selection reads
+                        // exactly that. Scoring lives in the service, which
+                        // this handler does not reach.
+                    } else {
+
+                        let metadata = rustock_networking::peers::PeerMetadata {
+                            best_number: s.best_block_number,
+                            best_hash: s.best_block_hash,
+                            total_difficulty: claimed,
+                            client_id: "".to_string(),
+                            address: None,
+                        };
+                        let peer_store = self.manager.peer_store.clone();
+                        tokio::spawn(async move {
+                            peer_store.update_metadata(&id, metadata).await;
+                        });
+                    }
                 }
                 RskSubMessage::BlockHashResponse(r) => {
                     let _ = self.event_tx.send(SyncEvent::BlockHashResponse {
@@ -511,4 +539,18 @@ pub(crate) fn canonical_run(
         }
     }
     Some(headers)
+}
+
+
+/// Whether a peer's advertised total difficulty is already impossible.
+///
+/// Only the free case: a claim for a height at or below the checkpoint, where
+/// the work is known exactly and nothing may exceed it. Heights above the
+/// checkpoint need sampling (`crate::sampler`), which costs requests.
+fn rustock_sync_checkpoint_refuted(claimed: alloy_primitives::U256, height: u64) -> bool {
+    crate::sampler::ChainSampler::refuted_by_checkpoint_alone(
+        &rustock_core::checkpoint::MAINNET_CHECKPOINT,
+        claimed,
+        height,
+    )
 }
