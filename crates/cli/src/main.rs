@@ -1963,6 +1963,15 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
 
     let snap_config = rustock_sync::SnapConfig {
+        // Only mainnet has a checkpoint. Elsewhere the walk runs as before
+        // rather than being gated against a constant that means nothing on
+        // that chain.
+        checkpoint: (config.chain_id == 30)
+            .then_some(rustock_core::checkpoint::MAINNET_CHECKPOINT),
+        // The sampled window sits above the checkpoint, which is far above
+        // RSKIP156, so the divisor is the post-RSKIP156 one by construction.
+        difficulty_divisor: 400,
+        min_difficulty: config.min_difficulty,
         server_enabled: args.snap_server,
         client_enabled: args.snap_sync,
         chunk_bytes: args.snap_chunk_bytes,
