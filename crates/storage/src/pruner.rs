@@ -161,7 +161,23 @@ impl BlockStore {
         // chain" lookup keeps working, and the chain retains an anchor whose
         // hash is fixed by the network rather than by what this node happens
         // still to hold.
-        let from = floor.as_ref().map(|f| f.number).unwrap_or(1).max(1);
+        let mut from = floor.as_ref().map(|f| f.number).unwrap_or(1).max(1);
+
+        // Start where the block database actually begins, not at block 1.
+        //
+        // A snapshot-synced node has the canonical index only for a window
+        // around its checkpoint; everything below was never written to
+        // `CF_NUMBERS` at all. `canonical_hash` still answers for those
+        // heights -- it falls back to the freezer, where being present is
+        // itself the statement that a height is canonical -- so a sweep
+        // walking up from 1 spends whole batches deleting entries that were
+        // never there, and a node nine million blocks deep needs a hundred and
+        // eighty sweeps to reach anything real.
+        //
+        // One seek says where to begin instead.
+        if let Some(lowest) = self.lowest_indexed_height()? {
+            from = from.max(lowest);
+        }
         if from > target {
             debug!(target: "rustock::prune", "Already pruned to #{}", from.saturating_sub(1));
             return Ok(stats);
@@ -251,6 +267,28 @@ impl BlockStore {
         Ok(stats)
     }
 
+    /// The lowest height with a `number -> hash` entry in the block database.
+    ///
+    /// Deliberately asks the column family rather than `canonical_hash`, which
+    /// falls back to the freezer: this is "where does the block database
+    /// begin", and the freezer is not the block database. Genesis is skipped
+    /// because it is always retained and would otherwise answer 0 on every
+    /// node.
+    fn lowest_indexed_height(&self) -> Result<Option<u64>> {
+        let cf = self.cf_numbers()?;
+        let iter = self.db().iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&1u64.to_be_bytes(), rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (k, _) = item.context("scanning for the lowest indexed height")?;
+            if k.len() == 8 {
+                return Ok(Some(u64::from_be_bytes(k[..8].try_into().unwrap_or([0; 8]))));
+            }
+        }
+        Ok(None)
+    }
+
     /// The lowest block above genesis that the database holds contiguously: the
     /// prune floor if it has been pruned, genesis otherwise.
     ///
@@ -284,7 +322,7 @@ mod tests {
     use rustock_core::types::header::Header;
     use tempfile::tempdir;
 
-    fn header(number: u64, parent: B256) -> Header {
+    pub(super) fn header(number: u64, parent: B256) -> Header {
         Header {
             number,
             parent_hash: parent,
@@ -568,5 +606,75 @@ mod bridge_event_tests {
             store.receipts(doomed).unwrap().is_none(),
             "receipts are most of the weight; pruning that keeps them saves little"
         );
+    }
+}
+
+#[cfg(test)]
+mod snap_synced_tests {
+    use super::tests::{chain, header};
+    use super::*;
+    use crate::BlockStore;
+    use tempfile::tempdir;
+
+    /// A snapshot-synced node holds the canonical index only for a window
+    /// around its checkpoint. A sweep must begin there, not at block 1.
+    ///
+    /// Walking up from 1 is not merely slow: `canonical_hash` falls back to
+    /// the freezer, so those heights answer even though nothing was ever
+    /// written to the block database for them, and each sweep burns its whole
+    /// batch deleting entries that do not exist. Nine million blocks at fifty
+    /// thousand a sweep is a hundred and eighty sweeps before the first real
+    /// deletion.
+    #[test]
+    fn a_sweep_starts_where_the_block_database_begins() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Headers for the whole chain, as the snapshot walk leaves them:
+        // written by hash, with the canonical index only near the top.
+        let height = 60_000u64;
+        let window_from = 50_000u64;
+        let mut parent = B256::ZERO;
+        let mut td = U256::ZERO;
+        for i in 0..=height {
+            let h = header(i, parent);
+            let hash = h.hash();
+            td += h.difficulty;
+            store.put_header(&h).unwrap();
+            store.put_total_difficulty(hash, td).unwrap();
+            if i >= window_from || i == 0 {
+                store.put_canonical_hash(i, hash).unwrap();
+            }
+            parent = hash;
+        }
+
+        // One sweep, with a batch far smaller than the distance from block 1.
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 1_000 };
+        let stats = store.prune_blocks(&cfg, height).unwrap();
+
+        assert!(
+            stats.from >= window_from,
+            "the sweep began at #{} — below where the block database starts (#{window_from}), \
+             so it spent its batch on heights that were never written",
+            stats.from
+        );
+        assert!(stats.blocks > 0, "and it should have removed something real");
+        assert!(
+            stats.to <= height - MIN_KEEP_DEPTH,
+            "never closer to the head than the retention floor"
+        );
+    }
+
+    /// On an ordinarily synced node, whose index starts at the bottom, nothing
+    /// changes: the sweep still begins at block 1.
+    #[test]
+    fn an_ordinary_node_still_sweeps_from_the_bottom() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain(&store, 12_000);
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100 };
+        let stats = store.prune_blocks(&cfg, 11_999).unwrap();
+        assert_eq!(stats.from, 1, "genesis is retained, so the first prunable block is 1");
     }
 }
