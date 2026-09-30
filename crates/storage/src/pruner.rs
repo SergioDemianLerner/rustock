@@ -114,6 +114,17 @@ impl BlockStore {
         }))
     }
 
+    /// Sets the floor directly, for tests that need a pruned node without
+    /// running a sweep to build one.
+    pub fn set_prune_floor_for_test(
+        &self,
+        number: u64,
+        hash: B256,
+        total_difficulty: U256,
+    ) -> Result<()> {
+        self.set_prune_floor(&PruneFloor { number, hash, total_difficulty })
+    }
+
     fn set_prune_floor(&self, floor: &PruneFloor) -> Result<()> {
         let mut buf = Vec::with_capacity(72);
         buf.extend_from_slice(&floor.number.to_be_bytes());
@@ -266,6 +277,7 @@ impl BlockStore {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::BlockStore;
@@ -301,7 +313,7 @@ mod tests {
     }
 
     /// Builds a canonical chain of `n` blocks (0..n-1) with total difficulty.
-    fn chain(store: &BlockStore, n: u64) -> Vec<B256> {
+    pub(super) fn chain(store: &BlockStore, n: u64) -> Vec<B256> {
         let mut hashes = Vec::with_capacity(n as usize);
         let mut parent = B256::ZERO;
         let mut td = U256::ZERO;
@@ -465,6 +477,96 @@ mod tests {
             walked,
             9_499 - floor.number + 1,
             "the walk reaches the floor and stops, rather than running off the end"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bridge_event_tests {
+    use super::tests::chain;
+    use super::*;
+    use crate::BlockStore;
+    use tempfile::tempdir;
+
+    /// Peg history outlives the blocks it came from.
+    ///
+    /// Receipts are pruned — that is the point, they are most of the weight —
+    /// so `eth_getTransactionReceipt` stops answering for a pruned height. The
+    /// Bridge events inside them must not go with them: they live in their own
+    /// index, keyed by event signature, and the value carries the transaction
+    /// hash, topics and data rather than pointing back into the receipt. That
+    /// is what the peg is debugged from, long after the blocks are gone.
+    #[test]
+    fn bridge_events_survive_the_blocks_they_came_from() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain(&store, 12_000);
+
+        // A peg-in recorded at a height that is about to be pruned, and one
+        // safely inside the retention window.
+        let peg_in = B256::repeat_byte(0xa1);
+        let doomed_height = 100u64;
+        let kept_height = 11_500u64;
+        for (h, tx) in [(doomed_height, 0xd1u8), (kept_height, 0xd2)] {
+            store
+                .put_bridge_event(
+                    peg_in,
+                    h,
+                    0,
+                    0,
+                    B256::repeat_byte(tx),
+                    &[peg_in, B256::repeat_byte(0xbb)],
+                    b"amount and address",
+                )
+                .unwrap();
+        }
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let stats = store.prune_blocks(&cfg, 11_999).unwrap();
+        assert!(stats.blocks > 0, "the sweep must actually have removed something");
+        assert!(doomed_height <= stats.to, "the peg-in's block was in the swept range");
+
+        // The block really is gone, receipts included.
+        assert!(
+            store.canonical_hash(doomed_height).unwrap().is_none(),
+            "the block should have been pruned"
+        );
+
+        // The event is not.
+        let found = store.scan_bridge_events(peg_in, 0, u64::MAX).unwrap();
+        let heights: Vec<u64> = found.iter().map(|e| e.0).collect();
+        assert!(
+            heights.contains(&doomed_height),
+            "the peg-in at #{doomed_height} was lost with its block; found {heights:?}"
+        );
+        assert!(heights.contains(&kept_height));
+
+        // And it is still self-contained: the data came from the event index,
+        // not from a receipt that no longer exists.
+        let (_, _, _, tx_hash, topics, data) =
+            found.iter().find(|e| e.0 == doomed_height).unwrap();
+        assert_eq!(*tx_hash, B256::repeat_byte(0xd1));
+        assert_eq!(data.as_slice(), b"amount and address");
+        assert_eq!(topics.len(), 2, "topics come from the event index, not a receipt");
+    }
+
+    /// Receipts, by contrast, are meant to go.
+    #[test]
+    fn receipts_are_pruned_with_their_blocks() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hashes = chain(&store, 12_000);
+
+        let doomed = hashes[100];
+        store.put_receipts(doomed, &[]).unwrap();
+        assert!(store.receipts(doomed).unwrap().is_some());
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        store.prune_blocks(&cfg, 11_999).unwrap();
+
+        assert!(
+            store.receipts(doomed).unwrap().is_none(),
+            "receipts are most of the weight; pruning that keeps them saves little"
         );
     }
 }

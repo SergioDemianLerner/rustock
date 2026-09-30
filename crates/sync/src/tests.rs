@@ -5706,3 +5706,71 @@ async fn reseating_never_goes_below_the_executed_head() {
         seated.number
     );
 }
+
+// -- The prune gate ------------------------------------------------------
+//
+// Pruning deletes history that only a resync restores, so the question is not
+// "is a snapshot sync running right now" but "has this node established that
+// none is coming". Those differ exactly at startup, which is when a sweep
+// would do the most damage: the node is still finding peers, no session
+// exists yet to report itself, and a gate that asks the first question
+// answers "no snapshot sync" and lets the sweep run.
+
+/// The gate is shut before anything has been determined.
+#[tokio::test]
+async fn pruning_is_not_allowed_before_the_node_knows_what_it_is_doing() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let service = SyncService::new(manager, peer_store, event_rx);
+
+    assert!(
+        !service.prune_gate().load(std::sync::atomic::Ordering::Relaxed),
+        "a freshly built service must not permit pruning: no snapshot session \
+         exists yet, and that is not the same as none being due"
+    );
+}
+
+/// Suspending for a snapshot sync shuts it, and finishing opens it.
+#[tokio::test]
+async fn the_gate_tracks_the_snapshot_sync_rather_than_its_absence() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    let gate = service.prune_gate();
+
+    service.suspend_ordinary_sync_for_test();
+    assert!(!gate.load(std::sync::atomic::Ordering::Relaxed));
+
+    service.resume_ordinary_sync_for_test();
+    assert!(
+        gate.load(std::sync::atomic::Ordering::Relaxed),
+        "once the snapshot sync is over the pruner is free to run"
+    );
+}
+
+/// A snapshot sync that gives up without ever having suspended anything must
+/// still release the gate, or a node that tried and failed to snapshot sync
+/// would never prune at all.
+#[tokio::test]
+async fn giving_up_on_a_snapshot_sync_still_releases_the_gate() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    let gate = service.prune_gate();
+
+    // Never suspended, so `suspended_for_snap` is false throughout.
+    service.resume_ordinary_sync_for_test();
+    assert!(gate.load(std::sync::atomic::Ordering::Relaxed));
+}

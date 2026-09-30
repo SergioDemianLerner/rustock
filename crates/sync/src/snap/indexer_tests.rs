@@ -188,3 +188,51 @@ fn a_batch_stops_at_its_bound() {
     let (number, _) = next.expect("more to do");
     assert!(number < 5_000 && number > 4_000, "resumed at an implausible height {number}");
 }
+
+/// On a pruning node the fill stops at the floor.
+///
+/// The fill writes `number -> hash` downward; the pruner deletes exactly those
+/// entries below its floor. Without this they undo each other in a loop — the
+/// fill rebuilds the index for heights the pruner has just discarded, the next
+/// sweep discards them again, and the node spends its background disk writing
+/// what it is about to delete. There is nothing below the floor to point at
+/// anyway: those blocks are gone.
+#[tokio::test]
+async fn the_fill_stops_at_the_prune_floor() {
+    let (store, chain, _dir) = snap_synced(5_000, 400);
+    let head = chain.last().unwrap().hash();
+
+    // A floor as a sweep would leave it: everything below #3,000 discarded.
+    let floor_at = 3_000u64;
+    for h in chain.iter().filter(|h| h.number < floor_at && h.number > 0) {
+        store.delete_canonical_hash(h.number).expect("prune");
+    }
+    let floor_hash = chain[floor_at as usize].hash();
+    store
+        .set_prune_floor_for_test(floor_at, floor_hash, U256::from(1u64))
+        .expect("floor");
+
+    crate::snap::indexer::fill_canonical_index(store.clone(), head).await;
+
+    // Down to the floor, filled.
+    assert_eq!(
+        store.canonical_hash(4_000).unwrap(),
+        Some(chain[4_000].hash()),
+        "heights above the floor should still be indexed"
+    );
+
+    // Below it, left alone: the pruner threw those blocks away.
+    for n in [1_000u64, 2_000, 2_999] {
+        assert!(
+            store.canonical_hash(n).unwrap().is_none(),
+            "#{n} is below the prune floor and was re-indexed anyway"
+        );
+    }
+
+    // And the pass is finished, not merely paused, so it does not resume into
+    // the pruned range on the next restart.
+    assert!(
+        store.index_cursor().unwrap().is_none(),
+        "the fill should have completed at the floor"
+    );
+}

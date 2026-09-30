@@ -99,6 +99,9 @@ pub struct SnapshotSection {
     pub server: Option<bool>,
     /// Catch up by downloading a state rather than executing into one.
     pub sync: Option<bool>,
+    /// Blocks to download below the checkpoint when snapshot syncing. These
+    /// are the blocks the node keeps history for once the sync is done.
+    pub blocks: Option<u64>,
     /// Bytes of state to ask for per chunk.
     pub chunk_bytes: Option<u64>,
     /// The offset grid chunks sit on. Changing it invalidates a server's
@@ -166,6 +169,11 @@ pub struct GcSection {
 pub struct PruneSection {
     pub keep_depth: Option<u64>,
     pub max_batch: Option<u64>,
+    /// Delete block history below `keep_depth` as the node runs. Off by
+    /// default: it discards history that only a resync restores.
+    pub blocks: Option<bool>,
+    /// Seconds between sweeps.
+    pub every_secs: Option<u64>,
     /// Delete headers from the block database once the freezer holds them.
     /// Every lookup by hash for those blocks then depends on the freezer.
     pub frozen_headers: Option<bool>,
@@ -322,6 +330,8 @@ pub const CONFIGURABLE: &[&str] = &[
     "gc_check_secs",
     "prune_keep_depth",
     "prune_max_batch",
+    "prune_blocks",
+    "prune_every_secs",
     "rpc_logs_max_blocks",
     "dev_rpc",
     "mine",
@@ -344,6 +354,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "log_timezone",
     "snap_server",
     "snap_sync",
+    "snap_blocks",
     "snap_chunk_bytes",
     "snap_chunk_grid",
     "snap_parallel",
