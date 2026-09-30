@@ -4,20 +4,39 @@ use rustock_storage::BlockStore;
 use rustock_networking::protocol::{
     BlockHeadersQuery, BlockHeadersRequest, P2pMessage, RskMessage, RskSubMessage,
 };
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{B256, B512, U256};
 use anyhow::Result;
 // HashMap no longer needed — sequential TD propagation replaces hash-based parent lookup
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::{debug, trace, warn};
+
+use crate::unlinked::{UnlinkedHeaders, Verdict};
 
 /// Maximum skeleton chunks to process per round (rskj default: 20).
 pub(crate) const MAX_SKELETON_CHUNKS: usize = 20;
+
+/// What one batch of headers did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Ingested {
+    /// Headers written to the store.
+    pub stored: u64,
+    /// Headers that failed verification against a parent we hold.
+    pub rejected: u64,
+    /// Headers with no parent to verify against, kept only as evidence.
+    pub unlinked: u64,
+}
 
 /// Validates and stores headers.
 pub struct SyncManager {
     pub store: Arc<BlockStore>,
     verifier: Arc<HeaderVerifier>,
     pub peer_store: Arc<rustock_networking::peers::PeerStore>,
+    /// Headers whose named parent this node does not hold, counted per peer.
+    ///
+    /// Evidence that a peer is offering a chain we cannot connect to. Never a
+    /// chain itself: see [`crate::unlinked`].
+    unlinked: Mutex<UnlinkedHeaders>,
 }
 
 impl SyncManager {
@@ -30,16 +49,25 @@ impl SyncManager {
             store,
             verifier,
             peer_store,
+            unlinked: Mutex::new(UnlinkedHeaders::new()),
         }
     }
 
     /// Handles a batch of headers received from a peer.
     /// RSK peers return headers in descending order (from requested hash toward genesis).
     /// We reverse them, validate, and store in a single atomic RocksDB WriteBatch.
-    pub fn handle_headers_response(&self, mut headers: Vec<Header>) -> Result<()> {
+    pub fn handle_headers_response(&self, headers: Vec<Header>, peer: B512) -> Result<Ingested> {
+        self.ingest_headers(headers, Some(peer))
+    }
+
+    /// The body of [`Self::handle_headers_response`], with the peer optional so
+    /// that paths without an attributable sender can still store headers. A
+    /// header with no parent from such a path is dropped and charged to nobody,
+    /// because evidence without an owner is what this design exists to avoid.
+    fn ingest_headers(&self, mut headers: Vec<Header>, peer: Option<B512>) -> Result<Ingested> {
         if headers.is_empty() {
             trace!(target: "rustock::sync", "Received empty headers response");
-            return Ok(());
+            return Ok(Ingested::default());
         }
 
         // RSK returns headers in descending order; reverse for ascending processing
@@ -82,7 +110,8 @@ impl SyncManager {
         let mut prev_in_chunk: Option<(&Header, U256)> = None;
         let mut validated: Vec<(&Header, U256)> = Vec::with_capacity(headers.len());
         let mut skipped = 0u64;
-        let mut unverified = 0u64;
+        let mut unlinked_here = 0u64;
+        let now = Instant::now();
         // Deduplicate by hash, not by block number. Two different blocks may
         // legitimately share a height -- that is what a fork is -- and dropping
         // the second means dropping whichever of them arrived last, which may be
@@ -118,22 +147,42 @@ impl SyncManager {
                             .store
                             .total_difficulty(header.parent_hash)?
                             .unwrap_or_default();
-                    } else {
-                        // The named parent is not held. Do not substitute the
-                        // canonical block at `number - 1`: it is a different
-                        // block, and checking against it rejects valid headers.
-                        // Accept the header unverified and let the body/execution
-                        // path reject it if it really does not belong -- losing a
-                        // check is recoverable, discarding valid chain data is not.
+                    } else if already_stored {
+                        // Held already, so it was verified when it was first
+                        // stored. Carry its committed total difficulty rather
+                        // than recomputing one from a parent of zero, which
+                        // would rewrite a real chain's weight downward.
                         parent_ref = None;
-                        parent_td = U256::ZERO;
-                        unverified += 1;
-                        debug!(
-                            target: "rustock::sync",
-                            "Header #{} ({:?}): parent {:?} not held; storing without \
-                             difficulty verification",
-                            header.number, hash, header.parent_hash
-                        );
+                        parent_td = self
+                            .store
+                            .total_difficulty(hash)?
+                            .unwrap_or_default()
+                            .saturating_sub(header.difficulty);
+                    } else {
+                        // The named parent is not held, so there is nothing to
+                        // verify this header against. Storing it anyway is how
+                        // an unauthenticated header used to reach the store and
+                        // take a total difficulty derived from a parent of
+                        // zero -- that is, whatever the sender wrote in the
+                        // `difficulty` field -- and on that basis move the head.
+                        //
+                        // Do not substitute the canonical block at `number - 1`
+                        // either: it is a different block, and checking against
+                        // it rejects valid headers.
+                        //
+                        // Keep it as evidence instead. A peer offering a chain
+                        // we cannot connect to is a signal to go and find where
+                        // the two diverge, and everything fetched after that
+                        // search is verified normally.
+                        unlinked_here += 1;
+                        if let Some(p) = peer {
+                            self.unlinked.lock().unwrap().record(p, hash, header.number, now);
+                        }
+                        // Deliberately leave `prev_in_chunk` alone. A refused
+                        // header must not seed a total difficulty for the next
+                        // one, or the whole disconnected segment inherits a
+                        // base this node never verified.
+                        continue;
                     }
                 }
             }
@@ -167,6 +216,19 @@ impl SyncManager {
         // Commit all validated headers in a single atomic batch
         let _new_head = self.store.store_headers_batch(&validated, current_head_hash, current_td)?;
 
+        if unlinked_here > 0 {
+            // A chunk beginning above our head does this routinely while
+            // catching up, and the node re-requests the same range every few
+            // seconds, so this is not a warning.
+            debug!(
+                target: "rustock::sync",
+                "Held {} of {} headers (#{} -> #{}) as unlinked evidence from peer {:?}: \
+                 parent not held, nothing to verify against",
+                unlinked_here, headers.len(), first_num, last_num,
+                peer.map(|p| p.0[..4].to_vec()),
+            );
+        }
+
         if skipped > 0 {
             // A rejection is worth a warning: it leaves no canonical entry at
             // that height, and a hole in the canonical index halts execution
@@ -174,18 +236,8 @@ impl SyncManager {
             warn!(
                 target: "rustock::sync",
                 "Stored {} headers (#{} -> #{}), rejected {} invalid, {} stored \
-                 without a parent to verify against",
-                stored, first_num, last_num, skipped, unverified
-            );
-        } else if unverified > 0 {
-            // Storing a header whose named parent we do not hold is ordinary: a
-            // chunk routinely begins above our head, and the node re-requests
-            // the same range every few seconds while catching up. Warning about
-            // it produced a line every five seconds.
-            debug!(
-                target: "rustock::sync",
-                "Stored {} headers (#{} -> #{}), {} without a parent to verify against",
-                stored, first_num, last_num, unverified
+                 held as unlinked evidence",
+                stored, first_num, last_num, skipped, unlinked_here
             );
         } else {
             trace!(
@@ -194,7 +246,33 @@ impl SyncManager {
                 stored, first_num, last_num
             );
         }
-        Ok(())
+        Ok(Ingested { stored, rejected: skipped, unlinked: unlinked_here })
+    }
+
+    /// Whether this peer's unlinked headers now justify a connection-point
+    /// search, and where to start looking.
+    ///
+    /// Marks the search as taken, so the caller cannot forget to.
+    pub fn consider_fork_search(&self, peer: &B512) -> Verdict {
+        self.unlinked.lock().unwrap().consider(peer, Instant::now())
+    }
+
+    /// Whether this peer is still sending headers we cannot connect to after a
+    /// search already resolved where its chain diverges — a peer not serving
+    /// the chain it agreed on.
+    pub fn unlinked_persisted_after_search(&self, peer: &B512) -> bool {
+        self.unlinked.lock().unwrap().persisted_after_search(peer)
+    }
+
+    /// See [`UnlinkedHeaders::backdate`].
+    #[cfg(test)]
+    pub fn backdate_unlinked(&self, peer: &B512, by: std::time::Duration) {
+        self.unlinked.lock().unwrap().backdate(peer, by);
+    }
+
+    /// Releases a disconnected peer's evidence.
+    pub fn forget_peer(&self, peer: &B512) {
+        self.unlinked.lock().unwrap().clear_peer(peer);
     }
 
     /// Helper to create a headers request message.

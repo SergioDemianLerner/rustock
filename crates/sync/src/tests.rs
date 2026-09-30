@@ -3,6 +3,12 @@ use alloy_primitives::{Address, B256, U256, Bytes, B512};
 use tempfile::tempdir;
 use crate::service::EXECUTION_OFF_CHAIN_GRACE;
 
+/// A stand-in node id. Header handling is per peer now, so every call needs
+/// one; which peer it is only matters where a test says so.
+fn test_peer() -> B512 {
+    B512::repeat_byte(0xAB)
+}
+
 fn dummy_header(number: u64, parent: B256, difficulty: U256) -> Header {
     Header {
         number,
@@ -55,26 +61,100 @@ async fn test_sync_manager_processing() {
 
     // 1. Valid sequential block
     let b1 = dummy_header(1, genesis_hash, U256::from(10));
-    manager.handle_headers_response(vec![b1.clone()]).unwrap();
+    manager.handle_headers_response(vec![b1.clone()], test_peer()).unwrap();
     assert_eq!(store.head().unwrap(), Some(b1.hash()));
     assert_eq!(store.total_difficulty(b1.hash()).unwrap(), Some(U256::from(11)));
 
     // 2. Duplicate block (should be ignored)
-    manager.handle_headers_response(vec![b1.clone()]).unwrap();
+    manager.handle_headers_response(vec![b1.clone()], test_peer()).unwrap();
     assert_eq!(store.head().unwrap(), Some(b1.hash()));
 
     // 3. Extension block
     let b2 = dummy_header(2, b1.hash(), U256::from(5));
-    manager.handle_headers_response(vec![b2.clone()]).unwrap();
+    manager.handle_headers_response(vec![b2.clone()], test_peer()).unwrap();
     assert_eq!(store.head().unwrap(), Some(b2.hash()));
 
-    // 4. Gap block (parent unknown) — stored with TD = difficulty only
+    // 4. Gap block: the named parent is not held, so there is nothing to
+    //    verify it against and it is not stored. It is kept as evidence that
+    //    this peer has a chain we cannot connect to, which is what provokes a
+    //    search for where the two diverge.
     let b4 = dummy_header(4, B256::repeat_byte(0xee), U256::from(1));
     let b4_hash = b4.hash();
-    manager.handle_headers_response(vec![b4]).unwrap();
+    manager.handle_headers_response(vec![b4], test_peer()).unwrap();
     assert_eq!(store.head().unwrap(), Some(b2.hash()), "Head should not change");
-    assert!(store.header(b4_hash).unwrap().is_some(), "Gap block should be stored");
-    assert_eq!(store.total_difficulty(b4_hash).unwrap(), Some(U256::from(1)));
+    assert!(
+        store.header(b4_hash).unwrap().is_none(),
+        "a header with no parent to verify against must not reach the store"
+    );
+    assert_eq!(
+        store.total_difficulty(b4_hash).unwrap(),
+        None,
+        "and must not be given a total difficulty"
+    );
+}
+
+/// The reason case 4 matters. Total difficulty for a parentless header used to
+/// be derived from a parent of zero, making it whatever the sender wrote in
+/// the `difficulty` field. A peer could therefore claim the heaviest chain in
+/// existence for the cost of one header.
+#[tokio::test]
+async fn a_parentless_header_cannot_claim_the_head_with_any_difficulty() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let genesis_hash = genesis.hash();
+
+    let verifier = Arc::new(HeaderVerifier::new()
+        .with_parent_rule(rustock_core::validation::BlockNumberRule)
+        .with_parent_rule(rustock_core::validation::ParentHashRule));
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    let liar = dummy_header(9_000_000, B256::repeat_byte(0xee), U256::MAX);
+    let liar_hash = liar.hash();
+    manager.handle_headers_response(vec![liar], test_peer()).unwrap();
+
+    assert_eq!(
+        store.head().unwrap(),
+        Some(genesis_hash),
+        "a header nobody can verify must not move the head, whatever it claims"
+    );
+    assert!(store.header(liar_hash).unwrap().is_none());
+    assert_eq!(store.total_difficulty(liar_hash).unwrap(), None);
+}
+
+/// A disconnected run must not bootstrap itself. The first header has no
+/// parent we hold; the second's parent is the first. If the first is refused
+/// but still seeds a total difficulty, the rest of the run inherits a base
+/// this node never verified — the same hole, one block further along.
+#[tokio::test]
+async fn a_refused_header_does_not_seed_the_rest_of_its_chunk() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let genesis_hash = genesis.hash();
+
+    let verifier = Arc::new(HeaderVerifier::new()
+        .with_parent_rule(rustock_core::validation::BlockNumberRule)
+        .with_parent_rule(rustock_core::validation::ParentHashRule));
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    let orphan = dummy_header(500, B256::repeat_byte(0xee), U256::MAX);
+    let child = dummy_header(501, orphan.hash(), U256::from(1));
+    let (orphan_hash, child_hash) = (orphan.hash(), child.hash());
+    manager.handle_headers_response(vec![orphan, child], test_peer()).unwrap();
+
+    assert!(store.header(orphan_hash).unwrap().is_none());
+    assert!(
+        store.header(child_hash).unwrap().is_none(),
+        "the child's only parent is a header we refused, so it is no better off"
+    );
+    assert_eq!(store.head().unwrap(), Some(genesis_hash));
 }
 
 #[tokio::test]
@@ -95,7 +175,7 @@ async fn test_invalid_header_rejected_when_parent_known() {
     // Header claims parent is genesis but has wrong block number
     let bad = dummy_header(5, genesis_hash, U256::from(50));
     let bad_hash = bad.hash();
-    manager.handle_headers_response(vec![bad]).unwrap();
+    manager.handle_headers_response(vec![bad], test_peer()).unwrap();
 
     assert!(store.header(bad_hash).unwrap().is_none(), "Invalid header should be rejected");
     assert_eq!(store.head().unwrap(), Some(genesis_hash));
@@ -122,7 +202,7 @@ async fn test_parent_is_taken_from_parent_hash_not_from_batch_position() {
 
     // The real chain: genesis <- a1 <- a2.
     let a1 = dummy_header(1, genesis_hash, U256::from(10));
-    manager.handle_headers_response(vec![a1.clone()]).unwrap();
+    manager.handle_headers_response(vec![a1.clone()], test_peer()).unwrap();
 
     // A competing block at height 1, also building on genesis.
     let mut fork1 = dummy_header(1, genesis_hash, U256::from(11));
@@ -132,7 +212,7 @@ async fn test_parent_is_taken_from_parent_hash_not_from_batch_position() {
     // A batch carrying the fork immediately before a2. a2's parent is a1.
     let a2 = dummy_header(2, a1.hash(), U256::from(5));
     let a2_hash = a2.hash();
-    manager.handle_headers_response(vec![fork1.clone(), a2.clone()]).unwrap();
+    manager.handle_headers_response(vec![fork1.clone(), a2.clone()], test_peer()).unwrap();
 
     assert!(
         store.header(a2_hash).unwrap().is_some(),
@@ -168,7 +248,7 @@ async fn test_competing_headers_at_one_height_are_both_kept() {
     b1.timestamp = 777;
     assert_ne!(a1.hash(), b1.hash());
 
-    manager.handle_headers_response(vec![a1.clone(), b1.clone()]).unwrap();
+    manager.handle_headers_response(vec![a1.clone(), b1.clone()], test_peer()).unwrap();
 
     assert!(store.header(a1.hash()).unwrap().is_some(), "first block at height 1 kept");
     assert!(
@@ -229,7 +309,7 @@ async fn test_difficulty_is_checked_against_the_true_parent() {
     let manager = SyncManager::new(store.clone(), verifier, peer_store);
 
     // Store the true parent first, as the node would have from an earlier chunk.
-    manager.handle_headers_response(vec![parent.clone()]).unwrap();
+    manager.handle_headers_response(vec![parent.clone()], test_peer()).unwrap();
     assert!(store.header(parent_hash).unwrap().is_some(), "parent accepted");
 
     // A competing block at the parent's height, building on the grandparent
@@ -242,7 +322,7 @@ async fn test_difficulty_is_checked_against_the_true_parent() {
 
     // The fork arrives immediately before the child. Positionally it looks like
     // the parent -- same height, right order -- but it is a different block.
-    manager.handle_headers_response(vec![fork.clone(), child.clone()]).unwrap();
+    manager.handle_headers_response(vec![fork.clone(), child.clone()], test_peer()).unwrap();
 
     assert!(
         store.header(child_hash).unwrap().is_some(),
@@ -622,6 +702,7 @@ async fn test_connection_point_binary_search() {
         peer_best: 1000,
         start: 0,
         end: 1000,
+        gallop: None,
     };
 
     // Probe at midpoint 500: we don't have this block hash
@@ -662,6 +743,7 @@ async fn test_connection_point_binary_search() {
         peer_best: 1000,
         start: 0,
         end: 1,
+        gallop: None,
     };
     // Probe at 0: we have genesis
     service.on_block_hash_response(genesis_hash).await;
@@ -907,6 +989,7 @@ async fn test_timeout_resets_to_idle() {
         peer_best: 1000,
         start: 0,
         end: 1000,
+        gallop: None,
     };
     service.last_progress = Instant::now() - Duration::from_secs(60);
 
@@ -935,7 +1018,7 @@ async fn test_descending_headers_reversed() {
     let b2 = dummy_header(2, b1.hash(), U256::from(1));
     let b3 = dummy_header(3, b2.hash(), U256::from(1));
 
-    manager.handle_headers_response(vec![b3.clone(), b2.clone(), b1.clone()]).unwrap();
+    manager.handle_headers_response(vec![b3.clone(), b2.clone(), b1.clone()], test_peer()).unwrap();
 
     assert!(store.header(b1.hash()).unwrap().is_some());
     assert!(store.header(b2.hash()).unwrap().is_some());
@@ -5304,5 +5387,150 @@ async fn a_broken_canonical_index_declines_the_fast_path() {
     assert!(
         crate::handler::canonical_run(&store, &top, 32).is_none(),
         "a range whose headers do not link must fall back rather than serve a broken chain"
+    );
+}
+
+// -- Fork discovery ------------------------------------------------------
+//
+// The scenario these cover is the one that stalled a mainnet node for an
+// hour: this node sits on a chain the network has left behind, so every
+// header a peer sends names a parent we do not hold. Storing those headers
+// unverified is how an unauthenticated header used to reach the store;
+// refusing them without doing anything else leaves no way back, because the
+// node only ever asks for blocks above its own head and so never requests the
+// block where the two chains part.
+
+/// Builds a service whose head is on a chain of its own.
+fn service_on_a_minority_chain(
+    dir: &tempfile::TempDir,
+) -> (SyncService, Arc<SyncManager>, B512, mpsc::UnboundedSender<SyncEvent>) {
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    // A short private chain: genesis plus a few blocks only we have.
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut parent = genesis.hash();
+    let mut td = U256::from(1);
+    for n in 1..=8u64 {
+        let h = dummy_header(n, parent, U256::from(10));
+        td += U256::from(10);
+        store.update_head(&h, td).unwrap();
+        parent = h.hash();
+    }
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager.clone(), peer_store, event_rx);
+    service.state = SyncState::Following;
+    (service, manager, B512::repeat_byte(0x07), event_tx)
+}
+
+/// Headers built on a chain we do not have, which is what a node on a
+/// minority fork receives from every peer.
+fn headers_from_another_chain(count: u64) -> Vec<Header> {
+    let mut out = Vec::new();
+    let mut parent = B256::repeat_byte(0xee); // a block we do not hold
+    for n in 0..count {
+        let h = dummy_header(900 + n, parent, U256::from(1_000_000));
+        parent = h.hash();
+        out.push(h);
+    }
+    out
+}
+
+/// The recovery path. Enough unlinkable headers, settled, and the node goes
+/// looking for where the two chains diverge — which is the only way back.
+#[tokio::test]
+async fn a_node_fed_unlinkable_headers_searches_for_the_fork() {
+    let dir = tempdir().unwrap();
+    let (mut service, manager, peer, _tx) = service_on_a_minority_chain(&dir);
+
+    service.on_headers_response(peer, headers_from_another_chain(6)).await;
+    assert!(
+        matches!(service.state, SyncState::Following),
+        "not before the evidence has settled, got {:?}", service.state
+    );
+
+    // Let the settle window pass, then one more batch to reconsider.
+    manager.backdate_unlinked(&peer, Duration::from_secs(30));
+    service.on_headers_response(peer, headers_from_another_chain(6)).await;
+
+    match &service.state {
+        SyncState::FindingConnectionPoint { peer: p, gallop, end, .. } => {
+            assert_eq!(*p, peer, "the search must be against the peer that showed us");
+            assert_eq!(*gallop, Some(1), "and must start by probing near the head");
+            assert_eq!(*end, 8, "galloping down from our own head");
+        }
+        other => panic!("expected a connection-point search, got {other:?}"),
+    }
+}
+
+/// And it does not go looking on one stray header, which would let any peer
+/// interrupt a healthy node at will.
+#[tokio::test]
+async fn a_single_stray_header_does_not_start_a_search() {
+    let dir = tempdir().unwrap();
+    let (mut service, manager, peer, _tx) = service_on_a_minority_chain(&dir);
+
+    service.on_headers_response(peer, headers_from_another_chain(1)).await;
+    manager.backdate_unlinked(&peer, Duration::from_secs(300));
+    service.on_headers_response(peer, headers_from_another_chain(1)).await;
+
+    assert!(
+        matches!(service.state, SyncState::Following),
+        "one header is not evidence of a fork, got {:?}", service.state
+    );
+}
+
+/// None of this may put an unverifiable header into the store, whatever it
+/// claims about its own difficulty.
+#[tokio::test]
+async fn fork_discovery_stores_nothing_unverified() {
+    let dir = tempdir().unwrap();
+    let (mut service, manager, peer, _tx) = service_on_a_minority_chain(&dir);
+
+    let head_before = manager.store.head().unwrap();
+    let foreign = headers_from_another_chain(6);
+    service.on_headers_response(peer, foreign.clone()).await;
+    manager.backdate_unlinked(&peer, Duration::from_secs(30));
+    service.on_headers_response(peer, foreign.clone()).await;
+
+    for h in &foreign {
+        assert!(
+            manager.store.header(h.hash()).unwrap().is_none(),
+            "#{} reached the store without anything to verify it against", h.number
+        );
+        assert_eq!(manager.store.total_difficulty(h.hash()).unwrap(), None);
+    }
+    assert_eq!(
+        manager.store.head().unwrap(), head_before,
+        "the head must not move on headers nobody could verify"
+    );
+}
+
+/// A sync already in progress is doing this work; a peer sending junk must
+/// not be able to derail it.
+#[tokio::test]
+async fn unlinked_headers_do_not_interrupt_a_sync_in_progress() {
+    let dir = tempdir().unwrap();
+    let (mut service, manager, peer, _tx) = service_on_a_minority_chain(&dir);
+
+    let busy = SyncState::DownloadingSkeleton {
+        peer: B512::repeat_byte(0x02),
+        peer_best: 9_000_000,
+        connection_point: 8,
+    };
+    service.state = busy;
+
+    let foreign = headers_from_another_chain(20);
+    service.on_headers_response(peer, foreign.clone()).await;
+    manager.backdate_unlinked(&peer, Duration::from_secs(300));
+    service.on_headers_response(peer, foreign).await;
+
+    assert!(
+        matches!(service.state, SyncState::DownloadingSkeleton { .. }),
+        "a sync in progress was derailed: {:?}", service.state
     );
 }

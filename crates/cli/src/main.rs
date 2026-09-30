@@ -924,6 +924,8 @@ fn apply_file_config(
         &mut a.max_inbound_per_cidr);
     apply(matches, "inbound_cidr_prefix", f.peers.inbound_cidr_prefix.as_ref(),
         &mut a.inbound_cidr_prefix);
+    apply(matches, "closed_network", f.peers.closed_network.as_ref(),
+        &mut a.closed_network);
     // A list, so `apply`'s "the CLI wins" rule does not fit: the two sources
     // are *combined*. An operator keeping a standing ban list in the config
     // file should still be able to add one on the command line without
@@ -961,8 +963,13 @@ fn apply_file_config(
     apply(matches, "gc_burial", f.gc.burial.as_ref(), &mut a.gc_burial);
     apply(matches, "gc_check_secs", f.gc.check_secs.as_ref(), &mut a.gc_check_secs);
 
+    apply(matches, "read_threads", f.trie.read_threads.as_ref(), &mut a.read_threads);
+
     apply(matches, "prune_keep_depth", f.prune.keep_depth.as_ref(), &mut a.prune_keep_depth);
     apply(matches, "prune_max_batch", f.prune.max_batch.as_ref(), &mut a.prune_max_batch);
+    apply(matches, "prune_frozen_headers", f.prune.frozen_headers.as_ref(),
+        &mut a.prune_frozen_headers);
+    apply(matches, "no_freezer", f.prune.no_freezer.as_ref(), &mut a.no_freezer);
     apply(matches, "dev_rpc", f.rpc.dev.as_ref(), &mut a.dev_rpc);
     apply(
         matches,

@@ -178,7 +178,9 @@ impl BlockStore {
         // finished. Same rule as everywhere else: nothing that runs for
         // minutes goes without a sign of life.
         const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
-        let started = std::time::Instant::now();
+        // Reuse the timer started at the top of the function. A second one
+        // here shadows it, and `stats.seconds` below then measures from the
+        // wrong point.
         let mut last_report = started;
 
         let mut batch = WriteBatch::default();

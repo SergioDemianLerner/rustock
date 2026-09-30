@@ -133,6 +133,10 @@ pub struct PeersSection {
     /// Count scoring events but never punish (rskj
     /// `scoring.punishmentEnabled = false`).
     pub no_peer_punishment: Option<bool>,
+    /// Never learn new node ids from peers and never dial them. With
+    /// `bootnodes`, this pins the node to exactly the peers named here --
+    /// which is what makes a controlled two-node test trustworthy.
+    pub closed_network: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -143,6 +147,9 @@ pub struct TrieSection {
     pub node: Option<String>,
     /// Entries in the BTC stored-block cache; 0 disables it.
     pub btc_block_cache_entries: Option<usize>,
+    /// Threads used for parallel reads, by the snap-sync client and the trie
+    /// store as well as the one-shot verifier.
+    pub read_threads: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -159,6 +166,11 @@ pub struct GcSection {
 pub struct PruneSection {
     pub keep_depth: Option<u64>,
     pub max_batch: Option<u64>,
+    /// Delete headers from the block database once the freezer holds them.
+    /// Every lookup by hash for those blocks then depends on the freezer.
+    pub frozen_headers: Option<bool>,
+    /// Do not run the header freezer at all.
+    pub no_freezer: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -268,6 +280,11 @@ pub const ONE_SHOT: &[&str] = &[
     "trie_tool_copy",
     "trie_tool_copy_overwrite",
     "config",
+    // Profiling and verification modes: each runs against the database and
+    // exits, so there is no session for a file to configure.
+    "verify_state",
+    "trie_shape",
+    "measure_block_reads",
 ];
 
 /// Every runtime setting the file can supply. Kept beside the merge so the two
@@ -318,6 +335,12 @@ pub const CONFIGURABLE: &[&str] = &[
     "account_tx_rate_limit_gas_per_second_percent",
     "log_level",
     "log_to_stdout",
+    // Read parallelism is read by the snap-sync client and the trie store
+    // while the node is running, not only by the one-shot verifier.
+    "read_threads",
+    "prune_frozen_headers",
+    "no_freezer",
+    "closed_network",
     "log_timezone",
     "snap_server",
     "snap_sync",
@@ -376,6 +399,33 @@ mod tests {
         crate::apply_file_config(&m, &FileConfig::load(path).unwrap(), &mut a);
         assert_eq!(a.port, 50505, "command line beats file");
         assert_eq!(a.gc_burial, 9999, "and leaves the rest of the file alone");
+    }
+
+    /// Listing a flag in `CONFIGURABLE` only declares an intention. This
+    /// checks the four runtime flags added alongside the fork-discovery work
+    /// actually reach the args, because `deny_unknown_fields` means an
+    /// unwired key is not a silent no-op -- it rejects the whole file.
+    #[test]
+    fn the_runtime_flags_added_last_really_come_from_the_file() {
+        let file = write(
+            r#"
+            [peers]
+            closed_network = true
+            [trie]
+            read_threads = 7
+            [prune]
+            frozen_headers = true
+            no_freezer = true
+            "#,
+        );
+        let path = file.path().to_str().unwrap();
+        let (m, mut a) = parse(&["rustock", "--config", path]);
+        crate::apply_file_config(&m, &FileConfig::load(path).unwrap(), &mut a);
+
+        assert!(a.closed_network, "[peers] closed_network");
+        assert_eq!(a.read_threads, 7, "[trie] read_threads");
+        assert!(a.prune_frozen_headers, "[prune] frozen_headers");
+        assert!(a.no_freezer, "[prune] no_freezer");
     }
 
     /// The subtle case, and the reason the merge consults `ValueSource` rather
