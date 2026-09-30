@@ -321,7 +321,6 @@ fn answers_may_arrive_out_of_order() {
 
     assert!(walk.is_done(), "out-of-order answers did not assemble");
 }
-
 /// The walk stops at the first block this node already holds, which on a node
 /// that already has part of the chain is not genesis.
 ///

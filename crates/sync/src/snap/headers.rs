@@ -57,7 +57,7 @@ use tracing::{debug, info, warn};
 pub const HEADER_CHUNK: u64 = 192;
 
 /// Identifiers one skeleton answer carries.
-const SKELETON_POINTS: u64 = 20;
+pub const SKELETON_POINTS: u64 = 20;
 
 /// What the walk wants asked next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
