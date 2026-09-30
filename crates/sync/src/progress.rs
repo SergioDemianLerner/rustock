@@ -283,6 +283,7 @@ mod tests {
             peer_best: 9_260_892,
             start: 9_000_000,
             end: 9_260_892,
+            gallop: None,
         });
         assert!(finding.contains("#9000000..#9260892"), "{finding}");
 

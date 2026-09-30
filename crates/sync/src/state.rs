@@ -24,12 +24,24 @@ pub enum SyncState {
     /// Waiting for peers / nothing to do.
     #[default]
     Idle,
-    /// Binary-searching for the last block we share with the peer.
+    /// Searching for the last block we share with the peer.
+    ///
+    /// Two phases. While `gallop` is `Some(step)` the search probes
+    /// `end - step` with `step` doubling, walking down from our head until it
+    /// finds a block both nodes hold; `end` stays put as the origin. Once one
+    /// is found the search falls back to bisecting the bracket that failed,
+    /// with `gallop` set to `None`, `start` the highest shared height known
+    /// and `end` the lowest height known to be unshared.
+    ///
+    /// The gallop exists because forks are almost always one or two blocks
+    /// deep, and bisecting `0..9.28M` spends 23 round trips to learn that.
     FindingConnectionPoint {
         peer: B512,
         peer_best: u64,
         start: u64,
         end: u64,
+        /// Current downward step, or `None` once bisecting.
+        gallop: Option<u64>,
     },
     /// Waiting for the skeleton response.
     DownloadingSkeleton {

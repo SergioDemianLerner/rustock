@@ -1,6 +1,7 @@
 use crate::events::SyncEvent;
 use crate::manager::{SyncManager, MAX_SKELETON_CHUNKS};
 use crate::progress::SyncProgress;
+use crate::unlinked::Verdict;
 use crate::state::{InFlightBody, SyncState};
 use crate::invariant::{self, Scope, Violation};
 use crate::tracker::PeerChunkTracker;
@@ -2611,7 +2612,7 @@ impl SyncService {
         } else {
             debug!(
                 target: "rustock::sync",
-                "Peer best hash unknown, searching for connection point (0..{})",
+                "Peer best hash unknown, searching for connection point below #{}",
                 head.number
             );
             self.state = SyncState::FindingConnectionPoint {
@@ -2619,6 +2620,7 @@ impl SyncService {
                 peer_best: metadata.best_number,
                 start: 0,
                 end: head.number,
+                gallop: Some(1),
             };
             self.last_progress = Instant::now();
             self.send_connection_point_probe().await;
@@ -2626,14 +2628,21 @@ impl SyncService {
     }
 
     async fn send_connection_point_probe(&self) {
-        if let SyncState::FindingConnectionPoint { peer, start, end, .. } = &self.state {
-            let mid = start + (end - start) / 2;
-            debug!(
-                target: "rustock::sync",
-                "Probing connection point at height #{} (range {}..{})",
-                mid, start, end
-            );
-            let msg = create_block_hash_request(mid);
+        if let SyncState::FindingConnectionPoint { peer, start, end, gallop, .. } = &self.state {
+            let height = connection_point_probe_height(*start, *end, *gallop);
+            match gallop {
+                Some(step) => debug!(
+                    target: "rustock::sync",
+                    "Probing connection point at #{} (galloping down from #{}, step {})",
+                    height, end, step
+                ),
+                None => debug!(
+                    target: "rustock::sync",
+                    "Probing connection point at #{} (bisecting {}..{})",
+                    height, start, end
+                ),
+            }
+            let msg = create_block_hash_request(height);
             self.peer_store.send_to_peer(peer, msg).await;
         }
     }
@@ -2830,9 +2839,9 @@ impl SyncService {
         let old = std::mem::take(&mut self.state);
         match old {
             SyncState::FindingConnectionPoint {
-                peer, peer_best, start, end,
+                peer, peer_best, start, end, gallop,
             } => {
-                let mid = start + (end - start) / 2;
+                let probed = connection_point_probe_height(start, end, gallop);
                 let known = match self.manager.store.has_block(hash) {
                     Ok(v) => v,
                     Err(e) => {
@@ -2845,28 +2854,53 @@ impl SyncService {
                     }
                 };
 
-                let (new_start, new_end) = if known {
-                    (mid, end)
-                } else {
-                    (start, mid)
-                };
-
-                if new_end - new_start <= 1 {
-                    let cp = new_start;
-                    debug!(target: "rustock::sync", "Connection point found at #{}", cp);
-                    self.state = SyncState::DownloadingSkeleton {
-                        peer,
-                        peer_best,
-                        connection_point: cp,
-                    };
-                    self.send_skeleton_request_to(&peer, cp).await;
-                } else {
-                    self.state = SyncState::FindingConnectionPoint {
-                        peer, peer_best,
-                        start: new_start,
-                        end: new_end,
-                    };
-                    self.send_connection_point_probe().await;
+                match advance_connection_point(start, end, gallop, probed, known) {
+                    Probe::NoCommonAncestor => {
+                        // The gallop reached the bottom and even the peer's
+                        // lowest block is not ours. This peer is following a
+                        // different network's chain, and no amount of further
+                        // searching will produce an ancestor.
+                        warn!(
+                            target: "rustock::sync",
+                            "No common ancestor with peer {:?}: its chain shares \
+                             nothing with ours",
+                            &peer.0[..4]
+                        );
+                        if let Some(scoring) = &self.scoring {
+                            scoring.record_peer(
+                                peer,
+                                rustock_networking::scoring::EventType::InvalidMessage,
+                            );
+                        }
+                        self.state = SyncState::Idle;
+                    }
+                    Probe::Gallop { step } => {
+                        self.state = SyncState::FindingConnectionPoint {
+                            peer, peer_best, start, end, gallop: Some(step),
+                        };
+                        self.send_connection_point_probe().await;
+                    }
+                    Probe::Bisect { start: new_start, end: new_end }
+                        if new_end.saturating_sub(new_start) <= 1 =>
+                    {
+                        let cp = new_start;
+                        debug!(target: "rustock::sync", "Connection point found at #{}", cp);
+                        self.state = SyncState::DownloadingSkeleton {
+                            peer,
+                            peer_best,
+                            connection_point: cp,
+                        };
+                        self.send_skeleton_request_to(&peer, cp).await;
+                    }
+                    Probe::Bisect { start: new_start, end: new_end } => {
+                        self.state = SyncState::FindingConnectionPoint {
+                            peer, peer_best,
+                            start: new_start,
+                            end: new_end,
+                            gallop: None,
+                        };
+                        self.send_connection_point_probe().await;
+                    }
                 }
             }
             other => {
@@ -2982,10 +3016,35 @@ impl SyncService {
                 // Process all consecutive ready chunks
                 let ready = tracker.drain_ready();
                 for (_idx, chunk_peer, chunk_headers) in &ready {
-                    if let Err(e) = self.manager.handle_headers_response(chunk_headers.clone()) {
+                    // A chunk that does not connect is a failure, not
+                    // something to carry on past. Chunks are released in
+                    // skeleton order, so the first header's parent is the last
+                    // header of the chunk before it and must already be held.
+                    // When it is not, the rest of the chunk has nothing to
+                    // verify against and is refused — and continuing would
+                    // leave a hole in the canonical index that halts execution
+                    // when it is reached. Storing it unverified instead is the
+                    // hole this change exists to close, so the answer is to
+                    // stop and resync, charging the peer that served it.
+                    let outcome = self
+                        .manager
+                        .handle_headers_response(chunk_headers.clone(), *chunk_peer)
+                        .map_err(|e| format!("{e:?}"))
+                        .and_then(|o| {
+                            if o.unlinked > 0 {
+                                Err(format!(
+                                    "{} of {} headers did not connect to our chain",
+                                    o.unlinked,
+                                    chunk_headers.len()
+                                ))
+                            } else {
+                                Ok(o)
+                            }
+                        });
+                    if let Err(e) = outcome {
                         error!(
                             target: "rustock::sync",
-                            "Failed to process headers chunk: {:?}", e
+                            "Failed to process headers chunk: {}", e
                         );
                         // INVALID_HEADER is one of the three counters that
                         // cost reputation in rskj, so this is a punishing
@@ -3023,7 +3082,7 @@ impl SyncService {
                 self.state = other;
                 let before_height = self.our_head_number();
                 let before_hash = self.manager.store.head().ok().flatten();
-                let _ = self.manager.handle_headers_response(headers.clone());
+                let _ = self.manager.handle_headers_response(headers.clone(), peer);
                 if is_following {
                     let after_height = self.our_head_number();
                     let after_hash = self.manager.store.head().ok().flatten();
@@ -3044,8 +3103,81 @@ impl SyncService {
                         self.request_follow_bodies(&headers).await;
                     }
                 }
+
+                // Headers we could not link are evidence that this peer has a
+                // chain we cannot connect to. When enough of it has settled,
+                // go and find where the two diverge.
+                //
+                // This is the half that makes refusing an unverifiable header
+                // safe. Refusing without it leaves a node on a minority chain
+                // with no way back: it asks only for blocks above its own
+                // head, so the other chain's fork block is never requested and
+                // nothing ever links. That is what stalled a node for an hour.
+                self.maybe_search_for_fork(peer).await;
             }
         }
+    }
+
+    /// Starts a connection-point search if this peer's unlinked headers have
+    /// settled into enough evidence to justify one.
+    ///
+    /// Only from `Following`. A search already under way, or a skeleton
+    /// download in progress, is doing this work already, and interrupting it
+    /// would let a peer that sends junk derail a sync that was going fine.
+    async fn maybe_search_for_fork(&mut self, peer: B512) {
+        if !matches!(self.state, SyncState::Following) {
+            return;
+        }
+
+        // A peer still sending headers we cannot link after a search already
+        // settled where its chain diverges is not serving the chain it agreed
+        // on. That is the signal worth charging for: it survived the search
+        // precisely because the search succeeded.
+        if self.manager.unlinked_persisted_after_search(&peer) {
+            warn!(
+                target: "rustock::sync",
+                "Peer {:?} keeps sending headers we cannot link after its chain was \
+                 already resolved",
+                &peer.0[..4]
+            );
+            if let Some(scoring) = &self.scoring {
+                scoring.record_peer(
+                    peer,
+                    rustock_networking::scoring::EventType::InvalidMessage,
+                );
+            }
+            self.manager.forget_peer(&peer);
+            return;
+        }
+
+        let Verdict::SearchForFork { from } = self.manager.consider_fork_search(&peer) else {
+            return;
+        };
+
+        let head = self.our_head_number();
+        let peer_best = self
+            .peer_store
+            .metadata(&peer)
+            .await
+            .map(|m| m.best_number)
+            .unwrap_or(head);
+
+        info!(
+            target: "rustock::sync",
+            "Peer {:?} is on a chain we cannot connect to (lowest unlinked #{}); \
+             searching for the fork point below our head #{}",
+            &peer.0[..4], from, head
+        );
+
+        self.state = SyncState::FindingConnectionPoint {
+            peer,
+            peer_best,
+            start: 0,
+            end: head,
+            gallop: Some(1),
+        };
+        self.last_progress = Instant::now();
+        self.send_connection_point_probe().await;
     }
 
     /// Handle NewBlockHashes: fetch announced headers we don't have yet,
@@ -4250,3 +4382,278 @@ fn process_downloaded_blocks(
     }
 }
 
+
+/// The outcome of one connection-point probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Probe {
+    /// Keep walking down from the head with a larger step.
+    Gallop { step: u64 },
+    /// Bisect this bracket: `start` is shared, `end` is not.
+    Bisect { start: u64, end: u64 },
+    /// The peer shares no block with us at all.
+    NoCommonAncestor,
+}
+
+/// Largest downward step the gallop takes before giving up and bisecting.
+///
+/// Doubling alone is `2·log2(depth)` probes: excellent for a shallow fork, but
+/// for a divergence at genesis it spends ~23 steps reaching the bottom and
+/// ~21 more bisecting, against 23 for a plain bisection of `0..head`.
+///
+/// Capping it bounds that loss. Past this step the gallop has already
+/// established that the fork is deep, which is the one case bisection handles
+/// better, so it hands over: at most 9 probes spent before a bisection that is
+/// itself no worse than the one this replaces. Forks up to 512 deep — which in
+/// practice is all of them — still resolve within the gallop.
+pub(crate) const MAX_GALLOP_STEP: u64 = 512;
+
+/// Gallop step meaning "probe the lowest height and settle the question".
+///
+/// The bisection starts at `start = 0` and treats it as shared, but nothing
+/// ever checked that. For a peer on another network it is false, and the
+/// search then reports a connection point at genesis and syncs against a chain
+/// with which we have nothing in common. Reaching that terminal state asks
+/// instead, and `saturating_sub` turns this step into a probe of height 0.
+pub(crate) const CONFIRM_LOWEST: u64 = u64::MAX;
+
+/// What one probe result means for the search.
+///
+/// Pure, and the only place the transition is written, so that a test can
+/// drive the real search rather than a restatement of it that could be wrong
+/// in the same way.
+pub(crate) fn advance_connection_point(
+    start: u64,
+    end: u64,
+    gallop: Option<u64>,
+    probed: u64,
+    known: bool,
+) -> Probe {
+    let next = match (gallop, known) {
+        // Galloping, and this height is not shared: step twice as far down.
+        // `end` stays the origin, so the next probe is measured from the head
+        // rather than from here — doubling the distance, not the decrement.
+        (Some(_), false) if probed == 0 => Probe::NoCommonAncestor,
+        // The gallop has gone as far as it usefully can. Everything below
+        // `probed` is still a candidate, and bisection searches that better
+        // than more doubling would.
+        (Some(step), false) if step >= MAX_GALLOP_STEP => Probe::Bisect { start, end: probed },
+        (Some(step), false) => Probe::Gallop { step: step.saturating_mul(2) },
+        // A shared block. The fork is between here and the last height the
+        // gallop rejected, which sits one step back up — or the origin, if
+        // this was the very first probe.
+        (Some(step), true) => Probe::Bisect {
+            start: probed,
+            end: end.saturating_sub(step / 2),
+        },
+        (None, true) => Probe::Bisect { start: probed, end },
+        (None, false) => Probe::Bisect { start, end: probed },
+    };
+
+    // Never finish on an assumption. If the search has narrowed to height 0
+    // and no probe ever confirmed that we share it, ask before believing it.
+    match next {
+        // ...unless this very probe is what confirmed it.
+        Probe::Bisect { start: 0, end }
+            if end <= 1 && !(known && probed == 0) && gallop != Some(CONFIRM_LOWEST) =>
+        {
+            Probe::Gallop { step: CONFIRM_LOWEST }
+        }
+        other => other,
+    }
+}
+
+/// Which height the next connection-point probe asks about.
+///
+/// While galloping, `end` is the origin the search started from and the probe
+/// walks down from it by `step`, so a one-block fork is found in one request
+/// rather than the 23 a bisection of `0..head` would spend. Once bisecting,
+/// `start` is the highest shared height known and `end` the lowest unshared
+/// one, and the probe splits them.
+pub(crate) fn connection_point_probe_height(start: u64, end: u64, gallop: Option<u64>) -> u64 {
+    match gallop {
+        Some(step) => end.saturating_sub(step),
+        None => start + (end - start) / 2,
+    }
+}
+
+#[cfg(test)]
+mod connection_point_search_tests {
+    use super::{advance_connection_point, connection_point_probe_height, Probe, MAX_GALLOP_STEP};
+
+    /// Runs the real search against a chain whose highest shared height is
+    /// `fork`, driving the same transition the service does.
+    ///
+    /// Returns the connection point it settles on and how many probes it
+    /// spent, or `None` for "no common ancestor".
+    fn search(head: u64, fork: u64) -> (Option<u64>, usize) {
+        let (mut start, mut end, mut gallop) = (0u64, head, Some(1u64));
+        let mut probes = 0usize;
+
+        loop {
+            let probed = connection_point_probe_height(start, end, gallop);
+            probes += 1;
+            assert!(probes < 200, "search did not converge (head {head}, fork {fork})");
+
+            // The peer holds every height; we share the ones at or below the
+            // fork. `known` is therefore monotone decreasing in height, which
+            // is the property both phases rely on.
+            let known = probed <= fork;
+
+            match advance_connection_point(start, end, gallop, probed, known) {
+                Probe::NoCommonAncestor => return (None, probes),
+                Probe::Gallop { step } => gallop = Some(step),
+                Probe::Bisect { start: s, end: e } => {
+                    if e.saturating_sub(s) <= 1 {
+                        return (Some(s), probes);
+                    }
+                    start = s;
+                    end = e;
+                    gallop = None;
+                }
+            }
+        }
+    }
+
+    /// Probes a plain bisection of `0..head` would spend, for comparison.
+    fn bisect_probes(head: u64, fork: u64) -> usize {
+        let (mut start, mut end, mut probes) = (0u64, head, 0usize);
+        while end - start > 1 {
+            let mid = start + (end - start) / 2;
+            probes += 1;
+            if mid <= fork { start = mid } else { end = mid }
+        }
+        probes
+    }
+
+    /// The property that matters: it finds the right block. Every fork depth
+    /// from the head down, exhaustively — not a sampled few.
+    #[test]
+    fn it_finds_the_exact_fork_at_every_depth() {
+        let head = 4096u64;
+        for fork in 0..head {
+            let (found, _) = search(head, fork);
+            assert_eq!(
+                found,
+                Some(fork),
+                "head {head}, fork {fork}: search must land on the fork itself"
+            );
+        }
+    }
+
+    /// And at a realistic chain height, where an off-by-one in the gallop's
+    /// bracket would be invisible against a small `head`.
+    #[test]
+    fn it_finds_the_exact_fork_on_a_mainnet_sized_chain() {
+        let head = 9_280_000u64;
+        // Shallow forks, the common case.
+        for depth in 1..=512u64 {
+            let fork = head - depth;
+            assert_eq!(search(head, fork).0, Some(fork), "depth {depth}");
+        }
+        // Powers of two and their neighbours, where the step lands exactly on
+        // or beside a boundary.
+        for shift in 0..23u32 {
+            for delta in [-1i64, 0, 1] {
+                let depth = (1u64 << shift).saturating_add_signed(delta).max(1);
+                if depth >= head { continue }
+                let fork = head - depth;
+                assert_eq!(search(head, fork).0, Some(fork), "depth {depth}");
+            }
+        }
+        // And a genuinely ancient divergence.
+        for fork in [0u64, 1, 2, 1000, head / 2, head - 1] {
+            assert_eq!(search(head, fork).0, Some(fork), "fork {fork}");
+        }
+    }
+
+    /// The point of the gallop. A one-block fork cost 23 round trips.
+    #[test]
+    fn a_shallow_fork_costs_a_handful_of_probes() {
+        let head = 9_280_000u64;
+        assert_eq!(search(head, head - 1).1, 1, "a one-block fork: one request");
+        assert!(search(head, head - 2).1 <= 2);
+        for depth in 1..=MAX_GALLOP_STEP {
+            let probes = search(head, head - depth).1;
+            assert!(
+                probes <= 2 * (MAX_GALLOP_STEP.ilog2() as usize + 1),
+                "depth {depth} took {probes} probes; bisection takes {}",
+                bisect_probes(head, head - depth)
+            );
+        }
+    }
+
+    /// The other end of open question 0: an ancient divergence must not cost
+    /// materially more than the bisection this replaces.
+    #[test]
+    fn a_deep_fork_does_not_lose_to_bisection() {
+        let head = 9_280_000u64;
+        for fork in [0u64, 1, 1000, 100_000, head / 4, head / 2, head - head / 8] {
+            let (found, probes) = search(head, fork);
+            assert_eq!(found, Some(fork));
+            let bisect = bisect_probes(head, fork);
+            // The cap costs at most the doublings spent before it fires.
+            let overhead = MAX_GALLOP_STEP.ilog2() as usize + 2;
+            assert!(
+                probes <= bisect + overhead,
+                "fork {fork}: gallop {probes} probes vs bisection {bisect} \
+                 (allowed overhead {overhead})"
+            );
+        }
+    }
+
+    /// Doubling must stay O(log n) — never a linear walk down the chain.
+    #[test]
+    fn the_search_is_logarithmic_everywhere() {
+        let head = 9_280_000u64;
+        let mut worst = 0usize;
+        for fork in (0..head).step_by(9_973) {
+            worst = worst.max(search(head, fork).1);
+        }
+        assert!(worst <= 48, "worst case {worst} probes is not logarithmic");
+    }
+
+    /// A peer sharing nothing is not searched forever; it is identified.
+    #[test]
+    fn a_peer_sharing_nothing_is_identified_not_searched_forever() {
+        // Nothing at all is shared, not even height 0.
+        let head = 9_280_000u64;
+        let (mut start, mut end, mut gallop) = (0u64, head, Some(1u64));
+        let mut probes = 0;
+        loop {
+            let probed = connection_point_probe_height(start, end, gallop);
+            probes += 1;
+            assert!(probes < 100, "gave up too slowly");
+            match advance_connection_point(start, end, gallop, probed, false) {
+                Probe::NoCommonAncestor => break,
+                Probe::Gallop { step } => gallop = Some(step),
+                Probe::Bisect { start: s, end: e } => {
+                    start = s;
+                    end = e;
+                    gallop = None;
+                }
+            }
+        }
+        // The cost is the gallop to its cap, a bisection of what remains, and
+        // one probe of height 0 to settle it — bounded, and paid once per peer
+        // before that peer is charged and stops being asked.
+        let bound = (MAX_GALLOP_STEP.ilog2() as usize + 1) + bisect_probes(head, 0) + 1;
+        assert!(
+            probes <= bound,
+            "{probes} probes to conclude nothing is shared, expected at most {bound}"
+        );
+    }
+
+    /// A node at genesis has nothing to search.
+    #[test]
+    fn a_tiny_chain_does_not_underflow() {
+        for head in 0..4u64 {
+            for fork in 0..=head {
+                let (found, _) = search(head, fork);
+                assert!(
+                    found.is_some(),
+                    "head {head}, fork {fork}: must terminate with an answer"
+                );
+            }
+        }
+    }
+}
