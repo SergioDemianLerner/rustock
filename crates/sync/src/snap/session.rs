@@ -94,6 +94,10 @@ pub enum SnapFailure {
     IncompleteState(String),
     #[error("{0} chunk requests in a row came back with nothing usable")]
     NoProgress(u32),
+    #[error(
+        "the peer claimed cumulative difficulty {claimed} at the checkpoint but the chain          it served carries at most {ceiling}"
+    )]
+    OverstatedDifficulty { claimed: U256, ceiling: U256 },
     #[error("block #{number}: the {what} are not the ones its header commits to")]
     BadBody { number: u64, what: &'static str },
 }
@@ -613,6 +617,25 @@ impl SnapSession {
                 ),
             }
             let _ = self.store.set_head(hash);
+        }
+
+        // The walk has read every header from the checkpoint down to a block
+        // this node already trusted, so the work of that chain is known. The
+        // claimed cumulative difficulty may exceed it only by the checkpoint
+        // block's own difficulty -- the one header the walk never visits as a
+        // candidate.
+        //
+        // The claim is written as this node's own total difficulty at the
+        // checkpoint, so it is worth establishing rather than accepting.
+        if let Some(established) = self.walk.as_ref().and_then(|w| w.established_difficulty()) {
+            let ceiling = established
+                .saturating_add(checkpoint.as_ref().map_or(U256::ZERO, |h| h.difficulty));
+            if self.checkpoint_td > ceiling {
+                return self.fail(SnapFailure::OverstatedDifficulty {
+                    claimed: self.checkpoint_td,
+                    ceiling,
+                });
+            }
         }
 
         info!(

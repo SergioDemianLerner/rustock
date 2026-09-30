@@ -321,3 +321,53 @@ fn answers_may_arrive_out_of_order() {
 
     assert!(walk.is_done(), "out-of-order answers did not assemble");
 }
+
+/// The walk stops at the first block this node already holds, which on a node
+/// that already has part of the chain is not genesis.
+///
+/// `walked_difficulty` is then the work of the walked *segment* only. The
+/// claim it gets checked against -- a peer's cumulative difficulty at the
+/// checkpoint -- is measured from genesis, so the two are different quantities
+/// and comparing them directly refuses an honest peer by everything this node
+/// already had below the anchor. On a real node that is nearly the whole chain.
+#[test]
+fn the_established_difficulty_counts_from_genesis_not_from_the_anchor() {
+    let f = fixture(1000);
+
+    // This node already holds the chain up to the grid point at #768, with the
+    // total difficulties it established for it.
+    let anchor = 768u64;
+    let mut td = U256::from(100u64); // genesis
+    for i in 1..=anchor as usize {
+        let h = &f.chain[i];
+        td += h.difficulty;
+        f.store.put_header_with_hash(h.hash(), h).expect("header");
+        f.store.put_canonical_hash(h.number, h.hash()).expect("index");
+        f.store.put_total_difficulty(h.hash(), td).expect("td");
+    }
+    let anchor_td = td;
+
+    let mut walk = f.walk(1000, HeaderVerifier::new());
+    assert_eq!(walk.established_difficulty(), None, "nothing is established yet");
+
+    walk.on_headers(1000, &f.headers(1000, (1000 - 960) as u32)).expect("honest");
+    walk.advance().expect("links");
+    walk.on_headers(960, &f.headers(960, HEADER_CHUNK as u32)).expect("honest");
+    walk.advance().expect("links");
+
+    assert!(walk.is_done(), "the walk should have anchored at #{anchor}");
+
+    let walked = walk.walked_difficulty();
+    let established = walk.established_difficulty().expect("anchored");
+
+    assert_eq!(
+        established,
+        anchor_td + walked,
+        "established work must include what this node already had at the anchor"
+    );
+    assert!(
+        established > walked * U256::from(3),
+        "the segment walked ({walked}) is a small part of the work established \
+         ({established}); using it alone would refuse an honest peer"
+    );
+}

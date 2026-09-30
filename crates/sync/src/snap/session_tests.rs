@@ -1084,3 +1084,105 @@ fn outstanding_snap_requests_never_exceed_the_budget() {
         );
     }
 }
+
+/// A whole session against an honest peer, on a node that already holds part
+/// of the chain, must not trip the difficulty check.
+///
+/// The arithmetic this guards is in
+/// `header_tests::the_established_difficulty_counts_from_genesis_not_from_the_anchor`;
+/// this is the end-to-end statement that an honest peer completes. Note the
+/// walk tests `is_ours` only at run boundaries, so with a chain this short it
+/// consumes the whole run and anchors at genesis regardless -- which is why
+/// the unit test above carries the real case.
+#[test]
+fn an_honest_peer_completes_when_this_node_already_holds_part_of_the_chain() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 6, genesis, 100, f.state_root);
+    let checkpoint = blocks.last().unwrap().header.clone();
+
+    // This node already holds the first three blocks, with their total
+    // difficulties, so the walk anchors at #3 rather than at genesis.
+    for (b, td) in blocks.iter().zip(tds.iter()).take(3) {
+        let hash = b.header.hash();
+        f.store.put_header_with_hash(hash, &b.header).expect("header");
+        f.store.put_canonical_hash(b.header.number, hash).expect("index");
+        f.store.put_total_difficulty(hash, *td).expect("td");
+    }
+
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let peer_store = Arc::new(BlockStore::open(peer_dir.path()).expect("open"));
+    for (b, td) in blocks.iter().zip(tds.iter()) {
+        let hash = b.header.hash();
+        peer_store.put_header_with_hash(hash, &b.header).expect("header");
+        peer_store.put_canonical_hash(b.header.number, hash).expect("index");
+        peer_store.put_total_difficulty(hash, *td).expect("td");
+    }
+
+    let mut session = f.session(HeaderVerifier::new());
+    let config = SnapConfig {
+        server_enabled: true,
+        blocks_required: 2,
+        block_chunk_size: 2,
+        ..SnapConfig::default()
+    };
+    let server = SnapServer::new(
+        peer_store.clone(),
+        f.trie.clone() as Arc<dyn TrieStore>,
+        config.clone(),
+    );
+
+    // The peer states the truth throughout.
+    let mut actions = session.on_status(&blocks, &tds, 8_000, 0);
+    let mut guard = 0;
+    while session.phase() != Phase::Done && session.phase() != Phase::Failed {
+        guard += 1;
+        assert!(guard < 10_000, "session did not terminate in phase {:?}", session.phase());
+        if actions.is_empty() {
+            actions = session.poll();
+            assert!(!actions.is_empty(), "stuck in phase {:?}", session.phase());
+        }
+        let action = actions.remove(0);
+        let next = match action {
+            Action::RequestStatus => session.on_status(&blocks, &tds, 8_000, 0),
+            Action::RequestHeaders { point, count, .. } => {
+                session.on_headers(point, &headers_for(&blocks, point, count))
+            }
+            Action::RequestSkeleton { .. } => session.on_skeleton(&[]),
+            Action::RequestChunk { from, budget, .. } => {
+                let response = server
+                    .chunk(&SnapChunkRequest {
+                        id: 1,
+                        block_number: checkpoint.number,
+                        from,
+                        chunk_size: budget,
+                        state_root: Some(f.state_root),
+                    })
+                    .expect("server answers");
+                session.on_chunk(from, &response.payload, Refusal::None)
+            }
+            Action::RequestBlocks { block_number } => {
+                let answer: Vec<Block> = blocks
+                    .iter()
+                    .filter(|b| b.header.number < block_number)
+                    .cloned()
+                    .collect();
+                let answer_tds: Vec<U256> = blocks
+                    .iter()
+                    .zip(tds.iter())
+                    .filter(|(b, _)| b.header.number < block_number)
+                    .map(|(_, td)| *td)
+                    .collect();
+                session.on_blocks(&answer, &answer_tds)
+            }
+        };
+        actions.extend(next);
+    }
+
+    assert!(
+        !matches!(session.failure(), Some(SnapFailure::OverstatedDifficulty { .. })),
+        "an honest peer was refused because the walk anchored above genesis: {:?}",
+        session.failure()
+    );
+    assert_eq!(session.phase(), Phase::Done, "failure: {:?}", session.failure());
+}

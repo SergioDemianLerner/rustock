@@ -43,7 +43,7 @@
 //! of work included, exactly as before. Pipelining changes when the questions
 //! are asked, not which answers are accepted.
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
 use rustock_core::validation::HeaderVerifier;
 use rustock_core::Header;
 use rustock_networking::protocol::BlockIdentifier;
@@ -119,6 +119,25 @@ pub struct HeaderWalk {
     need_hash: B256,
     done: bool,
 
+    /// Difficulty summed over every header the walk has verified.
+    ///
+    /// The checkpoint's total difficulty arrives as a claim and is written to
+    /// the store as this node's own, so it is worth establishing against the
+    /// chain actually walked. The walk reads every header anyway; adding them
+    /// up costs nothing and makes the claim checkable.
+    walked_difficulty: U256,
+
+    /// Total difficulty this node had already established at the block the
+    /// walk anchored on.
+    ///
+    /// The walk stops at the first block this node already holds, which is
+    /// usually but not always genesis. `walked_difficulty` is therefore the
+    /// work of the walked *segment*, while the claim it is checked against is
+    /// cumulative from genesis. Without this the two are different quantities,
+    /// and comparing them refuses an honest peer by whatever the node already
+    /// had below the anchor.
+    anchor_difficulty: Option<U256>,
+
     /// Blocks strictly below this may be frozen: `top - FREEZE_DEPTH`.
     freeze_horizon: u64,
     /// Headers written against a checkpoint that is still only a peer's claim.
@@ -185,9 +204,31 @@ impl HeaderWalk {
             need_number: number,
             need_hash: top_hash,
             done: false,
+            walked_difficulty: U256::ZERO,
+            anchor_difficulty: None,
             freeze_horizon: number.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
             staging,
         }
+    }
+
+    /// Difficulty summed across every header verified so far.
+    ///
+    /// Once the walk is done this is the work of the whole chain below the
+    /// checkpoint, and a peer's claimed cumulative difficulty may not exceed
+    /// it by more than the checkpoint block's own difficulty.
+    pub fn walked_difficulty(&self) -> U256 {
+        self.walked_difficulty
+    }
+
+    /// The cumulative difficulty the walked chain implies at the checkpoint,
+    /// once the walk has anchored: what this node already had at the anchor,
+    /// plus every header the walk verified above it.
+    ///
+    /// `None` until the walk anchors, because until then the chain below is
+    /// still the peer's word and nothing has been established.
+    pub fn established_difficulty(&self) -> Option<U256> {
+        self.anchor_difficulty
+            .map(|anchor| anchor.saturating_add(self.walked_difficulty))
     }
 
     /// The height the walk started from.
@@ -340,6 +381,7 @@ impl HeaderWalk {
         })?;
 
         for header in headers {
+            self.walked_difficulty = self.walked_difficulty.saturating_add(header.difficulty);
             let _ = self.store.put_header_with_hash(header.hash(), header);
         }
 
@@ -413,6 +455,16 @@ impl HeaderWalk {
             // Reached ground this node already accepted: everything above is
             // now anchored to work it had already taken.
             if self.is_ours(self.need_number, self.need_hash) {
+                // Record what this node had already established here, so the
+                // walked work can be compared against a claim measured from
+                // genesis rather than from wherever the walk happened to stop.
+                self.anchor_difficulty = Some(
+                    self.store
+                        .total_difficulty(self.need_hash)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                );
                 self.done = true;
                 self.commit_freezer();
                 break;
