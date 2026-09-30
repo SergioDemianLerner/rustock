@@ -5534,3 +5534,175 @@ async fn unlinked_headers_do_not_interrupt_a_sync_in_progress() {
         "a sync in progress was derailed: {:?}", service.state
     );
 }
+
+// -- Chunk identification ------------------------------------------------
+
+/// A skeleton entry for a header, as the peer would have offered it.
+fn entry_for(h: &Header) -> BlockIdentifier {
+    BlockIdentifier { hash: h.hash(), number: h.number }
+}
+
+/// A contiguous run of headers ending at `top`, newest last.
+fn run_of(top: u64, len: u64) -> Vec<Header> {
+    let mut out = Vec::new();
+    let mut parent = B256::repeat_byte(0x11);
+    for n in (top + 1 - len)..=top {
+        let h = dummy_header(n, parent, U256::from(1));
+        parent = h.hash();
+        out.push(h);
+    }
+    out
+}
+
+/// The honest case, which matters most: a chunk that really is the answer to
+/// the question is still accepted. A matcher that rejects these stalls the
+/// download.
+#[test]
+fn an_honest_chunk_is_identified() {
+    let chunk = run_of(500, 20);
+    let skeleton = vec![
+        entry_for(&run_of(300, 1)[0]),
+        entry_for(chunk.last().unwrap()),
+        entry_for(&run_of(700, 1)[0]),
+    ];
+    assert_eq!(
+        crate::service::identify_chunk_by_content(&chunk, &skeleton),
+        Some(1)
+    );
+}
+
+/// Order is not something a peer has to get right for us: the matcher works
+/// off the highest and lowest numbers, not the position in the vector.
+#[test]
+fn a_descending_chunk_is_still_identified() {
+    let mut chunk = run_of(500, 20);
+    let skeleton = vec![entry_for(chunk.last().unwrap())];
+    chunk.reverse();
+    assert_eq!(
+        crate::service::identify_chunk_by_content(&chunk, &skeleton),
+        Some(0)
+    );
+}
+
+/// The point of matching by hash. A chunk from another chain tops out at the
+/// right height, and under number-only matching it was accepted as the answer
+/// to a question about a different block.
+#[test]
+fn a_chunk_from_another_chain_at_the_right_height_is_refused() {
+    let ours = run_of(500, 20);
+    let skeleton = vec![entry_for(ours.last().unwrap())];
+
+    let mut theirs = run_of(500, 20);
+    theirs[19] = dummy_header(500, B256::repeat_byte(0xee), U256::from(1));
+    assert_ne!(theirs[19].hash(), ours[19].hash(), "different blocks at #500");
+
+    assert_eq!(
+        crate::service::identify_chunk_by_content(&theirs, &skeleton),
+        None,
+        "a matching height is not evidence that this is the chunk we asked for"
+    );
+}
+
+/// A chunk is a contiguous run. One with a hole covers less than it claims,
+/// and accepting it leaves a gap in the canonical index.
+#[test]
+fn a_chunk_with_a_hole_is_refused() {
+    let mut chunk = run_of(500, 20);
+    chunk.remove(5);
+    let skeleton = vec![entry_for(chunk.last().unwrap())];
+    assert_eq!(
+        crate::service::identify_chunk_by_content(&chunk, &skeleton),
+        None
+    );
+}
+
+/// Padding a chunk with repeats makes it look longer than the range it spans.
+#[test]
+fn a_chunk_padded_with_duplicates_is_refused() {
+    let mut chunk = run_of(500, 20);
+    let dup = chunk[3].clone();
+    chunk.insert(4, dup);
+    let skeleton = vec![entry_for(chunk.last().unwrap())];
+    assert_eq!(
+        crate::service::identify_chunk_by_content(&chunk, &skeleton),
+        None
+    );
+}
+
+/// A short chunk is still a contiguous run ending at the entry asked about,
+/// so it identifies: peers are allowed to answer with less than was requested.
+#[test]
+fn a_short_but_contiguous_chunk_is_identified() {
+    let chunk = run_of(500, 3);
+    let skeleton = vec![entry_for(chunk.last().unwrap())];
+    assert_eq!(
+        crate::service::identify_chunk_by_content(&chunk, &skeleton),
+        Some(0)
+    );
+}
+
+/// Nothing to identify.
+#[test]
+fn an_empty_chunk_identifies_nothing() {
+    assert_eq!(crate::service::identify_chunk_by_content(&[], &[]), None);
+}
+/// A head that cannot be reached from the executed head is re-seated onto one
+/// that can.
+///
+/// The node used to report this and do nothing about it: the invariant
+/// checker named the break correctly, every tick, while execution asked for
+/// the blocks across it, failed, and retried from the same place. Correct
+/// diagnosis, no recovery — the node stood still and stayed still.
+#[tokio::test]
+async fn a_head_unreachable_from_the_executed_head_is_reseated() {
+    let (store, _dir, headers) = linked_chain(10);
+
+    // Executed to #5, and the chain is intact to #10.
+    let executed = &headers[5];
+    store.set_exec_head(executed.hash(), executed.state_root).unwrap();
+
+    // A head far above, with nothing in between: the canonical index has one
+    // entry up there and a hole the whole way down.
+    let stranded = dummy_header(1_000, B256::repeat_byte(0x99), U256::from(1));
+    store.put_header_with_hash(stranded.hash(), &stranded).unwrap();
+    store.put_canonical_hash(1_000, stranded.hash()).unwrap();
+    store.update_canonical_chain(stranded.hash()).unwrap();
+    assert_eq!(store.head().unwrap(), Some(stranded.hash()), "test setup");
+
+    let mut service = service_over(store.clone());
+    service.verify_coherence();
+
+    let head = store.head().unwrap().expect("a head");
+    assert_ne!(head, stranded.hash(), "the unreachable head must not survive");
+    let seated = store.header(head).unwrap().expect("header for the new head");
+    assert!(
+        (5..=10).contains(&seated.number),
+        "the head must land on the contiguous run above the executed head, got #{}",
+        seated.number
+    );
+}
+
+/// The re-seat never moves the head below what has already been executed:
+/// that would be undoing work, not repairing a break.
+#[tokio::test]
+async fn reseating_never_goes_below_the_executed_head() {
+    let (store, _dir, headers) = linked_chain(10);
+    let executed = &headers[8];
+    store.set_exec_head(executed.hash(), executed.state_root).unwrap();
+
+    let stranded = dummy_header(2_000, B256::repeat_byte(0x55), U256::from(1));
+    store.put_header_with_hash(stranded.hash(), &stranded).unwrap();
+    store.put_canonical_hash(2_000, stranded.hash()).unwrap();
+    store.update_canonical_chain(stranded.hash()).unwrap();
+
+    let mut service = service_over(store.clone());
+    service.verify_coherence();
+
+    let head = store.head().unwrap().expect("a head");
+    let seated = store.header(head).unwrap().expect("header");
+    assert!(
+        seated.number >= 8,
+        "the head must not drop below the executed head #8, got #{}",
+        seated.number
+    );
+}

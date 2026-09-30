@@ -94,6 +94,12 @@ pub enum SnapFailure {
     IncompleteState(String),
     #[error("{0} chunk requests in a row came back with nothing usable")]
     NoProgress(u32),
+    #[error(
+        "the peer claimed cumulative difficulty {claimed} at the checkpoint but the chain          it served carries at most {ceiling}"
+    )]
+    OverstatedDifficulty { claimed: U256, ceiling: U256 },
+    #[error("the peer would not substantiate its claimed difficulty: {why}")]
+    UnsubstantiatedClaim { why: String },
     #[error("block #{number}: the {what} are not the ones its header commits to")]
     BadBody { number: u64, what: &'static str },
 }
@@ -127,6 +133,14 @@ pub enum ChunkFault {
 pub enum Phase {
     /// Waiting to hear what any peer can serve.
     AwaitingStatus,
+    /// Bounding the peer's claimed cumulative difficulty before committing to
+    /// the walk.
+    ///
+    /// The walk costs about twenty-five minutes and ten gigabytes on a
+    /// mainnet chain, all of it on the strength of a checkpoint this peer
+    /// offered. Sampling a few hundred headers first turns that into a
+    /// verdict up front.
+    SamplingClaim,
     /// Walking the header chain back toward a block we already trust.
     VerifyingHeaders,
     /// Downloading the state under the checkpoint's root.
@@ -175,6 +189,9 @@ pub struct SnapSession {
     /// The next `SnapBlocks` request to make, walking backwards.
     blocks_cursor: u64,
     blocks_in_flight: bool,
+    /// Bounds the peer's claimed cumulative difficulty before the walk is
+    /// committed to. `None` once the verdict is in.
+    gate: Option<crate::sampler::SamplingGate>,
     /// When the current phase began, and when it last said so.
     phase_started: Instant,
     last_report: Instant,
@@ -208,6 +225,7 @@ impl SnapSession {
             blocks_wanted_to: 0,
             blocks_cursor: 0,
             blocks_in_flight: false,
+            gate: None,
             phase_started: Instant::now(),
             last_report: Instant::now(),
             fruitless_blocks: 0,
@@ -369,6 +387,49 @@ impl SnapSession {
         match self.phase {
             Phase::AwaitingStatus => vec![Action::RequestStatus],
 
+            Phase::SamplingClaim => {
+                use crate::sampler::{GateAction, GateOutcome, GateRejection};
+                let Some(gate) = self.gate.as_mut() else {
+                    self.set_phase(Phase::VerifyingHeaders);
+                    return self.poll();
+                };
+                let actions = gate.poll();
+                match gate.outcome() {
+                    GateOutcome::Pending => actions
+                        .into_iter()
+                        .map(|a| match a {
+                            GateAction::RequestSkeleton { start } => {
+                                Action::RequestSkeleton { start }
+                            }
+                            GateAction::RequestHeader { hash, .. } => {
+                                Action::RequestHeaders { from: hash, count: 1, point: 0 }
+                            }
+                        })
+                        .collect(),
+                    GateOutcome::Passed { ceiling } => {
+                        info!(
+                            target: "rustock::snap",
+                            "the peer's claimed difficulty is within what its chain could \
+                             carry (ceiling {ceiling}); verifying its header chain"
+                        );
+                        self.gate = None;
+                        self.set_phase(Phase::VerifyingHeaders);
+                        self.poll()
+                    }
+                    GateOutcome::Rejected(why) => match why {
+                        GateRejection::AboveCeiling { claimed, ceiling }
+                        | GateRejection::BelowCheckpoint { claimed, allowed: ceiling } => {
+                            self.fail(SnapFailure::OverstatedDifficulty { claimed, ceiling })
+                        }
+                        GateRejection::Unsubstantiated { missing } => {
+                            self.fail(SnapFailure::UnsubstantiatedClaim {
+                                why: format!("{missing} sample(s) went unanswered"),
+                            })
+                        }
+                    },
+                }
+            }
+
             Phase::VerifyingHeaders => {
                 let Some(walk) = self.walk.as_mut() else { return Vec::new() };
                 walk.wants(budget)
@@ -471,6 +532,28 @@ impl SnapSession {
         self.checkpoint_td = *difficulties.last().unwrap_or(&U256::ZERO);
         self.offered = blocks.iter().cloned().zip(difficulties.iter().copied()).collect();
 
+        // Bound the claim before committing to the walk. The walk costs about
+        // twenty-five minutes on a mainnet chain and rests entirely on this
+        // peer's offer; a few hundred sampled headers settle it first.
+        //
+        // The anchor is this node's own chain where it has one -- its own
+        // accumulated work is better evidence than a shipped constant, and
+        // more recent. The checkpoint is the fallback for a node with nothing
+        // of its own, which is the case snapshot sync runs in.
+        if let Some(checkpoint) = self.config.checkpoint {
+            if header.number > checkpoint.number {
+                self.gate = Some(crate::sampler::SamplingGate::new(
+                    checkpoint,
+                    self.checkpoint_td,
+                    header.number,
+                    self.config.difficulty_divisor,
+                    self.config.min_difficulty,
+                    super::headers::HEADER_CHUNK * super::headers::SKELETON_POINTS,
+                ));
+                self.set_phase(Phase::SamplingClaim);
+            }
+        }
+
         self.walk = Some(super::headers::HeaderWalk::new(
             header.clone(),
             self.store.clone(),
@@ -478,13 +561,29 @@ impl SnapSession {
         ));
 
         self.checkpoint = Some(header);
-        self.set_phase(Phase::VerifyingHeaders);
+        // The walk is built either way, but the gate — when there is one —
+        // decides whether it runs. Only move to the walk if nothing is
+        // bounding the claim first.
+        if self.phase != Phase::SamplingClaim {
+            self.set_phase(Phase::VerifyingHeaders);
+        }
         self.poll()
     }
 
     /// Headers walking back from the checkpoint, newest first, as rskj's
     /// `BlockHeadersResponse` delivers them.
     pub fn on_headers(&mut self, point: u64, headers: &[Header]) -> Vec<Action> {
+        // While the claim is being bounded, headers are samples rather than
+        // chain: each is checked against the identifier it was asked for and
+        // its own proof of work, and only its difficulty is kept.
+        if self.phase == Phase::SamplingClaim {
+            if let Some(gate) = self.gate.as_mut() {
+                for header in headers {
+                    gate.on_header(header, self.verifier.as_ref());
+                }
+            }
+            return self.poll();
+        }
         if self.phase != Phase::VerifyingHeaders {
             return Vec::new();
         }
@@ -522,6 +621,14 @@ impl SnapSession {
     /// Block identifiers telling the walk where to ask next. Claims about
     /// where blocks sit, believed only as far as the runs they lead to link.
     pub fn on_skeleton(&mut self, identifiers: &[BlockIdentifier]) -> Vec<Action> {
+        if self.phase == Phase::SamplingClaim {
+            if let Some(gate) = self.gate.as_mut() {
+                let ids: Vec<(u64, B256)> =
+                    identifiers.iter().map(|i| (i.number, i.hash)).collect();
+                gate.on_skeleton(&ids);
+            }
+            return self.poll();
+        }
         if self.phase != Phase::VerifyingHeaders {
             return Vec::new();
         }
@@ -613,6 +720,25 @@ impl SnapSession {
                 ),
             }
             let _ = self.store.set_head(hash);
+        }
+
+        // The walk has read every header from the checkpoint down to a block
+        // this node already trusted, so the work of that chain is known. The
+        // claimed cumulative difficulty may exceed it only by the checkpoint
+        // block's own difficulty -- the one header the walk never visits as a
+        // candidate.
+        //
+        // The claim is written as this node's own total difficulty at the
+        // checkpoint, so it is worth establishing rather than accepting.
+        if let Some(established) = self.walk.as_ref().and_then(|w| w.established_difficulty()) {
+            let ceiling = established
+                .saturating_add(checkpoint.as_ref().map_or(U256::ZERO, |h| h.difficulty));
+            if self.checkpoint_td > ceiling {
+                return self.fail(SnapFailure::OverstatedDifficulty {
+                    claimed: self.checkpoint_td,
+                    ceiling,
+                });
+            }
         }
 
         info!(
