@@ -27,11 +27,11 @@
 
 use clap::parser::ValueSource;
 use clap::ArgMatches;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Settings the file may supply. Every field is optional: absent means "leave
 /// whatever the command line or the default decided".
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     #[serde(default)]
@@ -58,7 +58,7 @@ pub struct FileConfig {
     pub snapshot: SnapshotSection,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSection {
     pub port: Option<u16>,
@@ -73,7 +73,7 @@ pub struct NodeSection {
     pub rskj_multisig_senders: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RpcSection {
     pub host: Option<String>,
@@ -92,7 +92,7 @@ pub struct RpcSection {
 }
 
 /// Snapshot sync, off on both sides by default (rskj ships it the same way).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotSection {
     /// Serve snapshots of this node's state to peers that ask.
@@ -118,7 +118,7 @@ pub struct SnapshotSection {
     pub total_rate: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeersSection {
     pub max_peers: Option<usize>,
@@ -142,7 +142,7 @@ pub struct PeersSection {
     pub closed_network: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrieSection {
     pub backend: Option<String>,
@@ -155,7 +155,7 @@ pub struct TrieSection {
     pub read_threads: Option<usize>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GcSection {
     pub epochs: Option<usize>,
@@ -164,7 +164,7 @@ pub struct GcSection {
     pub check_secs: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PruneSection {
     pub keep_depth: Option<u64>,
@@ -181,7 +181,7 @@ pub struct PruneSection {
     pub no_freezer: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MiningSection {
     pub enabled: Option<bool>,
@@ -190,7 +190,7 @@ pub struct MiningSection {
     pub refresh_secs: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitSection {
     pub enabled: Option<bool>,
@@ -200,7 +200,7 @@ pub struct RateLimitSection {
     pub gas_per_second_percent: Option<f64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogSection {
     pub level: Option<String>,
@@ -209,7 +209,7 @@ pub struct LogSection {
     pub timezone: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertsSection {
     pub alerts_config: Option<String>,
@@ -537,6 +537,68 @@ mod tests {
                 "`{listed}` is listed but is not a flag"
             );
         }
+    }
+
+    /// Every configurable option must appear in the shipped example.
+    ///
+    /// The weaker test below checks that the example parses and names every
+    /// section; it passed for a long time while eighteen of fifty-three
+    /// options were undocumented, including a `[snapshot]` section that was
+    /// missing outright. "Covers every section" is not "covers every option",
+    /// and an operator reading the example has no way to discover what it
+    /// leaves out.
+    ///
+    /// Done by reflection rather than by a list, because a list is one more
+    /// thing to forget: the example is parsed with its commented-out keys
+    /// uncommented, serialised, and checked for any field still `null`. A new
+    /// option is a new `None`, and fails here until it is documented.
+    #[test]
+    fn the_example_documents_every_option() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../node.example.toml");
+        let raw = std::fs::read_to_string(path).expect("example file");
+
+        // Uncomment `# key = value`, which is how an optional setting is shown.
+        // Prose comments do not match: the line must be a bare lowercase key
+        // followed by `=`.
+        let uncommented: String = raw
+            .lines()
+            .map(|line| {
+                let t = line.trim_start();
+                let Some(rest) = t.strip_prefix('#') else { return line.to_string() };
+                let rest = rest.trim_start();
+                let is_setting = rest
+                    .split_once('=')
+                    .is_some_and(|(k, _)| {
+                        let k = k.trim();
+                        !k.is_empty()
+                            && k.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+                    });
+                if is_setting { rest.to_string() } else { line.to_string() }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let cfg: FileConfig = toml::from_str(&uncommented)
+            .expect("the example must still parse once its optional keys are uncommented");
+        let value = serde_json::to_value(&cfg).expect("serialise");
+
+        let mut undocumented = Vec::new();
+        let serde_json::Value::Object(sections) = &value else { panic!("expected sections") };
+        for (section, body) in sections {
+            let serde_json::Value::Object(fields) = body else { continue };
+            for (field, v) in fields {
+                if v.is_null() {
+                    undocumented.push(format!("[{section}] {field}"));
+                }
+            }
+        }
+        undocumented.sort();
+        assert!(
+            undocumented.is_empty(),
+            "these options are configurable but absent from node.example.toml, so nothing \
+             tells an operator they exist:\n  {}",
+            undocumented.join("\n  ")
+        );
     }
 
     /// The shipped example must parse, and must exercise every section.

@@ -30,6 +30,8 @@ admin = false                      # enables rsk_collectTrie, rsk_pruneBlocks, �
 disabled = false                   # true is the same as --no-rpc
 logs_max_blocks = 10000            # widest eth_getLogs span; rskj's rpc.logs.maxBlocksToQuery is 5000
 dev = false                        # evm_* namespace: snapshot/revert/mine — development chains only
+ws = false                         # WebSocket JSON-RPC, for eth_subscribe
+ws_port = 4445
 
 [peers]
 max_peers = 25
@@ -38,6 +40,12 @@ max_inbound_per_ip = 2
 max_inbound_per_cidr = 4
 inbound_cidr_prefix = 24
 # bootnodes = ["127.0.0.1:30304"]   # replaces the chain's built-in list; port is listen+1
+# banned_peers = ["203.0.113.0/24"] # refused at connection time; rskj's peer.bannedPeerIPs
+no_peer_punishment = false         # count scoring events but never act on them
+# Never learn node ids from peers and never dial them. With `bootnodes` this
+# pins the node to exactly the addresses named there, which is what makes a
+# controlled two-node test trustworthy; on its own it only stops discovery.
+closed_network = false
 
 [trie]
 backend = "epoch"                  # epoch | single
@@ -51,6 +59,10 @@ backend = "epoch"                  # epoch | single
 # ~200 bytes per entry; 0 disables.
 btc_block_cache_entries = 10000
 
+# Threads for parallel reads: the snapshot-sync client, the trie store, and the
+# one-shot state verifier. Defaults to the core count, clamped to at least 1.
+# read_threads = 16
+
 # Trie garbage collection. `burial` must exceed the deepest reorg worth
 # surviving: collecting against a root that is later reorganised away discards
 # state the chain needs to rebuild.
@@ -60,13 +72,57 @@ rotate_mb = 1024
 burial = 4000
 check_secs = 60
 
-# Block-history pruning. Nothing is deleted unless rsk_pruneBlocks is called,
-# which needs rpc.admin; these only set the boundary it uses. `keep_depth` is
-# clamped up to 8000 whatever is given — 4000 for reorg tolerance plus 4000 for
-# the block-info precompiles, which a re-executed block may itself reach through.
+# Block-history pruning: bodies, receipts, the transaction index, headers and
+# the canonical mapping, for blocks far enough behind.
+#
+# Off by default, and deliberately. Turning it on is not a tuning change — it
+# discards history that only a resync restores, and `eth_getTransactionReceipt`
+# stops answering for a pruned height. Bridge events are KEPT: they live in
+# their own index, self-contained, and are what the peg is debugged from.
+# Genesis is always retained.
+#
+# `keep_depth` is clamped up to 8000 whatever is given — 4000 for reorg
+# tolerance plus 4000 for the block-info precompiles and REMASC's maturity,
+# which a re-executed block may itself reach through. The depth is measured
+# from the block this node has EXECUTED to, not from the best header it holds:
+# on a snapshot-synced node those differ by thousands of blocks, and measuring
+# from the header would delete what execution has not reached yet.
+#
+# Sweeps never run until the node has settled into ordinary sync, so a
+# snapshot sync's blocks are never swept while it is still fetching them.
+# `rsk_pruneBlocks` (needs rpc.admin) forces one sweep with the same clamps.
 [prune]
+blocks = false                     # run sweeps at all
 keep_depth = 100000
-max_batch = 50000
+max_batch = 50000                  # most blocks one sweep may remove
+every_secs = 300                   # seconds between sweeps
+# Delete headers from the block database once the freezer holds them. Every
+# lookup by hash for those blocks then depends on the freezer.
+frozen_headers = false
+no_freezer = false                 # do not run the header freezer at all
+
+# Snapshot sync: catch up by downloading a state rather than executing into
+# one. The header chain is verified to the snapshot point first — a snapshot is
+# only trustworthy because the walk vouches for the checkpoint it hangs from.
+[snapshot]
+sync = false                       # act as a client
+server = false                     # serve snapshots to peers that ask
+# Blocks of history to download below the checkpoint. These are the blocks the
+# node holds once the sync is done. Setting this above prune.keep_depth is how
+# a pruning node is given its first sweep's work.
+blocks = 6000
+chunk_bytes = 100000               # state bytes per chunk request
+chunk_grid = 100000                # offset grid chunks sit on; changing it
+                                   # invalidates a server's cached cells
+parallel = 8                       # chunk requests in flight, across all peers
+# Fill the canonical index for history below the checkpoint window after a
+# snapshot sync. Costs ~0.4 GB and, on a cold store, up to an hour and a half
+# of low-priority background disk; resumable, and it stops at the prune floor.
+# Without it this node can answer RPC about its window only, and cannot help
+# anyone else sync past it.
+index_history = true
+peer_rate = 8388608                # state bytes/s served to ONE peer
+total_rate = 33554432              # state bytes/s this server produces in total
 
 [mining]
 enabled = false                    # serve the mnr_* namespace
