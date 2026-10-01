@@ -2825,6 +2825,17 @@ impl SyncService {
                 return;
             }
 
+            // A peer whose history starts above this skeleton cannot answer
+            // any chunk in it. Asking anyway costs a round trip and a timeout
+            // each, which is what the served range exists to avoid -- and
+            // silence still means "ask me anything", so this narrows nothing
+            // on a network of peers that do not state a range.
+            let lowest_needed = *connection_point;
+            let serving = self.peer_store.peers_serving(&peers, lowest_needed).await;
+            if !serving.is_empty() {
+                peers = serving;
+            }
+
             // Exclude sidelined (stalled) peers; if every peer is sidelined,
             // forgive them all rather than stalling the round.
             let now = Instant::now();
