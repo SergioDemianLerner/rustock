@@ -2399,6 +2399,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         .with_scoring(Some(scoring.clone()))
         .with_events(events.clone())
         .with_follow_up(args.follow_up)
+        .with_serve_ceiling(args.simulate_height)
         .with_exit_when_synced(args.exit_when_synced);
 
     if args.snap_sync {

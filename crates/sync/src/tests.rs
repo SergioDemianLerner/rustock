@@ -6143,3 +6143,99 @@ async fn a_following_node_adopts_the_same_push() {
         "the header is acceptable; only the instruction kept it out above"
     );
 }
+
+// -- Keeping a peer engaged ----------------------------------------------
+//
+// rskj refreshes a node's liveness only when a STATUS arrives:
+// `SyncPeerStatus.updateActivity` is called from its constructor and from
+// `setStatus`, and nowhere else. Block traffic, headers, bodies and
+// announcements all leave the clock untouched. After
+// `sync.expirationTimePeerStatus` — ten minutes — it drops the node from the
+// set it will sync from, while the connection stays up and looks healthy.
+//
+// rustock sent its status once, at the handshake. Observed: an rskj client
+// synced 12,096 blocks, logged "Completed syncing phase" fourteen minutes in,
+// and never started another round.
+
+/// The refresh must be well inside rskj's expiry, not merely under it.
+#[test]
+fn the_status_refresh_is_far_inside_rskj_expiry() {
+    let rskj_expiry = Duration::from_secs(10 * 60);
+    assert!(
+        crate::service::STATUS_REFRESH * 12 < rskj_expiry,
+        "a {}s refresh against a {}s expiry leaves no margin for a node that is busy, \
+         and the failure is silent: the peer stays connected and simply stops syncing",
+        crate::service::STATUS_REFRESH.as_secs(),
+        rskj_expiry.as_secs()
+    );
+    assert_eq!(
+        crate::service::STATUS_REFRESH,
+        Duration::from_secs(10),
+        "rskj broadcasts its own status every 10 seconds; matching it is the point"
+    );
+}
+
+/// The refreshed status says the same thing the handshake said.
+///
+/// A server simulating a shorter chain that then refreshed with its real head
+/// would tell one peer two different stories about where the chain ends, and
+/// the second one would undo the first.
+#[tokio::test]
+async fn a_refreshed_status_agrees_with_the_simulated_head() {
+    let (store, _dir, headers) = linked_chain(20);
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+
+    let service = SyncService::new(manager, peer_store, event_rx)
+        .with_serve_ceiling(Some(5));
+
+    let status = service.current_status_for_test().expect("a status");
+    assert_eq!(
+        status.best_block_number, 5,
+        "the refresh announced the real head, contradicting the handshake"
+    );
+    assert_eq!(status.best_block_hash, headers[5].hash());
+}
+
+/// Without a ceiling it announces the real head — and follows it.
+///
+/// Built from the store on each refresh rather than captured at startup,
+/// because on a following node the head moves. A status frozen at the height
+/// this node had when it started would have a peer believe it had stopped.
+#[tokio::test]
+async fn a_refreshed_status_tracks_the_head() {
+    let (store, _dir, headers) = linked_chain(20);
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let service = SyncService::new(manager, peer_store, event_rx);
+
+    let top = headers.last().unwrap();
+    let before = service.current_status_for_test().expect("a status");
+    assert_eq!(before.best_block_number, top.number);
+    assert!(
+        before.total_difficulty.is_some(),
+        "the status must carry total difficulty, which is what a peer picks a chain on"
+    );
+    assert!(
+        before.best_block_parent_hash.is_some(),
+        "and the parent, or the message is the two-element form and carries no difficulty"
+    );
+
+    // The head moves, as it does on a node that is following.
+    let next = dummy_header(top.number + 1, top.hash(), U256::from(10));
+    let next_td = store.total_difficulty(top.hash()).unwrap().unwrap() + U256::from(10);
+    store.update_head(&next, next_td).unwrap();
+
+    let after = service.current_status_for_test().expect("a status");
+    assert_eq!(
+        after.best_block_number,
+        top.number + 1,
+        "the refresh still announced the old head, so a peer would think this node \
+         had stopped"
+    );
+    assert_eq!(after.total_difficulty, Some(next_td));
+}
