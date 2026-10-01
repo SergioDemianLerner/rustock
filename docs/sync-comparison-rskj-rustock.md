@@ -182,6 +182,45 @@ The more interesting number is that the warm cache barely helps rskj -- 9%,
 against 19% for rustock. Its bottleneck over this range is not reading from the
 server.
 
+### Snapshot sync near the tip: not measurable, because the two cannot speak it
+
+The server was started frozen at the real head with `--read-only --follow-up
+false` and no simulated height, and it had a snapshot to offer:
+
+```
+INFO Snapshot server enabled: serving state at #(head - 10000)
+INFO Snapshot server: currently offering the state at #9275000
+```
+
+rskj recognised it, accepted it as a snapshot peer and began:
+
+```
+INFO syncprocessor     - Start Snap syncing with NodeID{b943d28d...}
+INFO snapshotprocessor - Starting Snap sync
+DEBUG snapshotprocessor - Sending request: [SNAP_STATUS_REQUEST_MESSAGE] with id: [1]
+```
+
+and then nothing. The request expired, was re-sent, expired again, and rskj
+restarted the whole sync -- about every ninety seconds, indefinitely, with a
+healthy connection and one peer. The rustock server logged **nothing at all**,
+at any level.
+
+The cause is one extra byte of framing. rskj writes a snap message as `[id,
+<the fields, as a list>]`; rustock wrapped that list in an RLP string as well,
+giving `[id, 0x81 0xc0]` where rskj writes `[id, 0xc0]`. The rustock decoder
+then *required* that string, so an rskj request was rejected before any handler
+saw it. rustock talked to rustock because both ends were wrong in the same way.
+
+Issue #238, fixed: rustock now writes rskj's bytes exactly, and reads both
+framings so that upgrading one end of a pair needs no flag day. **The snapshot
+comparison can be run once a server and a client on the fix are available; it
+has not been run.**
+
+That this was found at all is the argument for the exercise. Everything up to
+the first byte of payload was right -- matching message type numbers, working
+capability negotiation, rskj recognising the node as snap-capable and starting
+the sync -- and no amount of reading either codebase had turned it up.
+
 ### What this does not establish
 
 **10,000 blocks of early chain is not a representative sample.** These blocks
