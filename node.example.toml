@@ -6,7 +6,22 @@
 # Anything given on the command line wins, so a setting here can always be
 # overridden for one run without editing the file.
 #
-# Every key is optional; omitting one leaves the built-in default shown below.
+# EVERYTHING HERE IS COMMENTED OUT, on purpose. Copy this file, uncomment the
+# few settings you are changing, and the uncommented lines are then exactly
+# your changes -- there is no need to remember which of them you touched, or
+# to diff against the original to find out.
+#
+# A copy taken unchanged therefore does nothing at all; a test asserts that.
+#
+# Each line says what the node does without it:
+#
+#   # key = value   # default          the value shown IS the built-in default
+#   # key = ...     # default: unset   no built-in default; the value is an
+#                                      illustration of the shape expected
+#
+# A test checks every one of those claims against the node's real defaults, so
+# this file can be read as the authoritative statement of what the node does
+# when left alone.
 # Unknown keys are an ERROR rather than being ignored, so a typo is reported
 # instead of silently leaving a setting at its default.
 #
@@ -15,62 +30,69 @@
 # node that re-ran an import on every start would be a trap, not a convenience.
 
 [node]
-port = 30303                       # P2P listen port
-data_dir = "./rustock-data"        # database and node key
-network_id = 30                    # 30 mainnet, 31 testnet
-# secret_key = "…"                 # hex node key; generated and stored if unset
-# external_ip = "203.0.113.1"      # advertised address; 127.0.0.1 if unset
-supply_check = "per-block"         # off | per-block | per-transaction
-rskj_multisig_senders = "on"       # on | off — emulate rskj multisig peg-in senders
+# port = 30303                      # default — P2P listen port
+# data_dir = "./data"               # default — database and node key
+# network_id = 30                   # default — 30 mainnet, 31 testnet
+# secret_key = "…"                  # default: unset — hex node key; generated and stored if unset
+# external_ip = "203.0.113.1"       # default: unset — advertised address; 127.0.0.1 if unset
+# off | per-block | per-transaction | both. Per-transaction is strictly more
+# sensitive: block-level netting hides a creation when one transaction mints
+# and another destroys the same amount. "both" keeps per-block as a cross-check
+# that the per-transaction deltas account for the whole block.
+# supply_check = "both"             # default
+# rskj_multisig_senders = "on"      # default — on | off — emulate rskj multisig peg-in senders
 
 [rpc]
-host = "127.0.0.1"
-port = 4444
-admin = false                      # enables rsk_collectTrie, rsk_pruneBlocks, …
-disabled = false                   # true is the same as --no-rpc
-logs_max_blocks = 10000            # widest eth_getLogs span; rskj's rpc.logs.maxBlocksToQuery is 5000
-dev = false                        # evm_* namespace: snapshot/revert/mine — development chains only
-ws = false                         # WebSocket JSON-RPC, for eth_subscribe
-ws_port = 4445
+# host = "127.0.0.1"                # default
+# port = 4444                       # default
+# admin = false                     # default — enables rsk_collectTrie, rsk_pruneBlocks, …
+# disabled = false                  # default — true is the same as --no-rpc
+# logs_max_blocks = 10000           # default — widest eth_getLogs span; rskj's rpc.logs.maxBlocksToQuery is 5000
+# dev = false                       # default — evm_* namespace: snapshot/revert/mine — development chains only
+# ws = false                        # default — WebSocket JSON-RPC, for eth_subscribe
+# ws_port = 4445                    # default
 
 [peers]
-max_peers = 25
-max_inbound_peers = 10
-max_inbound_per_ip = 2
-max_inbound_per_cidr = 4
-inbound_cidr_prefix = 24
-# bootnodes = ["127.0.0.1:30304"]   # replaces the chain's built-in list; port is listen+1
-# banned_peers = ["203.0.113.0/24"] # refused at connection time; rskj's peer.bannedPeerIPs
-no_peer_punishment = false         # count scoring events but never act on them
+# max_peers = 25                    # default
+# max_inbound_peers = 32            # default
+# max_inbound_per_ip = 4            # default
+# max_inbound_per_cidr = 16         # default
+# inbound_cidr_prefix = 24          # default
+# bootnodes = ["127.0.0.1:30304"]   # default: unset — replaces the chain's built-in list; port is listen+1
+# banned_peers = ["203.0.113.0/24"] # default: unset — refused at connection time; rskj's peer.bannedPeerIPs
+# no_peer_punishment = false        # default — count scoring events but never act on them
 # Never learn node ids from peers and never dial them. With `bootnodes` this
 # pins the node to exactly the addresses named there, which is what makes a
 # controlled two-node test trustworthy; on its own it only stops discovery.
-closed_network = false
+# closed_network = false            # default
 
 [trie]
-backend = "epoch"                  # epoch | single
-# dir = "/var/lib/rustock/trie-epochs"
-# node = "…"                       # diagnostic: start from this state root
-
+# single | external | epoch. "single" keeps every historical version in the
+# main database and grows without bound; "epoch" bounds the size by reclaiming
+# state older than the retention window, which means historical state queries
+# below that window stop working. That is a real trade, so it is opt-in — but
+# "epoch" is what a node that is not an archive wants.
+# backend = "single"                # default
+# dir = "/var/lib/rustock/trie-epochs"# default: unset
+# node = "…"                        # default: unset — diagnostic: start from this state root
 # BTC stored-block cache. Answering "which BTC block is at height H?" costs one
 # trie read per block of depth whenever the RSKIP199 height index cannot answer.
 # The cache holds blocks already read for consensus -- it never pre-loads and
 # never records an absence -- so it changes latency and nothing else.
 # ~200 bytes per entry; 0 disables.
-btc_block_cache_entries = 10000
+# btc_block_cache_entries = 10000   # default
 
 # Threads for parallel reads: the snapshot-sync client, the trie store, and the
 # one-shot state verifier. Defaults to the core count, clamped to at least 1.
-# read_threads = 16
-
+# read_threads = 16                 # default
 # Trie garbage collection. `burial` must exceed the deepest reorg worth
 # surviving: collecting against a root that is later reorganised away discards
 # state the chain needs to rebuild.
 [gc]
-epochs = 4
-rotate_mb = 1024
-burial = 4000
-check_secs = 60
+# epochs = 4                        # default
+# rotate_mb = 1024                  # default
+# burial = 4000                     # default
+# check_secs = 60                   # default
 
 # Block-history pruning: bodies, receipts, the transaction index, headers and
 # the canonical mapping, for blocks far enough behind.
@@ -92,64 +114,63 @@ check_secs = 60
 # snapshot sync's blocks are never swept while it is still fetching them.
 # `rsk_pruneBlocks` (needs rpc.admin) forces one sweep with the same clamps.
 [prune]
-blocks = false                     # run sweeps at all
-keep_depth = 100000
-max_batch = 50000                  # most blocks one sweep may remove
-every_secs = 300                   # seconds between sweeps
+# blocks = false                    # default — run sweeps at all
+# keep_depth = 100000               # default
+# max_batch = 50000                 # default — most blocks one sweep may remove
+# every_secs = 300                  # default — seconds between sweeps
 # Delete headers from the block database once the freezer holds them. Every
 # lookup by hash for those blocks then depends on the freezer.
-frozen_headers = false
-no_freezer = false                 # do not run the header freezer at all
+# frozen_headers = false            # default
+# no_freezer = false                # default — do not run the header freezer at all
 
 # Snapshot sync: catch up by downloading a state rather than executing into
 # one. The header chain is verified to the snapshot point first — a snapshot is
 # only trustworthy because the walk vouches for the checkpoint it hangs from.
 [snapshot]
-sync = false                       # act as a client
-server = false                     # serve snapshots to peers that ask
+# sync = false                      # default — act as a client
+# server = false                    # default — serve snapshots to peers that ask
 # Blocks of history to download below the checkpoint. These are the blocks the
 # node holds once the sync is done. Setting this above prune.keep_depth is how
 # a pruning node is given its first sweep's work.
-blocks = 6000
-chunk_bytes = 100000               # state bytes per chunk request
-chunk_grid = 100000                # offset grid chunks sit on; changing it
+# blocks = 6000                     # default
+# chunk_bytes = 100000              # default — state bytes per chunk request
+# chunk_grid = 100000               # default — offset grid chunks sit on; changing it
                                    # invalidates a server's cached cells
-parallel = 8                       # chunk requests in flight, across all peers
+# parallel = 8                      # default — chunk requests in flight, across all peers
 # Fill the canonical index for history below the checkpoint window after a
 # snapshot sync. Costs ~0.4 GB and, on a cold store, up to an hour and a half
 # of low-priority background disk; resumable, and it stops at the prune floor.
 # Without it this node can answer RPC about its window only, and cannot help
 # anyone else sync past it.
-index_history = true
-peer_rate = 8388608                # state bytes/s served to ONE peer
-total_rate = 33554432              # state bytes/s this server produces in total
+# index_history = true              # default
+# peer_rate = 8388608               # default — state bytes/s served to ONE peer
+# total_rate = 33554432             # default — state bytes/s this server produces in total
 
 [mining]
-enabled = false                    # serve the mnr_* namespace
-# coinbase = "0x…"                 # REQUIRED when enabled
-extra_data = ""                    # at most 32 bytes
-refresh_secs = 60
+# enabled = false                   # default — serve the mnr_* namespace
+# coinbase = "0x…"                  # default: unset — REQUIRED when enabled
+# extra_data = ""                   # default — at most 32 bytes
+# refresh_secs = 60                 # default
 
 # Per-account virtual gas quota (rskj TxQuotaChecker). An account accumulates
 # quota while idle and spends it when broadcasting, so one that floods the
 # mempool is refused here and not relayed onward. Ordinary use never reaches it.
 [account_tx_rate_limit]
-enabled = true
-cleaner_period = 30                # minutes; 0 or negative disables the sweep
-max_accounts = 400000
-quota_multiplier = 2000            # seconds of idleness an account may bank
-gas_per_second_percent = 0.9       # of the block gas limit, accrued per second
+# enabled = true                    # default
+# cleaner_period = 30               # default — minutes; 0 or negative disables the sweep
+# max_accounts = 400000             # default
+# quota_multiplier = 2000           # default — seconds of idleness an account may bank
+# gas_per_second_percent = 0.9      # default — of the block gas limit, accrued per second
 
 [log]
-level = "info"
-to_stdout = false                  # true when run under systemd (journald)
+# level = "info"                    # default
+# to_stdout = false                 # default — true when run under systemd (journald)
 # Timezone for log timestamps: "utc" (default), "local", or a fixed UTC
 # offset. Timestamps stay RFC 3339, so the offset is part of every line:
 # UTC prints ...T21:13:45.9+00:00, "-03:00" prints ...T18:13:45.9-03:00.
 # "local" is read once at start-up and then held, so it does not follow a
 # daylight-saving change; a fixed offset says so plainly, and is exactly
 # right for zones without DST (Argentina has had none since 2009).
-# timezone = "-03:00"
-
+# timezone = "utc"                  # default — or "local", or a fixed offset like "-03:00"
 [alerts]
-# alerts_config = "/etc/rustock/alerts.toml"
+# alerts_config = "/etc/rustock/alerts.toml"# default: unset
