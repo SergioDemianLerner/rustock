@@ -11,9 +11,10 @@
 //!
 //! - **Reorg tolerance.** The node must be able to rebuild from a
 //!   reorganisation up to `D` blocks deep, which needs the blocks themselves.
-//! - **Block-info precompiles.** Rootstock exposes precompiles that read
-//!   attributes of recent blocks, reaching up to 4,000 blocks back. Executing a
-//!   block at height `h` may therefore read data from `h - 4000`.
+//! - **Block-info precompiles, and REMASC.** Rootstock exposes precompiles that
+//!   read attributes of recent blocks, reaching up to 4,000 blocks back, and
+//!   REMASC pays out with a maturity of 4,000. Executing a block at height `h`
+//!   may therefore read data from `h - 4000`.
 //!
 //! They compose rather than overlap: after a 4,000-block reorg the node
 //! re-executes from `head - 4000`, and executing *that* block may reach back a
@@ -31,6 +32,27 @@
 //! Genesis is always retained. It costs one block and keeps every "start of the
 //! chain" lookup working, so the gap is a hole in the middle of the chain rather
 //! than a missing beginning.
+//!
+//! # Measured from the executed head, never the header head
+//!
+//! Both requirements above are about **execution**: it is the executing block
+//! that reaches back 4,000, and a reorg that re-executes. So the retention
+//! depth is measured from the block this node has executed to, not from the
+//! best header it holds.
+//!
+//! The two are the same on a node that is keeping up and wildly different on
+//! one that is not. A snapshot-synced node has every header of the chain but
+//! has executed only from its checkpoint, so its header head can sit thousands
+//! of blocks above its executed head -- and a sweep measured from the header
+//! head deletes blocks that execution has not reached yet but still needs.
+//!
+//! Observed: a test node pruned to #9,274,241 while executing #9,275,670,
+//! whose REMASC payout needed #9,271,670. That block was gone, execution
+//! failed, and no retry could succeed because the data was not coming back.
+//!
+//! The clamp lives here rather than in the callers. Deleting history is not
+//! recoverable, so the rule belongs at the point of deletion where no caller
+//! can forget it.
 //!
 //! The floor is recorded in the database -- number, hash and total difficulty --
 //! so a node can say what it holds without a scan, and so the value needed to
@@ -141,6 +163,26 @@ impl BlockStore {
         let keep = config.effective_keep_depth();
         let started = Instant::now();
         let mut stats = PruneStats::default();
+
+        // Retention is measured from the executed head, whatever the caller
+        // passed. Every reason for the depth is an execution reason -- the
+        // block-info precompiles reach 4,000 back, REMASC pays at a maturity
+        // of 4,000, a reorg re-executes -- so the header head is the wrong
+        // reference whenever it runs ahead, which on a snapshot-synced node is
+        // always.
+        let executed = self
+            .exec_head()?
+            .and_then(|(hash, _)| self.header(hash).ok().flatten())
+            .map(|h| h.number);
+        let Some(executed) = executed else {
+            debug!(
+                target: "rustock::prune",
+                "nothing executed yet; not pruning -- there is no safe reference to \
+                 measure retention from"
+            );
+            return Ok(stats);
+        };
+        let head_number = head_number.min(executed);
 
         let Some(target) = head_number.checked_sub(keep) else {
             debug!(
@@ -350,7 +392,11 @@ mod tests {
         }
     }
 
-    /// Builds a canonical chain of `n` blocks (0..n-1) with total difficulty.
+    /// Builds a canonical chain of `n` blocks (0..n-1) with total difficulty,
+    /// executed to the top.
+    ///
+    /// The executed head matters: retention is measured from it, so a fixture
+    /// without one describes a node that has run nothing and must not prune.
     pub(super) fn chain(store: &BlockStore, n: u64) -> Vec<B256> {
         let mut hashes = Vec::with_capacity(n as usize);
         let mut parent = B256::ZERO;
@@ -365,6 +411,9 @@ mod tests {
             store.put_body(hash, &[], &[]).unwrap();
             parent = hash;
             hashes.push(hash);
+        }
+        if let Some(top) = hashes.last() {
+            store.set_exec_head(*top, B256::ZERO).unwrap();
         }
         hashes
     }
@@ -645,6 +694,9 @@ mod snap_synced_tests {
             if i >= window_from || i == 0 {
                 store.put_canonical_hash(i, hash).unwrap();
             }
+            if i == height {
+                store.set_exec_head(hash, B256::ZERO).unwrap();
+            }
             parent = hash;
         }
 
@@ -676,5 +728,110 @@ mod snap_synced_tests {
         let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100 };
         let stats = store.prune_blocks(&cfg, 11_999).unwrap();
         assert_eq!(stats.from, 1, "genesis is retained, so the first prunable block is 1");
+    }
+}
+
+#[cfg(test)]
+mod executed_head_tests {
+    use super::tests::header;
+    use super::*;
+    use crate::BlockStore;
+    use tempfile::tempdir;
+
+    /// Builds a chain and marks `executed` as the block this node has run to.
+    fn chain_executed_to(store: &BlockStore, n: u64, executed: u64) -> Vec<B256> {
+        let mut hashes = Vec::with_capacity(n as usize);
+        let mut parent = B256::ZERO;
+        let mut td = U256::ZERO;
+        for i in 0..n {
+            let h = header(i, parent);
+            let hash = h.hash();
+            td += h.difficulty;
+            store.put_header(&h).unwrap();
+            store.put_canonical_hash(i, hash).unwrap();
+            store.put_total_difficulty(hash, td).unwrap();
+            store.put_body(hash, &[], &[]).unwrap();
+            parent = hash;
+            hashes.push(hash);
+        }
+        store.set_exec_head(hashes[executed as usize], B256::ZERO).unwrap();
+        hashes
+    }
+
+    /// The bug this exists to prevent, seen on a real node.
+    ///
+    /// A snapshot-synced node holds every header but has executed only from
+    /// its checkpoint, so the header head sits thousands of blocks above the
+    /// executed head. Measuring retention from the header head deletes blocks
+    /// execution has not reached yet and still needs: the node pruned to
+    /// #9,274,241 while executing #9,275,670, whose REMASC payout needed
+    /// #9,271,670. That block was gone and no retry could bring it back.
+    #[test]
+    fn retention_is_measured_from_the_executed_head_not_the_header_head() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Headers to #30,000; executed only to #20,000, as after a snapshot
+        // sync whose forward header download has run ahead.
+        let executed = 20_000u64;
+        chain_executed_to(&store, 30_001, executed);
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let stats = store.prune_blocks(&cfg, 30_000).unwrap();
+
+        let highest_removed = stats.to;
+        assert!(
+            highest_removed <= executed - MIN_KEEP_DEPTH,
+            "pruned up to #{highest_removed}, but execution is at #{executed} and reaches \
+             {MIN_KEEP_DEPTH} blocks back — everything above #{} is still needed",
+            executed - MIN_KEEP_DEPTH
+        );
+
+        // The block REMASC would ask for while executing the next one.
+        let needed = executed + 1 - 4_000;
+        assert!(
+            store.canonical_hash(needed).unwrap().is_some(),
+            "#{needed} is what REMASC reads when executing #{}; it must survive",
+            executed + 1
+        );
+        assert!(store.body(store.canonical_hash(needed).unwrap().unwrap()).unwrap().is_some());
+    }
+
+    /// A node that has executed nothing has no safe reference, so it prunes
+    /// nothing rather than guessing.
+    #[test]
+    fn a_node_that_has_executed_nothing_prunes_nothing() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let mut parent = B256::ZERO;
+        let mut td = U256::ZERO;
+        for i in 0..30_000u64 {
+            let h = header(i, parent);
+            let hash = h.hash();
+            td += h.difficulty;
+            store.put_header(&h).unwrap();
+            store.put_canonical_hash(i, hash).unwrap();
+            store.put_total_difficulty(hash, td).unwrap();
+            parent = hash;
+        }
+        // No exec head set.
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let stats = store.prune_blocks(&cfg, 29_999).unwrap();
+        assert_eq!(stats.blocks, 0, "nothing executed means no safe reference");
+        assert!(store.prune_floor().unwrap().is_none(), "and no floor was claimed");
+    }
+
+    /// When the node is keeping up, the two heads agree and nothing changes.
+    #[test]
+    fn a_node_that_is_keeping_up_prunes_as_before() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain_executed_to(&store, 20_000, 19_999);
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let stats = store.prune_blocks(&cfg, 19_999).unwrap();
+        assert_eq!(stats.to, 19_999 - MIN_KEEP_DEPTH);
     }
 }
