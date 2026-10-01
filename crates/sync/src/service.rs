@@ -3160,22 +3160,66 @@ impl SyncService {
                     // when it is reached. Storing it unverified instead is the
                     // hole this change exists to close, so the answer is to
                     // stop and resync, charging the peer that served it.
-                    let outcome = self
-                        .manager
-                        .handle_headers_response(chunk_headers.clone(), *chunk_peer)
-                        .map_err(|e| format!("{e:?}"))
-                        .and_then(|o| {
-                            if o.unlinked > 0 {
-                                Err(format!(
-                                    "{} of {} headers did not connect to our chain",
-                                    o.unlinked,
-                                    chunk_headers.len()
-                                ))
-                            } else {
-                                Ok(o)
+                    let outcome =
+                        self.manager.handle_headers_response(chunk_headers.clone(), *chunk_peer);
+
+                    // A chunk that does not connect stops the round, but does
+                    // not condemn the peer that served it.
+                    //
+                    // The two are separate judgements and were previously the
+                    // same one. Stopping is right: continuing past a chunk
+                    // whose tail has nothing to verify against leaves a hole
+                    // in the canonical index that halts execution when it is
+                    // reached. Condemning is not, because this node cannot
+                    // tell the difference between a peer serving junk and its
+                    // own head having moved under a request already in
+                    // flight -- a reorg mid-round, or a late answer from a
+                    // previous skeleton, produce exactly this observation and
+                    // are nobody's fault.
+                    //
+                    // So it is treated the way a stalled peer is: sidelined
+                    // from assignment for the sideline window, and recorded
+                    // against a counter that does not gate `has_good_score`.
+                    // A peer that does this once is skipped; one that does it
+                    // every round is sidelined every round, never gets work,
+                    // and leaves a record an operator can see. What it is no
+                    // longer is permanently unusable after a single event
+                    // whose cause may have been local.
+                    if let Ok(o) = &outcome {
+                        if o.unlinked > 0 {
+                            warn!(
+                                target: "rustock::sync",
+                                "Chunk from peer {:?} did not connect: {} of {} headers had \
+                                 no parent held. Dropping the round and resyncing; the peer \
+                                 is sidelined, not charged -- this node cannot tell its \
+                                 fault from a reorg under an in-flight request.",
+                                &chunk_peer.0[..4], o.unlinked, chunk_headers.len()
+                            );
+                            self.sidelined
+                                .insert(*chunk_peer, Instant::now() + PEER_SIDELINE_DURATION);
+                            if let Some(scoring) = &self.scoring {
+                                scoring.record_peer(
+                                    *chunk_peer,
+                                    rustock_networking::scoring::EventType::UnexpectedMessage,
+                                );
                             }
-                        });
-                    if let Err(e) = outcome {
+                            self.state = SyncState::Idle;
+                            return;
+                        }
+                        if o.rejected > 0 {
+                            // Distinct, and unambiguous: these headers had a
+                            // parent this node holds and failed verification
+                            // against it. That is the peer's doing.
+                            warn!(
+                                target: "rustock::sync",
+                                "Peer {:?} served {} header(s) that failed verification \
+                                 against a parent this node holds",
+                                &chunk_peer.0[..4], o.rejected
+                            );
+                        }
+                    }
+
+                    if let Err(e) = outcome.map_err(|e| format!("{e:?}")) {
                         error!(
                             target: "rustock::sync",
                             "Failed to process headers chunk: {}", e

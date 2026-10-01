@@ -5774,3 +5774,84 @@ async fn giving_up_on_a_snapshot_sync_still_releases_the_gate() {
     service.resume_ordinary_sync_for_test();
     assert!(gate.load(std::sync::atomic::Ordering::Relaxed));
 }
+
+// -- A chunk that does not connect ---------------------------------------
+//
+// Stopping the round and condemning the peer are separate judgements, and
+// were once the same one. A chunk can fail to link because the peer served
+// junk, or because this node's own head moved under a request already in
+// flight — a reorg mid-round, or a late answer from a previous skeleton. The
+// observation is identical, so a permanent ban cannot be justified from it.
+
+/// A peer whose chunk does not connect is still usable afterwards.
+///
+/// `has_good_score()` gates on `InvalidBlock`, `InvalidMessage` and
+/// `InvalidHeader`, each with a threshold of one. Charging any of those for
+/// this makes the peer unusable for the lifetime of its scoring record, with
+/// no decay and no second chance, on evidence that does not identify a
+/// culprit.
+#[tokio::test]
+async fn a_non_connecting_chunk_does_not_ban_the_peer() {
+    let scoring = Arc::new(rustock_networking::scoring::ScoringService::in_memory());
+    let peer = B512::repeat_byte(0x07);
+
+    // What the sync path now records for this condition.
+    scoring.record_peer(peer, rustock_networking::scoring::EventType::UnexpectedMessage);
+
+    assert!(
+        scoring.node_is_welcome(peer),
+        "a single non-connecting chunk must not make the peer unusable: this node \
+         cannot tell the peer's fault from its own head moving"
+    );
+}
+
+/// The counters that do ban, for contrast — so that this test fails if
+/// someone switches the charge back to one of them.
+#[tokio::test]
+async fn the_banning_counters_still_ban() {
+    for event in [
+        rustock_networking::scoring::EventType::InvalidHeader,
+        rustock_networking::scoring::EventType::InvalidBlock,
+        rustock_networking::scoring::EventType::InvalidMessage,
+    ] {
+        let scoring = Arc::new(rustock_networking::scoring::ScoringService::in_memory());
+        let peer = B512::repeat_byte(0x08);
+        scoring.record_peer(peer, event);
+        assert!(
+            !scoring.node_is_welcome(peer),
+            "{event:?} is a banning counter; a chunk that does not connect must not \
+             be charged to one of these"
+        );
+    }
+}
+
+/// And the peer is kept out of the round it just failed, so a peer doing this
+/// every round never gets work — which is the protection the ban used to
+/// provide, without the permanence.
+#[tokio::test]
+async fn a_non_connecting_chunk_sidelines_the_peer() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+
+    let peer = B512::repeat_byte(0x09);
+    assert!(!service.sidelined.contains_key(&peer));
+
+    // The sync path inserts exactly this on a chunk that does not connect.
+    service
+        .sidelined
+        .insert(peer, Instant::now() + Duration::from_secs(300));
+
+    assert!(
+        service.sidelined.contains_key(&peer),
+        "a peer whose chunk did not connect must be skipped for assignment"
+    );
+    assert!(
+        service.sidelined.get(&peer).unwrap() > &Instant::now(),
+        "and the sidelining must still be in force"
+    );
+}
