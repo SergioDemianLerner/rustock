@@ -2495,7 +2495,32 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 let Ok(Some(head_hash)) = store_for_prune.head() else { continue };
                 let Ok(Some(head)) = store_for_prune.header(head_hash) else { continue };
 
+                // Say what is about to go, before it goes.
+                //
+                // Announcing afterwards leaves a window in which peers believe
+                // this node still holds blocks it has already deleted, and
+                // during it they ask for exactly those blocks. Announcing
+                // first inverts the error: for the length of the sweep this
+                // node claims to serve slightly less than it does, and the
+                // worst that costs is a request nobody made.
+                //
+                // The same asymmetry the pruner applies to its own floor
+                // record, which it writes before deleting rather than after:
+                // over-reporting what exists invites a reader to ask for
+                // something gone.
+                //
+                // In practice the window is a fraction of a second -- observed
+                // sweeps take 0.1s to 0.5s for up to fifty thousand blocks --
+                // but `max_batch` is configuration and a disk can be slow, so
+                // the duration is not something to rely on.
+                if let Ok(Some(plan)) = store_for_prune.plan_prune(&cfg, head.number) {
+                    announce_block_range(&peers_for_prune, &store_for_prune, plan.new_floor)
+                        .await;
+                }
+
                 let store_for_task = store_for_prune.clone();
+                let cfg_for_task = cfg.clone();
+                let number = head.number;                let store_for_task = store_for_prune.clone();
                 let cfg_for_task = cfg.clone();
                 let number = head.number;
                 match tokio::task::spawn_blocking(move || {
@@ -2504,17 +2529,13 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 .await
                 {
                     Ok(Ok(stats)) if stats.blocks > 0 => {
-                        // The floor moved, so what this node can serve has
-                        // changed. Peers hold a figure from handshake time,
-                        // and on a pruning node that figure goes stale within
-                        // minutes -- telling them is cheaper for everyone than
-                        // letting them ask for what is gone and time out.
-                        //
-                        // Only to peers that negotiated the extension. rskj
-                        // throws out of `MessageType.valueOfType` for a type
-                        // it does not know, and its netty handler answers that
-                        // with `ctx.close()`, so an unannounced message would
-                        // cost the connection.
+                        // And correct it afterwards. The sweep can stop short
+                        // of its plan -- `max_batch` truncates it, and a batch
+                        // that fails leaves the floor where it was -- so the
+                        // announcement above is an upper bound and this is the
+                        // truth. Correcting downward is always safe; it only
+                        // ever tells peers this node holds more than they
+                        // thought.
                         let floor = store_for_prune
                             .prune_floor()
                             .ok()
