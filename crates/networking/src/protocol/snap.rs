@@ -323,29 +323,58 @@ fn decode_blocks_and_difficulties(
 ///
 /// This is rskj's `MessageWithId` shape, where the parameters are themselves
 /// an RLP list carried as a blob.
+/// `RLP([id, <the message's own fields, as rskj writes them>])`.
+///
+/// rskj's `MessageWithId.getEncodedMessage` is
+/// `RLP.encodeList(rlpId, getEncodedMessageWithoutId())`, and every snap
+/// subclass returns an `RLP.encodeList(...)` from the second call. So the
+/// second element is that list itself.
+///
+/// This used to wrap it in an RLP **string** as well, making the same logical
+/// message different bytes -- `[id, 0x81 0xc0]` where rskj writes `[id,
+/// 0xc0]`. rustock talked to rustock because both ends were wrong in the same
+/// way; an rskj snap request reached a rustock server, failed to decode, and
+/// was dropped without a reply, so rskj retried until it gave up and started
+/// over, forever.
 fn with_id(id: u64, params: Vec<u8>) -> Vec<u8> {
     let mut body = Vec::new();
     id.encode(&mut body);
-    RlpHeader { list: false, payload_length: params.len() }.encode(&mut body);
     body.extend_from_slice(&params);
     list_of(body)
 }
 
-/// Splits `RLP([id, RLP_string(params)])` back into the two.
+/// Splits `RLP([id, params])` back into the two, where `params` is returned
+/// as a complete RLP item for the caller to parse.
+///
+/// Accepts both framings. rskj writes the fields as a list; rustock used to
+/// wrap that list in an RLP string, and nodes on the older encoding are still
+/// out there. Reading either costs one header inspection and removes a
+/// flag-day from a change that otherwise needs one.
+///
+/// Being lenient here is not symmetric with being lenient when writing: this
+/// node now *writes* only rskj's form, so the two encodings do not propagate.
 fn split_id(buf: &mut &[u8]) -> alloy_rlp::Result<(u64, Vec<u8>)> {
     let h = RlpHeader::decode(buf)?;
     if !h.list || buf.len() < h.payload_length {
         return Err(alloy_rlp::Error::Custom("malformed snap message"));
     }
-    let mut body = &buf[..h.payload_length];
+    let body = &buf[..h.payload_length];
     *buf = &buf[h.payload_length..];
 
-    let id = decode_u64_lenient(&mut body)?;
-    let params_h = RlpHeader::decode(&mut body)?;
-    if params_h.list || body.len() < params_h.payload_length {
-        return Err(alloy_rlp::Error::Custom("expected an RLP string for snap params"));
+    let mut rest = body;
+    let id = decode_u64_lenient(&mut rest)?;
+
+    // Look at what follows without consuming it: a list is the message's
+    // fields themselves, a string is the older wrapper around them.
+    let mut peek = rest;
+    let params_h = RlpHeader::decode(&mut peek)?;
+    if params_h.list {
+        return Ok((id, rest.to_vec()));
     }
-    Ok((id, body[..params_h.payload_length].to_vec()))
+    if peek.len() < params_h.payload_length {
+        return Err(alloy_rlp::Error::Custom("truncated snap params"));
+    }
+    Ok((id, peek[..params_h.payload_length].to_vec()))
 }
 
 impl SnapStatusRequest {
@@ -855,5 +884,101 @@ fn hex_lit(s: &str) -> Vec<u8> {
             let _ = decode_block(&mut junk.as_slice());
             let _: Result<RskMessage, _> = alloy_rlp::Decodable::decode(&mut junk.as_slice());
         }
+    }
+}
+
+#[cfg(test)]
+mod rskj_wire_tests {
+    use super::*;
+
+    /// Exactly the bytes rskj puts on the wire for `SNAP_STATUS_REQUEST`.
+    ///
+    /// `MessageWithId.getEncodedMessage` is
+    /// `RLP.encodeList(rlpId, getEncodedMessageWithoutId())`, and a status
+    /// request's body is `RLP.encodedEmptyList()` -- so `[id, 0xc0]`.
+    fn rskj_status_request(id: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        id.encode(&mut body);
+        body.push(0xc0);
+        let mut out = Vec::new();
+        RlpHeader { list: true, payload_length: body.len() }.encode(&mut out);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// The older rustock framing: the same fields, wrapped in an RLP string.
+    fn legacy_status_request(id: u64) -> Vec<u8> {
+        let params = vec![0xc0u8];
+        let mut body = Vec::new();
+        id.encode(&mut body);
+        RlpHeader { list: false, payload_length: params.len() }.encode(&mut body);
+        body.extend_from_slice(&params);
+        let mut out = Vec::new();
+        RlpHeader { list: true, payload_length: body.len() }.encode(&mut out);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// What this node writes is byte-for-byte what rskj writes.
+    ///
+    /// Not "decodes to the same thing" -- the same bytes. An rskj node reads
+    /// these with its own decoder, so anything else is a guess about how
+    /// forgiving that decoder is.
+    #[test]
+    fn this_node_writes_exactly_what_rskj_writes() {
+        assert_eq!(
+            SnapStatusRequest { id: 1 }.encode_body(),
+            rskj_status_request(1),
+            "the snap status request is not rskj's bytes"
+        );
+    }
+
+    /// And reads what rskj writes. This is the direction that was broken: an
+    /// rskj request reached the server, failed to decode, and was dropped
+    /// without a reply or a log line.
+    #[test]
+    fn this_node_reads_what_rskj_writes() {
+        let decoded = SnapStatusRequest::decode_body(&mut rskj_status_request(7).as_slice())
+            .expect("an rskj snap request must decode");
+        assert_eq!(decoded.id, 7);
+    }
+
+    /// And still reads the older rustock framing, so upgrading one end of a
+    /// pair does not need a flag day.
+    #[test]
+    fn this_node_still_reads_the_older_rustock_framing() {
+        let decoded = SnapStatusRequest::decode_body(&mut legacy_status_request(9).as_slice())
+            .expect("the previous encoding must still decode");
+        assert_eq!(decoded.id, 9);
+    }
+
+    /// Every message that carries an id round-trips through its own codec.
+    ///
+    /// The framing helpers are shared, so a mistake in them would show up
+    /// here across the whole family rather than in one message.
+    #[test]
+    fn every_snap_message_round_trips() {
+        let req = SnapChunkRequest {
+            id: 3,
+            block_number: 9_275_000,
+            from: 1024,
+            chunk_size: 4096,
+            state_root: None,
+        };
+        let mut buf = req.encode_body();
+        let back = SnapChunkRequest::decode_body(&mut buf.as_slice()).expect("chunk request");
+        assert_eq!((back.id, back.block_number, back.from), (3, 9_275_000, 1024));
+
+        let blocks = SnapBlocksRequest { id: 5, block_number: 9_274_000 };
+        buf = blocks.encode_body();
+        let back = SnapBlocksRequest::decode_body(&mut buf.as_slice()).expect("blocks request");
+        assert_eq!((back.id, back.block_number), (5, 9_274_000));
+
+        let status = SnapStatusRequest { id: 11 };
+        buf = status.encode_body();
+        assert_eq!(
+            SnapStatusRequest::decode_body(&mut buf.as_slice()).expect("status").id,
+            11
+        );
     }
 }

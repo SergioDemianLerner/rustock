@@ -97,11 +97,149 @@ peer and it is the intended one; the production node's peer count is unchanged.
 
 ## 5. Procedure
 
-(To be filled in as each run completes.)
+One client at a time, against the same server, with **the production node
+stopped** for the duration. Production shares four cores and the `sdb` device
+the server reads from, and leaving it running would have put an uncontrolled
+variable in the middle of the measurement.
+
+```
+systemctl stop rustock                 # production, 19:45:29 UTC
+./server.sh                            # --read-only --follow-up false
+                                       # --simulate-height 10000
+<client>                               # rskj, then rustock
+systemctl start rustock                # 20:05 UTC, ~20 minutes down
+```
+
+The target was reduced from #1,000,000 to **#10,000** to get a first comparison
+in an hour rather than a day. At 10,000 blocks the chain is nearly empty, which
+is a real limit on what the result means — see §7.
 
 ## 6. Results
 
-(To be filled in.)
+### Full sync to #10,000
+
+| | rskj 9.1.0-SNAPSHOT | rustock |
+|---|---|---|
+| wall clock | **725 s** (12.1 min) | **65 s** |
+| rate | 13.8 blocks/s | 153.8 blocks/s |
+| database | 0.06 GB | 0.15 GB (0.07 data + 0.08 trie) |
+| peers | 1 | 1 |
+
+**rustock was 11.2x faster over this range.**
+
+### Both reached the same chain, verified
+
+A speed difference means nothing if the clients did different work. Both
+finished at block #10,000 with:
+
+```
+hash       0x5147931463d6f2e6713ef44d2553a123aee54ed1184c5ecfabe54cec351d2c4e
+stateRoot  0x83ff52f9edc4e931f548ee1064d4a393c6a2c4032127f0f18bce579efb7be680
+```
+
+The state root is the part that matters: it is what execution produces, so
+matching it means rustock ran the blocks rather than trusting them. Confirmed
+by reopening the client's database afterwards and asking it directly, not by
+reading its own log -- a `Processed N blocks, state root:` line in rustock's
+output reports a different value, which is a misleading log message and is
+noted as such rather than taken as evidence either way.
+
+### Conditions during the runs
+
+| | rskj | rustock |
+|---|---|---|
+| started | 19:45:51 UTC | 20:02:38 UTC |
+| server binary | **without** #237 | with #237 |
+| production node | stopped | stopped |
+| page cache | cold for the server's reads | warmed by the rskj run |
+
+### Run 2: reversed order, cold cache first
+
+The first run had rustock going second, with the page cache warmed by rskj. To
+settle whether that explained the gap, the whole thing was repeated with the
+order swapped and the page cache dropped first, so the *first* client faced a
+genuinely cold cache. Both runs this time also faced the same server binary,
+removing the other asymmetry.
+
+| client | cold cache | warm cache | cache is worth |
+|---|---|---|---|
+| rustock | **80 s** | **65 s** | 19% |
+| rskj | **725 s** | **658 s** | 9% |
+
+Like for like:
+
+| | ratio |
+|---|---|
+| both cold | **9.1x** |
+| both warm | **10.1x** |
+| rustock cold vs rskj warm (worst case for rustock) | **8.2x** |
+
+**The ordering advantage was real and small.** Page cache is worth 15 s to
+rustock and 67 s to rskj; the gap to explain was 645 s. Whichever way the order
+runs, rustock is between eight and eleven times faster over this range.
+
+The more interesting number is that the warm cache barely helps rskj -- 9%,
+against 19% for rustock. Its bottleneck over this range is not reading from the
+server.
+
+### Snapshot sync near the tip: not measurable, because the two cannot speak it
+
+The server was started frozen at the real head with `--read-only --follow-up
+false` and no simulated height, and it had a snapshot to offer:
+
+```
+INFO Snapshot server enabled: serving state at #(head - 10000)
+INFO Snapshot server: currently offering the state at #9275000
+```
+
+rskj recognised it, accepted it as a snapshot peer and began:
+
+```
+INFO syncprocessor     - Start Snap syncing with NodeID{b943d28d...}
+INFO snapshotprocessor - Starting Snap sync
+DEBUG snapshotprocessor - Sending request: [SNAP_STATUS_REQUEST_MESSAGE] with id: [1]
+```
+
+and then nothing. The request expired, was re-sent, expired again, and rskj
+restarted the whole sync -- about every ninety seconds, indefinitely, with a
+healthy connection and one peer. The rustock server logged **nothing at all**,
+at any level.
+
+The cause is one extra byte of framing. rskj writes a snap message as `[id,
+<the fields, as a list>]`; rustock wrapped that list in an RLP string as well,
+giving `[id, 0x81 0xc0]` where rskj writes `[id, 0xc0]`. The rustock decoder
+then *required* that string, so an rskj request was rejected before any handler
+saw it. rustock talked to rustock because both ends were wrong in the same way.
+
+Issue #238, fixed: rustock now writes rskj's bytes exactly, and reads both
+framings so that upgrading one end of a pair needs no flag day. **The snapshot
+comparison can be run once a server and a client on the fix are available; it
+has not been run.**
+
+That this was found at all is the argument for the exercise. Everything up to
+the first byte of payload was right -- matching message type numbers, working
+capability negotiation, rskj recognising the node as snap-capable and starting
+the sync -- and no amount of reading either codebase had turned it up.
+
+### What this does not establish
+
+**10,000 blocks of early chain is not a representative sample.** These blocks
+are nearly empty; the comparison is dominated by per-block overhead rather than
+by executing transactions. A node syncing the real chain spends most of its
+time on blocks far heavier than these, and nothing here predicts that.
+
+~~**rustock ran second, with a warm page cache.**~~ **Settled by run 2.** Cache
+is worth 19% to rustock and 9% to rskj, against a gap of roughly ten times.
+Reversing the order moves the ratio from 11.2x to 9.1x and changes nothing
+about the conclusion.
+
+~~**The rskj run used a server without the status fix (#237).**~~ **Removed in
+run 2**, where both clients faced the same server binary.
+
+**Neither client was tuned.** rskj ran with `-Xmx3g` on a 7 GB machine and
+otherwise stock settings; rustock ran with its defaults. Someone who knows
+either client well could likely move these numbers, and nothing here is a
+statement about the best each can do.
 
 ## 7. What could make these numbers misleading
 
