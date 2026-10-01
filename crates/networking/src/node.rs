@@ -418,6 +418,17 @@ pub(crate) async fn register_and_run_session(
 
     let (tx, rx) = mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
 
+    debug!(
+        target: "rustock::net",
+        "peer {:?} speaks rsk/{}{}{}",
+        &peer_id.0[..4],
+        caps.rsk_version,
+        if caps.snap { " snap/1" } else { "" },
+        match rsk_status.earliest_block {
+            Some(e) => format!(", serves from #{e}"),
+            None => ", served range unstated".to_string(),
+        },
+    );
     if !peer_store.add_peer_with(peer_id, tx, caps).await {
         trace!(target: "rustock::net", "Peer already connected: {:?}", peer_id);
         return Ok(());

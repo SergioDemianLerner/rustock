@@ -1413,6 +1413,27 @@ mod block_range_tests {
         assert_eq!(decoded.earliest_block, Some(8_992_000));
     }
 
+    /// The update survives the full message framing, not just its own RLP:
+    /// type byte 26, the blob wrapper, and the outer list rskj's
+    /// `Eth62MessageFactory` unwraps.
+    #[test]
+    fn a_range_update_round_trips_through_the_whole_message() {
+        let range = BlockRange {
+            earliest_block: 9_278_157,
+            latest_block: 9_286_156,
+            latest_block_hash: B256::repeat_byte(0x55),
+        };
+        let msg = RskMessage::new(RskSubMessage::BlockRangeUpdate(range));
+        let mut buf = Vec::new();
+        alloy_rlp::Encodable::encode(&msg, &mut buf);
+
+        let decoded = RskMessage::decode(&mut buf.as_slice()).expect("decodes");
+        match decoded.sub_message {
+            RskSubMessage::BlockRangeUpdate(got) => assert_eq!(got, range),
+            other => panic!("framed as {other:?}"),
+        }
+    }
+
     #[test]
     fn a_block_range_round_trips() {
         let range = BlockRange {
