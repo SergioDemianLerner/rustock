@@ -1248,3 +1248,45 @@ fn an_honest_peer_completes_when_this_node_already_holds_part_of_the_chain() {
     );
     assert_eq!(session.phase(), Phase::Done, "failure: {:?}", session.failure());
 }
+
+/// A server simulating a short chain must not offer a state above it.
+///
+/// The checkpoint is derived from the head, so without a ceiling a server
+/// told the chain ends at #1,000,000 would still offer the state at
+/// #9,275,000 — and a client could snap-sync straight past the end it was
+/// told about, which is not the test anyone asked for.
+#[test]
+fn a_simulated_chain_end_bounds_the_snapshot_offered() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 40, genesis, 100, f.state_root);
+    for (b, td) in blocks.iter().zip(tds.iter()) {
+        let hash = b.header.hash();
+        f.store.put_header_with_hash(hash, &b.header).expect("header");
+        f.store.put_canonical_hash(b.header.number, hash).expect("index");
+        f.store.put_total_difficulty(hash, *td).expect("td");
+        f.store.put_body(hash, &b.transactions, &b.ommers).expect("body");
+    }
+    let top = blocks.last().unwrap().header.hash();
+    f.store.update_head(&blocks.last().unwrap().header, *tds.last().unwrap()).unwrap();
+    let _ = top;
+
+    let capped = SnapServer::new(
+        f.store.clone(),
+        f.trie.clone() as Arc<dyn TrieStore>,
+        SnapConfig {
+            server_enabled: true,
+            checkpoint_distance: 10,
+            serve_ceiling: Some(20),
+            ..SnapConfig::default()
+        },
+    );
+
+    if let Some(status) = capped.status(&rustock_networking::protocol::snap::SnapStatusRequest { id: 1 }) {
+        let offered = status.blocks.last().expect("a checkpoint").header.number;
+        assert!(
+            offered <= 20,
+            "offered the state at #{offered}, above the simulated chain end of #20"
+        );
+    }
+}

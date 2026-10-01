@@ -1500,7 +1500,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let read_only =
         args.read_only || args.measure_block_reads.is_some() || args.verify_state.is_some();
     let store = Arc::new(if read_only {
-        info!("Opening {} READ-ONLY for profiling", args.data_dir);
+        info!("Opening {} READ-ONLY; nothing this node does can write to it", args.data_dir);
         BlockStore::open_read_only(&args.data_dir)?
     } else {
         BlockStore::open(&args.data_dir)?
@@ -1541,6 +1541,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let verifying_key = signing_key.verifying_key();
     let encoded_point = verifying_key.to_encoded_point(false);
     let node_id = alloy_primitives::B512::from_slice(&encoded_point.as_bytes()[1..]);
+    // Printed in full because a peer that must be told who to dial needs it,
+    // and deriving it from the key by hand is a step that invites a typo.
+    info!("Node ID: {}", alloy_primitives::hex::encode(node_id.as_slice()));
 
     // `--simulate-height` rejected before anything opens, so a node that
     // disagrees with itself never starts. Simulating a shorter chain while
@@ -2119,6 +2122,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         total_bytes_per_second: args.snap_total_rate,
         max_in_flight: args.snap_parallel.max(1),
         blocks_required: args.snap_blocks,
+        serve_ceiling: args.simulate_height,
         ..rustock_sync::SnapConfig::default()
     };
 

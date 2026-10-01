@@ -1547,3 +1547,4 @@ fn a_missing_root_is_caught() {
     let err = client.verify_stored().expect_err("a missing root must be caught");
     assert!(err.contains("root"), "unhelpful complaint: {err}");
 }
+

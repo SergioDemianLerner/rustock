@@ -68,6 +68,14 @@ pub struct SnapConfig {
     /// Far enough back that the state is settled and unlikely to be reorged
     /// out from under the download.
     pub checkpoint_distance: u64,
+    /// Highest block this server will speak for, when told to behave as
+    /// though the chain ends there (`--simulate-height`).
+    ///
+    /// The checkpoint is derived from the head, so without this a server
+    /// simulating a short chain would still offer a state far above it — and
+    /// a client could snap-sync straight past the end it was told about,
+    /// which is not the test anyone asked for.
+    pub serve_ceiling: Option<u64>,
     /// Bounds a peer's claimed cumulative difficulty before the header walk
     /// is committed to. `None` on a chain with no checkpoint, where the walk
     /// simply runs as before.
@@ -175,6 +183,7 @@ impl Default for SnapConfig {
 
             checkpoint_distance: 10_000,
             checkpoint: None,
+            serve_ceiling: None,
             // Post-RSKIP156, which is what the sampled window is by
             // construction.
             difficulty_divisor: 400,
