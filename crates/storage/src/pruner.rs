@@ -107,6 +107,17 @@ pub struct PruneFloor {
     pub total_difficulty: U256,
 }
 
+/// What a sweep would do, computed before it does it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrunePlan {
+    /// Lowest block the sweep would delete.
+    pub from: u64,
+    /// Highest block the sweep would delete, inclusive.
+    pub to: u64,
+    /// The floor that would follow: the lowest block still held.
+    pub new_floor: u64,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct PruneStats {
     pub from: u64,
@@ -159,78 +170,66 @@ impl BlockStore {
     ///
     /// Returns what was removed. Deleting nothing is success, not an error: a
     /// chain shorter than the retention depth simply has nothing to prune.
+    /// What the next sweep would delete, without deleting it.
+    ///
+    /// Returns the inclusive range and the floor that would follow. `None`
+    /// when there is nothing to do.
+    ///
+    /// Exists so that a node can say what it is about to stop serving *before*
+    /// it stops serving it. Announcing afterwards leaves a window in which
+    /// peers believe this node holds blocks it has already deleted, which is
+    /// the direction this module avoids everywhere else: over-reporting what
+    /// exists invites a reader to ask for something gone, while
+    /// under-reporting only costs a request nobody made.
+    ///
+    /// The sweep calls this too, so the figure announced and the figure acted
+    /// on cannot drift apart.
+    pub fn plan_prune(&self, config: &PruneConfig, head_number: u64) -> Result<Option<PrunePlan>> {
+        let keep = config.effective_keep_depth();
+
+        let executed = self
+            .exec_head()?
+            .and_then(|(hash, _)| self.header(hash).ok().flatten())
+            .map(|h| h.number);
+        let Some(executed) = executed else { return Ok(None) };
+        let head_number = head_number.min(executed);
+
+        let Some(target) = head_number.checked_sub(keep) else { return Ok(None) };
+
+        let floor = self.prune_floor()?;
+        let mut from = floor.as_ref().map(|f| f.number).unwrap_or(1).max(1);
+        if let Some(lowest) = self.lowest_indexed_height()? {
+            from = from.max(lowest);
+        }
+        if from > target {
+            return Ok(None);
+        }
+        let to = target.min(from + config.max_batch.max(1) - 1);
+        Ok(Some(PrunePlan { from, to, new_floor: to + 1 }))
+    }
+
     pub fn prune_blocks(&self, config: &PruneConfig, head_number: u64) -> Result<PruneStats> {
         let keep = config.effective_keep_depth();
         let started = Instant::now();
         let mut stats = PruneStats::default();
 
-        // Retention is measured from the executed head, whatever the caller
-        // passed. Every reason for the depth is an execution reason -- the
-        // block-info precompiles reach 4,000 back, REMASC pays at a maturity
-        // of 4,000, a reorg re-executes -- so the header head is the wrong
-        // reference whenever it runs ahead, which on a snapshot-synced node is
-        // always.
-        let executed = self
-            .exec_head()?
-            .and_then(|(hash, _)| self.header(hash).ok().flatten())
-            .map(|h| h.number);
-        let Some(executed) = executed else {
+        // One source of truth for what this sweep covers, shared with
+        // `plan_prune` so that the range a node announces and the range it
+        // deletes cannot disagree.
+        let Some(plan) = self.plan_prune(config, head_number)? else {
             debug!(
                 target: "rustock::prune",
-                "nothing executed yet; not pruning -- there is no safe reference to \
-                 measure retention from"
+                "nothing to prune below #{head_number} at a depth of {keep}"
             );
             return Ok(stats);
         };
-        let head_number = head_number.min(executed);
-
-        let Some(target) = head_number.checked_sub(keep) else {
-            debug!(
-                target: "rustock::prune",
-                "Head #{head_number} is within the {keep}-block retention depth; nothing to prune"
-            );
-            return Ok(stats);
-        };
-
-        let floor = self.prune_floor()?;
-        // Resume *at* the floor, not past it. The floor is the lowest pruned-to
-        // block, so it is the next one eligible to go; starting at `floor + 1`
-        // leaves one block behind on every resumed sweep, stranding data below
-        // the floor that nothing will ever report or reclaim.
-        //
-        // Genesis is never pruned, so the first prunable block is 1. Keeping it
-        // costs one block and removes a class of edge cases: every "start of the
-        // chain" lookup keeps working, and the chain retains an anchor whose
-        // hash is fixed by the network rather than by what this node happens
-        // still to hold.
-        let mut from = floor.as_ref().map(|f| f.number).unwrap_or(1).max(1);
-
-        // Start where the block database actually begins, not at block 1.
-        //
-        // A snapshot-synced node has the canonical index only for a window
-        // around its checkpoint; everything below was never written to
-        // `CF_NUMBERS` at all. `canonical_hash` still answers for those
-        // heights -- it falls back to the freezer, where being present is
-        // itself the statement that a height is canonical -- so a sweep
-        // walking up from 1 spends whole batches deleting entries that were
-        // never there, and a node nine million blocks deep needs a hundred and
-        // eighty sweeps to reach anything real.
-        //
-        // One seek says where to begin instead.
-        if let Some(lowest) = self.lowest_indexed_height()? {
-            from = from.max(lowest);
-        }
-        if from > target {
-            debug!(target: "rustock::prune", "Already pruned to #{}", from.saturating_sub(1));
-            return Ok(stats);
-        }
-        let to = target.min(from + config.max_batch.max(1) - 1);
+        let (from, to) = (plan.from, plan.to);
 
         // Establish the new floor *before* deleting, so an interrupted sweep
         // leaves a floor that understates what is held rather than one that
         // claims blocks already gone. Over-reporting what exists is the
         // dangerous direction: it invites a reader to ask for something deleted.
-        let new_floor_number = to + 1;
+        let new_floor_number = plan.new_floor;
         let new_floor = self.floor_record(new_floor_number)?;
         if let Some(f) = &new_floor {
             self.set_prune_floor(f)?;
@@ -833,5 +832,96 @@ mod executed_head_tests {
         let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
         let stats = store.prune_blocks(&cfg, 19_999).unwrap();
         assert_eq!(stats.to, 19_999 - MIN_KEEP_DEPTH);
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::tests::chain;
+    use super::*;
+    use crate::BlockStore;
+    use tempfile::tempdir;
+
+    /// The plan is what the sweep then does. If these drift, a node announces
+    /// one range and deletes another, and the announcement becomes a lie in
+    /// whichever direction the drift went.
+    #[test]
+    fn the_plan_matches_what_the_sweep_does() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain(&store, 20_000);
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 3_000 };
+        let plan = store.plan_prune(&cfg, 19_999).unwrap().expect("something to do");
+        let stats = store.prune_blocks(&cfg, 19_999).unwrap();
+
+        assert_eq!((plan.from, plan.to), (stats.from, stats.to));
+        assert_eq!(
+            store.prune_floor().unwrap().unwrap().number,
+            plan.new_floor,
+            "the floor the sweep left is the one the plan promised"
+        );
+    }
+
+    /// Planning does not delete. The whole point is to be able to say what is
+    /// about to go while it is still there.
+    #[test]
+    fn planning_changes_nothing() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hashes = chain(&store, 20_000);
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 3_000 };
+        let plan = store.plan_prune(&cfg, 19_999).unwrap().expect("something to do");
+
+        assert!(store.prune_floor().unwrap().is_none(), "no floor was written");
+        for n in [plan.from, plan.to] {
+            assert!(
+                store.header(hashes[n as usize]).unwrap().is_some(),
+                "#{n} is in the plan but must still be here until the sweep runs"
+            );
+        }
+    }
+
+    /// The announced floor is never below the one the sweep achieves.
+    ///
+    /// This is the property that makes announcing first safe. A sweep may stop
+    /// short of its plan -- `max_batch` truncates it -- so the figure
+    /// announced beforehand is an upper bound. Over-estimating means briefly
+    /// claiming to serve less than this node holds, which costs a request
+    /// nobody made; under-estimating would invite peers to ask for blocks
+    /// already gone.
+    #[test]
+    fn the_announced_floor_is_never_below_the_achieved_one() {
+        for max_batch in [1u64, 7, 500, 3_000, 100_000] {
+            let dir = tempdir().unwrap();
+            let store = BlockStore::open(dir.path()).unwrap();
+            chain(&store, 20_000);
+
+            let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch };
+            let plan = store.plan_prune(&cfg, 19_999).unwrap().expect("something to do");
+            store.prune_blocks(&cfg, 19_999).unwrap();
+            let achieved = store.prune_floor().unwrap().unwrap().number;
+
+            assert!(
+                plan.new_floor >= achieved,
+                "max_batch {max_batch}: announced #{} but kept blocks down to #{achieved}, \
+                 so peers were told this node holds less than it does -- the safe \
+                 direction -- but the inequality must hold the other way never",
+                plan.new_floor
+            );
+        }
+    }
+
+    /// Nothing to do is said plainly, so a caller does not announce a range
+    /// that is not changing.
+    #[test]
+    fn a_node_with_nothing_to_prune_has_no_plan() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain(&store, 1_000); // shorter than the retention depth
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 1_000 };
+        assert_eq!(store.plan_prune(&cfg, 999).unwrap(), None);
     }
 }
