@@ -5855,3 +5855,109 @@ async fn a_non_connecting_chunk_sidelines_the_peer() {
         "and the sidelining must still be in force"
     );
 }
+
+// -- The follow-mode stall -----------------------------------------------
+//
+// A node in follow mode stops making progress. The watchdog notices, reports
+// it correctly, and escalates — setting `force_connection_search` and
+// dropping to `Idle` so that a search follows. Then `try_start_sync` ran its
+// near-tip shortcut first, returned to `Following`, and never consulted the
+// flag. The node re-entered the state it was stuck in, the flag stayed set,
+// and the cycle repeated every few minutes. Observed for three hours on
+// mainnet, and two hours forty on a test node with a peer 358 blocks ahead
+// the whole time.
+
+/// Builds a service whose head is `behind` blocks under a peer's best.
+async fn service_behind_peer(behind: u64) -> (SyncService, tempfile::TempDir, B512) {
+    let (store, dir, headers) = linked_chain(10);
+    let top = headers.last().unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let service = SyncService::new(manager, peer_store.clone(), event_rx);
+
+    let peer = B512::repeat_byte(0x21);
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    peer_store.add_peer(peer, tx).await;
+    peer_store
+        .update_metadata(
+            &peer,
+            rustock_networking::peers::PeerMetadata {
+                best_number: top.number + behind,
+                best_hash: B256::repeat_byte(0xfe),
+                total_difficulty: U256::from(1_000_000u64),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    (service, dir, peer)
+}
+
+/// The escalation must not be swallowed by the near-tip shortcut.
+///
+/// This is the whole bug: a node a few hundred blocks behind is "near tip" by
+/// the gap test, so it took that branch and returned to follow mode — the
+/// state the watchdog had just reported as stuck.
+#[tokio::test]
+async fn a_forced_search_is_not_swallowed_by_the_near_tip_shortcut() {
+    // Thirteen, as observed on mainnet: "No progress for 185s: Φ = (behind 13,
+    // outstanding 0, oldest 0s)" followed by "Near tip (13 blocks behind),
+    // entering follow mode". `LONG_SYNC_LIMIT` is 24, so this is squarely
+    // inside the shortcut — which is the point.
+    let (mut service, _dir, _peer) = service_behind_peer(13).await;
+
+    // What the watchdog's second rung does.
+    service.force_connection_search = true;
+    service.state = SyncState::Idle;
+
+    service.try_start_sync().await;
+
+    assert!(
+        !matches!(service.state, SyncState::Following),
+        "the node returned to follow mode, which is the state the watchdog had just \
+         reported as stalled; it must go looking instead. State: {:?}",
+        service.state
+    );
+    assert!(
+        !service.force_connection_search,
+        "the flag must be consumed, or the next tick escalates again on a stall \
+         that was never acted on"
+    );
+}
+
+/// Without the flag, a near-tip node still follows. The shortcut exists
+/// because a node a few blocks behind should not run a skeleton round, and
+/// this change must not cost that.
+#[tokio::test]
+async fn a_near_tip_node_still_follows_when_nothing_is_wrong() {
+    let (mut service, _dir, _peer) = service_behind_peer(13).await;
+    service.state = SyncState::Idle;
+
+    service.try_start_sync().await;
+
+    assert!(
+        matches!(service.state, SyncState::Following),
+        "a healthy node near the tip should follow, not start a search: {:?}",
+        service.state
+    );
+}
+
+/// A peer with nothing above us yields no search, forced or not: a search
+/// would converge on this node's own head and achieve nothing.
+#[tokio::test]
+async fn a_forced_search_against_a_peer_with_nothing_above_us_still_follows() {
+    let (mut service, _dir, _peer) = service_behind_peer(0).await;
+    service.force_connection_search = true;
+    service.state = SyncState::Idle;
+
+    service.try_start_sync().await;
+
+    assert!(
+        matches!(service.state, SyncState::Following),
+        "nothing to search for: {:?}",
+        service.state
+    );
+}
