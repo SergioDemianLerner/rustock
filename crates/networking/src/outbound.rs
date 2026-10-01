@@ -302,12 +302,13 @@ async fn dial(
     trace!(target: "rustock::net", "TCP connected to outbound peer: {}", addr);
     let handshake = Handshake::new(stream, config, Some(remote_id));
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake.run()).await {
-        Ok(Ok((peer_id, rsk_status, framed))) => {
+        Ok(Ok((peer_id, rsk_status, caps, framed))) => {
             stats.successes.fetch_add(1, Ordering::Relaxed);
             debug!(target: "rustock::net", "Outbound handshake successful: {:?}", &peer_id.as_slice()[..4]);
             let _ = register_and_run_session(
                 peer_id,
                 rsk_status,
+                caps,
                 framed,
                 handlers,
                 peer_store,

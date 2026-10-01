@@ -19,9 +19,17 @@ pub struct PeerMetadata {
     /// sync layer only ever holds a node id, so the address has to be
     /// reachable from here.
     pub address: Option<std::net::IpAddr>,
+    /// Lowest block this peer says it can serve.
+    ///
+    /// `None` means it did not say, which must be read as "serves everything"
+    /// rather than "serves nothing": every rskj peer looks like this, and so
+    /// does every rustock peer before the first status arrives. Treating
+    /// silence as a refusal would empty the peer set.
+    pub earliest_block: Option<u64>,
 }
 
 struct PeerState {
+    caps: crate::handshake::PeerCapabilities,
     sender: mpsc::Sender<P2pMessage>,
     metadata: PeerMetadata,
 }
@@ -49,15 +57,90 @@ impl PeerStore {
 
     /// Attempts to add a peer to the store. Returns true if it was newly added.
     pub async fn add_peer(&self, id: B512, sender: mpsc::Sender<P2pMessage>) -> bool {
+        self.add_peer_with(id, sender, Default::default()).await
+    }
+
+    /// As [`Self::add_peer`], recording what the peer said it speaks.
+    pub async fn add_peer_with(
+        &self,
+        id: B512,
+        sender: mpsc::Sender<P2pMessage>,
+        caps: crate::handshake::PeerCapabilities,
+    ) -> bool {
         let mut peers = self.connected_peers.lock().await;
         use std::collections::hash_map::Entry;
         match peers.entry(id) {
             Entry::Occupied(_) => false,
             Entry::Vacant(e) => {
-                e.insert(PeerState { sender, metadata: PeerMetadata::default() });
+                e.insert(PeerState { sender, metadata: PeerMetadata::default(), caps });
                 true
             }
         }
+    }
+
+    /// Records a peer's new lower bound, leaving the rest of its metadata be.
+    pub async fn set_earliest_block(&self, id: &B512, earliest: u64) {
+        if let Some(p) = self.connected_peers.lock().await.get_mut(id) {
+            p.metadata.earliest_block = Some(earliest);
+        }
+    }
+
+    /// What this peer said it speaks.
+    pub async fn capabilities(
+        &self,
+        id: &B512,
+    ) -> Option<crate::handshake::PeerCapabilities> {
+        self.connected_peers.lock().await.get(id).map(|p| p.caps)
+    }
+
+    /// Peers that negotiated the served-range extension.
+    ///
+    /// The gate on every `BlockRangeUpdate`: an rskj peer that received one
+    /// would throw out of `MessageType.valueOfType` and close the connection,
+    /// so a peer is sent one only once it has said it understands it.
+    pub async fn peers_understanding_block_range(&self) -> Vec<B512> {
+        self.connected_peers
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, p)| p.caps.understands_block_range())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Whether this peer can serve a block at `number`.
+    ///
+    /// A peer that never stated a range serves everything: that is what every
+    /// rskj peer looks like, and what a rustock peer looks like until its
+    /// first status arrives. Reading silence as a refusal would empty the peer
+    /// set on a network where most peers do not speak the extension yet.
+    ///
+    /// Only the lower bound is enforced. The upper bound is a snapshot that
+    /// trails the peer's real head, so a peer merely late with an
+    /// announcement is still worth asking -- geth makes the same distinction,
+    /// treating the floor as exact and the ceiling as loose.
+    pub async fn serves(&self, id: &B512, number: u64) -> bool {
+        self.connected_peers
+            .lock()
+            .await
+            .get(id)
+            .map(|p| p.metadata.earliest_block.is_none_or(|e| number >= e))
+            .unwrap_or(false)
+    }
+
+    /// Those of `candidates` that can serve a block at `number`.
+    pub async fn peers_serving(&self, candidates: &[B512], number: u64) -> Vec<B512> {
+        let peers = self.connected_peers.lock().await;
+        candidates
+            .iter()
+            .filter(|id| {
+                peers
+                    .get(*id)
+                    .map(|p| p.metadata.earliest_block.is_none_or(|e| number >= e))
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect()
     }
 
     /// Updates the metadata for a peer.
@@ -209,6 +292,7 @@ mod tests {
             total_difficulty: U256::from(999),
             client_id: "test".to_string(),
             address: Some("203.0.113.1".parse().unwrap()),
+        earliest_block: None,
         };
         store.update_metadata(&peer_id, metadata.clone()).await;
 
@@ -294,5 +378,85 @@ mod tests {
 
         assert!(rx1.try_recv().is_ok());
         assert!(rx2.try_recv().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod served_range_tests {
+    use super::*;
+
+    async fn store_with(earliest: Option<u64>) -> (PeerStore, B512) {
+        let store = PeerStore::new();
+        let id = B512::repeat_byte(0x01);
+        let (tx, _rx) = mpsc::channel(1);
+        store.add_peer(id, tx).await;
+        store
+            .update_metadata(
+                &id,
+                PeerMetadata { earliest_block: earliest, ..Default::default() },
+            )
+            .await;
+        (store, id)
+    }
+
+    /// The rule everything else rests on: a peer that never stated a range
+    /// serves everything.
+    ///
+    /// Every rskj peer looks like this, and so does every rustock peer until
+    /// its first status arrives. Reading silence as a refusal would empty the
+    /// peer set on a network where almost nobody speaks the extension yet.
+    #[tokio::test]
+    async fn a_peer_that_said_nothing_serves_everything() {
+        let (store, id) = store_with(None).await;
+        assert!(store.serves(&id, 0).await);
+        assert!(store.serves(&id, 9_000_000).await);
+    }
+
+    /// A pruned peer is not asked for what it threw away.
+    #[tokio::test]
+    async fn a_pruned_peer_is_not_asked_below_its_floor() {
+        let (store, id) = store_with(Some(9_275_000)).await;
+        assert!(!store.serves(&id, 9_000_000).await, "below the floor");
+        assert!(store.serves(&id, 9_275_000).await, "the floor itself is held");
+        assert!(store.serves(&id, 9_280_000).await, "and everything above it");
+    }
+
+    /// Filtering keeps the peers that can help and drops only those that
+    /// certainly cannot.
+    #[tokio::test]
+    async fn filtering_keeps_the_silent_and_the_capable() {
+        let store = PeerStore::new();
+        let (silent, pruned, archival) = (
+            B512::repeat_byte(0x01),
+            B512::repeat_byte(0x02),
+            B512::repeat_byte(0x03),
+        );
+        for (id, earliest) in [(silent, None), (pruned, Some(9_275_000)), (archival, Some(0))] {
+            let (tx, _rx) = mpsc::channel(1);
+            store.add_peer(id, tx).await;
+            store
+                .update_metadata(
+                    &id,
+                    PeerMetadata { earliest_block: earliest, ..Default::default() },
+                )
+                .await;
+        }
+
+        let all = vec![silent, pruned, archival];
+        let deep = store.peers_serving(&all, 9_000_000).await;
+        assert!(deep.contains(&silent) && deep.contains(&archival));
+        assert!(!deep.contains(&pruned), "the pruned peer cannot answer this");
+
+        let shallow = store.peers_serving(&all, 9_280_000).await;
+        assert_eq!(shallow.len(), 3, "near the tip everyone can answer");
+    }
+
+    /// An update narrows what a peer is asked for, without a reconnection.
+    #[tokio::test]
+    async fn a_range_update_takes_effect_immediately() {
+        let (store, id) = store_with(None).await;
+        assert!(store.serves(&id, 100).await);
+        store.set_earliest_block(&id, 9_275_000).await;
+        assert!(!store.serves(&id, 100).await);
     }
 }

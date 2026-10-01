@@ -1489,15 +1489,29 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let encoded_point = verifying_key.to_encoded_point(false);
     let node_id = alloy_primitives::B512::from_slice(&encoded_point.as_bytes()[1..]);
 
-    let (best_hash, best_td, best_number) = if let Some(head_hash) = store.head()? {
+    let (best_hash, best_td, best_number, best_parent) = if let Some(head_hash) = store.head()? {
         let td = store.total_difficulty(head_hash)?.unwrap_or(U256::ZERO);
-        let number = store.header(head_hash)?
-            .map(|h| h.number)
-            .unwrap_or(0);
-        (head_hash, td, number)
+        let header = store.header(head_hash)?;
+        let number = header.as_ref().map(|h| h.number).unwrap_or(0);
+        // The status message is positional: without the parent, elements
+        // three onwards cannot be sent at all, which is why this node used to
+        // advertise a two-element status and never state its own total
+        // difficulty on the RSK protocol.
+        (head_hash, td, number, header.map(|h| h.parent_hash))
     } else {
-        (genesis_hash, U256::ZERO, 0)
+        (genesis_hash, U256::ZERO, 0, None)
     };
+
+    // Lowest block this node can serve. The prune floor when it has one, and
+    // genesis otherwise -- a node holding everything says zero rather than
+    // staying silent, because silence is what an rskj peer looks like and has
+    // to keep meaning "ask me anything".
+    let earliest_served = store
+        .prune_floor()
+        .ok()
+        .flatten()
+        .map(|f| f.number)
+        .unwrap_or(0);
 
     let node_config = NodeConfig {
         client_id: "Rustock/0.1.0".to_string(),
@@ -1508,7 +1522,13 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         genesis_hash,
         best_hash,
         best_block_number: best_number,
+        best_block_parent_hash: best_parent,
         total_difficulty: best_td,
+        earliest_block: earliest_served,
+        // rskj offers `snap/1` whenever it speaks RSK; this node offers it
+        // when it has something to do with snapshots at all, so that a peer
+        // can tell a snapshot server from a node that will never answer.
+        snap_capability: args.snap_server || args.snap_sync,
         bootnodes: if args.bootnodes.is_empty() {
             config.bootnodes()
         } else {
@@ -2435,6 +2455,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     if args.prune_blocks {
         let store_for_prune = store.clone();
         let gate = prune_gate.clone();
+        let peers_for_prune = peer_store.clone();
         let cfg = rustock_storage::pruner::PruneConfig {
             keep_depth: args.prune_keep_depth,
             max_batch: args.prune_max_batch,
@@ -2482,6 +2503,26 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 })
                 .await
                 {
+                    Ok(Ok(stats)) if stats.blocks > 0 => {
+                        // The floor moved, so what this node can serve has
+                        // changed. Peers hold a figure from handshake time,
+                        // and on a pruning node that figure goes stale within
+                        // minutes -- telling them is cheaper for everyone than
+                        // letting them ask for what is gone and time out.
+                        //
+                        // Only to peers that negotiated the extension. rskj
+                        // throws out of `MessageType.valueOfType` for a type
+                        // it does not know, and its netty handler answers that
+                        // with `ctx.close()`, so an unannounced message would
+                        // cost the connection.
+                        let floor = store_for_prune
+                            .prune_floor()
+                            .ok()
+                            .flatten()
+                            .map(|f| f.number)
+                            .unwrap_or(0);
+                        announce_block_range(&peers_for_prune, &store_for_prune, floor).await;
+                    }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         warn!(target: "rustock::prune", "prune sweep failed: {e:#}")
@@ -3566,4 +3607,44 @@ fn start_health_alerts(
         Arc::new(sinks),
     ));
     Ok(true)
+}
+
+/// Tells the peers that can understand it what this node now serves.
+///
+/// Sent only to peers that negotiated `rsk/63`. An rskj peer receiving an
+/// unknown message type throws out of `MessageType.valueOfType`, and its netty
+/// handler answers that with `ctx.close()` — so the gate is not politeness, it
+/// is the difference between informing a peer and losing it.
+async fn announce_block_range(
+    peer_store: &std::sync::Arc<rustock_networking::peers::PeerStore>,
+    store: &std::sync::Arc<rustock_storage::BlockStore>,
+    earliest: u64,
+) {
+    let Ok(Some(head_hash)) = store.head() else { return };
+    let Ok(Some(head)) = store.header(head_hash) else { return };
+
+    let targets = peer_store.peers_understanding_block_range().await;
+    if targets.is_empty() {
+        return;
+    }
+    let msg = rustock_networking::protocol::P2pMessage::RskMessage(
+        rustock_networking::protocol::RskMessage::new(
+            rustock_networking::protocol::RskSubMessage::BlockRangeUpdate(
+                rustock_networking::protocol::rsk::BlockRange {
+                    earliest_block: earliest,
+                    latest_block: head.number,
+                    latest_block_hash: head_hash,
+                },
+            ),
+        ),
+    );
+    debug!(
+        target: "rustock::prune",
+        "announcing #{earliest}..#{} to {} peer(s) that speak the extension",
+        head.number,
+        targets.len()
+    );
+    for peer in targets {
+        peer_store.send_to_peer(&peer, msg.clone()).await;
+    }
 }
