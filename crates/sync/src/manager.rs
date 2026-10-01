@@ -187,7 +187,19 @@ impl SyncManager {
                 }
             }
 
-            let new_td = parent_td + header.difficulty;
+            // Total difficulty counts the uncle difficulties too, and those
+            // live only in the body -- a header records `uncle_count` and
+            // nothing more. During header-first sync the body has usually not
+            // arrived, so this is the header difficulty alone: a lower bound,
+            // corrected once the body lands. A block that declares no uncles
+            // needs no body, and `cumulative_difficulty` says so without a read.
+            let contribution = self
+                .store
+                .cumulative_difficulty(hash, header)
+                .ok()
+                .flatten()
+                .unwrap_or(header.difficulty);
+            let new_td = parent_td + contribution;
 
             // For NEW headers with a known parent, run full verification.
             // Already-stored headers skip verification (they were validated on first store).

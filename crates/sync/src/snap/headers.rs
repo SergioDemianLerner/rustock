@@ -126,6 +126,11 @@ pub struct HeaderWalk {
     /// chain actually walked. The walk reads every header anyway; adding them
     /// up costs nothing and makes the claim checkable.
     walked_difficulty: U256,
+    /// Uncles seen during the walk whose difficulty could not be added,
+    /// because a header walk never carries bodies. Non-zero means
+    /// `walked_difficulty` understates the chain and the totals derived from
+    /// it need `--repair total-difficulty` once bodies are present.
+    uncles_omitted: u64,
 
     /// Total difficulty this node had already established at the block the
     /// walk anchored on.
@@ -205,6 +210,7 @@ impl HeaderWalk {
             need_hash: top_hash,
             done: false,
             walked_difficulty: U256::ZERO,
+            uncles_omitted: 0,
             anchor_difficulty: None,
             freeze_horizon: number.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
             staging,
@@ -218,6 +224,11 @@ impl HeaderWalk {
     /// it by more than the checkpoint block's own difficulty.
     pub fn walked_difficulty(&self) -> U256 {
         self.walked_difficulty
+    }
+
+    /// How many uncles the walk could not account for. See `uncles_omitted`.
+    pub fn uncles_omitted(&self) -> u64 {
+        self.uncles_omitted
     }
 
     /// The cumulative difficulty the walked chain implies at the checkpoint,
@@ -381,8 +392,17 @@ impl HeaderWalk {
         })?;
 
         for header in headers {
+            // Headers only: the uncle difficulties that also count toward the
+            // total travel in the body, which a backward header walk never
+            // fetches. `walked_difficulty` is therefore a lower bound on what
+            // the chain really accumulated, and every block that included an
+            // uncle widens the gap. See `uncles_omitted` below.
+            let hash = header.hash();
             self.walked_difficulty = self.walked_difficulty.saturating_add(header.difficulty);
-            let _ = self.store.put_header_with_hash(header.hash(), header);
+            if header.uncle_count > 0 {
+                self.uncles_omitted += header.uncle_count;
+            }
+            let _ = self.store.put_header_with_hash(hash, header);
         }
 
         // The headers are in hand and verified against each other; writing

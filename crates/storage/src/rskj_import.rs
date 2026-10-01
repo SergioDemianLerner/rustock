@@ -763,6 +763,17 @@ pub fn rebuild_chain_metadata_in_memory(
     dest.db().flush()?;
     let fwd_secs = fwd_start.elapsed().as_secs_f64();
 
+    // This path walks an in-memory header index on purpose, and a header
+    // records only `uncle_count`, never the uncle difficulties that also
+    // count toward the total. Everything it wrote is therefore an undercount
+    // wherever the chain absorbed an uncle.
+    warn!(
+        target: "rustock::import",
+        "total difficulty written by the in-memory metadata pass is PROVISIONAL: it omits \
+         uncle difficulties, which live only in block bodies. Run \
+         `--repair total-difficulty` once bodies are imported, before serving peers."
+    );
+
     if let Some((_, tip_hash, _)) = lineage.last() {
         set_heads(dest, *tip_hash, td)?;
     }
@@ -932,6 +943,8 @@ pub fn rebuild_chain_metadata_range(
         .with_context(|| format!("no canonical hash at #{to}; run a full metadata pass first"))?;
 
     // Seed the difficulty from the block before the range.
+    // Blocks whose body was absent, so uncle difficulty could not be added.
+    let mut bodyless = 0u64;
     let mut td = if from == 0 {
         U256::ZERO
     } else {
@@ -970,7 +983,16 @@ pub fn rebuild_chain_metadata_range(
     let fwd_start = Instant::now();
     for (number, hash) in &lineage {
         let h = dest.header(*hash)?.context("header vanished mid-walk")?;
-        td += h.difficulty;
+        // Uncle difficulties count toward the total, and they live only in the
+        // body. Without it the contribution is an undercount, so note it and
+        // tell the operator to run `--repair total-difficulty` afterwards.
+        match dest.cumulative_difficulty(*hash, &h)? {
+            Some(c) => td += c,
+            None => {
+                td += h.difficulty;
+                bodyless += 1;
+            }
+        }
         dest.put_canonical_hash(*number, *hash)?;
         dest.put_total_difficulty(*hash, td)?;
         if shutdown_requested() {
@@ -978,6 +1000,13 @@ pub fn rebuild_chain_metadata_range(
         }
     }
     let fwd_secs = fwd_start.elapsed().as_secs_f64();
+    if bodyless > 0 {
+        warn!(
+            target: "rustock::import",
+            "{bodyless} blocks had no body, so their uncle difficulties were omitted and the \
+             totals above them are an undercount; run `--repair total-difficulty`"
+        );
+    }
     let total_secs = start.elapsed().as_secs_f64();
     let n = lineage.len() as f64;
 
@@ -1053,12 +1082,19 @@ pub fn rebuild_chain_metadata(dest: &BlockStore, tip: B256, csv: Option<&mut dyn
     // Forward pass: canonical mapping plus cumulative difficulty.
     let mut td = U256::ZERO;
     let fwd_start = Instant::now();
+    let mut bodyless = 0u64;
     let total = lineage.len() as u64;
     let mut done = 0u64;
     let mut last_report = Instant::now();
     for (number, hash) in &lineage {
         let h = dest.header(*hash)?.context("header vanished mid-walk")?;
-        td += h.difficulty;
+        match dest.cumulative_difficulty(*hash, &h)? {
+            Some(c) => td += c,
+            None => {
+                td += h.difficulty;
+                bodyless += 1;
+            }
+        }
         dest.put_canonical_hash(*number, *hash)?;
         dest.put_total_difficulty(*hash, td)?;
         done += 1;
@@ -1081,6 +1117,13 @@ pub fn rebuild_chain_metadata(dest: &BlockStore, tip: B256, csv: Option<&mut dyn
         }
     }
     set_heads(dest, tip, td)?;
+    if bodyless > 0 {
+        warn!(
+            target: "rustock::import",
+            "{bodyless} blocks had no body, so their uncle difficulties were omitted and the \
+             totals above them are an undercount; run `--repair total-difficulty`"
+        );
+    }
     let elapsed = start.elapsed().as_secs_f64();
     if let Some(w) = csv {
         let _ = writeln!(w, "metadata,{},{},0,0,{:.1}", lineage.len(), lineage.len(), elapsed);

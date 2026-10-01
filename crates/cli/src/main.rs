@@ -1357,7 +1357,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         let store = Arc::new(BlockStore::open(&args.data_dir)?);
         match task.as_str() {
             "tx-index" => run_repair_tx_index(&store, args.repair_from, args.repair_to)?,
-            other => anyhow::bail!("unknown repair task {other:?}; known tasks: tx-index"),
+            "total-difficulty" => {
+                run_repair_total_difficulty(&store, args.repair_from, args.repair_to)?
+            }
+            other => anyhow::bail!(
+                "unknown repair task {other:?}; known tasks: tx-index, total-difficulty"
+            ),
         }
         return Ok(());
     }
@@ -3343,6 +3348,72 @@ fn run_repair_tx_index(
         blocks as f64 / elapsed.max(0.001),
         txs as f64 / elapsed.max(0.001),
     );
+    Ok(())
+}
+
+/// Rewrite stored total difficulty with the uncle contribution rskj includes.
+///
+/// Reads bodies only -- no trie, no execution. The chain must be offline: this
+/// rewrites the values the sync layer ranks chains with.
+fn run_repair_total_difficulty(
+    store: &Arc<BlockStore>,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    let head = match store.head()? {
+        Some(hash) => store.header(hash)?.map(|h| h.number).unwrap_or(0),
+        None => 0,
+    };
+    let from = from.unwrap_or(0);
+    let to = to.unwrap_or(head);
+    if to < from {
+        anyhow::bail!("--repair-to ({to}) is below --repair-from ({from})");
+    }
+    let total = to - from + 1;
+
+    info!("repair total-difficulty: blocks #{from}..#{to} ({total} blocks), chain head #{head}");
+    info!(
+        "repair total-difficulty: td(n) = td(n-1) + difficulty(n) + sum(uncle difficulties),          as rskj Block.getCumulativeDifficulty does"
+    );
+    if from > 0 {
+        info!(
+            "repair total-difficulty: seeding from the stored total at #{}; it must already              be correct, so resume where the last run stopped",
+            from - 1
+        );
+    }
+
+    let started = Instant::now();
+    let (written, unchanged, absent) =
+        store.recompute_total_difficulty(from, to, 10_000, |block, done, td| {
+            let elapsed = started.elapsed().as_secs_f64();
+            let scanned = block.saturating_sub(from) + 1;
+            let pct = scanned as f64 * 100.0 / total as f64;
+            let bps = scanned as f64 / elapsed.max(0.001);
+            let eta = if bps > 0.0 { (total - scanned) as f64 / bps } else { 0.0 };
+            info!(
+                "repair total-difficulty: {pct:.2}% (#{block}) | {done} rewritten | td {td} | \
+                 {bps:.0} blocks/s | elapsed {} | ETA {}",
+                fmt_duration(elapsed),
+                fmt_duration(eta)
+            );
+        })?;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    info!(
+        "repair total-difficulty: DONE in {} | {written} rewritten, {unchanged} already correct, \
+         {absent} heights with no block | {:.0} blocks/s",
+        fmt_duration(elapsed),
+        (written + unchanged) as f64 / elapsed.max(0.001),
+    );
+    if absent > 0 {
+        warn!(
+            "repair total-difficulty: {absent} of {total} heights hold no block, so their totals \
+             were left alone. A snap-synced node has nothing below its checkpoint and cannot \
+             rebuild those totals -- it inherits them from the checkpoint it trusted."
+        );
+    }
     Ok(())
 }
 

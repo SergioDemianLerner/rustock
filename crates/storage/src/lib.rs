@@ -1427,6 +1427,101 @@ impl BlockStore {
         Ok((blocks, txs, skipped))
     }
 
+    /// A block's own contribution to total difficulty: its header difficulty
+    /// plus every uncle's, matching rskj `Block.getCumulativeDifficulty()`.
+    ///
+    /// This needs the body. The header commits to the uncle list through
+    /// `ommers_hash` and records only `uncle_count`, so the uncle difficulties
+    /// exist nowhere else -- not in the freezer, which is canonical headers by
+    /// height, and an uncle is by definition not canonical. A block whose body
+    /// has been pruned therefore has no recoverable contribution, and this
+    /// returns `None` rather than the header difficulty alone: a silent
+    /// undercount is what put the chain's stored total difficulty wrong in the
+    /// first place.
+    pub fn cumulative_difficulty(&self, hash: B256, header: &Header) -> Result<Option<U256>> {
+        if header.uncle_count == 0 {
+            return Ok(Some(header.difficulty));
+        }
+        let Some((_txs, ommers)) = self.body(hash)? else { return Ok(None) };
+        let mut total = header.difficulty;
+        for uncle in &ommers {
+            total = total.saturating_add(uncle.difficulty);
+        }
+        Ok(Some(total))
+    }
+
+    /// Rewrite total difficulty across the canonical chain using the rule
+    /// rskj applies: `td(n) = td(n-1) + difficulty(n) + sum(uncle difficulties)`.
+    ///
+    /// Walks upward so each block reads a parent total that this pass has
+    /// already corrected. `from` is seeded from the stored total of `from - 1`,
+    /// which must itself already be correct -- so a partial repair has to
+    /// resume where the last one stopped, and a repair of the whole chain
+    /// starts at genesis.
+    ///
+    /// Returns `(written, unchanged, absent)`, where `absent` counts heights
+    /// with no canonical block -- a snap-synced node holds nothing below its
+    /// checkpoint, and reporting that as success would hide the fact that
+    /// nothing was corrected.
+    pub fn recompute_total_difficulty<F>(
+        &self,
+        from: u64,
+        to: u64,
+        report_every: u64,
+        mut progress: F,
+    ) -> Result<(u64, u64, u64)>
+    where
+        F: FnMut(u64, u64, U256),
+    {
+        let (mut written, mut unchanged, mut absent) = (0u64, 0u64, 0u64);
+
+        let mut running = if from == 0 {
+            U256::ZERO
+        } else {
+            let prev = self
+                .canonical_hash(from - 1)?
+                .ok_or_else(|| anyhow!("no canonical block at #{} to seed from", from - 1))?;
+            self.total_difficulty(prev)?
+                .ok_or_else(|| anyhow!("no stored total difficulty at #{}", from - 1))?
+        };
+
+        for number in from..=to {
+            let Some(hash) = self.canonical_hash(number)? else {
+                absent += 1;
+                continue;
+            };
+            let Some(header) = self.header(hash)? else {
+                absent += 1;
+                continue;
+            };
+
+            match self.cumulative_difficulty(hash, &header)? {
+                Some(contribution) => running = running.saturating_add(contribution),
+                None => {
+                    // The body is gone, so this block's uncle difficulties are
+                    // unrecoverable and every total above it would inherit the
+                    // error. Stopping is the honest outcome.
+                    return Err(anyhow!(
+                        "block #{number} has no body, so its uncle difficulties are                          unrecoverable; totals above it cannot be corrected"
+                    ));
+                }
+            }
+
+            if self.total_difficulty(hash)? == Some(running) {
+                unchanged += 1;
+            } else {
+                self.put_total_difficulty(hash, running)?;
+                written += 1;
+            }
+
+            if report_every > 0 && number % report_every == 0 {
+                progress(number, written, running);
+            }
+        }
+
+        Ok((written, unchanged, absent))
+    }
+
     /// Record one Bridge event. See `CF_BRIDGE_EVENTS` for the key layout.
     pub fn put_bridge_event(
         &self,
@@ -1764,7 +1859,7 @@ mod tests {
         }
     }
 
-    fn dummy_header(number: u64) -> Header {
+    pub(super) fn dummy_header(number: u64) -> Header {
         Header {
             number,
             parent_hash: B256::ZERO,
@@ -1984,7 +2079,7 @@ mod tests {
 
     // --- Reorg / canonical chain tests ---
 
-    fn make_chain_header(number: u64, parent_hash: B256, difficulty: u64, nonce: u8) -> Header {
+    pub(super) fn make_chain_header(number: u64, parent_hash: B256, difficulty: u64, nonce: u8) -> Header {
         let mut h = dummy_header(number);
         h.parent_hash = parent_hash;
         h.difficulty = U256::from(difficulty);
@@ -3169,5 +3264,165 @@ mod frozen_delete_tests {
         assert_eq!(store.frozen_delete_cursor().unwrap(), 30);
         assert_eq!(store.delete_frozen_headers(100, 30).unwrap(), 30);
         assert_eq!(store.frozen_delete_cursor().unwrap(), 60);
+    }
+}
+
+#[cfg(test)]
+mod total_difficulty_tests {
+    use super::*;
+    use super::tests::{dummy_header, make_chain_header};
+    use tempfile::tempdir;
+
+    /// An uncle's difficulty counts toward the including block's contribution,
+    /// as rskj `Block.getCumulativeDifficulty()` does. rskj rejects a snap
+    /// status response whose totals omit it, which is how this was found.
+    #[test]
+    fn cumulative_difficulty_includes_uncles() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let mut uncle_a = dummy_header(4);
+        uncle_a.difficulty = U256::from(7u64);
+        let mut uncle_b = dummy_header(3);
+        uncle_b.difficulty = U256::from(11u64);
+
+        let mut h = make_chain_header(5, B256::ZERO, 100, 0x01);
+        h.uncle_count = 2;
+        let hash = h.hash();
+        store.put_header_with_hash(hash, &h).unwrap();
+        store.put_body(hash, &[], &[uncle_a, uncle_b]).unwrap();
+
+        assert_eq!(
+            store.cumulative_difficulty(hash, &h).unwrap(),
+            Some(U256::from(118u64)),
+            "100 + 7 + 11"
+        );
+    }
+
+    /// A header that declares no uncles needs no body read, so a pruned node
+    /// still gets an exact answer for the blocks that absorbed nothing.
+    #[test]
+    fn cumulative_difficulty_without_uncles_needs_no_body() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let h = make_chain_header(5, B256::ZERO, 100, 0x01);
+        let hash = h.hash();
+        store.put_header_with_hash(hash, &h).unwrap();
+        // No body stored at all.
+        assert_eq!(store.cumulative_difficulty(hash, &h).unwrap(), Some(U256::from(100u64)));
+    }
+
+    /// The uncle difficulties are unrecoverable once the body is gone, so the
+    /// answer is "cannot say", never the header difficulty alone. Returning the
+    /// undercount silently is the bug this whole change exists to remove.
+    #[test]
+    fn cumulative_difficulty_is_unknown_when_the_body_is_pruned() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let mut h = make_chain_header(5, B256::ZERO, 100, 0x01);
+        h.uncle_count = 1;
+        let hash = h.hash();
+        store.put_header_with_hash(hash, &h).unwrap();
+        assert_eq!(store.cumulative_difficulty(hash, &h).unwrap(), None);
+    }
+
+    /// Build a chain whose stored totals omit the uncles -- the state every
+    /// rustock database was in -- and check the repair rewrites them to the
+    /// values rskj computes.
+    #[test]
+    fn repair_rewrites_totals_to_include_uncles() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let mut parent = B256::ZERO;
+        let mut wrong = U256::ZERO;
+        let mut expected = Vec::new();
+        let mut running = U256::ZERO;
+
+        for n in 0..6u64 {
+            let mut h = make_chain_header(n, parent, 100, 0x01);
+            // Every other block absorbs one uncle worth 30.
+            let uncles: Vec<Header> = if n % 2 == 1 {
+                let mut u = dummy_header(n - 1);
+                u.difficulty = U256::from(30u64);
+                vec![u]
+            } else {
+                Vec::new()
+            };
+            h.uncle_count = uncles.len() as u64;
+            let hash = h.hash();
+
+            store.put_header_with_hash(hash, &h).unwrap();
+            store.put_body(hash, &[], &uncles).unwrap();
+            store.put_canonical_hash(n, hash).unwrap();
+
+            // The old, wrong accumulation: header difficulty only.
+            wrong += h.difficulty;
+            store.put_total_difficulty(hash, wrong).unwrap();
+
+            running += h.difficulty + U256::from(30u64) * U256::from(uncles.len() as u64);
+            expected.push((hash, running));
+            parent = hash;
+        }
+        store.set_head(parent).unwrap();
+
+        // Precondition: the stored totals really are short.
+        let (tip, want) = *expected.last().unwrap();
+        assert_ne!(store.total_difficulty(tip).unwrap(), Some(want));
+
+        let (written, _unchanged, absent) =
+            store.recompute_total_difficulty(0, 5, 0, |_, _, _| {}).unwrap();
+        assert_eq!(absent, 0);
+        assert!(written > 0);
+
+        for (hash, want) in expected {
+            assert_eq!(store.total_difficulty(hash).unwrap(), Some(want));
+        }
+    }
+
+    /// A snap-synced node holds nothing below its checkpoint. The repair must
+    /// say so rather than reporting a clean run over blocks it never saw.
+    #[test]
+    fn repair_counts_heights_that_hold_no_block() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let h = make_chain_header(0, B256::ZERO, 100, 0x01);
+        let hash = h.hash();
+        store.put_header_with_hash(hash, &h).unwrap();
+        store.put_canonical_hash(0, hash).unwrap();
+        store.set_head(hash).unwrap();
+
+        let (written, unchanged, absent) =
+            store.recompute_total_difficulty(0, 99, 0, |_, _, _| {}).unwrap();
+        assert_eq!(absent, 99, "heights 1..=99 hold nothing");
+        assert_eq!(written + unchanged, 1);
+    }
+
+    /// The repair refuses to invent a total it cannot derive: a pruned body
+    /// below the range stops it rather than letting the error propagate
+    /// upward into every block above.
+    #[test]
+    fn repair_stops_at_a_block_whose_body_is_gone() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let mut parent = B256::ZERO;
+        for n in 0..4u64 {
+            let mut h = make_chain_header(n, parent, 100, 0x01);
+            h.uncle_count = if n == 2 { 1 } else { 0 };
+            let hash = h.hash();
+            store.put_header_with_hash(hash, &h).unwrap();
+            if n != 2 {
+                store.put_body(hash, &[], &[]).unwrap();
+            }
+            store.put_canonical_hash(n, hash).unwrap();
+            store.put_total_difficulty(hash, U256::from((n + 1) * 100)).unwrap();
+            parent = hash;
+        }
+        store.set_head(parent).unwrap();
+
+        let err = store.recompute_total_difficulty(0, 3, 0, |_, _, _| {}).unwrap_err();
+        assert!(err.to_string().contains("#2"), "names the block: {err}");
     }
 }
