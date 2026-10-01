@@ -74,6 +74,11 @@ pub struct NodeConfig {
     pub bootnodes: Vec<String>,
     /// Connect only to `bootnodes`; never learn peers from them.
     pub closed_network: bool,
+    /// Write nothing to `data_dir`.
+    ///
+    /// The databases are opened read-only separately; this covers the files
+    /// the node keeps beside them, which that protection does not reach.
+    pub read_only: bool,
     pub secret_key: [u8; 32],
     pub discovery_port: u16,
     pub data_dir: String,
@@ -147,7 +152,12 @@ impl Node {
         let discovery_path = std::path::Path::new(&self.config.data_dir).join("discovery.rlp");
 
         let mut table_lock = table.write().await;
-        if discovery_path.exists() {
+        // A closed network is told who to talk to. Loading a table saved by
+        // some earlier run reintroduces exactly the peers the flag exists to
+        // exclude -- and `closed_network` only stops the table *growing*, so
+        // nothing downstream would catch it. Observed: a node pointed at one
+        // address came up with 32 known nodes and ten connections.
+        if should_load_saved_table(discovery_path.exists(), self.config.closed_network) {
             match tokio::fs::read(&discovery_path).await {
                 Ok(data) => {
                     if let Err(e) = table_lock.decode_and_add(&data) {
@@ -223,6 +233,13 @@ impl Node {
         &self,
         table: Arc<tokio::sync::RwLock<crate::discovery::table::NodeTable>>,
     ) {
+        // Read-only means read-only. This is not database data, so the
+        // store's own protection does not cover it, and a node told not to
+        // write should not be leaving files in a directory it was pointed at
+        // -- which may be another node's.
+        if !should_persist_table(self.config.read_only) {
+            return;
+        }
         let discovery_path = std::path::Path::new(&self.config.data_dir)
             .join("discovery.rlp");
         tokio::spawn(async move {
@@ -593,6 +610,7 @@ mod tests {
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
             closed_network: false,
+            read_only: false,
             secret_key: [0x42; 32],
             discovery_port: 0,
             data_dir: ".".to_string(),
@@ -619,6 +637,7 @@ mod tests {
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
             closed_network: false,
+            read_only: false,
             secret_key: [0x43; 32],
             discovery_port: 0,
             data_dir: ".".to_string(),
@@ -688,5 +707,57 @@ mod tests {
         assert!(!store.add_peer(peer_id, tx2).await, "Duplicate add should be rejected");
 
         assert_eq!(store.count().await, 1);
+    }
+}
+
+/// Whether to seed the discovery table from one saved by an earlier run.
+///
+/// A closed network is told who to talk to. Loading a saved table
+/// reintroduces exactly the peers the flag exists to exclude, and
+/// `closed_network` only stops the table *growing*, so nothing downstream
+/// catches it. Observed: a node pointed at a single address came up with 32
+/// known nodes and ten connections, because the data directory it was reading
+/// held another node's saved table.
+fn should_load_saved_table(path_exists: bool, closed_network: bool) -> bool {
+    path_exists && !closed_network
+}
+
+/// Whether to write the discovery table back out.
+///
+/// Read-only means read-only. This is not database data, so the store's own
+/// protection does not cover it, and a node told not to write should not be
+/// leaving files in a directory it was pointed at -- which may be another
+/// node's.
+fn should_persist_table(read_only: bool) -> bool {
+    !read_only
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    /// Two flags, two failures, both found by running the thing rather than
+    /// reading it.
+    #[test]
+    fn a_closed_network_does_not_inherit_a_saved_peer_table() {
+        assert!(
+            !should_load_saved_table(true, true),
+            "a closed node loaded a table saved by an earlier run, which is how a node \
+             pointed at one address ends up with ten connections to somewhere else"
+        );
+        assert!(
+            should_load_saved_table(true, false),
+            "an open node should still resume from what it knew"
+        );
+        assert!(!should_load_saved_table(false, false), "nothing saved, nothing to load");
+    }
+
+    #[test]
+    fn a_read_only_node_writes_no_discovery_table() {
+        assert!(
+            !should_persist_table(true),
+            "a read-only node wrote beside a database it was told only to read"
+        );
+        assert!(should_persist_table(false), "an ordinary node still saves what it learned");
     }
 }

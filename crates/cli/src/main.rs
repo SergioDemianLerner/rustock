@@ -1625,6 +1625,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             args.bootnodes.clone()
         },
         closed_network: args.closed_network,
+        read_only,
         secret_key: secret_key_bytes,
         discovery_port: args.port + 1,
         data_dir: args.data_dir.clone(),
