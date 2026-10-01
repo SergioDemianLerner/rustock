@@ -11,9 +11,10 @@
 //!
 //! - **Reorg tolerance.** The node must be able to rebuild from a
 //!   reorganisation up to `D` blocks deep, which needs the blocks themselves.
-//! - **Block-info precompiles.** Rootstock exposes precompiles that read
-//!   attributes of recent blocks, reaching up to 4,000 blocks back. Executing a
-//!   block at height `h` may therefore read data from `h - 4000`.
+//! - **Block-info precompiles, and REMASC.** Rootstock exposes precompiles that
+//!   read attributes of recent blocks, reaching up to 4,000 blocks back, and
+//!   REMASC pays out with a maturity of 4,000. Executing a block at height `h`
+//!   may therefore read data from `h - 4000`.
 //!
 //! They compose rather than overlap: after a 4,000-block reorg the node
 //! re-executes from `head - 4000`, and executing *that* block may reach back a
@@ -31,6 +32,27 @@
 //! Genesis is always retained. It costs one block and keeps every "start of the
 //! chain" lookup working, so the gap is a hole in the middle of the chain rather
 //! than a missing beginning.
+//!
+//! # Measured from the executed head, never the header head
+//!
+//! Both requirements above are about **execution**: it is the executing block
+//! that reaches back 4,000, and a reorg that re-executes. So the retention
+//! depth is measured from the block this node has executed to, not from the
+//! best header it holds.
+//!
+//! The two are the same on a node that is keeping up and wildly different on
+//! one that is not. A snapshot-synced node has every header of the chain but
+//! has executed only from its checkpoint, so its header head can sit thousands
+//! of blocks above its executed head -- and a sweep measured from the header
+//! head deletes blocks that execution has not reached yet but still needs.
+//!
+//! Observed: a test node pruned to #9,274,241 while executing #9,275,670,
+//! whose REMASC payout needed #9,271,670. That block was gone, execution
+//! failed, and no retry could succeed because the data was not coming back.
+//!
+//! The clamp lives here rather than in the callers. Deleting history is not
+//! recoverable, so the rule belongs at the point of deletion where no caller
+//! can forget it.
 //!
 //! The floor is recorded in the database -- number, hash and total difficulty --
 //! so a node can say what it holds without a scan, and so the value needed to
@@ -114,6 +136,17 @@ impl BlockStore {
         }))
     }
 
+    /// Sets the floor directly, for tests that need a pruned node without
+    /// running a sweep to build one.
+    pub fn set_prune_floor_for_test(
+        &self,
+        number: u64,
+        hash: B256,
+        total_difficulty: U256,
+    ) -> Result<()> {
+        self.set_prune_floor(&PruneFloor { number, hash, total_difficulty })
+    }
+
     fn set_prune_floor(&self, floor: &PruneFloor) -> Result<()> {
         let mut buf = Vec::with_capacity(72);
         buf.extend_from_slice(&floor.number.to_be_bytes());
@@ -130,6 +163,26 @@ impl BlockStore {
         let keep = config.effective_keep_depth();
         let started = Instant::now();
         let mut stats = PruneStats::default();
+
+        // Retention is measured from the executed head, whatever the caller
+        // passed. Every reason for the depth is an execution reason -- the
+        // block-info precompiles reach 4,000 back, REMASC pays at a maturity
+        // of 4,000, a reorg re-executes -- so the header head is the wrong
+        // reference whenever it runs ahead, which on a snapshot-synced node is
+        // always.
+        let executed = self
+            .exec_head()?
+            .and_then(|(hash, _)| self.header(hash).ok().flatten())
+            .map(|h| h.number);
+        let Some(executed) = executed else {
+            debug!(
+                target: "rustock::prune",
+                "nothing executed yet; not pruning -- there is no safe reference to \
+                 measure retention from"
+            );
+            return Ok(stats);
+        };
+        let head_number = head_number.min(executed);
 
         let Some(target) = head_number.checked_sub(keep) else {
             debug!(
@@ -150,7 +203,23 @@ impl BlockStore {
         // chain" lookup keeps working, and the chain retains an anchor whose
         // hash is fixed by the network rather than by what this node happens
         // still to hold.
-        let from = floor.as_ref().map(|f| f.number).unwrap_or(1).max(1);
+        let mut from = floor.as_ref().map(|f| f.number).unwrap_or(1).max(1);
+
+        // Start where the block database actually begins, not at block 1.
+        //
+        // A snapshot-synced node has the canonical index only for a window
+        // around its checkpoint; everything below was never written to
+        // `CF_NUMBERS` at all. `canonical_hash` still answers for those
+        // heights -- it falls back to the freezer, where being present is
+        // itself the statement that a height is canonical -- so a sweep
+        // walking up from 1 spends whole batches deleting entries that were
+        // never there, and a node nine million blocks deep needs a hundred and
+        // eighty sweeps to reach anything real.
+        //
+        // One seek says where to begin instead.
+        if let Some(lowest) = self.lowest_indexed_height()? {
+            from = from.max(lowest);
+        }
         if from > target {
             debug!(target: "rustock::prune", "Already pruned to #{}", from.saturating_sub(1));
             return Ok(stats);
@@ -240,6 +309,28 @@ impl BlockStore {
         Ok(stats)
     }
 
+    /// The lowest height with a `number -> hash` entry in the block database.
+    ///
+    /// Deliberately asks the column family rather than `canonical_hash`, which
+    /// falls back to the freezer: this is "where does the block database
+    /// begin", and the freezer is not the block database. Genesis is skipped
+    /// because it is always retained and would otherwise answer 0 on every
+    /// node.
+    fn lowest_indexed_height(&self) -> Result<Option<u64>> {
+        let cf = self.cf_numbers()?;
+        let iter = self.db().iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&1u64.to_be_bytes(), rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (k, _) = item.context("scanning for the lowest indexed height")?;
+            if k.len() == 8 {
+                return Ok(Some(u64::from_be_bytes(k[..8].try_into().unwrap_or([0; 8]))));
+            }
+        }
+        Ok(None)
+    }
+
     /// The lowest block above genesis that the database holds contiguously: the
     /// prune floor if it has been pruned, genesis otherwise.
     ///
@@ -266,13 +357,14 @@ impl BlockStore {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::BlockStore;
     use rustock_core::types::header::Header;
     use tempfile::tempdir;
 
-    fn header(number: u64, parent: B256) -> Header {
+    pub(super) fn header(number: u64, parent: B256) -> Header {
         Header {
             number,
             parent_hash: parent,
@@ -300,8 +392,12 @@ mod tests {
         }
     }
 
-    /// Builds a canonical chain of `n` blocks (0..n-1) with total difficulty.
-    fn chain(store: &BlockStore, n: u64) -> Vec<B256> {
+    /// Builds a canonical chain of `n` blocks (0..n-1) with total difficulty,
+    /// executed to the top.
+    ///
+    /// The executed head matters: retention is measured from it, so a fixture
+    /// without one describes a node that has run nothing and must not prune.
+    pub(super) fn chain(store: &BlockStore, n: u64) -> Vec<B256> {
         let mut hashes = Vec::with_capacity(n as usize);
         let mut parent = B256::ZERO;
         let mut td = U256::ZERO;
@@ -315,6 +411,9 @@ mod tests {
             store.put_body(hash, &[], &[]).unwrap();
             parent = hash;
             hashes.push(hash);
+        }
+        if let Some(top) = hashes.last() {
+            store.set_exec_head(*top, B256::ZERO).unwrap();
         }
         hashes
     }
@@ -466,5 +565,273 @@ mod tests {
             9_499 - floor.number + 1,
             "the walk reaches the floor and stops, rather than running off the end"
         );
+    }
+}
+
+#[cfg(test)]
+mod bridge_event_tests {
+    use super::tests::chain;
+    use super::*;
+    use crate::BlockStore;
+    use tempfile::tempdir;
+
+    /// Peg history outlives the blocks it came from.
+    ///
+    /// Receipts are pruned — that is the point, they are most of the weight —
+    /// so `eth_getTransactionReceipt` stops answering for a pruned height. The
+    /// Bridge events inside them must not go with them: they live in their own
+    /// index, keyed by event signature, and the value carries the transaction
+    /// hash, topics and data rather than pointing back into the receipt. That
+    /// is what the peg is debugged from, long after the blocks are gone.
+    #[test]
+    fn bridge_events_survive_the_blocks_they_came_from() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain(&store, 12_000);
+
+        // A peg-in recorded at a height that is about to be pruned, and one
+        // safely inside the retention window.
+        let peg_in = B256::repeat_byte(0xa1);
+        let doomed_height = 100u64;
+        let kept_height = 11_500u64;
+        for (h, tx) in [(doomed_height, 0xd1u8), (kept_height, 0xd2)] {
+            store
+                .put_bridge_event(
+                    peg_in,
+                    h,
+                    0,
+                    0,
+                    B256::repeat_byte(tx),
+                    &[peg_in, B256::repeat_byte(0xbb)],
+                    b"amount and address",
+                )
+                .unwrap();
+        }
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let stats = store.prune_blocks(&cfg, 11_999).unwrap();
+        assert!(stats.blocks > 0, "the sweep must actually have removed something");
+        assert!(doomed_height <= stats.to, "the peg-in's block was in the swept range");
+
+        // The block really is gone, receipts included.
+        assert!(
+            store.canonical_hash(doomed_height).unwrap().is_none(),
+            "the block should have been pruned"
+        );
+
+        // The event is not.
+        let found = store.scan_bridge_events(peg_in, 0, u64::MAX).unwrap();
+        let heights: Vec<u64> = found.iter().map(|e| e.0).collect();
+        assert!(
+            heights.contains(&doomed_height),
+            "the peg-in at #{doomed_height} was lost with its block; found {heights:?}"
+        );
+        assert!(heights.contains(&kept_height));
+
+        // And it is still self-contained: the data came from the event index,
+        // not from a receipt that no longer exists.
+        let (_, _, _, tx_hash, topics, data) =
+            found.iter().find(|e| e.0 == doomed_height).unwrap();
+        assert_eq!(*tx_hash, B256::repeat_byte(0xd1));
+        assert_eq!(data.as_slice(), b"amount and address");
+        assert_eq!(topics.len(), 2, "topics come from the event index, not a receipt");
+    }
+
+    /// Receipts, by contrast, are meant to go.
+    #[test]
+    fn receipts_are_pruned_with_their_blocks() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hashes = chain(&store, 12_000);
+
+        let doomed = hashes[100];
+        store.put_receipts(doomed, &[]).unwrap();
+        assert!(store.receipts(doomed).unwrap().is_some());
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        store.prune_blocks(&cfg, 11_999).unwrap();
+
+        assert!(
+            store.receipts(doomed).unwrap().is_none(),
+            "receipts are most of the weight; pruning that keeps them saves little"
+        );
+    }
+}
+
+#[cfg(test)]
+mod snap_synced_tests {
+    use super::tests::{chain, header};
+    use super::*;
+    use crate::BlockStore;
+    use tempfile::tempdir;
+
+    /// A snapshot-synced node holds the canonical index only for a window
+    /// around its checkpoint. A sweep must begin there, not at block 1.
+    ///
+    /// Walking up from 1 is not merely slow: `canonical_hash` falls back to
+    /// the freezer, so those heights answer even though nothing was ever
+    /// written to the block database for them, and each sweep burns its whole
+    /// batch deleting entries that do not exist. Nine million blocks at fifty
+    /// thousand a sweep is a hundred and eighty sweeps before the first real
+    /// deletion.
+    #[test]
+    fn a_sweep_starts_where_the_block_database_begins() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Headers for the whole chain, as the snapshot walk leaves them:
+        // written by hash, with the canonical index only near the top.
+        let height = 60_000u64;
+        let window_from = 50_000u64;
+        let mut parent = B256::ZERO;
+        let mut td = U256::ZERO;
+        for i in 0..=height {
+            let h = header(i, parent);
+            let hash = h.hash();
+            td += h.difficulty;
+            store.put_header(&h).unwrap();
+            store.put_total_difficulty(hash, td).unwrap();
+            if i >= window_from || i == 0 {
+                store.put_canonical_hash(i, hash).unwrap();
+            }
+            if i == height {
+                store.set_exec_head(hash, B256::ZERO).unwrap();
+            }
+            parent = hash;
+        }
+
+        // One sweep, with a batch far smaller than the distance from block 1.
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 1_000 };
+        let stats = store.prune_blocks(&cfg, height).unwrap();
+
+        assert!(
+            stats.from >= window_from,
+            "the sweep began at #{} — below where the block database starts (#{window_from}), \
+             so it spent its batch on heights that were never written",
+            stats.from
+        );
+        assert!(stats.blocks > 0, "and it should have removed something real");
+        assert!(
+            stats.to <= height - MIN_KEEP_DEPTH,
+            "never closer to the head than the retention floor"
+        );
+    }
+
+    /// On an ordinarily synced node, whose index starts at the bottom, nothing
+    /// changes: the sweep still begins at block 1.
+    #[test]
+    fn an_ordinary_node_still_sweeps_from_the_bottom() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain(&store, 12_000);
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100 };
+        let stats = store.prune_blocks(&cfg, 11_999).unwrap();
+        assert_eq!(stats.from, 1, "genesis is retained, so the first prunable block is 1");
+    }
+}
+
+#[cfg(test)]
+mod executed_head_tests {
+    use super::tests::header;
+    use super::*;
+    use crate::BlockStore;
+    use tempfile::tempdir;
+
+    /// Builds a chain and marks `executed` as the block this node has run to.
+    fn chain_executed_to(store: &BlockStore, n: u64, executed: u64) -> Vec<B256> {
+        let mut hashes = Vec::with_capacity(n as usize);
+        let mut parent = B256::ZERO;
+        let mut td = U256::ZERO;
+        for i in 0..n {
+            let h = header(i, parent);
+            let hash = h.hash();
+            td += h.difficulty;
+            store.put_header(&h).unwrap();
+            store.put_canonical_hash(i, hash).unwrap();
+            store.put_total_difficulty(hash, td).unwrap();
+            store.put_body(hash, &[], &[]).unwrap();
+            parent = hash;
+            hashes.push(hash);
+        }
+        store.set_exec_head(hashes[executed as usize], B256::ZERO).unwrap();
+        hashes
+    }
+
+    /// The bug this exists to prevent, seen on a real node.
+    ///
+    /// A snapshot-synced node holds every header but has executed only from
+    /// its checkpoint, so the header head sits thousands of blocks above the
+    /// executed head. Measuring retention from the header head deletes blocks
+    /// execution has not reached yet and still needs: the node pruned to
+    /// #9,274,241 while executing #9,275,670, whose REMASC payout needed
+    /// #9,271,670. That block was gone and no retry could bring it back.
+    #[test]
+    fn retention_is_measured_from_the_executed_head_not_the_header_head() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Headers to #30,000; executed only to #20,000, as after a snapshot
+        // sync whose forward header download has run ahead.
+        let executed = 20_000u64;
+        chain_executed_to(&store, 30_001, executed);
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let stats = store.prune_blocks(&cfg, 30_000).unwrap();
+
+        let highest_removed = stats.to;
+        assert!(
+            highest_removed <= executed - MIN_KEEP_DEPTH,
+            "pruned up to #{highest_removed}, but execution is at #{executed} and reaches \
+             {MIN_KEEP_DEPTH} blocks back — everything above #{} is still needed",
+            executed - MIN_KEEP_DEPTH
+        );
+
+        // The block REMASC would ask for while executing the next one.
+        let needed = executed + 1 - 4_000;
+        assert!(
+            store.canonical_hash(needed).unwrap().is_some(),
+            "#{needed} is what REMASC reads when executing #{}; it must survive",
+            executed + 1
+        );
+        assert!(store.body(store.canonical_hash(needed).unwrap().unwrap()).unwrap().is_some());
+    }
+
+    /// A node that has executed nothing has no safe reference, so it prunes
+    /// nothing rather than guessing.
+    #[test]
+    fn a_node_that_has_executed_nothing_prunes_nothing() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let mut parent = B256::ZERO;
+        let mut td = U256::ZERO;
+        for i in 0..30_000u64 {
+            let h = header(i, parent);
+            let hash = h.hash();
+            td += h.difficulty;
+            store.put_header(&h).unwrap();
+            store.put_canonical_hash(i, hash).unwrap();
+            store.put_total_difficulty(hash, td).unwrap();
+            parent = hash;
+        }
+        // No exec head set.
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let stats = store.prune_blocks(&cfg, 29_999).unwrap();
+        assert_eq!(stats.blocks, 0, "nothing executed means no safe reference");
+        assert!(store.prune_floor().unwrap().is_none(), "and no floor was claimed");
+    }
+
+    /// When the node is keeping up, the two heads agree and nothing changes.
+    #[test]
+    fn a_node_that_is_keeping_up_prunes_as_before() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain_executed_to(&store, 20_000, 19_999);
+
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let stats = store.prune_blocks(&cfg, 19_999).unwrap();
+        assert_eq!(stats.to, 19_999 - MIN_KEEP_DEPTH);
     }
 }

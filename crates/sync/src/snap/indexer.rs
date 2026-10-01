@@ -33,6 +33,21 @@
 //! **resume**, because a node that restarts daily would otherwise never
 //! finish: the cursor is stored, so an interrupted pass picks up where it
 //! stopped rather than at the top.
+//!
+//! # And it must stop at the prune floor
+//!
+//! This fill writes `number -> hash` downward; the pruner deletes exactly
+//! those entries below its floor. Left to themselves the two undo each other
+//! in a loop: the fill rebuilds the index for heights the pruner has just
+//! discarded, the next sweep discards them again, and the node spends its
+//! background disk writing data it is about to delete.
+//!
+//! So the fill stops at the floor. A pruning node does not want an index for
+//! history it has thrown away, and the blocks below the floor are gone --
+//! there is nothing there to point at. The stop lives inside
+//! `index_canonical_batch`, per height: a batch is ten thousand heights, so a
+//! check between batches would write straight through the floor and overshoot
+//! by up to a batch.
 
 use rustock_storage::BlockStore;
 use std::sync::Arc;

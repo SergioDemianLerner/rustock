@@ -542,6 +542,20 @@ pub struct SyncService {
     /// by the next session. Making the handover explicit means one place
     /// decides, and it decides after the outcome is known. See #185.
     suspended_for_snap: bool,
+    /// Whether the block pruner may run, readable from outside the service.
+    ///
+    /// **Starts false, and is only ever turned on once this service has
+    /// determined what the node is doing.** A snapshot sync downloads the
+    /// blocks below its checkpoint as its last phase, so a sweep during one
+    /// would delete the very history the sync is fetching.
+    ///
+    /// Default-deny rather than default-allow, because the two are not
+    /// symmetric. Asking "is a snapshot sync running?" at startup answers
+    /// "no" during the window before one has begun -- the node is still
+    /// finding peers, and no session exists yet to report itself. A sweep in
+    /// that window deletes history that only a resync restores. Waiting a few
+    /// seconds longer than necessary costs nothing.
+    prune_allowed: Arc<std::sync::atomic::AtomicBool>,
     /// Peer scoring, when the node was built with it.
     ///
     /// The sidelining below **feeds** this rather than being replaced by it.
@@ -602,6 +616,7 @@ impl SyncService {
             events: None,
             body_providers: HashMap::new(),
             suspended_for_snap: false,
+            prune_allowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             scoring: None,
             last_prefetch_start: None,
             block_source: None,
@@ -701,6 +716,11 @@ impl SyncService {
         self.chain_activity.clone()
     }
 
+    /// Whether the block pruner may run. See [`Self::prune_allowed`].
+    pub fn prune_gate(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.prune_allowed.clone()
+    }
+
     /// Share a gas-price tracker with the transaction pool, which needs the
     /// same one: the limiter's low-gas-price factor and `eth_gasPrice` must
     /// not disagree about the market.
@@ -788,6 +808,16 @@ impl SyncService {
             target: "rustock::sync",
             "Sync service started (pipelined multi-peer skeleton sync)"
         );
+
+        // The node's state is now determined: either a snapshot session is
+        // open, or none is coming. Only in the second case may the pruner run,
+        // and this is the earliest point at which that is knowable -- which is
+        // why the gate starts closed rather than being inferred later from the
+        // absence of a session.
+        if self.snap.is_none() && self.snap_restart.is_none() {
+            self.prune_allowed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
         let mut timer = tokio::time::interval(TICK_INTERVAL);
 
         loop {
@@ -908,6 +938,16 @@ impl SyncService {
 
     /// Whether ordinary sync is standing down for a snapshot session.
     #[cfg(test)]
+    #[cfg(test)]
+    pub(crate) fn suspend_ordinary_sync_for_test(&mut self) {
+        self.suspend_ordinary_sync();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_ordinary_sync_for_test(&mut self) {
+        self.resume_ordinary_sync();
+    }
+
     pub(crate) fn is_suspended_for_snap_for_test(&self) -> bool {
         self.suspended_for_snap
     }
@@ -985,6 +1025,7 @@ impl SyncService {
     /// leaving a node that reported it could not resume. See #185.
     fn suspend_ordinary_sync(&mut self) {
         self.suspended_for_snap = true;
+        self.prune_allowed.store(false, std::sync::atomic::Ordering::Relaxed);
         // Abandon whatever round was in flight rather than leaving it parked:
         // its requests are outstanding against the same peers the snapshot
         // session is about to need, and its answers would be matched against a
@@ -1008,6 +1049,11 @@ impl SyncService {
     /// A replacement re-suspends, so the flag ends up true again and the gap
     /// never opens.
     fn resume_ordinary_sync(&mut self) {
+        // Outside the `if`: this is also the path taken when a snapshot sync
+        // gives up without ever having suspended anything, and pruning must
+        // still be released then or a node that tried and failed to snapshot
+        // sync would never prune at all.
+        self.prune_allowed.store(true, std::sync::atomic::Ordering::Relaxed);
         if self.suspended_for_snap {
             self.suspended_for_snap = false;
             debug!(target: "rustock::snap", "ordinary sync resumed");

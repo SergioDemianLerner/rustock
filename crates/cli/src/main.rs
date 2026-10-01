@@ -208,6 +208,18 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     snap_index_history: bool,
 
+    /// Blocks to download below the checkpoint when snapshot syncing.
+    ///
+    /// These are the blocks the node holds history for once the sync is done.
+    /// The default is enough for the block-info precompiles (4,000 back) and a
+    /// reorg that re-executes from 4,000 back, with margin.
+    ///
+    /// Raising it is how a pruning node is given something to prune: set this
+    /// above `--prune-keep-depth` and the first sweep after the sync has the
+    /// difference to remove.
+    #[arg(long, default_value_t = 6_000, value_name = "BLOCKS")]
+    snap_blocks: u64,
+
     /// State bytes per second one peer may be served.
     ///
     /// Computing chunks is bounded by the server's cache -- it serves one
@@ -798,6 +810,25 @@ struct Args {
     #[arg(long, default_value_t = 50_000)]
     prune_max_batch: u64,
 
+    /// Delete block history below `--prune-keep-depth` as the node runs.
+    ///
+    /// Off by default, and deliberately: turning it on is not a tuning
+    /// change, it deletes history that only a resync can bring back. A node
+    /// holding the whole chain keeps holding it until someone says otherwise.
+    ///
+    /// Bodies, receipts and the transaction index for pruned heights go, so
+    /// `eth_getTransactionByHash` and `eth_getTransactionReceipt` stop
+    /// answering for them. Bridge events are kept: they live in their own
+    /// index, self-contained, and are what the peg is debugged from.
+    ///
+    /// Sweeps never run while a snapshot sync is in progress.
+    #[arg(long, default_value_t = false)]
+    prune_blocks: bool,
+
+    /// Seconds between prune sweeps.
+    #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+    prune_every_secs: u64,
+
     /// Enable the `evm_*` namespace: snapshot, revert, reset, mine on demand
     /// and move the clock.
     ///
@@ -903,6 +934,7 @@ fn apply_file_config(
     apply(matches, "ws_port", f.rpc.ws_port.as_ref(), &mut a.ws_port);
     apply(matches, "snap_server", f.snapshot.server.as_ref(), &mut a.snap_server);
     apply(matches, "snap_sync", f.snapshot.sync.as_ref(), &mut a.snap_sync);
+    apply(matches, "snap_blocks", f.snapshot.blocks.as_ref(), &mut a.snap_blocks);
     apply(matches, "snap_chunk_bytes", f.snapshot.chunk_bytes.as_ref(), &mut a.snap_chunk_bytes);
     apply(matches, "snap_chunk_grid", f.snapshot.chunk_grid.as_ref(), &mut a.snap_chunk_grid);
     apply(matches, "snap_parallel", f.snapshot.parallel.as_ref(), &mut a.snap_parallel);
@@ -967,6 +999,8 @@ fn apply_file_config(
 
     apply(matches, "prune_keep_depth", f.prune.keep_depth.as_ref(), &mut a.prune_keep_depth);
     apply(matches, "prune_max_batch", f.prune.max_batch.as_ref(), &mut a.prune_max_batch);
+    apply(matches, "prune_blocks", f.prune.blocks.as_ref(), &mut a.prune_blocks);
+    apply(matches, "prune_every_secs", f.prune.every_secs.as_ref(), &mut a.prune_every_secs);
     apply(matches, "prune_frozen_headers", f.prune.frozen_headers.as_ref(),
         &mut a.prune_frozen_headers);
     apply(matches, "no_freezer", f.prune.no_freezer.as_ref(), &mut a.no_freezer);
@@ -1978,6 +2012,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         peer_bytes_per_second: args.snap_peer_rate,
         total_bytes_per_second: args.snap_total_rate,
         max_in_flight: args.snap_parallel.max(1),
+        blocks_required: args.snap_blocks,
         ..rustock_sync::SnapConfig::default()
     };
 
@@ -2265,6 +2300,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     // Taken before the service is moved into its task: the RPC layer reads the
     // same gauge the sync loop publishes, so `debug_wireProtocolQueueSize`
     // answers with the live backlog.
+    // Shared with the prune sweep below. Closed until the sync service has
+    // determined what this node is doing.
+    let prune_gate = sync_service.prune_gate();
     let wire_queue_depth = sync_service.wire_queue_depth();
 
     if let Some(path) = &args.import_blocks_db {
@@ -2379,6 +2417,81 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             // its mail settings are wrong is worse than one that runs unwatched.
             Err(e) => error!("Peg-out alerts disabled — {path}: {e:#}"),
         }
+    }
+
+    // Delete block history the node no longer needs, on a timer.
+    //
+    // Opt-in. Turning this on discards history that only a resync restores, so
+    // a node holding the whole chain keeps holding it until an operator says
+    // otherwise.
+    //
+    // Two things it waits for. A snapshot sync downloads the blocks below its
+    // checkpoint as its final phase, so sweeping during one would delete what
+    // is still being fetched -- and `--snap-blocks` above `--prune-keep-depth`
+    // is exactly how a pruning node is given its first sweep's work. And the
+    // canonical index fill writes `number -> hash` downward while this deletes
+    // it below the floor; the fill now stops at the floor, so the two meet
+    // rather than chase.
+    if args.prune_blocks {
+        let store_for_prune = store.clone();
+        let gate = prune_gate.clone();
+        let cfg = rustock_storage::pruner::PruneConfig {
+            keep_depth: args.prune_keep_depth,
+            max_batch: args.prune_max_batch,
+        };
+        let every = std::time::Duration::from_secs(args.prune_every_secs.max(1));
+        info!(
+            "Block pruning on: keeping {} blocks below the head, up to {} per sweep, \
+             every {}s",
+            args.prune_keep_depth.max(rustock_storage::pruner::MIN_KEEP_DEPTH),
+            args.prune_max_batch,
+            args.prune_every_secs,
+        );
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(every);
+            ticker.tick().await; // the first tick fires immediately
+            let mut announced_wait = false;
+            loop {
+                ticker.tick().await;
+
+                if !gate.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !announced_wait {
+                        announced_wait = true;
+                        info!(
+                            target: "rustock::prune",
+                            "holding: pruning waits until the node has settled into ordinary \
+                             sync, so a snapshot sync's blocks are never swept while it is \
+                             still fetching them"
+                        );
+                    }
+                    continue;
+                }
+                if announced_wait {
+                    announced_wait = false;
+                    info!(target: "rustock::prune", "pruning released; sweeping from now on");
+                }
+
+                let Ok(Some(head_hash)) = store_for_prune.head() else { continue };
+                let Ok(Some(head)) = store_for_prune.header(head_hash) else { continue };
+
+                let store_for_task = store_for_prune.clone();
+                let cfg_for_task = cfg.clone();
+                let number = head.number;
+                match tokio::task::spawn_blocking(move || {
+                    store_for_task.prune_blocks(&cfg_for_task, number)
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        warn!(target: "rustock::prune", "prune sweep failed: {e:#}")
+                    }
+                    Err(join) => {
+                        error!(target: "rustock::prune", "prune sweep panicked: {join}")
+                    }
+                }
+            }
+        });
     }
 
     // Supervise the sync task: a panic inside it would otherwise be swallowed

@@ -1695,11 +1695,23 @@ impl BlockStore {
         let mut written = 0u64;
         let mut current = hash;
 
+        // On a pruning node there is nothing below the floor to index: those
+        // blocks are gone, and writing `number -> hash` for them would only
+        // give the next sweep more to delete. Checked per height rather than
+        // per batch, because a batch spanning the floor would otherwise write
+        // straight through it.
+        let floor = self.prune_floor()?.map(|f| f.number);
+
         for _ in 0..batch_size {
             let Some(header) = self.header(current)? else {
                 self.db.write(batch).context("commit canonical index batch")?;
                 return Ok((written, None));
             };
+
+            if floor.is_some_and(|f| header.number < f) {
+                self.db.write(batch).context("commit canonical index batch")?;
+                return Ok((written, None));
+            }
 
             // Rewriting an agreeing height would be wasted I/O; disagreeing
             // ones are corrected, because this walk is following the chain the
