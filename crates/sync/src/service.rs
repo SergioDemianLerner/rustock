@@ -2693,20 +2693,50 @@ impl SyncService {
             return;
         }
 
+        // Read before the near-tip shortcut, not after it.
+        //
+        // The watchdog sets this when a round has stopped making progress, and
+        // follow mode is the round it most often stops in: `outstanding 0`
+        // means nothing is in flight, so no timeout will fire and nothing will
+        // restart the flow. The escalation drops to `Idle` expecting a search
+        // to follow.
+        //
+        // Consulting the flag below the shortcut made that escalation a
+        // no-op. A node a few hundred blocks behind takes the near-tip branch,
+        // returns to the state it was stuck in, and never reaches the search
+        // it was told to run -- so the flag is still set, the stall is still
+        // there, and the watchdog fires again on the next tick, forever.
+        // Observed twice: three hours on the mainnet node, and two hours forty
+        // on a test node that had a peer 358 blocks ahead the whole time.
+        //
+        // The near-tip branch is an assumption that this node is where it
+        // thinks it is. That assumption is exactly what the flag withdraws.
+        let forced = std::mem::take(&mut self.force_connection_search);
+
         if head.number >= metadata.best_number {
+            // Nothing above us on this peer, so there is no search to run:
+            // it would converge on our own head.
             self.state = SyncState::Following;
             return;
         }
 
         let gap = metadata.best_number - head.number;
 
-        if gap <= LONG_SYNC_LIMIT {
+        if gap <= LONG_SYNC_LIMIT && !forced {
             info!(
                 target: "rustock::sync",
                 "Near tip ({} blocks behind), entering follow mode", gap
             );
             self.state = SyncState::Following;
             return;
+        }
+
+        if forced && gap <= LONG_SYNC_LIMIT {
+            info!(
+                target: "rustock::sync",
+                "Near tip ({gap} blocks behind) but progress had stopped; searching for \
+                 the connection point rather than following again"
+            );
         }
 
         info!(
@@ -2719,8 +2749,8 @@ impl SyncService {
 
         // If the peer's best hash matches our chain, use our head as connection point.
         // Otherwise, use binary search to find where our chain diverges from the peer.
-        let peer_hash_known = !std::mem::take(&mut self.force_connection_search)
-            && self.manager.store.has_block(metadata.best_hash).unwrap_or(false);
+        let peer_hash_known =
+            !forced && self.manager.store.has_block(metadata.best_hash).unwrap_or(false);
 
         if peer_hash_known || head.number == 0 {
             let cp = head.number;
