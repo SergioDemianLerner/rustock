@@ -19,9 +19,17 @@ pub struct PeerMetadata {
     /// sync layer only ever holds a node id, so the address has to be
     /// reachable from here.
     pub address: Option<std::net::IpAddr>,
+    /// Lowest block this peer says it can serve.
+    ///
+    /// `None` means it did not say, which must be read as "serves everything"
+    /// rather than "serves nothing": every rskj peer looks like this, and so
+    /// does every rustock peer before the first status arrives. Treating
+    /// silence as a refusal would empty the peer set.
+    pub earliest_block: Option<u64>,
 }
 
 struct PeerState {
+    caps: crate::handshake::PeerCapabilities,
     sender: mpsc::Sender<P2pMessage>,
     metadata: PeerMetadata,
 }
@@ -49,15 +57,55 @@ impl PeerStore {
 
     /// Attempts to add a peer to the store. Returns true if it was newly added.
     pub async fn add_peer(&self, id: B512, sender: mpsc::Sender<P2pMessage>) -> bool {
+        self.add_peer_with(id, sender, Default::default()).await
+    }
+
+    /// As [`Self::add_peer`], recording what the peer said it speaks.
+    pub async fn add_peer_with(
+        &self,
+        id: B512,
+        sender: mpsc::Sender<P2pMessage>,
+        caps: crate::handshake::PeerCapabilities,
+    ) -> bool {
         let mut peers = self.connected_peers.lock().await;
         use std::collections::hash_map::Entry;
         match peers.entry(id) {
             Entry::Occupied(_) => false,
             Entry::Vacant(e) => {
-                e.insert(PeerState { sender, metadata: PeerMetadata::default() });
+                e.insert(PeerState { sender, metadata: PeerMetadata::default(), caps });
                 true
             }
         }
+    }
+
+    /// Records a peer's new lower bound, leaving the rest of its metadata be.
+    pub async fn set_earliest_block(&self, id: &B512, earliest: u64) {
+        if let Some(p) = self.connected_peers.lock().await.get_mut(id) {
+            p.metadata.earliest_block = Some(earliest);
+        }
+    }
+
+    /// What this peer said it speaks.
+    pub async fn capabilities(
+        &self,
+        id: &B512,
+    ) -> Option<crate::handshake::PeerCapabilities> {
+        self.connected_peers.lock().await.get(id).map(|p| p.caps)
+    }
+
+    /// Peers that negotiated the served-range extension.
+    ///
+    /// The gate on every `BlockRangeUpdate`: an rskj peer that received one
+    /// would throw out of `MessageType.valueOfType` and close the connection,
+    /// so a peer is sent one only once it has said it understands it.
+    pub async fn peers_understanding_block_range(&self) -> Vec<B512> {
+        self.connected_peers
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, p)| p.caps.understands_block_range())
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Updates the metadata for a peer.
@@ -209,6 +257,7 @@ mod tests {
             total_difficulty: U256::from(999),
             client_id: "test".to_string(),
             address: Some("203.0.113.1".parse().unwrap()),
+        earliest_block: None,
         };
         store.update_metadata(&peer_id, metadata.clone()).await;
 

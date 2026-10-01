@@ -52,7 +52,25 @@ pub struct NodeConfig {
     pub genesis_hash: B256,
     pub best_hash: B256,
     pub best_block_number: u64,
+    /// Parent of the best block.
+    ///
+    /// The RSK status message is positional: parent and total difficulty are
+    /// elements three and four, and without them nothing after can be sent.
+    /// Leaving this unset is why this node advertised a two-element status --
+    /// and so never stated its own total difficulty on the RSK protocol, only
+    /// on the eth one.
+    pub best_block_parent_hash: Option<B256>,
     pub total_difficulty: U256,
+    /// Lowest block this node can serve: the prune floor, or zero.
+    ///
+    /// Sent as a fifth element, which rskj ignores. See
+    /// [`rustock_networking::protocol::RskStatus::earliest_block`].
+    pub earliest_block: u64,
+    /// Whether to offer the `snap` capability in the handshake.
+    ///
+    /// rskj already defines `snap/1` and looks for it in a peer's hello, so
+    /// this is matching a capability it understands rather than inventing one.
+    pub snap_capability: bool,
     pub bootnodes: Vec<String>,
     /// Connect only to `bootnodes`; never learn peers from them.
     pub closed_network: bool,
@@ -377,6 +395,7 @@ use crate::protocol::rsk::RskStatus;
 pub(crate) async fn register_and_run_session(
     peer_id: B512,
     rsk_status: RskStatus,
+    caps: crate::handshake::PeerCapabilities,
     framed: tokio_util::codec::Framed<TcpStream, crate::handshake::HandshakeCodec>,
     handlers: Vec<Arc<dyn P2pHandler>>,
     peer_store: Arc<PeerStore>,
@@ -399,7 +418,7 @@ pub(crate) async fn register_and_run_session(
 
     let (tx, rx) = mpsc::channel(crate::peers::PEER_CHANNEL_CAPACITY);
 
-    if !peer_store.add_peer(peer_id, tx).await {
+    if !peer_store.add_peer_with(peer_id, tx, caps).await {
         trace!(target: "rustock::net", "Peer already connected: {:?}", peer_id);
         return Ok(());
     }
@@ -421,6 +440,7 @@ pub(crate) async fn register_and_run_session(
         total_difficulty: rsk_status.total_difficulty.unwrap_or_default(),
         client_id: String::new(),
         address,
+    earliest_block: None,
     };
     peer_store.update_metadata(&peer_id, metadata).await;
 
@@ -479,7 +499,7 @@ pub async fn handle_incoming(
         }
     };
 
-    let (peer_id, rsk_status, framed) = match outcome {
+    let (peer_id, rsk_status, caps, framed) = match outcome {
         Ok(Ok(parts)) => parts,
         Ok(Err(e)) => {
             failed(&scoring);
@@ -490,8 +510,10 @@ pub async fn handle_incoming(
             return Err(anyhow::Error::new(e).context("Inbound handshake timed out"));
         }
     };
-    register_and_run_session(peer_id, rsk_status, framed, handlers, peer_store, scoring, address)
-        .await
+    register_and_run_session(
+        peer_id, rsk_status, caps, framed, handlers, peer_store, scoring, address,
+    )
+    .await
 }
 
 /// Give back one inbound slot from the per-IP or per-block table.
@@ -569,6 +591,9 @@ mod tests {
             max_inbound_per_ip: 4,
             max_inbound_per_cidr: 16,
             inbound_cidr_prefix: 24,
+        best_block_parent_hash: None,
+        earliest_block: 0,
+        snap_capability: false,
         };
         
         let node2_config = NodeConfig {
@@ -592,6 +617,9 @@ mod tests {
             max_inbound_per_ip: 4,
             max_inbound_per_cidr: 16,
             inbound_cidr_prefix: 24,
+        best_block_parent_hash: None,
+        earliest_block: 0,
+        snap_capability: false,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

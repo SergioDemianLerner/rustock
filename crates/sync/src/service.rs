@@ -3327,6 +3327,7 @@ impl SyncService {
                     total_difficulty: alloy_primitives::U256::ZERO,
                     client_id: String::new(),
                     address: None,
+                earliest_block: None,
                 };
                 self.peer_store.update_metadata(&peer, metadata).await;
 

@@ -179,6 +179,9 @@ mod tests {
             max_inbound_per_ip: 4,
             max_inbound_per_cidr: 16,
             inbound_cidr_prefix: 24,
+        best_block_parent_hash: None,
+        earliest_block: 0,
+        snap_capability: false,
         }
     }
 

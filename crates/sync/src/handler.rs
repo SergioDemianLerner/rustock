@@ -8,7 +8,7 @@ use rustock_networking::protocol::{
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 /// Skeleton step size (must match rskj's chunkSize = 192).
 const SKELETON_STEP: u64 = 192;
@@ -339,12 +339,32 @@ impl P2pHandler for SyncHandler {
                             total_difficulty: claimed,
                             client_id: "".to_string(),
                             address: None,
+                            // `None` from an rskj peer, which has not been
+                            // asked and must keep meaning "ask me anything".
+                            earliest_block: s.earliest_block,
                         };
                         let peer_store = self.manager.peer_store.clone();
                         tokio::spawn(async move {
                             peer_store.update_metadata(&id, metadata).await;
                         });
                     }
+                }
+                RskSubMessage::BlockRangeUpdate(range) => {
+                    // A peer narrowing or extending what it serves, without a
+                    // reconnection. A pruning node's floor rises continuously,
+                    // so a figure fixed at handshake time goes stale within
+                    // minutes; this is what keeps it current.
+                    debug!(
+                        target: "rustock::sync",
+                        "Peer {:?} now serves #{}..#{}",
+                        &id.0[..4], range.earliest_block, range.latest_block
+                    );
+                    let peer_store = self.manager.peer_store.clone();
+                    let peer = id;
+                    let earliest = range.earliest_block;
+                    tokio::spawn(async move {
+                        peer_store.set_earliest_block(&peer, earliest).await;
+                    });
                 }
                 RskSubMessage::BlockHashResponse(r) => {
                     let _ = self.event_tx.send(SyncEvent::BlockHashResponse {

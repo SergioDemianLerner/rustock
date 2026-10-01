@@ -10,6 +10,21 @@ pub struct RskStatus {
     pub best_block_hash: B256,
     pub best_block_parent_hash: Option<B256>,
     pub total_difficulty: Option<U256>,
+    /// Lowest block this node can serve, as a fifth trailing element.
+    ///
+    /// Appended rather than replacing anything: rskj's decoder reads indices
+    /// 0..3 and never consults the list length again, so a fifth element is
+    /// accepted and ignored. Verified against rskj 9.1.0 by decoding 2-, 4-,
+    /// 5- and 6-element messages through its own `MessageType.createMessage`;
+    /// all four were accepted with the known fields intact.
+    ///
+    /// Total difficulty stays where it is. `eth/69` dropped it because it is
+    /// meaningless after the merge, which is not true here.
+    ///
+    /// `None` means "did not say", and a reader must treat that as "serves
+    /// everything" rather than "serves nothing" -- that is what every rskj
+    /// peer will look like.
+    pub earliest_block: Option<u64>,
 }
 
 impl Encodable for RskStatus {
@@ -21,6 +36,11 @@ impl Encodable for RskStatus {
         if let (Some(parent), Some(td)) = (self.best_block_parent_hash, self.total_difficulty) {
             parent.encode(&mut list);
             td.encode(&mut list);
+            // Only after the four rskj knows about, and only when there is
+            // something to say. A node serving the whole chain adds nothing.
+            if let Some(earliest) = self.earliest_block {
+                earliest.encode(&mut list);
+            }
         }
         
         RlpHeader { list: true, payload_length: list.len() }.encode(out);
@@ -50,11 +70,19 @@ impl Decodable for RskStatus {
             best_block_hash,
             best_block_parent_hash: None,
             total_difficulty: None,
+            earliest_block: None,
         };
 
         if !body.is_empty() {
             status.best_block_parent_hash = Some(B256::decode(&mut body)?);
             status.total_difficulty = Some(decode_u256_lenient(&mut body)?);
+        }
+
+        // A fifth element, if the peer speaks the extension. Anything beyond
+        // it is left alone on purpose: this is the tolerance a later field
+        // will rely on, and it is the same courtesy rskj extends to us.
+        if !body.is_empty() {
+            status.earliest_block = Some(decode_u64_lenient(&mut body)?);
         }
 
         Ok(status)
@@ -150,6 +178,65 @@ pub enum RskMessageType {
     SnapStatusResponse = 23,
     SnapBlocksRequest = 24,
     SnapBlocksResponse = 25,
+    /// Announces a change to the range of blocks this node serves.
+    ///
+    /// 26 is the first type rskj does not define; its highest is 25. An rskj
+    /// node that received this would throw `IllegalArgumentException` out of
+    /// `MessageType.valueOfType` and close the connection, so it is sent only
+    /// to peers that negotiated `rsk/63`.
+    BlockRangeUpdate = 26,
+}
+
+/// The `rsk` subprotocol version that carries the served block range.
+///
+/// `62` is what rskj speaks today. A node negotiating `63` has agreed to read
+/// a fifth element in the status message and to accept
+/// [`RskSubMessage::BlockRangeUpdate`]; one at `62` has agreed to neither, and
+/// sending it the update would close the connection -- rskj throws out of
+/// `MessageType.valueOfType` for any type it does not know, and its netty
+/// handler answers that with `ctx.close()`.
+pub const RSK_RANGE_VERSION: u64 = 63;
+
+/// The range of blocks a node can serve.
+///
+/// Shaped after `eth/69`'s `BlockRangeUpdatePacket`, so that an RSKIP
+/// proposing it to rskj maps onto something already argued through upstream.
+///
+/// `earliest` is exact -- a node never holds blocks below it. `latest` trails
+/// the real head, because an announcement is a snapshot taken at a moment and
+/// the head moves on; a reader should treat the upper bound as loose and the
+/// lower bound as firm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRange {
+    /// Lowest block this node can serve. Zero on a node holding the whole
+    /// chain, and the prune floor on one that does not.
+    pub earliest_block: u64,
+    pub latest_block: u64,
+    pub latest_block_hash: B256,
+}
+
+impl Encodable for BlockRange {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        let mut list = Vec::new();
+        self.earliest_block.encode(&mut list);
+        self.latest_block.encode(&mut list);
+        self.latest_block_hash.encode(&mut list);
+        RlpHeader { list: true, payload_length: list.len() }.encode(out);
+        out.put_slice(&list);
+    }
+}
+
+impl Decodable for BlockRange {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = RlpHeader::decode(buf)?;
+        let mut body = &buf[..header.payload_length];
+        *buf = &buf[header.payload_length..];
+        Ok(Self {
+            earliest_block: decode_u64_lenient(&mut body)?,
+            latest_block: decode_u64_lenient(&mut body)?,
+            latest_block_hash: B256::decode(&mut body)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +258,7 @@ pub enum RskSubMessage {
     SnapChunkResponse(Box<snap::SnapChunkResponse>),
     SnapBlocksRequest(snap::SnapBlocksRequest),
     SnapBlocksResponse(Box<snap::SnapBlocksResponse>),
+    BlockRangeUpdate(BlockRange),
     Unknown(u8),
 }
 
@@ -194,6 +282,7 @@ impl RskSubMessage {
             RskSubMessage::SnapChunkResponse(_) => RskMessageType::SnapStateChunkResponse,
             RskSubMessage::SnapBlocksRequest(_) => RskMessageType::SnapBlocksRequest,
             RskSubMessage::SnapBlocksResponse(_) => RskMessageType::SnapBlocksResponse,
+            RskSubMessage::BlockRangeUpdate(_) => RskMessageType::BlockRangeUpdate,
             RskSubMessage::Unknown(_) => RskMessageType::Status, // Not used for encoding
         }
     }
@@ -209,9 +298,15 @@ impl RskSubMessage {
                 if let (Some(parent), Some(td)) = (s.best_block_parent_hash, s.total_difficulty) {
                     parent.encode(&mut list);
                     td.encode(&mut list);
+                    if let Some(earliest) = s.earliest_block {
+                        earliest.encode(&mut list);
+                    }
                 }
                 RlpHeader { list: true, payload_length: list.len() }.encode(out);
                 out.extend_from_slice(&list);
+            }
+            RskSubMessage::BlockRangeUpdate(range) => {
+                range.encode(out);
             }
             RskSubMessage::BlockHeadersRequest(r) => {
                 // RLP([id, RLP([hash, count])])
@@ -477,10 +572,14 @@ impl Decodable for RskMessage {
                     best_block_hash,
                     best_block_parent_hash: None,
                     total_difficulty: None,
+                    earliest_block: None,
                 };
                 if !list_body.is_empty() {
                     status.best_block_parent_hash = Some(B256::decode(&mut list_body)?);
                     status.total_difficulty = Some(decode_u256_lenient(&mut list_body)?);
+                }
+                if !list_body.is_empty() {
+                    status.earliest_block = Some(decode_u64_lenient(&mut list_body)?);
                 }
                 RskSubMessage::Status(status)
             }
@@ -673,6 +772,7 @@ impl Decodable for RskMessage {
             snap::message_type::BLOCKS_RESPONSE => RskSubMessage::SnapBlocksResponse(
                 Box::new(snap::SnapBlocksResponse::decode_body(&mut body_params)?),
             ),
+            26 => RskSubMessage::BlockRangeUpdate(BlockRange::decode(&mut body_params)?),
             other => {
                 RskSubMessage::Unknown(other)
             }
@@ -734,6 +834,7 @@ mod tests {
             best_block_hash: B256::repeat_byte(0x11),
             best_block_parent_hash: Some(B256::repeat_byte(0x22)),
             total_difficulty: Some(U256::from(9999)),
+        earliest_block: None,
         };
 
         let mut buf = Vec::new();
@@ -751,6 +852,7 @@ mod tests {
             best_block_hash: B256::repeat_byte(0xaa),
             best_block_parent_hash: None,
             total_difficulty: None,
+        earliest_block: None,
         };
         let msg = RskMessage::new(RskSubMessage::Status(status));
 
@@ -1198,6 +1300,165 @@ mod tests {
             assert!(txs.is_empty());
         } else {
             panic!("Expected Transactions, got {:?}", decoded.sub_message);
+        }
+    }
+}
+
+#[cfg(test)]
+mod block_range_tests {
+    use super::*;
+
+    fn status(earliest: Option<u64>) -> RskStatus {
+        RskStatus {
+            best_block_number: 9_000_000,
+            best_block_hash: B256::repeat_byte(0x11),
+            best_block_parent_hash: Some(B256::repeat_byte(0x22)),
+            total_difficulty: Some(U256::from(123_456_789u64)),
+            earliest_block: earliest,
+        }
+    }
+
+    /// The fifth element goes after the four rskj reads, never instead of one.
+    ///
+    /// rskj's decoder takes indices 0..3 and never consults the length again,
+    /// so an extra element is ignored — but only because it is *extra*.
+    /// Replacing total difficulty, as `eth/69` did, would change what index 3
+    /// means and make every rskj peer read a block number as a difficulty.
+    #[test]
+    fn the_extension_is_appended_and_displaces_nothing() {
+        let mut plain = Vec::new();
+        status(None).encode(&mut plain);
+        let mut extended = Vec::new();
+        status(Some(8_992_000)).encode(&mut extended);
+
+        // Compare payloads, not whole messages: the list header carries the
+        // length, so it differs by construction.
+        let payload = |mut buf: &[u8]| -> Vec<u8> {
+            let h = RlpHeader::decode(&mut buf).expect("header");
+            buf[..h.payload_length].to_vec()
+        };
+        let plain = payload(&plain);
+        let extended = payload(&extended);
+
+        assert!(
+            extended.len() > plain.len(),
+            "the extension must add to the message, not rewrite it"
+        );
+        assert_eq!(
+            &extended[..plain.len()],
+            &plain[..],
+            "the four fields rskj reads must be byte-identical and in place; \
+             replacing one, as eth/69 did with total difficulty, would make every \
+             rskj peer read this node's numbers as something else"
+        );
+    }
+
+    #[test]
+    fn a_status_with_the_extension_round_trips() {
+        let original = status(Some(8_992_000));
+        let mut buf = Vec::new();
+        original.encode(&mut buf);
+        let decoded = RskStatus::decode(&mut buf.as_slice()).expect("decodes");
+        assert_eq!(decoded.earliest_block, Some(8_992_000));
+        assert_eq!(decoded.best_block_number, original.best_block_number);
+        assert_eq!(decoded.total_difficulty, original.total_difficulty);
+    }
+
+    /// What an rskj peer sends: four elements, no range. It must read as
+    /// "did not say", never as "serves nothing from zero".
+    #[test]
+    fn a_four_element_status_says_nothing_rather_than_zero() {
+        let mut buf = Vec::new();
+        status(None).encode(&mut buf);
+        let decoded = RskStatus::decode(&mut buf.as_slice()).expect("decodes");
+        assert_eq!(
+            decoded.earliest_block, None,
+            "silence must stay distinguishable from a stated floor of zero"
+        );
+    }
+
+    /// And the two-element form rskj also emits.
+    #[test]
+    fn a_two_element_status_still_decodes() {
+        let bare = RskStatus {
+            best_block_number: 42,
+            best_block_hash: B256::repeat_byte(0x33),
+            best_block_parent_hash: None,
+            total_difficulty: None,
+            earliest_block: None,
+        };
+        let mut buf = Vec::new();
+        bare.encode(&mut buf);
+        let decoded = RskStatus::decode(&mut buf.as_slice()).expect("decodes");
+        assert_eq!(decoded.best_block_number, 42);
+        assert_eq!(decoded.earliest_block, None);
+    }
+
+    /// A sixth element, as some later extension would add, must not break
+    /// this one — the same courtesy rskj extends to us.
+    #[test]
+    fn a_later_extension_does_not_break_this_one() {
+        let mut list = Vec::new();
+        9_000_000u64.encode(&mut list);
+        B256::repeat_byte(0x11).encode(&mut list);
+        B256::repeat_byte(0x22).encode(&mut list);
+        U256::from(7u64).encode(&mut list);
+        8_992_000u64.encode(&mut list);
+        99u64.encode(&mut list); // whatever comes next
+        let mut buf = Vec::new();
+        RlpHeader { list: true, payload_length: list.len() }.encode(&mut buf);
+        buf.extend_from_slice(&list);
+
+        let decoded = RskStatus::decode(&mut buf.as_slice()).expect("decodes");
+        assert_eq!(decoded.earliest_block, Some(8_992_000));
+    }
+
+    #[test]
+    fn a_block_range_round_trips() {
+        let range = BlockRange {
+            earliest_block: 9_270_000,
+            latest_block: 9_280_000,
+            latest_block_hash: B256::repeat_byte(0x44),
+        };
+        let mut buf = Vec::new();
+        range.encode(&mut buf);
+        assert_eq!(BlockRange::decode(&mut buf.as_slice()).expect("decodes"), range);
+    }
+
+    /// 26 is free in rskj, whose highest message type is 25.
+    #[test]
+    fn the_new_message_type_does_not_collide() {
+        assert_eq!(RskMessageType::BlockRangeUpdate as u8, 26);
+        assert_eq!(RskMessageType::SnapBlocksResponse as u8, 25);
+    }
+}
+
+#[cfg(test)]
+mod rskj_interop {
+    use super::*;
+
+    /// Dumps the exact bytes this node puts on the wire for an extended
+    /// status, so they can be fed to rskj's own decoder.
+    ///
+    /// Run with `cargo test -p rustock-networking rskj_interop -- --nocapture --ignored`.
+    /// The companion Java probe decodes the output through
+    /// `co.rsk.net.messages.Message.create`, which is what an rskj node runs.
+    #[test]
+    #[ignore = "produces input for the cross-implementation check"]
+    fn dump_wire_bytes_for_rskj() {
+        for (label, earliest) in [("four-element", None), ("extended", Some(8_992_000u64))] {
+            let status = RskStatus {
+                best_block_number: 9_000_000,
+                best_block_hash: B256::repeat_byte(0x11),
+                best_block_parent_hash: Some(B256::repeat_byte(0x22)),
+                total_difficulty: Some(U256::from(123_456_789u64)),
+                earliest_block: earliest,
+            };
+            let msg = RskMessage::new(RskSubMessage::Status(status));
+            let mut buf = Vec::new();
+            alloy_rlp::Encodable::encode(&msg, &mut buf);
+            let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+            println!("{label} {hex}");
         }
     }
 }
