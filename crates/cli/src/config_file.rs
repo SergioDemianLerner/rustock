@@ -27,11 +27,11 @@
 
 use clap::parser::ValueSource;
 use clap::ArgMatches;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Settings the file may supply. Every field is optional: absent means "leave
 /// whatever the command line or the default decided".
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     #[serde(default)]
@@ -58,7 +58,7 @@ pub struct FileConfig {
     pub snapshot: SnapshotSection,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSection {
     pub port: Option<u16>,
@@ -73,7 +73,7 @@ pub struct NodeSection {
     pub rskj_multisig_senders: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RpcSection {
     pub host: Option<String>,
@@ -92,7 +92,7 @@ pub struct RpcSection {
 }
 
 /// Snapshot sync, off on both sides by default (rskj ships it the same way).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotSection {
     /// Serve snapshots of this node's state to peers that ask.
@@ -118,7 +118,7 @@ pub struct SnapshotSection {
     pub total_rate: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeersSection {
     pub max_peers: Option<usize>,
@@ -142,7 +142,7 @@ pub struct PeersSection {
     pub closed_network: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrieSection {
     pub backend: Option<String>,
@@ -155,7 +155,7 @@ pub struct TrieSection {
     pub read_threads: Option<usize>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GcSection {
     pub epochs: Option<usize>,
@@ -164,7 +164,7 @@ pub struct GcSection {
     pub check_secs: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PruneSection {
     pub keep_depth: Option<u64>,
@@ -181,7 +181,7 @@ pub struct PruneSection {
     pub no_freezer: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MiningSection {
     pub enabled: Option<bool>,
@@ -190,7 +190,7 @@ pub struct MiningSection {
     pub refresh_secs: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitSection {
     pub enabled: Option<bool>,
@@ -200,7 +200,7 @@ pub struct RateLimitSection {
     pub gas_per_second_percent: Option<f64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogSection {
     pub level: Option<String>,
@@ -209,7 +209,7 @@ pub struct LogSection {
     pub timezone: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertsSection {
     pub alerts_config: Option<String>,
@@ -539,29 +539,435 @@ mod tests {
         }
     }
 
-    /// The shipped example must parse, and must exercise every section.
+    /// One option as the example documents it.
+    struct Documented {
+        section: String,
+        key: String,
+        value: String,
+        commented: bool,
+        line: String,
+    }
+
+    const REFERENCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../node.example.toml");
+    const LIGHT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../node-light.example.toml");
+
+    /// Reads the example into one entry per option.
+    fn documented_options() -> Vec<Documented> {
+        options_in(REFERENCE)
+    }
+
+    fn options_in(path: &str) -> Vec<Documented> {
+        let raw = std::fs::read_to_string(path).expect("example file");
+        let mut out = Vec::new();
+        let mut section = String::new();
+        for line in raw.lines() {
+            let t = line.trim();
+            if let Some(name) = t.strip_prefix('[').and_then(|r| r.split(']').next()) {
+                if !t.starts_with("[[") {
+                    section = name.to_string();
+                    continue;
+                }
+            }
+            let (body, commented) = match t.strip_prefix('#') {
+                Some(rest) => (rest.trim_start(), true),
+                None => (t, false),
+            };
+            // Anything before the first section header is prose, including
+            // the header's own illustration of this very convention.
+            if section.is_empty() {
+                continue;
+            }
+            let Some((k, v)) = body.split_once('=') else { continue };
+            let key = k.trim();
+            if key.is_empty()
+                || !key.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+            {
+                continue;
+            }
+            // Strip a trailing inline comment, respecting quotes and brackets.
+            let mut value = String::new();
+            let (mut in_str, mut depth) = (false, 0i32);
+            for c in v.trim().chars() {
+                match c {
+                    '"' => in_str = !in_str,
+                    '[' if !in_str => depth += 1,
+                    ']' if !in_str => depth -= 1,
+                    '#' if !in_str && depth == 0 => break,
+                    _ => {}
+                }
+                value.push(c);
+            }
+            out.push(Documented {
+                section: section.clone(),
+                key: key.to_string(),
+                value: value.trim().to_string(),
+                commented,
+                line: line.to_string(),
+            });
+        }
+        out
+    }
+
+    /// A TOML value unlike the one given, so that applying it moves whichever
+    /// `Args` field the key drives and reveals which one that is.
+    fn perturb(value: &str) -> String {
+        match value {
+            "true" => "false".into(),
+            "false" => "true".into(),
+            v if v.starts_with('[') => "[\"probe-value\"]".into(),
+            v if v.starts_with('"') => format!("\"{}probe\"", v.trim_matches('"')),
+            v => match v.replace('_', "").parse::<i64>() {
+                Ok(n) => (n + 7).to_string(),
+                Err(_) => match v.parse::<f64>() {
+                    Ok(f) => format!("{}", f + 0.25),
+                    Err(_) => format!("\"{v}probe\""),
+                },
+            },
+        }
+    }
+
+    /// Which `Args` field a `[section] key` drives, found by setting it alone
+    /// to something unlike the default and seeing what moved.
     ///
-    /// Without this the example rots: a renamed key or a new section would
-    /// leave the documented file quietly wrong, and `deny_unknown_fields`
-    /// would then reject it for anyone who copied it.
+    /// Derived rather than tabulated: a table of 53 mappings is one more thing
+    /// to keep in step, and this cannot fall out of step with `apply_file_config`
+    /// because it is `apply_file_config` that answers.
+    fn field_driven_by(section: &str, key: &str, value: &str) -> Option<String> {
+        let text = format!("[{section}]\n{key} = {value}\n");
+        let file: FileConfig = toml::from_str(&text).ok()?;
+        let (matches, mut moved) = parse(&["rustock"]);
+        crate::apply_file_config(&matches, &file, &mut moved);
+
+        let (_, base) = parse(&["rustock"]);
+        let a = serde_json::to_value(&moved).ok()?;
+        let b = serde_json::to_value(&base).ok()?;
+        let (serde_json::Value::Object(a), serde_json::Value::Object(b)) = (a, b) else {
+            return None;
+        };
+        a.into_iter().find(|(k, v)| b.get(k) != Some(v)).map(|(k, _)| k)
+    }
+
+    /// Every option states its default, and every statement is true.
+    ///
+    /// The convention, which the file's header spells out so a reader need not
+    /// infer it:
+    ///
+    /// ```text
+    ///   key = value   # default          the value shown IS the built-in default
+    ///   # key = ...   # default: unset   no built-in default
+    /// ```
+    ///
+    /// Both claims are checked. `# default` is verified by applying that very
+    /// value and requiring nothing moved; `# default: unset` by finding the
+    /// field the key drives and requiring the node leaves it empty.
+    ///
+    /// Six values were wrong when this was written — `data_dir`,
+    /// `supply_check`, the three inbound peer limits and the trie backend — so
+    /// deleting a line changed behaviour in the direction the line denied.
     #[test]
-    fn the_example_file_parses_and_covers_every_section() {
+    fn the_example_declares_the_real_defaults() {
+        let (_, defaults) = parse(&["rustock"]);
+        let defaults_json = serde_json::to_value(&defaults).expect("serialise");
+
+        let mut wrong = Vec::new();
+        for opt in documented_options() {
+            let marks_unset = opt.line.contains("default: unset");
+            let marks_default = !marks_unset && opt.line.contains("# default");
+            if !marks_default && !marks_unset {
+                wrong.push(format!(
+                    "[{}] {} states no default; every option must carry `# default` or \
+                     `# default: unset`",
+                    opt.section, opt.key
+                ));
+                continue;
+            }
+
+            if marks_default {
+                // Claim: this value is what the node uses anyway. Apply it and
+                // nothing should move.
+                let text = format!("[{}]\n{} = {}\n", opt.section, opt.key, opt.value);
+                let Ok(file) = toml::from_str::<FileConfig>(&text) else {
+                    wrong.push(format!("[{}] {} does not parse", opt.section, opt.key));
+                    continue;
+                };
+                let (matches, mut applied) = parse(&["rustock"]);
+                crate::apply_file_config(&matches, &file, &mut applied);
+                if applied != defaults {
+                    wrong.push(format!(
+                        "[{}] {} = {} is marked `# default` but is not the default",
+                        opt.section, opt.key, opt.value
+                    ));
+                }
+                continue;
+            }
+
+            // Claim: no built-in default. The field the key drives must be
+            // empty on a node started with no arguments.
+            match field_driven_by(&opt.section, &opt.key, &opt.value) {
+                Some(field) => {
+                    let empty = defaults_json
+                        .get(&field)
+                        .map(|v| v.is_null() || v == &serde_json::json!([]))
+                        .unwrap_or(false);
+                    if !empty {
+                        wrong.push(format!(
+                            "[{}] {} is marked `# default: unset` but `{field}` defaults to {}",
+                            opt.section,
+                            opt.key,
+                            defaults_json.get(&field).unwrap_or(&serde_json::Value::Null)
+                        ));
+                    }
+                }
+                // Applying the shown value moved nothing. Either the key is
+                // not wired into `apply_file_config`, or the value shown is
+                // itself the default -- in which case the option has one and
+                // `# default: unset` is the wrong mark.
+                None => wrong.push(format!(
+                    "[{}] {} is marked `# default: unset`, but setting it to {} changes \
+                     nothing: either it is not wired into apply_file_config, or that is \
+                     the default and the mark should be `# default`",
+                    opt.section, opt.key, opt.value
+                )),
+            }
+        }
+        wrong.sort();
+        assert!(
+            wrong.is_empty(),
+            "node.example.toml misstates what the node does by default:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    /// Every configurable option must appear in the shipped example.
+    ///
+    /// The weaker test below checks that the example parses and names every
+    /// section; it passed for a long time while eighteen of fifty-three
+    /// options were undocumented, including a `[snapshot]` section that was
+    /// missing outright. "Covers every section" is not "covers every option",
+    /// and an operator reading the example has no way to discover what it
+    /// leaves out.
+    ///
+    /// Done by reflection rather than by a list, because a list is one more
+    /// thing to forget: the example is parsed with its commented-out keys
+    /// uncommented, serialised, and checked for any field still `null`. A new
+    /// option is a new `None`, and fails here until it is documented.
+    #[test]
+    fn the_example_documents_every_option() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../node.example.toml");
-        let cfg = FileConfig::load(path)
+        let raw = std::fs::read_to_string(path).expect("example file");
+
+        // Uncomment `# key = value`, which is how an optional setting is shown.
+        // Prose comments do not match: the line must be a bare lowercase key
+        // followed by `=`.
+        let mut seen_section = false;
+        let uncommented: String = raw
+            .lines()
+            .map(|line| {
+                let t = line.trim_start();
+                if t.starts_with('[') {
+                    seen_section = true;
+                }
+                if !seen_section {
+                    return line.to_string();
+                }
+                let Some(rest) = t.strip_prefix('#') else { return line.to_string() };
+                let rest = rest.trim_start();
+                let is_setting = rest
+                    .split_once('=')
+                    .is_some_and(|(k, _)| {
+                        let k = k.trim();
+                        !k.is_empty()
+                            && k.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+                    });
+                if is_setting { rest.to_string() } else { line.to_string() }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let cfg: FileConfig = toml::from_str(&uncommented)
+            .expect("the example must still parse once its optional keys are uncommented");
+        let value = serde_json::to_value(&cfg).expect("serialise");
+
+        let mut undocumented = Vec::new();
+        let serde_json::Value::Object(sections) = &value else { panic!("expected sections") };
+        for (section, body) in sections {
+            let serde_json::Value::Object(fields) = body else { continue };
+            for (field, v) in fields {
+                if v.is_null() {
+                    undocumented.push(format!("[{section}] {field}"));
+                }
+            }
+        }
+        undocumented.sort();
+        assert!(
+            undocumented.is_empty(),
+            "these options are configurable but absent from node.example.toml, so nothing \
+             tells an operator they exist:\n  {}",
+            undocumented.join("\n  ")
+        );
+    }
+
+    /// A copy of the example, taken unchanged, does nothing.
+    ///
+    /// That is the point of shipping it entirely commented out: an operator
+    /// copies it, uncomments the few settings being changed, and the
+    /// uncommented lines are then exactly the changes -- no diff against the
+    /// original needed to find out what was touched.
+    ///
+    /// An uncommented line here would be a setting applied to every node that
+    /// copied the file, silently, whether or not its owner meant it.
+    #[test]
+    fn the_example_as_shipped_changes_nothing() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../node.example.toml");
+        let file = FileConfig::load(path)
             .unwrap_or_else(|e| panic!("node.example.toml does not parse: {e}"));
 
-        // Every section must actually be present, or the example stops being a
-        // reference for the settings it omits.
-        assert!(cfg.node.port.is_some(), "[node]");
-        assert!(cfg.rpc.port.is_some(), "[rpc]");
-        assert!(cfg.rpc.logs_max_blocks.is_some(), "[rpc] logs_max_blocks");
-        assert!(cfg.peers.max_peers.is_some(), "[peers]");
-        assert!(cfg.trie.backend.is_some(), "[trie]");
-        assert!(cfg.gc.burial.is_some(), "[gc]");
-        assert!(cfg.prune.keep_depth.is_some(), "[prune]");
-        assert!(cfg.mining.enabled.is_some(), "[mining]");
-        assert!(cfg.account_tx_rate_limit.enabled.is_some(), "[account_tx_rate_limit]");
-        assert!(cfg.log.level.is_some(), "[log]");
+        let (matches, mut applied) = parse(&["rustock"]);
+        crate::apply_file_config(&matches, &file, &mut applied);
+
+        let (_, defaults) = parse(&["rustock"]);
+        assert_eq!(
+            applied, defaults,
+            "a setting in node.example.toml is left uncommented, so copying the file \
+             changes behaviour without the copier having asked for it"
+        );
+
+        // Checked textually as well, because the comparison above cannot see
+        // an uncommented line whose value happens to equal the default. It
+        // would change nothing today and silently become a change the moment
+        // that default moved -- and it would already spoil the property this
+        // file exists for, which is that the uncommented lines in a copy are
+        // the copier's own edits.
+        let live: Vec<String> = documented_options()
+            .into_iter()
+            .filter(|o| !o.commented)
+            .map(|o| format!("[{}] {}", o.section, o.key))
+            .collect();
+        assert!(
+            live.is_empty(),
+            "these settings are uncommented in node.example.toml; every one must be \
+             commented out so that a copy shows only what its owner changed:\n  {}",
+            live.join("\n  ")
+        );
+    }
+
+    /// The light profile really is light, and says which settings make it so.
+    ///
+    /// Everything it changes is uncommented and marked `# light:`, so the
+    /// uncommented lines are exactly the difference from the reference file.
+    /// Everything it leaves alone stays commented and still states its
+    /// default, checked by the same rules as the reference.
+    #[test]
+    fn the_light_example_states_what_it_changes_and_why() {
+        let file = FileConfig::load(LIGHT)
+            .unwrap_or_else(|e| panic!("node-light.example.toml does not parse: {e}"));
+
+        // Every live setting is marked as a deliberate departure.
+        let unmarked: Vec<String> = options_in(LIGHT)
+            .into_iter()
+            .filter(|o| !o.commented && !o.line.contains("# light:"))
+            .map(|o| format!("[{}] {}", o.section, o.key))
+            .collect();
+        assert!(
+            unmarked.is_empty(),
+            "these settings are live in node-light.example.toml but not marked `# light:`, \
+             so nothing says why they differ from the reference:\n  {}",
+            unmarked.join("\n  ")
+        );
+
+        // And the profile is actually the one described.
+        assert_eq!(file.prune.blocks, Some(true), "[prune] blocks");
+        assert_eq!(file.snapshot.sync, Some(true), "[snapshot] sync");
+        assert_eq!(
+            file.trie.backend.as_deref(),
+            Some("epoch"),
+            "[trie] backend — the only setting that turns trie collection on"
+        );
+        assert_eq!(
+            file.prune.no_freezer,
+            Some(true),
+            "[prune] no_freezer — without it the node keeps 9.5 GB of frozen headers \
+             that pruning never touches"
+        );
+
+        // The relationship that makes the profile coherent: a node must arrive
+        // holding at least as much history as it has undertaken to keep, or
+        // the retention depth is a promise about blocks it never had.
+        let snap_blocks = file.snapshot.blocks.expect("[snapshot] blocks");
+        let keep = file.prune.keep_depth.expect("[prune] keep_depth");
+        assert!(
+            snap_blocks >= keep,
+            "[snapshot] blocks = {snap_blocks} is below [prune] keep_depth = {keep}: the \
+             node would arrive with less history than it keeps, and the first sweep would \
+             have nothing to do"
+        );
+        assert!(
+            keep >= rustock_storage::pruner::MIN_KEEP_DEPTH,
+            "[prune] keep_depth = {keep} is below the floor the node clamps to anyway"
+        );
+    }
+
+    /// The light profile's commented lines state defaults too, and truthfully.
+    ///
+    /// It is a copy of the reference with a few lines activated, so the rest
+    /// must still be a faithful statement of what the node does by default --
+    /// otherwise the two files drift and one of them starts lying.
+    #[test]
+    fn the_light_example_states_the_real_defaults_for_what_it_leaves_alone() {
+        let (_, defaults) = parse(&["rustock"]);
+        let mut wrong = Vec::new();
+        for opt in options_in(LIGHT).into_iter().filter(|o| o.commented) {
+            if opt.line.contains("default: unset") {
+                continue; // covered for the reference; same lines
+            }
+            if !opt.line.contains("# default") {
+                wrong.push(format!("[{}] {} states no default", opt.section, opt.key));
+                continue;
+            }
+            let text = format!("[{}]\n{} = {}\n", opt.section, opt.key, opt.value);
+            let Ok(file) = toml::from_str::<FileConfig>(&text) else {
+                wrong.push(format!("[{}] {} does not parse", opt.section, opt.key));
+                continue;
+            };
+            let (matches, mut applied) = parse(&["rustock"]);
+            crate::apply_file_config(&matches, &file, &mut applied);
+            if applied != defaults {
+                wrong.push(format!(
+                    "[{}] {} = {} is marked `# default` but is not the default",
+                    opt.section, opt.key, opt.value
+                ));
+            }
+        }
+        wrong.sort();
+        assert!(
+            wrong.is_empty(),
+            "node-light.example.toml misstates what the node does by default:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    /// Both files describe the same node, so they must offer the same options.
+    ///
+    /// A setting added to one and forgotten in the other is how the pair stops
+    /// being two views of one thing and becomes two half-truths.
+    #[test]
+    fn both_examples_cover_the_same_options() {
+        let keys = |path: &str| -> std::collections::BTreeSet<String> {
+            options_in(path)
+                .into_iter()
+                .map(|o| format!("[{}] {}", o.section, o.key))
+                .collect()
+        };
+        let reference = keys(REFERENCE);
+        let light = keys(LIGHT);
+        let only_reference: Vec<_> = reference.difference(&light).cloned().collect();
+        let only_light: Vec<_> = light.difference(&reference).cloned().collect();
+        assert!(
+            only_reference.is_empty() && only_light.is_empty(),
+            "the two example files have drifted.\n  only in node.example.toml: {:?}\n  \
+             only in node-light.example.toml: {:?}",
+            only_reference, only_light
+        );
     }
 
     /// No flag may be in both lists; the two are a partition.

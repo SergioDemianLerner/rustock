@@ -110,7 +110,7 @@ impl rustock_execution::mining::PendingTransactionSource for PoolTxSource {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, PartialEq, serde::Serialize)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Read settings from a TOML file.

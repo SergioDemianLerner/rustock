@@ -1,27 +1,43 @@
-# rustock node configuration.
+# rustock light node configuration.
 #
-#   rustock --config /etc/rustock/node.toml
+#   rustock --config /etc/rustock/node-light.toml
 #
-# Precedence: command line  >  this file  >  built-in default.
-# Anything given on the command line wins, so a setting here can always be
-# overridden for one run without editing the file.
+# A node that follows the chain and serves current state, on a few gigabytes
+# instead of forty-five. It keeps the state, the recent blocks, and the whole
+# Bridge event history; it gives up old blocks, old state, and the ability to
+# serve either to anyone else.
 #
-# EVERYTHING HERE IS COMMENTED OUT, on purpose. Copy this file, uncomment the
-# few settings you are changing, and the uncommented lines are then exactly
-# your changes -- there is no need to remember which of them you touched, or
-# to diff against the original to find out.
+# Measured against this project's mainnet node, which holds everything:
 #
-# A copy taken unchanged therefore does nothing at all; a test asserts that.
+#     state (epoch, 4 epochs)      2.1 GB      kept
+#     block database              33.6 GB      ~30 MB of it kept
+#     header freezer               9.5 GB      not used at all
 #
-# Each line says what the node does without it:
+# This file is the reference `node.example.toml` with the handful of settings
+# a light node changes UNCOMMENTED and marked `# light:`. Everything else is
+# commented out and still states its default, so the uncommented lines are
+# exactly what makes this profile different.
 #
-#   # key = value   # default          the value shown IS the built-in default
-#   # key = ...     # default: unset   no built-in default; the value is an
-#                                      illustration of the shape expected
+#   key = value     # light: why          deliberately not the default
+#   # key = value   # default             the value shown IS the default
+#   # key = ...     # default: unset      no default; shape illustration
 #
-# A test checks every one of those claims against the node's real defaults, so
-# this file can be read as the authoritative statement of what the node does
-# when left alone.
+# What you give up, stated plainly:
+#
+#   - Blocks below `head - keep_depth` are gone. `eth_getBlockByNumber`,
+#     `eth_getTransactionByHash` and `eth_getTransactionReceipt` answer `null`
+#     for them, and `eth_getLogs` cannot see them. Genesis is kept.
+#   - State older than the collection window is gone, so historical
+#     `eth_call` and `eth_getBalance` at an old block stop working.
+#   - This node cannot serve blocks, headers or snapshots to other peers past
+#     its own window. It takes history from the network and returns none, so
+#     run one of these because you need a wallet or an endpoint, not as a
+#     contribution to the network.
+#
+# What you keep: Bridge events. They live in their own index, self-contained,
+# and nothing here deletes them -- the peg stays debuggable on a node that has
+# thrown its blocks away.
+#
 # Unknown keys are an ERROR rather than being ignored, so a typo is reported
 # instead of silently leaving a setting at its default.
 #
@@ -72,7 +88,10 @@
 # state older than the retention window, which means historical state queries
 # below that window stop working. That is a real trade, so it is opt-in — but
 # "epoch" is what a node that is not an archive wants.
-# backend = "single"                # default
+backend = "epoch"                   # light: bounds state size. This setting ALONE turns trie
+                                    # collection on -- the [gc] section below does nothing with
+                                    # any other backend. Historical state below the collection
+                                    # window stops being queryable. Default "single".
 # dir = "/var/lib/rustock/trie-epochs"# default: unset
 # node = "…"                        # default: unset — diagnostic: start from this state root
 # BTC stored-block cache. Answering "which BTC block is at height H?" costs one
@@ -114,25 +133,43 @@
 # snapshot sync's blocks are never swept while it is still fetching them.
 # `rsk_pruneBlocks` (needs rpc.admin) forces one sweep with the same clamps.
 [prune]
-# blocks = false                    # default — run sweeps at all
-# keep_depth = 100000               # default
+blocks = true                       # light: run sweeps. Default false -- pruning discards
+                                    # history that only a resync restores, so it is never on
+                                    # unless an operator says so.
+keep_depth = 8000                   # light: the floor, and the least the node may keep -- 4000
+                                    # for reorg tolerance plus 4000 for the block-info
+                                    # precompiles and REMASC maturity. Measured from the
+                                    # EXECUTED head. Default 100000.
 # max_batch = 50000                 # default — most blocks one sweep may remove
 # every_secs = 300                  # default — seconds between sweeps
 # Delete headers from the block database once the freezer holds them. Every
 # lookup by hash for those blocks then depends on the freezer.
 # frozen_headers = false            # default
-# no_freezer = false                # default — do not run the header freezer at all
+no_freezer = true                   # light: the single biggest saving here, and the one most
+                                    # easily missed. The freezer holds every canonical header
+                                    # below head-20000 in flat files -- 9.5 GB on mainnet -- and
+                                    # pruning NEVER touches it, so a pruning node with a freezer
+                                    # still carries all of it. Without one, headers stay in the
+                                    # block database where the sweep can remove them, and the
+                                    # node keeps about keep_depth of them. The freezer is what
+                                    # makes serving headers to peers cheap; this node does not
+                                    # serve them. Default false (freezer on).
 
 # Snapshot sync: catch up by downloading a state rather than executing into
 # one. The header chain is verified to the snapshot point first — a snapshot is
 # only trustworthy because the walk vouches for the checkpoint it hangs from.
 [snapshot]
-# sync = false                      # default — act as a client
+sync = true                         # light: download a state rather than execute nine million
+                                    # blocks into one. Default false.
 # server = false                    # default — serve snapshots to peers that ask
 # Blocks of history to download below the checkpoint. These are the blocks the
 # node holds once the sync is done. Setting this above prune.keep_depth is how
 # a pruning node is given its first sweep's work.
-# blocks = 6000                     # default
+blocks = 8500                       # light: must be ABOVE prune.keep_depth below, or the node
+                                    # arrives holding less history than it has undertaken to
+                                    # keep and the first sweep has nothing to do. Default 6000,
+                                    # which is below the 8000 floor. The 500 difference is what
+                                    # the first sweep removes.
 # chunk_bytes = 100000              # default — state bytes per chunk request
 # chunk_grid = 100000               # default — offset grid chunks sit on; changing it
                                    # invalidates a server's cached cells
@@ -142,7 +179,9 @@
 # of low-priority background disk; resumable, and it stops at the prune floor.
 # Without it this node can answer RPC about its window only, and cannot help
 # anyone else sync past it.
-# index_history = true              # default
+index_history = false               # light: this index exists to answer RPC about old heights
+                                    # and to serve history to peers. A pruning node has neither,
+                                    # so the work is wasted. Default true.
 # peer_rate = 8388608               # default — state bytes/s served to ONE peer
 # total_rate = 33554432             # default — state bytes/s this server produces in total
 
