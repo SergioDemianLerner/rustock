@@ -548,9 +548,15 @@ mod tests {
         line: String,
     }
 
+    const REFERENCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../node.example.toml");
+    const LIGHT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../node-light.example.toml");
+
     /// Reads the example into one entry per option.
     fn documented_options() -> Vec<Documented> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../node.example.toml");
+        options_in(REFERENCE)
+    }
+
+    fn options_in(path: &str) -> Vec<Documented> {
         let raw = std::fs::read_to_string(path).expect("example file");
         let mut out = Vec::new();
         let mut section = String::new();
@@ -842,6 +848,125 @@ mod tests {
             "these settings are uncommented in node.example.toml; every one must be \
              commented out so that a copy shows only what its owner changed:\n  {}",
             live.join("\n  ")
+        );
+    }
+
+    /// The light profile really is light, and says which settings make it so.
+    ///
+    /// Everything it changes is uncommented and marked `# light:`, so the
+    /// uncommented lines are exactly the difference from the reference file.
+    /// Everything it leaves alone stays commented and still states its
+    /// default, checked by the same rules as the reference.
+    #[test]
+    fn the_light_example_states_what_it_changes_and_why() {
+        let file = FileConfig::load(LIGHT)
+            .unwrap_or_else(|e| panic!("node-light.example.toml does not parse: {e}"));
+
+        // Every live setting is marked as a deliberate departure.
+        let unmarked: Vec<String> = options_in(LIGHT)
+            .into_iter()
+            .filter(|o| !o.commented && !o.line.contains("# light:"))
+            .map(|o| format!("[{}] {}", o.section, o.key))
+            .collect();
+        assert!(
+            unmarked.is_empty(),
+            "these settings are live in node-light.example.toml but not marked `# light:`, \
+             so nothing says why they differ from the reference:\n  {}",
+            unmarked.join("\n  ")
+        );
+
+        // And the profile is actually the one described.
+        assert_eq!(file.prune.blocks, Some(true), "[prune] blocks");
+        assert_eq!(file.snapshot.sync, Some(true), "[snapshot] sync");
+        assert_eq!(
+            file.trie.backend.as_deref(),
+            Some("epoch"),
+            "[trie] backend — the only setting that turns trie collection on"
+        );
+        assert_eq!(
+            file.prune.no_freezer,
+            Some(true),
+            "[prune] no_freezer — without it the node keeps 9.5 GB of frozen headers \
+             that pruning never touches"
+        );
+
+        // The relationship that makes the profile coherent: a node must arrive
+        // holding at least as much history as it has undertaken to keep, or
+        // the retention depth is a promise about blocks it never had.
+        let snap_blocks = file.snapshot.blocks.expect("[snapshot] blocks");
+        let keep = file.prune.keep_depth.expect("[prune] keep_depth");
+        assert!(
+            snap_blocks >= keep,
+            "[snapshot] blocks = {snap_blocks} is below [prune] keep_depth = {keep}: the \
+             node would arrive with less history than it keeps, and the first sweep would \
+             have nothing to do"
+        );
+        assert!(
+            keep >= rustock_storage::pruner::MIN_KEEP_DEPTH,
+            "[prune] keep_depth = {keep} is below the floor the node clamps to anyway"
+        );
+    }
+
+    /// The light profile's commented lines state defaults too, and truthfully.
+    ///
+    /// It is a copy of the reference with a few lines activated, so the rest
+    /// must still be a faithful statement of what the node does by default --
+    /// otherwise the two files drift and one of them starts lying.
+    #[test]
+    fn the_light_example_states_the_real_defaults_for_what_it_leaves_alone() {
+        let (_, defaults) = parse(&["rustock"]);
+        let mut wrong = Vec::new();
+        for opt in options_in(LIGHT).into_iter().filter(|o| o.commented) {
+            if opt.line.contains("default: unset") {
+                continue; // covered for the reference; same lines
+            }
+            if !opt.line.contains("# default") {
+                wrong.push(format!("[{}] {} states no default", opt.section, opt.key));
+                continue;
+            }
+            let text = format!("[{}]\n{} = {}\n", opt.section, opt.key, opt.value);
+            let Ok(file) = toml::from_str::<FileConfig>(&text) else {
+                wrong.push(format!("[{}] {} does not parse", opt.section, opt.key));
+                continue;
+            };
+            let (matches, mut applied) = parse(&["rustock"]);
+            crate::apply_file_config(&matches, &file, &mut applied);
+            if applied != defaults {
+                wrong.push(format!(
+                    "[{}] {} = {} is marked `# default` but is not the default",
+                    opt.section, opt.key, opt.value
+                ));
+            }
+        }
+        wrong.sort();
+        assert!(
+            wrong.is_empty(),
+            "node-light.example.toml misstates what the node does by default:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    /// Both files describe the same node, so they must offer the same options.
+    ///
+    /// A setting added to one and forgotten in the other is how the pair stops
+    /// being two views of one thing and becomes two half-truths.
+    #[test]
+    fn both_examples_cover_the_same_options() {
+        let keys = |path: &str| -> std::collections::BTreeSet<String> {
+            options_in(path)
+                .into_iter()
+                .map(|o| format!("[{}] {}", o.section, o.key))
+                .collect()
+        };
+        let reference = keys(REFERENCE);
+        let light = keys(LIGHT);
+        let only_reference: Vec<_> = reference.difference(&light).cloned().collect();
+        let only_light: Vec<_> = light.difference(&reference).cloned().collect();
+        assert!(
+            only_reference.is_empty() && only_light.is_empty(),
+            "the two example files have drifted.\n  only in node.example.toml: {:?}\n  \
+             only in node-light.example.toml: {:?}",
+            only_reference, only_light
         );
     }
 

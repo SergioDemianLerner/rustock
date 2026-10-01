@@ -1,0 +1,215 @@
+# rustock light node configuration.
+#
+#   rustock --config /etc/rustock/node-light.toml
+#
+# A node that follows the chain and serves current state, on a few gigabytes
+# instead of forty-five. It keeps the state, the recent blocks, and the whole
+# Bridge event history; it gives up old blocks, old state, and the ability to
+# serve either to anyone else.
+#
+# Measured against this project's mainnet node, which holds everything:
+#
+#     state (epoch, 4 epochs)      2.1 GB      kept
+#     block database              33.6 GB      ~30 MB of it kept
+#     header freezer               9.5 GB      not used at all
+#
+# This file is the reference `node.example.toml` with the handful of settings
+# a light node changes UNCOMMENTED and marked `# light:`. Everything else is
+# commented out and still states its default, so the uncommented lines are
+# exactly what makes this profile different.
+#
+#   key = value     # light: why          deliberately not the default
+#   # key = value   # default             the value shown IS the default
+#   # key = ...     # default: unset      no default; shape illustration
+#
+# What you give up, stated plainly:
+#
+#   - Blocks below `head - keep_depth` are gone. `eth_getBlockByNumber`,
+#     `eth_getTransactionByHash` and `eth_getTransactionReceipt` answer `null`
+#     for them, and `eth_getLogs` cannot see them. Genesis is kept.
+#   - State older than the collection window is gone, so historical
+#     `eth_call` and `eth_getBalance` at an old block stop working.
+#   - This node cannot serve blocks, headers or snapshots to other peers past
+#     its own window. It takes history from the network and returns none, so
+#     run one of these because you need a wallet or an endpoint, not as a
+#     contribution to the network.
+#
+# What you keep: Bridge events. They live in their own index, self-contained,
+# and nothing here deletes them -- the peg stays debuggable on a node that has
+# thrown its blocks away.
+#
+# Unknown keys are an ERROR rather than being ignored, so a typo is reported
+# instead of silently leaving a setting at its default.
+#
+# One-shot operations (--import-*, --repair, --trie-tool-*, --probe-*,
+# --build-*, --metadata-*) are command-line only. They run and then exit, so a
+# node that re-ran an import on every start would be a trap, not a convenience.
+
+[node]
+# port = 30303                      # default — P2P listen port
+# data_dir = "./data"               # default — database and node key
+# network_id = 30                   # default — 30 mainnet, 31 testnet
+# secret_key = "…"                  # default: unset — hex node key; generated and stored if unset
+# external_ip = "203.0.113.1"       # default: unset — advertised address; 127.0.0.1 if unset
+# off | per-block | per-transaction | both. Per-transaction is strictly more
+# sensitive: block-level netting hides a creation when one transaction mints
+# and another destroys the same amount. "both" keeps per-block as a cross-check
+# that the per-transaction deltas account for the whole block.
+# supply_check = "both"             # default
+# rskj_multisig_senders = "on"      # default — on | off — emulate rskj multisig peg-in senders
+
+[rpc]
+# host = "127.0.0.1"                # default
+# port = 4444                       # default
+# admin = false                     # default — enables rsk_collectTrie, rsk_pruneBlocks, …
+# disabled = false                  # default — true is the same as --no-rpc
+# logs_max_blocks = 10000           # default — widest eth_getLogs span; rskj's rpc.logs.maxBlocksToQuery is 5000
+# dev = false                       # default — evm_* namespace: snapshot/revert/mine — development chains only
+# ws = false                        # default — WebSocket JSON-RPC, for eth_subscribe
+# ws_port = 4445                    # default
+
+[peers]
+# max_peers = 25                    # default
+# max_inbound_peers = 32            # default
+# max_inbound_per_ip = 4            # default
+# max_inbound_per_cidr = 16         # default
+# inbound_cidr_prefix = 24          # default
+# bootnodes = ["127.0.0.1:30304"]   # default: unset — replaces the chain's built-in list; port is listen+1
+# banned_peers = ["203.0.113.0/24"] # default: unset — refused at connection time; rskj's peer.bannedPeerIPs
+# no_peer_punishment = false        # default — count scoring events but never act on them
+# Never learn node ids from peers and never dial them. With `bootnodes` this
+# pins the node to exactly the addresses named there, which is what makes a
+# controlled two-node test trustworthy; on its own it only stops discovery.
+# closed_network = false            # default
+
+[trie]
+# single | external | epoch. "single" keeps every historical version in the
+# main database and grows without bound; "epoch" bounds the size by reclaiming
+# state older than the retention window, which means historical state queries
+# below that window stop working. That is a real trade, so it is opt-in — but
+# "epoch" is what a node that is not an archive wants.
+backend = "epoch"                   # light: bounds state size. This setting ALONE turns trie
+                                    # collection on -- the [gc] section below does nothing with
+                                    # any other backend. Historical state below the collection
+                                    # window stops being queryable. Default "single".
+# dir = "/var/lib/rustock/trie-epochs"# default: unset
+# node = "…"                        # default: unset — diagnostic: start from this state root
+# BTC stored-block cache. Answering "which BTC block is at height H?" costs one
+# trie read per block of depth whenever the RSKIP199 height index cannot answer.
+# The cache holds blocks already read for consensus -- it never pre-loads and
+# never records an absence -- so it changes latency and nothing else.
+# ~200 bytes per entry; 0 disables.
+# btc_block_cache_entries = 10000   # default
+
+# Threads for parallel reads: the snapshot-sync client, the trie store, and the
+# one-shot state verifier. Defaults to the core count, clamped to at least 1.
+# read_threads = 16                 # default
+# Trie garbage collection. `burial` must exceed the deepest reorg worth
+# surviving: collecting against a root that is later reorganised away discards
+# state the chain needs to rebuild.
+[gc]
+# epochs = 4                        # default
+# rotate_mb = 1024                  # default
+# burial = 4000                     # default
+# check_secs = 60                   # default
+
+# Block-history pruning: bodies, receipts, the transaction index, headers and
+# the canonical mapping, for blocks far enough behind.
+#
+# Off by default, and deliberately. Turning it on is not a tuning change — it
+# discards history that only a resync restores, and `eth_getTransactionReceipt`
+# stops answering for a pruned height. Bridge events are KEPT: they live in
+# their own index, self-contained, and are what the peg is debugged from.
+# Genesis is always retained.
+#
+# `keep_depth` is clamped up to 8000 whatever is given — 4000 for reorg
+# tolerance plus 4000 for the block-info precompiles and REMASC's maturity,
+# which a re-executed block may itself reach through. The depth is measured
+# from the block this node has EXECUTED to, not from the best header it holds:
+# on a snapshot-synced node those differ by thousands of blocks, and measuring
+# from the header would delete what execution has not reached yet.
+#
+# Sweeps never run until the node has settled into ordinary sync, so a
+# snapshot sync's blocks are never swept while it is still fetching them.
+# `rsk_pruneBlocks` (needs rpc.admin) forces one sweep with the same clamps.
+[prune]
+blocks = true                       # light: run sweeps. Default false -- pruning discards
+                                    # history that only a resync restores, so it is never on
+                                    # unless an operator says so.
+keep_depth = 8000                   # light: the floor, and the least the node may keep -- 4000
+                                    # for reorg tolerance plus 4000 for the block-info
+                                    # precompiles and REMASC maturity. Measured from the
+                                    # EXECUTED head. Default 100000.
+# max_batch = 50000                 # default — most blocks one sweep may remove
+# every_secs = 300                  # default — seconds between sweeps
+# Delete headers from the block database once the freezer holds them. Every
+# lookup by hash for those blocks then depends on the freezer.
+# frozen_headers = false            # default
+no_freezer = true                   # light: the single biggest saving here, and the one most
+                                    # easily missed. The freezer holds every canonical header
+                                    # below head-20000 in flat files -- 9.5 GB on mainnet -- and
+                                    # pruning NEVER touches it, so a pruning node with a freezer
+                                    # still carries all of it. Without one, headers stay in the
+                                    # block database where the sweep can remove them, and the
+                                    # node keeps about keep_depth of them. The freezer is what
+                                    # makes serving headers to peers cheap; this node does not
+                                    # serve them. Default false (freezer on).
+
+# Snapshot sync: catch up by downloading a state rather than executing into
+# one. The header chain is verified to the snapshot point first — a snapshot is
+# only trustworthy because the walk vouches for the checkpoint it hangs from.
+[snapshot]
+sync = true                         # light: download a state rather than execute nine million
+                                    # blocks into one. Default false.
+# server = false                    # default — serve snapshots to peers that ask
+# Blocks of history to download below the checkpoint. These are the blocks the
+# node holds once the sync is done. Setting this above prune.keep_depth is how
+# a pruning node is given its first sweep's work.
+blocks = 8500                       # light: must be ABOVE prune.keep_depth below, or the node
+                                    # arrives holding less history than it has undertaken to
+                                    # keep and the first sweep has nothing to do. Default 6000,
+                                    # which is below the 8000 floor. The 500 difference is what
+                                    # the first sweep removes.
+# chunk_bytes = 100000              # default — state bytes per chunk request
+# chunk_grid = 100000               # default — offset grid chunks sit on; changing it
+                                   # invalidates a server's cached cells
+# parallel = 8                      # default — chunk requests in flight, across all peers
+# Fill the canonical index for history below the checkpoint window after a
+# snapshot sync. Costs ~0.4 GB and, on a cold store, up to an hour and a half
+# of low-priority background disk; resumable, and it stops at the prune floor.
+# Without it this node can answer RPC about its window only, and cannot help
+# anyone else sync past it.
+index_history = false               # light: this index exists to answer RPC about old heights
+                                    # and to serve history to peers. A pruning node has neither,
+                                    # so the work is wasted. Default true.
+# peer_rate = 8388608               # default — state bytes/s served to ONE peer
+# total_rate = 33554432             # default — state bytes/s this server produces in total
+
+[mining]
+# enabled = false                   # default — serve the mnr_* namespace
+# coinbase = "0x…"                  # default: unset — REQUIRED when enabled
+# extra_data = ""                   # default — at most 32 bytes
+# refresh_secs = 60                 # default
+
+# Per-account virtual gas quota (rskj TxQuotaChecker). An account accumulates
+# quota while idle and spends it when broadcasting, so one that floods the
+# mempool is refused here and not relayed onward. Ordinary use never reaches it.
+[account_tx_rate_limit]
+# enabled = true                    # default
+# cleaner_period = 30               # default — minutes; 0 or negative disables the sweep
+# max_accounts = 400000             # default
+# quota_multiplier = 2000           # default — seconds of idleness an account may bank
+# gas_per_second_percent = 0.9      # default — of the block gas limit, accrued per second
+
+[log]
+# level = "info"                    # default
+# to_stdout = false                 # default — true when run under systemd (journald)
+# Timezone for log timestamps: "utc" (default), "local", or a fixed UTC
+# offset. Timestamps stay RFC 3339, so the offset is part of every line:
+# UTC prints ...T21:13:45.9+00:00, "-03:00" prints ...T18:13:45.9-03:00.
+# "local" is read once at start-up and then held, so it does not follow a
+# daylight-saving change; a fixed offset says so plainly, and is exactly
+# right for zones without DST (Argentina has had none since 2009).
+# timezone = "utc"                  # default — or "local", or a fixed offset like "-03:00"
+[alerts]
+# alerts_config = "/etc/rustock/alerts.toml"# default: unset
