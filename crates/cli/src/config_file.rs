@@ -71,6 +71,15 @@ pub struct NodeSection {
     pub supply_check: Option<String>,
     /// `"on"` / `"off"`, as the flag takes.
     pub rskj_multisig_senders: Option<String>,
+    /// Open both databases read-only and write nothing.
+    pub read_only: Option<bool>,
+    /// Catch up with new blocks. `false` serves what is held and nothing more.
+    pub follow_up: Option<bool>,
+    /// Behave as though the canonical chain ends at this height. Requires
+    /// `follow_up = false`.
+    pub simulate_height: Option<u64>,
+    /// Exit once the chain is synced, reporting how long it took.
+    pub exit_when_synced: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -306,6 +315,10 @@ pub const CONFIGURABLE: &[&str] = &[
     "external_ip",
     "supply_check",
     "rskj_multisig_senders",
+    "read_only",
+    "follow_up",
+    "simulate_height",
+    "exit_when_synced",
     "rpc_host",
     "rpc_port",
     "rpc_admin",

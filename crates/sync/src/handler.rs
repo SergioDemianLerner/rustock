@@ -42,11 +42,50 @@ pub struct SyncHandler {
     /// Attached after the handler is shared, which is when the node knows
     /// whether it was asked to serve snapshots.
     snap_late: std::sync::RwLock<Option<Arc<SnapServer>>>,
+    /// Highest block this node will serve or name, when it has been told to
+    /// behave as though the chain ends there (`--simulate-height`).
+    ///
+    /// Enforced on every path a client could use to reach past it, not only
+    /// on what is announced: a client that can fetch a block above the
+    /// simulated head has not run the test that was intended, and the result
+    /// is not comparable with one that could not.
+    serve_ceiling: Option<u64>,
 }
 
 impl SyncHandler {
     pub fn new(manager: Arc<SyncManager>, event_tx: mpsc::UnboundedSender<SyncEvent>) -> Self {
-        Self { manager, event_tx, snap: None, snap_late: std::sync::RwLock::new(None) }
+        Self {
+            manager,
+            event_tx,
+            snap: None,
+            snap_late: std::sync::RwLock::new(None),
+            serve_ceiling: None,
+        }
+    }
+
+    /// Serve nothing above `height`. See [`Self::serve_ceiling`].
+    pub fn with_serve_ceiling(mut self, height: Option<u64>) -> Self {
+        self.serve_ceiling = height;
+        self
+    }
+
+    /// Whether a block at this height may be named or served.
+    fn may_serve(&self, number: u64) -> bool {
+        self.serve_ceiling.is_none_or(|c| number <= c)
+    }
+
+    /// The height this node speaks for: the simulated one, or its real head.
+    fn effective_head(&self) -> Option<u64> {
+        let store = &self.manager.store;
+        let real = store
+            .head()
+            .ok()?
+            .and_then(|h| store.header(h).ok()?)
+            .map(|h| h.number)?;
+        Some(match self.serve_ceiling {
+            Some(c) => real.min(c),
+            None => real,
+        })
     }
 
     /// Serve snapshots of this node's state to peers that ask.
@@ -150,12 +189,48 @@ impl SyncHandler {
     }
 
     /// Respond to a BodyRequest by looking up the block and returning its body.
+    #[cfg(test)]
+    pub(crate) fn serve_body_request_for_test(
+        &self,
+        id: u64,
+        hash: alloy_primitives::B256,
+    ) -> Option<P2pMessage> {
+        self.serve_body_request(id, hash)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn serve_headers_request_for_test(
+        &self,
+        id: u64,
+        hash: alloy_primitives::B256,
+        count: u32,
+    ) -> Option<P2pMessage> {
+        self.serve_headers_request(id, hash, count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn serve_block_hash_request_for_test(&self, id: u64, h: u64) -> Option<P2pMessage> {
+        self.serve_block_hash_request(id, h)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn serve_skeleton_request_for_test(&self, id: u64, s: u64) -> Option<P2pMessage> {
+        self.serve_skeleton_request(id, s)
+    }
+
     fn serve_body_request(
         &self,
         request_id: u64,
         hash: alloy_primitives::B256,
     ) -> Option<P2pMessage> {
         let store = &self.manager.store;
+        // Above the simulated head this node has nothing to say, even though
+        // the block is on disk.
+        if let Some(h) = store.header(hash).ok().flatten() {
+            if !self.may_serve(h.number) {
+                return None;
+            }
+        }
         let (transactions, uncles) = store.body(hash).ok()??;
 
         trace!(
@@ -186,8 +261,15 @@ impl SyncHandler {
         let store = &self.manager.store;
 
         let first = store.header(hash).ok()??;
-        let headers = canonical_run(store, &first, count)
+        if !self.may_serve(first.number) {
+            return None;
+        }
+        let mut headers = canonical_run(store, &first, count)
             .unwrap_or_else(|| walk_by_parent(store, first, count));
+        // A run walks downward from `first`, so nothing in it can exceed a
+        // ceiling the first header already satisfies -- but the filter is
+        // cheap and states the invariant rather than relying on it.
+        headers.retain(|h| self.may_serve(h.number));
 
         trace!(
             target: "rustock::sync",
@@ -211,7 +293,7 @@ impl SyncHandler {
         request_id: u64,
         height: u64,
     ) -> Option<P2pMessage> {
-        if height == 0 {
+        if height == 0 || !self.may_serve(height) {
             return None;
         }
         let hash = self.manager.store.canonical_hash(height).ok()??;
@@ -239,13 +321,12 @@ impl SyncHandler {
         let store = &self.manager.store;
 
         // Verify we have the starting block
+        if !self.may_serve(start_number) {
+            return None;
+        }
         store.canonical_hash(start_number).ok()??;
 
-        let best_number = store
-            .head()
-            .ok()?
-            .and_then(|h| store.header(h).ok()?)
-            .map(|h| h.number)?;
+        let best_number = self.effective_head()?;
 
         let skeleton_start = (start_number / SKELETON_STEP) * SKELETON_STEP;
         let max_skeleton_number = best_number.min(

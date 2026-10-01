@@ -58,6 +58,23 @@
 # supply_check = "both"             # default
 # rskj_multisig_senders = "on"      # default — on | off — emulate rskj multisig peg-in senders
 
+# Serving a frozen chain, for timed comparisons between clients. A server that
+# is still following is not the same fixture twice: it grows between runs and
+# the second client has more to do than the first.
+#
+# Turning following off is the instruction -- serve what is held, adopt
+# nothing. Opening read-only is the defence behind it: if some path is missed,
+# the database refuses the write rather than taking it.
+# read_only = false                 # default
+# follow_up = true                  # default
+# Behave as though the chain ends here. Everything announced agrees with it,
+# total difficulty included; nothing above it is served. Requires following to
+# be off.
+# simulate_height = 1000000         # default: unset
+# Exit once synced, reporting the elapsed time -- an unambiguous end time for
+# a measurement, rather than a log line to scrape.
+# exit_when_synced = false          # default
+
 [rpc]
 # host = "127.0.0.1"                # default
 # port = 4444                       # default

@@ -5961,3 +5961,185 @@ async fn a_forced_search_against_a_peer_with_nothing_above_us_still_follows() {
         service.state
     );
 }
+
+// -- Serving a simulated chain end ---------------------------------------
+//
+// `--simulate-height` makes this node behave as though the chain ends at a
+// given block, so that several clients can be timed against the same fixture.
+// A client that can reach past it has not run the test that was intended, so
+// the ceiling is enforced on every path a client could use, not only on what
+// is announced.
+
+fn handler_capped_at(store: Arc<BlockStore>, ceiling: Option<u64>) -> crate::handler::SyncHandler {
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+    let (event_tx, _rx) = mpsc::unbounded_channel();
+    crate::handler::SyncHandler::new(manager, event_tx).with_serve_ceiling(ceiling)
+}
+
+/// A block above the simulated head is not named, even though it is on disk.
+#[tokio::test]
+async fn a_block_hash_above_the_simulated_head_is_not_served() {
+    let (store, _dir, headers) = linked_chain(10);
+    let handler = handler_capped_at(store, Some(5));
+
+    assert!(
+        handler.serve_block_hash_request_for_test(1, 5).is_some(),
+        "the simulated head itself is served"
+    );
+    assert!(
+        handler.serve_block_hash_request_for_test(1, 6).is_none(),
+        "#6 is on disk but above the simulated head, so this node must not name it"
+    );
+    let _ = headers;
+}
+
+/// Nor are its headers.
+#[tokio::test]
+async fn headers_above_the_simulated_head_are_not_served() {
+    let (store, _dir, headers) = linked_chain(10);
+    let above = headers[7].hash();
+    let below = headers[3].hash();
+    let handler = handler_capped_at(store, Some(5));
+
+    assert!(handler.serve_headers_request_for_test(1, below, 2).is_some());
+    assert!(
+        handler.serve_headers_request_for_test(1, above, 2).is_none(),
+        "a header request starting above the simulated head must go unanswered"
+    );
+}
+
+/// Nor its body. The block is in the database; the point is that this node
+/// behaves as though the chain ended before it.
+#[tokio::test]
+async fn a_body_above_the_simulated_head_is_not_served() {
+    let (store, _dir, headers) = linked_chain(10);
+    for h in &headers {
+        store.put_body(h.hash(), &[], &[]).unwrap();
+    }
+    let handler = handler_capped_at(store, Some(5));
+
+    assert!(handler.serve_body_request_for_test(1, headers[3].hash()).is_some());
+    assert!(
+        handler.serve_body_request_for_test(1, headers[7].hash()).is_none(),
+        "the body is on disk but the block is above the simulated head"
+    );
+}
+
+/// A skeleton must not name a point above the simulated head: that is how a
+/// client discovers what to ask for, so a point above it would send the client
+/// after blocks this node will then refuse.
+#[tokio::test]
+async fn a_skeleton_names_nothing_above_the_simulated_head() {
+    let (store, _dir, _headers) = linked_chain(400);
+    let handler = handler_capped_at(store, Some(200));
+
+    let msg = handler.serve_skeleton_request_for_test(1, 0).expect("served");
+    let rustock_networking::protocol::P2pMessage::RskMessage(m) = msg else {
+        panic!("not an rsk message")
+    };
+    let rustock_networking::protocol::RskSubMessage::SkeletonResponse(r) = m.sub_message else {
+        panic!("not a skeleton")
+    };
+    for id in &r.block_identifiers {
+        assert!(
+            id.number <= 200,
+            "skeleton named #{} above the simulated head of #200",
+            id.number
+        );
+    }
+}
+
+/// Without a ceiling, nothing changes.
+#[tokio::test]
+async fn an_uncapped_node_serves_everything_as_before() {
+    let (store, _dir, headers) = linked_chain(10);
+    let handler = handler_capped_at(store, None);
+    assert!(handler.serve_block_hash_request_for_test(1, 9).is_some());
+    assert!(handler.serve_headers_request_for_test(1, headers[9].hash(), 2).is_some());
+}
+
+/// `--follow-up false` is an instruction, and it has to cover more than the
+/// start of a sync round.
+///
+/// A header response, a body, an announcement of a new tip: each writes chain
+/// data on arrival, without any round having been started. Gating only
+/// `try_start_sync` would leave a node that never *begins* a sync but still
+/// adopts whatever a peer pushes at it — which is exactly what a server being
+/// measured against must not do, because it would no longer be the same
+/// fixture for the next client.
+///
+/// `--read-only` sits behind this rather than replacing it: if a path is
+/// missed here the database refuses the write. One is the instruction, the
+/// other is what makes a mistake in carrying it out harmless.
+#[tokio::test]
+async fn serving_only_adopts_nothing_a_peer_pushes() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let genesis_hash = genesis.hash();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager.clone(), peer_store, event_rx)
+        .with_follow_up(false);
+
+    // A peer pushes a perfectly good block on top of our head.
+    let next = dummy_header(1, genesis_hash, U256::from(10));
+    let next_hash = next.hash();
+    service
+        .handle_event(SyncEvent::HeadersResponse {
+            peer: B512::repeat_byte(0x31),
+            id: 1,
+            headers: vec![next],
+        })
+        .await;
+
+    assert!(
+        store.header(next_hash).unwrap().is_none(),
+        "a serving-only node adopted a header a peer pushed at it"
+    );
+    assert_eq!(
+        store.head().unwrap(),
+        Some(genesis_hash),
+        "and its head moved, so it is no longer the fixture the next client will see"
+    );
+}
+
+/// With following on, the same push is adopted — so the test above is about
+/// the instruction, not about the header being unacceptable.
+#[tokio::test]
+async fn a_following_node_adopts_the_same_push() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let genesis_hash = genesis.hash();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+
+    let next = dummy_header(1, genesis_hash, U256::from(10));
+    let next_hash = next.hash();
+    service
+        .handle_event(SyncEvent::HeadersResponse {
+            peer: B512::repeat_byte(0x31),
+            id: 1,
+            headers: vec![next],
+        })
+        .await;
+
+    assert!(
+        store.header(next_hash).unwrap().is_some(),
+        "the header is acceptable; only the instruction kept it out above"
+    );
+}
