@@ -810,6 +810,54 @@ struct Args {
     #[arg(long, default_value_t = 50_000)]
     prune_max_batch: u64,
 
+    /// Open both databases read-only and write nothing.
+    ///
+    /// Everything that would write is refused: execution, pruning, the
+    /// freezer, the canonical index fill. What is left is a node that serves
+    /// what it already has.
+    ///
+    /// For a server that several measurements run against, where the thing
+    /// being measured is the client: a server that writes is not the same
+    /// fixture twice.
+    #[arg(long, default_value_t = false)]
+    read_only: bool,
+
+    /// Catch up with new blocks. `--follow-up false` serves what is held and
+    /// does not sync, execute or follow.
+    ///
+    /// On by default, so an ordinary node is unaffected. Off, the node stops
+    /// drifting forward, which is what makes a timed comparison against it
+    /// repeatable.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    follow_up: bool,
+
+    /// Behave as though the canonical chain ends at this height.
+    ///
+    /// Everything announced agrees with it, not only the block number: the
+    /// status message's best number, hash, parent and **total difficulty as
+    /// accumulated to this height**, the served block range, skeleton points,
+    /// and the answers to header, body and block-hash requests. A client that
+    /// can reach a block above it has not run the test that was intended.
+    ///
+    /// Only valid with `--follow-up false`. Simulating a shorter chain while
+    /// still following a longer one is incoherent, and is rejected at startup
+    /// rather than producing a node that disagrees with itself.
+    #[arg(long, value_name = "HEIGHT")]
+    simulate_height: Option<u64>,
+
+    /// Exit once the chain is synced, reporting how long it took.
+    ///
+    /// "Synced" means executed, not merely downloaded: the executed head has
+    /// reached the best height any peer advertises, and the node is following
+    /// rather than still fetching. A node that has the headers but has not run
+    /// the blocks has not finished the work being measured.
+    ///
+    /// For timed comparisons. A process exit is an unambiguous end time;
+    /// scraping a log line for one invites disagreement about which line
+    /// counts.
+    #[arg(long, default_value_t = false)]
+    exit_when_synced: bool,
+
     /// Delete block history below `--prune-keep-depth` as the node runs.
     ///
     /// Off by default, and deliberately: turning it on is not a tuning
@@ -923,6 +971,10 @@ fn apply_file_config(
     apply_opt(matches, "secret_key", f.node.secret_key.as_ref(), &mut a.secret_key);
     apply_opt(matches, "external_ip", f.node.external_ip.as_ref(), &mut a.external_ip);
     apply(matches, "supply_check", f.node.supply_check.as_ref(), &mut a.supply_check);
+    apply(matches, "read_only", f.node.read_only.as_ref(), &mut a.read_only);
+    apply(matches, "follow_up", f.node.follow_up.as_ref(), &mut a.follow_up);
+    apply_opt(matches, "simulate_height", f.node.simulate_height.as_ref(), &mut a.simulate_height);
+    apply(matches, "exit_when_synced", f.node.exit_when_synced.as_ref(), &mut a.exit_when_synced);
     apply(matches, "rskj_multisig_senders", f.node.rskj_multisig_senders.as_ref(),
         &mut a.rskj_multisig_senders);
 
@@ -1445,9 +1497,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     // Profiling modes attach to a database another process may own, so they
     // take the read-only path: it does not take RocksDB's lock and cannot
     // write. Everything else opens normally.
-    let read_only = args.measure_block_reads.is_some() || args.verify_state.is_some();
+    let read_only =
+        args.read_only || args.measure_block_reads.is_some() || args.verify_state.is_some();
     let store = Arc::new(if read_only {
-        info!("Opening {} READ-ONLY for profiling", args.data_dir);
+        info!("Opening {} READ-ONLY; nothing this node does can write to it", args.data_dir);
         BlockStore::open_read_only(&args.data_dir)?
     } else {
         BlockStore::open(&args.data_dir)?
@@ -1488,16 +1541,49 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let verifying_key = signing_key.verifying_key();
     let encoded_point = verifying_key.to_encoded_point(false);
     let node_id = alloy_primitives::B512::from_slice(&encoded_point.as_bytes()[1..]);
+    // Printed in full because a peer that must be told who to dial needs it,
+    // and deriving it from the key by hand is a step that invites a typo.
+    info!("Node ID: {}", alloy_primitives::hex::encode(node_id.as_slice()));
 
-    let (best_hash, best_td, best_number, best_parent) = if let Some(head_hash) = store.head()? {
-        let td = store.total_difficulty(head_hash)?.unwrap_or(U256::ZERO);
-        let header = store.header(head_hash)?;
+    // `--simulate-height` rejected before anything opens, so a node that
+    // disagrees with itself never starts. Simulating a shorter chain while
+    // still following a longer one would advertise one head and keep adopting
+    // another.
+    if args.simulate_height.is_some() && args.follow_up {
+        anyhow::bail!(
+            "--simulate-height requires --follow-up false: a node that keeps catching up \
+             would advertise the simulated head while adopting the real one"
+        );
+    }
+
+    // The head this node speaks for. Normally its own; under
+    // `--simulate-height`, the block at that height instead -- *and the total
+    // difficulty accumulated to it*, which is the part that matters. A client
+    // chooses what to sync from the advertised difficulty, so a simulated
+    // height carrying the real chain's difficulty would be a node claiming the
+    // work of blocks it refuses to serve.
+    let announced_head = match args.simulate_height {
+        Some(h) => store.canonical_hash(h)?.ok_or_else(|| {
+            anyhow::anyhow!("--simulate-height {h}: this node has no canonical block there")
+        })?,
+        None => store.head()?.unwrap_or(genesis_hash),
+    };
+    if let Some(h) = args.simulate_height {
+        info!(
+            "Simulating a chain that ends at #{h} ({announced_head:?}); \
+             nothing above it is announced or served"
+        );
+    }
+
+    let (best_hash, best_td, best_number, best_parent) = if store.head()?.is_some() {
+        let td = store.total_difficulty(announced_head)?.unwrap_or(U256::ZERO);
+        let header = store.header(announced_head)?;
         let number = header.as_ref().map(|h| h.number).unwrap_or(0);
         // The status message is positional: without the parent, elements
         // three onwards cannot be sent at all, which is why this node used to
         // advertise a two-element status and never state its own total
         // difficulty on the RSK protocol.
-        (head_hash, td, number, header.map(|h| h.parent_hash))
+        (announced_head, td, number, header.map(|h| h.parent_hash))
     } else {
         (genesis_hash, U256::ZERO, 0, None)
     };
@@ -1539,6 +1625,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             args.bootnodes.clone()
         },
         closed_network: args.closed_network,
+        read_only,
         secret_key: secret_key_bytes,
         discovery_port: args.port + 1,
         data_dir: args.data_dir.clone(),
@@ -1554,7 +1641,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let sync_manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let sync_handler = Arc::new(SyncHandler::new(sync_manager.clone(), event_tx));
+    let sync_handler = Arc::new(
+        SyncHandler::new(sync_manager.clone(), event_tx)
+            .with_serve_ceiling(args.simulate_height),
+    );
     let gc_config = rustock_storage::epoch_store::EpochConfig {
         epochs: args.gc_epochs,
         burial_depth: args.gc_burial,
@@ -2033,6 +2123,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         total_bytes_per_second: args.snap_total_rate,
         max_in_flight: args.snap_parallel.max(1),
         blocks_required: args.snap_blocks,
+        serve_ceiling: args.simulate_height,
         ..rustock_sync::SnapConfig::default()
     };
 
@@ -2306,7 +2397,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         .with_block_processor(block_processor, trie_store_for_exec, initial_state_root)
         .with_gas_price_tracker(gas_price_tracker.clone())
         .with_scoring(Some(scoring.clone()))
-        .with_events(events.clone());
+        .with_events(events.clone())
+        .with_follow_up(args.follow_up)
+        .with_serve_ceiling(args.simulate_height)
+        .with_exit_when_synced(args.exit_when_synced);
 
     if args.snap_sync {
         info!(

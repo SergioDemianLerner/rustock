@@ -299,6 +299,7 @@ mod tests {
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
             closed_network: false,
+        read_only: false,
             secret_key: sk,
             discovery_port: 0,
             data_dir: ".".to_string(),

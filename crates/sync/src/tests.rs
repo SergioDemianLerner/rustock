@@ -5961,3 +5961,281 @@ async fn a_forced_search_against_a_peer_with_nothing_above_us_still_follows() {
         service.state
     );
 }
+
+// -- Serving a simulated chain end ---------------------------------------
+//
+// `--simulate-height` makes this node behave as though the chain ends at a
+// given block, so that several clients can be timed against the same fixture.
+// A client that can reach past it has not run the test that was intended, so
+// the ceiling is enforced on every path a client could use, not only on what
+// is announced.
+
+fn handler_capped_at(store: Arc<BlockStore>, ceiling: Option<u64>) -> crate::handler::SyncHandler {
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+    let (event_tx, _rx) = mpsc::unbounded_channel();
+    crate::handler::SyncHandler::new(manager, event_tx).with_serve_ceiling(ceiling)
+}
+
+/// A block above the simulated head is not named, even though it is on disk.
+#[tokio::test]
+async fn a_block_hash_above_the_simulated_head_is_not_served() {
+    let (store, _dir, headers) = linked_chain(10);
+    let handler = handler_capped_at(store, Some(5));
+
+    assert!(
+        handler.serve_block_hash_request_for_test(1, 5).is_some(),
+        "the simulated head itself is served"
+    );
+    assert!(
+        handler.serve_block_hash_request_for_test(1, 6).is_none(),
+        "#6 is on disk but above the simulated head, so this node must not name it"
+    );
+    let _ = headers;
+}
+
+/// Nor are its headers.
+#[tokio::test]
+async fn headers_above_the_simulated_head_are_not_served() {
+    let (store, _dir, headers) = linked_chain(10);
+    let above = headers[7].hash();
+    let below = headers[3].hash();
+    let handler = handler_capped_at(store, Some(5));
+
+    assert!(handler.serve_headers_request_for_test(1, below, 2).is_some());
+    assert!(
+        handler.serve_headers_request_for_test(1, above, 2).is_none(),
+        "a header request starting above the simulated head must go unanswered"
+    );
+}
+
+/// Nor its body. The block is in the database; the point is that this node
+/// behaves as though the chain ended before it.
+#[tokio::test]
+async fn a_body_above_the_simulated_head_is_not_served() {
+    let (store, _dir, headers) = linked_chain(10);
+    for h in &headers {
+        store.put_body(h.hash(), &[], &[]).unwrap();
+    }
+    let handler = handler_capped_at(store, Some(5));
+
+    assert!(handler.serve_body_request_for_test(1, headers[3].hash()).is_some());
+    assert!(
+        handler.serve_body_request_for_test(1, headers[7].hash()).is_none(),
+        "the body is on disk but the block is above the simulated head"
+    );
+}
+
+/// A skeleton must not name a point above the simulated head: that is how a
+/// client discovers what to ask for, so a point above it would send the client
+/// after blocks this node will then refuse.
+#[tokio::test]
+async fn a_skeleton_names_nothing_above_the_simulated_head() {
+    let (store, _dir, _headers) = linked_chain(400);
+    let handler = handler_capped_at(store, Some(200));
+
+    let msg = handler.serve_skeleton_request_for_test(1, 0).expect("served");
+    let rustock_networking::protocol::P2pMessage::RskMessage(m) = msg else {
+        panic!("not an rsk message")
+    };
+    let rustock_networking::protocol::RskSubMessage::SkeletonResponse(r) = m.sub_message else {
+        panic!("not a skeleton")
+    };
+    for id in &r.block_identifiers {
+        assert!(
+            id.number <= 200,
+            "skeleton named #{} above the simulated head of #200",
+            id.number
+        );
+    }
+}
+
+/// Without a ceiling, nothing changes.
+#[tokio::test]
+async fn an_uncapped_node_serves_everything_as_before() {
+    let (store, _dir, headers) = linked_chain(10);
+    let handler = handler_capped_at(store, None);
+    assert!(handler.serve_block_hash_request_for_test(1, 9).is_some());
+    assert!(handler.serve_headers_request_for_test(1, headers[9].hash(), 2).is_some());
+}
+
+/// `--follow-up false` is an instruction, and it has to cover more than the
+/// start of a sync round.
+///
+/// A header response, a body, an announcement of a new tip: each writes chain
+/// data on arrival, without any round having been started. Gating only
+/// `try_start_sync` would leave a node that never *begins* a sync but still
+/// adopts whatever a peer pushes at it — which is exactly what a server being
+/// measured against must not do, because it would no longer be the same
+/// fixture for the next client.
+///
+/// `--read-only` sits behind this rather than replacing it: if a path is
+/// missed here the database refuses the write. One is the instruction, the
+/// other is what makes a mistake in carrying it out harmless.
+#[tokio::test]
+async fn serving_only_adopts_nothing_a_peer_pushes() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let genesis_hash = genesis.hash();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager.clone(), peer_store, event_rx)
+        .with_follow_up(false);
+
+    // A peer pushes a perfectly good block on top of our head.
+    let next = dummy_header(1, genesis_hash, U256::from(10));
+    let next_hash = next.hash();
+    service
+        .handle_event(SyncEvent::HeadersResponse {
+            peer: B512::repeat_byte(0x31),
+            id: 1,
+            headers: vec![next],
+        })
+        .await;
+
+    assert!(
+        store.header(next_hash).unwrap().is_none(),
+        "a serving-only node adopted a header a peer pushed at it"
+    );
+    assert_eq!(
+        store.head().unwrap(),
+        Some(genesis_hash),
+        "and its head moved, so it is no longer the fixture the next client will see"
+    );
+}
+
+/// With following on, the same push is adopted — so the test above is about
+/// the instruction, not about the header being unacceptable.
+#[tokio::test]
+async fn a_following_node_adopts_the_same_push() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let genesis_hash = genesis.hash();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+
+    let next = dummy_header(1, genesis_hash, U256::from(10));
+    let next_hash = next.hash();
+    service
+        .handle_event(SyncEvent::HeadersResponse {
+            peer: B512::repeat_byte(0x31),
+            id: 1,
+            headers: vec![next],
+        })
+        .await;
+
+    assert!(
+        store.header(next_hash).unwrap().is_some(),
+        "the header is acceptable; only the instruction kept it out above"
+    );
+}
+
+// -- Keeping a peer engaged ----------------------------------------------
+//
+// rskj refreshes a node's liveness only when a STATUS arrives:
+// `SyncPeerStatus.updateActivity` is called from its constructor and from
+// `setStatus`, and nowhere else. Block traffic, headers, bodies and
+// announcements all leave the clock untouched. After
+// `sync.expirationTimePeerStatus` — ten minutes — it drops the node from the
+// set it will sync from, while the connection stays up and looks healthy.
+//
+// rustock sent its status once, at the handshake. Observed: an rskj client
+// synced 12,096 blocks, logged "Completed syncing phase" fourteen minutes in,
+// and never started another round.
+
+/// The refresh must be well inside rskj's expiry, not merely under it.
+#[test]
+fn the_status_refresh_is_far_inside_rskj_expiry() {
+    let rskj_expiry = Duration::from_secs(10 * 60);
+    assert!(
+        crate::service::STATUS_REFRESH * 12 < rskj_expiry,
+        "a {}s refresh against a {}s expiry leaves no margin for a node that is busy, \
+         and the failure is silent: the peer stays connected and simply stops syncing",
+        crate::service::STATUS_REFRESH.as_secs(),
+        rskj_expiry.as_secs()
+    );
+    assert_eq!(
+        crate::service::STATUS_REFRESH,
+        Duration::from_secs(10),
+        "rskj broadcasts its own status every 10 seconds; matching it is the point"
+    );
+}
+
+/// The refreshed status says the same thing the handshake said.
+///
+/// A server simulating a shorter chain that then refreshed with its real head
+/// would tell one peer two different stories about where the chain ends, and
+/// the second one would undo the first.
+#[tokio::test]
+async fn a_refreshed_status_agrees_with_the_simulated_head() {
+    let (store, _dir, headers) = linked_chain(20);
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+
+    let service = SyncService::new(manager, peer_store, event_rx)
+        .with_serve_ceiling(Some(5));
+
+    let status = service.current_status_for_test().expect("a status");
+    assert_eq!(
+        status.best_block_number, 5,
+        "the refresh announced the real head, contradicting the handshake"
+    );
+    assert_eq!(status.best_block_hash, headers[5].hash());
+}
+
+/// Without a ceiling it announces the real head — and follows it.
+///
+/// Built from the store on each refresh rather than captured at startup,
+/// because on a following node the head moves. A status frozen at the height
+/// this node had when it started would have a peer believe it had stopped.
+#[tokio::test]
+async fn a_refreshed_status_tracks_the_head() {
+    let (store, _dir, headers) = linked_chain(20);
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let service = SyncService::new(manager, peer_store, event_rx);
+
+    let top = headers.last().unwrap();
+    let before = service.current_status_for_test().expect("a status");
+    assert_eq!(before.best_block_number, top.number);
+    assert!(
+        before.total_difficulty.is_some(),
+        "the status must carry total difficulty, which is what a peer picks a chain on"
+    );
+    assert!(
+        before.best_block_parent_hash.is_some(),
+        "and the parent, or the message is the two-element form and carries no difficulty"
+    );
+
+    // The head moves, as it does on a node that is following.
+    let next = dummy_header(top.number + 1, top.hash(), U256::from(10));
+    let next_td = store.total_difficulty(top.hash()).unwrap().unwrap() + U256::from(10);
+    store.update_head(&next, next_td).unwrap();
+
+    let after = service.current_status_for_test().expect("a status");
+    assert_eq!(
+        after.best_block_number,
+        top.number + 1,
+        "the refresh still announced the old head, so a peer would think this node \
+         had stopped"
+    );
+    assert_eq!(after.total_difficulty, Some(next_td));
+}

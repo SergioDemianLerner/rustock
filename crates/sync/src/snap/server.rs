@@ -196,7 +196,13 @@ impl SnapServer {
     fn checkpoint(&self) -> Option<Block> {
         let head_hash = self.store.head().ok()??;
         let head = self.store.header(head_hash).ok()??;
-        let number = self.config.checkpoint_for(head.number);
+        // The simulated chain end, when there is one: a server claiming the
+        // chain stops at N must not offer a state above N.
+        let head_number = match self.config.serve_ceiling {
+            Some(c) => head.number.min(c),
+            None => head.number,
+        };
+        let number = self.config.checkpoint_for(head_number);
 
         let hash = self.store.canonical_hash(number).ok()??;
         let block = self.store.block(hash).ok()??;

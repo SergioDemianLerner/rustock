@@ -247,6 +247,22 @@ const PEER_SIDELINE_DURATION: Duration = Duration::from_secs(300);
 /// Interval between sync tick checks.
 const TICK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often this node re-states its status to every peer.
+///
+/// rskj's figure, and matching it is the point rather than a coincidence. An
+/// rskj peer refreshes a node's liveness **only** when a `STATUS` arrives --
+/// `SyncPeerStatus.updateActivity` is called from its constructor and from
+/// `setStatus`, and from nowhere else, so block traffic, headers, bodies and
+/// announcements all leave the clock untouched. After
+/// `sync.expirationTimePeerStatus`, ten minutes, it drops the node from the
+/// set it will sync from, while the connection stays up and looks healthy.
+///
+/// rustock sent its status once, at the handshake. An rskj peer could
+/// therefore start a sync round from this node for ten minutes and never
+/// again, which was observed: a sync stopped after fourteen minutes at a whole
+/// number of skeleton chunks, with one connected peer and nothing wrong.
+pub(crate) const STATUS_REFRESH: Duration = Duration::from_secs(10);
+
 /// Maximum block gap for follow mode. Gaps larger than this trigger skeleton
 /// sync; smaller gaps are handled by fetching individual headers.
 /// Matches RSKj's `longSyncLimit` (default 24).
@@ -542,6 +558,24 @@ pub struct SyncService {
     /// by the next session. Making the handover explicit means one place
     /// decides, and it decides after the outcome is known. See #185.
     suspended_for_snap: bool,
+    /// Whether to catch up with the chain at all.
+    ///
+    /// `false` makes this node a server and nothing else: it answers requests
+    /// from what it holds and never syncs, executes or follows. A server that
+    /// drifts forward is not the same fixture twice, which is what a timed
+    /// comparison against it needs it to be.
+    pub(crate) follow_up: bool,
+    /// Exit once the chain is synced, reporting how long it took.
+    pub(crate) exit_when_synced: bool,
+    /// When this node started syncing, for that report.
+    started_at: Instant,
+    /// When this node last re-stated its status. See [`STATUS_REFRESH`].
+    last_status_sent: Instant,
+    /// Highest block this node speaks for, under `--simulate-height`.
+    ///
+    /// The refreshed status has to agree with what the handshake said, or a
+    /// peer would be told two different things about where the chain ends.
+    serve_ceiling: Option<u64>,
     /// Whether the block pruner may run, readable from outside the service.
     ///
     /// **Starts false, and is only ever turned on once this service has
@@ -616,6 +650,11 @@ impl SyncService {
             events: None,
             body_providers: HashMap::new(),
             suspended_for_snap: false,
+            follow_up: true,
+            exit_when_synced: false,
+            started_at: Instant::now(),
+            last_status_sent: Instant::now(),
+            serve_ceiling: None,
             prune_allowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             scoring: None,
             last_prefetch_start: None,
@@ -714,6 +753,122 @@ impl SyncService {
     /// the service is moved into its task.
     pub fn chain_activity(&self) -> Arc<crate::chain_activity::ChainActivity> {
         self.chain_activity.clone()
+    }
+
+    /// Stop, having caught up, and say how long it took.
+    ///
+    /// "Caught up" means **executed**, not downloaded. A node holding every
+    /// header to the tip but still running the blocks has not finished the
+    /// work being measured, and exiting there would report a time for
+    /// something nobody asked about.
+    ///
+    /// Exits the process rather than returning, because the point is an
+    /// unambiguous end time. A log line invites an argument about which line
+    /// counts; a process exit does not.
+    async fn exit_if_synced(&mut self) {
+        let Some((_, meta)) = self.peer_store.best_peer().await else { return };
+        if meta.best_number == 0 {
+            return; // nobody has told us where the chain ends yet
+        }
+
+        let store = &self.manager.store;
+        let executed = store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| store.header(hash).ok().flatten())
+            .map(|h| h.number)
+            .unwrap_or(0);
+
+        if executed < meta.best_number {
+            return;
+        }
+
+        let elapsed = self.started_at.elapsed();
+        info!(
+            target: "rustock::sync",
+            "Synced to #{} in {:.1}s ({:.1} blocks/s); exiting as instructed",
+            executed,
+            elapsed.as_secs_f64(),
+            executed as f64 / elapsed.as_secs_f64().max(f64::EPSILON),
+        );
+        // Flush whatever the logger is holding before the process goes.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::process::exit(0);
+    }
+
+    /// Re-state this node's status to every peer.
+    ///
+    /// Sent on a timer whether or not anything changed, and whether or not
+    /// this node is following. The figure is not the point: an rskj peer
+    /// treats the arrival of a `STATUS` as the only evidence that a node is
+    /// still worth syncing from, so a node whose status never changes still
+    /// has to keep saying it. A `--follow-up false` server is exactly that
+    /// case, and is the one most likely to be sat on by a peer for hours.
+    async fn refresh_status_to_peers(&self) {
+        let peers = self.peer_store.peers().await;
+        if peers.is_empty() {
+            return;
+        }
+        let Some(status) = self.current_status() else { return };
+        let msg = rustock_networking::protocol::P2pMessage::RskMessage(
+            rustock_networking::protocol::RskMessage::new(
+                rustock_networking::protocol::RskSubMessage::Status(status),
+            ),
+        );
+        for peer in peers {
+            self.peer_store.send_to_peer(&peer, msg.clone()).await;
+        }
+    }
+
+    /// This node's status as it stands now.
+    ///
+    /// Built from the store each time rather than captured at startup,
+    /// because on a following node the head moves and a stale figure is worse
+    /// than none: it would have a peer believe this node had stopped.
+    fn current_status(&self) -> Option<rustock_networking::protocol::RskStatus> {
+        let store = &self.manager.store;
+        // The simulated head when there is one, so a refresh cannot contradict
+        // what the handshake said.
+        let hash = match self.serve_ceiling {
+            Some(c) => store.canonical_hash(c).ok().flatten()?,
+            None => store.head().ok().flatten()?,
+        };
+        let header = store.header(hash).ok().flatten()?;
+        Some(rustock_networking::protocol::RskStatus {
+            best_block_number: header.number,
+            best_block_hash: hash,
+            best_block_parent_hash: Some(header.parent_hash),
+            total_difficulty: store.total_difficulty(hash).ok().flatten(),
+            earliest_block: Some(
+                store.prune_floor().ok().flatten().map(|f| f.number).unwrap_or(0),
+            ),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_status_for_test(
+        &self,
+    ) -> Option<rustock_networking::protocol::RskStatus> {
+        self.current_status()
+    }
+
+    /// Highest block to speak for, under `--simulate-height`.
+    pub fn with_serve_ceiling(mut self, ceiling: Option<u64>) -> Self {
+        self.serve_ceiling = ceiling;
+        self
+    }
+
+    /// Whether to catch up at all. `false` serves only.
+    pub fn with_follow_up(mut self, follow_up: bool) -> Self {
+        self.follow_up = follow_up;
+        self
+    }
+
+    /// Exit once synced, reporting the elapsed time.
+    pub fn with_exit_when_synced(mut self, exit: bool) -> Self {
+        self.exit_when_synced = exit;
+        self
     }
 
     /// Whether the block pruner may run. See [`Self::prune_allowed`].
@@ -1135,6 +1290,15 @@ impl SyncService {
         // Reap a finished background execution before driving the state machine
         // so a parked next batch can start executing and downloads can resume.
         self.poll_execution().await;
+
+        if self.exit_when_synced {
+            self.exit_if_synced().await;
+        }
+
+        if self.last_status_sent.elapsed() >= STATUS_REFRESH {
+            self.last_status_sent = Instant::now();
+            self.refresh_status_to_peers().await;
+        }
 
         if self.snap.is_some() {
             let now = Instant::now();
@@ -2601,6 +2765,12 @@ impl SyncService {
     }
 
     pub(crate) async fn try_start_sync(&mut self) {
+        if !self.follow_up {
+            // A server, by instruction. It answers what it is asked and
+            // adopts nothing.
+            return;
+        }
+
         let best_peer = self.peer_store.best_peer().await;
         let (peer_id, metadata) = match best_peer {
             Some(p) => p,
@@ -2943,6 +3113,37 @@ impl SyncService {
     // -----------------------------------------------------------------------
 
     pub(crate) async fn handle_event(&mut self, event: SyncEvent) {
+        // `--follow-up false` is an instruction not to catch up, and catching
+        // up is more than starting a sync round: a header response, a body, an
+        // announcement of a new tip all write chain data on arrival. Gating
+        // only `try_start_sync` would leave a node that does not *begin* a
+        // sync but still adopts whatever a peer pushes at it.
+        //
+        // `--read-only` is the defence behind this rather than the same
+        // measure twice: if some path is missed here, the database refuses the
+        // write rather than taking it. One is the instruction, the other is
+        // what makes a mistake in carrying it out harmless.
+        if !self.follow_up {
+            match &event {
+                SyncEvent::HeadersResponse { .. }
+                | SyncEvent::BodyResponse { .. }
+                | SyncEvent::SkeletonResponse { .. }
+                | SyncEvent::BlockHashResponse { .. }
+                | SyncEvent::NewBlockHashes { .. }
+                | SyncEvent::SnapStatusResponse { .. }
+                | SyncEvent::SnapChunkResponse { .. }
+                | SyncEvent::SnapBlocksResponse { .. } => {
+                    trace!(
+                        target: "rustock::sync",
+                        "serving only (--follow-up false); dropping an inbound chain-data \
+                         message"
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match event {
             SyncEvent::BlockHashResponse { hash, .. } => {
                 self.on_block_hash_response(hash).await;
