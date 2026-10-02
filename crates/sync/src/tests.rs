@@ -6239,3 +6239,84 @@ async fn a_refreshed_status_tracks_the_head() {
     );
     assert_eq!(after.total_difficulty, Some(next_td));
 }
+
+/// Headers carrying their uncles must produce the total difficulty rskj
+/// computes from bodies: `difficulty + sum(uncle difficulties)`. Without the
+/// uncles the same header yields only its own difficulty, which is the
+/// undercount `rsk/63` exists to remove.
+#[tokio::test]
+async fn uncles_sent_with_headers_make_total_difficulty_exact() {
+    use rustock_networking::protocol::HeaderWithUncles;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(
+        HeaderVerifier::new()
+            .with_parent_rule(rustock_core::validation::BlockNumberRule)
+            .with_parent_rule(rustock_core::validation::ParentHashRule),
+    );
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    // One block worth 10, absorbing two uncles worth 7 and 5.
+    let uncle_a = dummy_header(0, B256::ZERO, U256::from(7));
+    let uncle_b = dummy_header(0, B256::ZERO, U256::from(5));
+    let mut b1 = dummy_header(1, genesis_hash, U256::from(10));
+    b1.uncle_count = 2;
+
+    let entry = HeaderWithUncles { header: b1, uncles: vec![uncle_a, uncle_b] };
+    // The header must genuinely name these uncles, as it would on the wire.
+    let commitment = alloy_primitives::keccak256(entry.encoded_uncles());
+    let mut header = entry.header.clone();
+    header.ommers_hash = commitment;
+    let entry = HeaderWithUncles { header, uncles: entry.uncles };
+    assert!(entry.commitment_matches());
+
+    let hash = entry.header.hash();
+    let headers = manager.note_proven_difficulties(vec![entry]);
+    manager.handle_headers_response(headers, test_peer()).unwrap();
+
+    // 1 (genesis) + 10 + 7 + 5
+    assert_eq!(
+        store.total_difficulty(hash).unwrap(),
+        Some(U256::from(23)),
+        "uncle difficulty is counted, as rskj's getCumulativeDifficulty does"
+    );
+}
+
+/// Without the uncles, the same header can only yield a lower bound. This is
+/// what every `rsk/62` peer leaves us with, and why the fallback is a
+/// fallback rather than an equivalent.
+#[tokio::test]
+async fn headers_without_uncles_yield_only_a_lower_bound() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(
+        HeaderVerifier::new()
+            .with_parent_rule(rustock_core::validation::BlockNumberRule)
+            .with_parent_rule(rustock_core::validation::ParentHashRule),
+    );
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    let mut b1 = dummy_header(1, genesis_hash, U256::from(10));
+    b1.uncle_count = 2;
+    let hash = b1.hash();
+    manager.handle_headers_response(vec![b1], test_peer()).unwrap();
+
+    assert_eq!(
+        store.total_difficulty(hash).unwrap(),
+        Some(U256::from(11)),
+        "1 + 10, with the two uncles' difficulty missing for want of a body"
+    );
+}

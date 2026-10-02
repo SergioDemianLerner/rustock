@@ -8,6 +8,7 @@ pub use eth::EthStatus;
 pub use rsk::{
     RskStatus, RskSubMessage, RskMessage,
     BlockHeadersRequest, BlockHeadersQuery, BlockHeadersResponse,
+    BlockHeadersWithUnclesRequest, BlockHeadersWithUnclesResponse, HeaderWithUncles,
     BlockHashRequest, BlockHashResponse,
     SkeletonRequest, SkeletonResponse, BlockIdentifier,
     BodyRequest, BodyResponse,

@@ -11,7 +11,8 @@ use rustock_core::types::transaction::Transaction;
 use rustock_core::Block;
 use rustock_execution::BlockProcessor;
 use rustock_networking::protocol::{
-    BlockHashRequest, BlockIdentifier, BodyRequest, P2pMessage, RskMessage, RskSubMessage,
+    BlockHashRequest, BlockIdentifier, BodyRequest, HeaderWithUncles, P2pMessage, RskMessage,
+    RskSubMessage,
     SkeletonRequest,
 };
 use rustock_storage::{BlockStore, Transition, Validated};
@@ -988,6 +989,7 @@ impl SyncService {
                             let is_progress = matches!(
                                 &e,
                                 SyncEvent::HeadersResponse { .. }
+                                | SyncEvent::HeadersWithUnclesResponse { .. }
                                 | SyncEvent::BodyResponse { .. }
                                 | SyncEvent::SkeletonResponse { .. }
                                 | SyncEvent::BlockHashResponse { .. }
@@ -3007,8 +3009,7 @@ impl SyncService {
             &peer.as_slice()[..4]
         );
 
-        let msg = self.manager.create_headers_request(hash, count);
-        self.peer_store.send_to_peer(peer, msg).await;
+        self.request_headers_from(peer, hash, count).await;
     }
 
     /// Fill the pipeline for all available peers.
@@ -3126,6 +3127,7 @@ impl SyncService {
         if !self.follow_up {
             match &event {
                 SyncEvent::HeadersResponse { .. }
+                | SyncEvent::HeadersWithUnclesResponse { .. }
                 | SyncEvent::BodyResponse { .. }
                 | SyncEvent::SkeletonResponse { .. }
                 | SyncEvent::BlockHashResponse { .. }
@@ -3169,6 +3171,13 @@ impl SyncService {
                     return;
                 }
                 self.on_headers_response(peer, headers).await;
+            }
+            SyncEvent::HeadersWithUnclesResponse { peer, id, entries } => {
+                // A snap header walk asks with the plain message, so an answer
+                // here is always ordinary sync; the id is kept for symmetry
+                // with `HeadersResponse` and for tracing.
+                let _ = id;
+                self.on_headers_with_uncles_response(peer, entries).await;
             }
             SyncEvent::BodyResponse { peer, id, transactions, uncles } => {
                 self.on_body_response(peer, id, transactions, uncles).await;
@@ -3332,6 +3341,42 @@ impl SyncService {
                 self.state = other;
             }
         }
+    }
+
+    /// Ask `peer` for headers, with their uncles when it can supply them.
+    ///
+    /// Uncle difficulty counts toward total difficulty and lives only in
+    /// bodies, so headers from an `rsk/62` peer -- every rskj node today --
+    /// leave this node computing a lower bound. A peer at `rsk/63` sends the
+    /// uncles alongside, making it exact. Asking an `rsk/62` peer for the new
+    /// message would drop the connection, so the capability decides.
+    async fn request_headers_from(&self, peer: &B512, hash: B256, count: u32) {
+        let with_uncles = self
+            .peer_store
+            .capabilities(peer)
+            .await
+            .is_some_and(|c| c.understands_header_uncles());
+        let msg = if with_uncles {
+            self.manager.create_headers_with_uncles_request(hash, count)
+        } else {
+            self.manager.create_headers_request(hash, count)
+        };
+        self.peer_store.send_to_peer(peer, msg).await;
+    }
+
+    /// Headers that came with their uncles (`rsk/63`).
+    ///
+    /// The uncles are not stored -- they are not blocks of this chain -- but
+    /// the cumulative difficulty they prove is recorded, so the ordinary
+    /// header path computes a total difficulty that matches what rskj computes
+    /// from bodies. Everything after that is the plain header flow.
+    pub(crate) async fn on_headers_with_uncles_response(
+        &mut self,
+        peer: B512,
+        entries: Vec<HeaderWithUncles>,
+    ) {
+        let headers = self.manager.note_proven_difficulties(entries);
+        self.on_headers_response(peer, headers).await;
     }
 
     pub(crate) async fn on_headers_response(&mut self, peer: B512, headers: Vec<Header>) {
@@ -3623,8 +3668,7 @@ impl SyncService {
                     "NewBlockHashes: requesting {} headers up to #{} from peer {:?}",
                     count, id.number, &peer.as_slice()[..4]
                 );
-                let msg = self.manager.create_headers_request(id.hash, count);
-                self.peer_store.send_to_peer(&peer, msg).await;
+                self.request_headers_from(&peer, id.hash, count).await;
             } else {
                 // Block at or below our height — check for reorg candidate
                 let canonical = self.manager.store
@@ -3647,8 +3691,7 @@ impl SyncService {
                     id.hash,
                     count
                 );
-                let msg = self.manager.create_headers_request(id.hash, count);
-                self.peer_store.send_to_peer(&peer, msg).await;
+                self.request_headers_from(&peer, id.hash, count).await;
             }
         }
     }
@@ -3696,8 +3739,7 @@ impl SyncService {
                 "Follow gap of {} blocks, requesting headers up to #{}",
                 count, metadata.best_number
             );
-            let msg = self.manager.create_headers_request(metadata.best_hash, count);
-            self.peer_store.send_to_peer(&peer_id, msg).await;
+            self.request_headers_from(&peer_id, metadata.best_hash, count).await;
         }
     }
 

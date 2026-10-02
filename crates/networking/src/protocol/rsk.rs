@@ -107,6 +107,79 @@ pub struct BlockHeadersResponse {
     pub headers: Vec<Header>,
 }
 
+/// A request for trunk headers together with the uncle headers they reference.
+///
+/// Shaped exactly like [`BlockHeadersRequest`], so a node can substitute one
+/// for the other without changing how it drives sync.
+#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
+pub struct BlockHeadersWithUnclesRequest {
+    pub id: u64,
+    pub query: BlockHeadersQuery,
+}
+
+/// One trunk header and the uncle headers it references.
+///
+/// In RSK total difficulty advances by the trunk difficulty *plus* every
+/// uncle's, and the uncle headers travel only in the body. Carrying them beside
+/// the header is what lets a node that holds no bodies compute the chain's
+/// work. The pairing is not taken on trust: `ommers_hash` commits to the uncle
+/// list, so [`Self::commitment_matches`] decides whether the peer sent the list
+/// the header actually names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderWithUncles {
+    pub header: Header,
+    pub uncles: Vec<Header>,
+}
+
+impl HeaderWithUncles {
+    /// The RLP of the uncle list, as `ommers_hash` commits to it: rskj's
+    /// `BlockHeader.getUnclesEncoded`.
+    pub fn encoded_uncles(&self) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for uncle in &self.uncles {
+            uncle.encode(&mut payload);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 9);
+        RlpHeader { list: true, payload_length: payload.len() }.encode(&mut out);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// Whether the uncles are the ones the trunk header commits to.
+    ///
+    /// This is the whole security argument for the message. The receiver has
+    /// already checked the trunk header's proof of work, and the header fixes
+    /// the uncle list through `ommers_hash`, so a peer can neither add, drop
+    /// nor alter an uncle. The difficulties that follow are therefore as
+    /// trustworthy as the header itself.
+    pub fn commitment_matches(&self) -> bool {
+        self.uncles.len() as u64 == self.header.uncle_count
+            && alloy_primitives::keccak256(self.encoded_uncles()) == self.header.ommers_hash
+    }
+
+    /// `difficulty + sum(uncle difficulties)`, rskj's
+    /// `Block.getCumulativeDifficulty`.
+    ///
+    /// Only meaningful once [`Self::commitment_matches`] has passed; the proof
+    /// of work on each uncle has to be checked separately, by the consensus
+    /// layer, or a miner could claim cheap work by naming uncles that carry
+    /// arbitrary difficulty.
+    pub fn cumulative_difficulty(&self) -> alloy_primitives::U256 {
+        let mut total = self.header.difficulty;
+        for uncle in &self.uncles {
+            total = total.saturating_add(uncle.difficulty);
+        }
+        total
+    }
+}
+
+/// Trunk headers with their uncles. See [`HeaderWithUncles`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockHeadersWithUnclesResponse {
+    pub id: u64,
+    pub entries: Vec<HeaderWithUncles>,
+}
+
 /// A block identifier used in skeleton responses (hash + number).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockIdentifier {
@@ -185,6 +258,8 @@ pub enum RskMessageType {
     /// `MessageType.valueOfType` and close the connection, so it is sent only
     /// to peers that negotiated `rsk/63`.
     BlockRangeUpdate = 26,
+    BlockHeadersWithUnclesRequest = 27,
+    BlockHeadersWithUnclesResponse = 28,
 }
 
 /// The `rsk` subprotocol version that carries the served block range.
@@ -259,6 +334,8 @@ pub enum RskSubMessage {
     SnapBlocksRequest(snap::SnapBlocksRequest),
     SnapBlocksResponse(Box<snap::SnapBlocksResponse>),
     BlockRangeUpdate(BlockRange),
+    BlockHeadersWithUnclesRequest(BlockHeadersWithUnclesRequest),
+    BlockHeadersWithUnclesResponse(BlockHeadersWithUnclesResponse),
     Unknown(u8),
 }
 
@@ -283,6 +360,12 @@ impl RskSubMessage {
             RskSubMessage::SnapBlocksRequest(_) => RskMessageType::SnapBlocksRequest,
             RskSubMessage::SnapBlocksResponse(_) => RskMessageType::SnapBlocksResponse,
             RskSubMessage::BlockRangeUpdate(_) => RskMessageType::BlockRangeUpdate,
+            RskSubMessage::BlockHeadersWithUnclesRequest(_) => {
+                RskMessageType::BlockHeadersWithUnclesRequest
+            }
+            RskSubMessage::BlockHeadersWithUnclesResponse(_) => {
+                RskMessageType::BlockHeadersWithUnclesResponse
+            }
             RskSubMessage::Unknown(_) => RskMessageType::Status, // Not used for encoding
         }
     }
@@ -322,6 +405,43 @@ impl RskSubMessage {
                 r.id.encode(&mut params);
                 // The inner list is pre-encoded RLP, so it's just appended to the outer list
                 params.extend_from_slice(&inner_list);
+
+                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                out.extend_from_slice(&params);
+            }
+            RskSubMessage::BlockHeadersWithUnclesRequest(r) => {
+                // RLP([id, RLP([hash, count])]) -- the same shape as the plain
+                // header request, so a peer may answer either from one code path.
+                let mut query_params = Vec::new();
+                r.query.hash.encode(&mut query_params);
+                r.query.count.encode(&mut query_params);
+
+                let mut params = Vec::new();
+                r.id.encode(&mut params);
+                RlpHeader { list: true, payload_length: query_params.len() }.encode(&mut params);
+                params.extend_from_slice(&query_params);
+
+                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                out.extend_from_slice(&params);
+            }
+            RskSubMessage::BlockHeadersWithUnclesResponse(r) => {
+                // RLP([id, [ [trunkHeader, [uncle...]], ... ]])
+                let mut entries_payload = Vec::new();
+                for entry in &r.entries {
+                    let mut one = Vec::new();
+                    entry.header.encode(&mut one);
+                    one.extend_from_slice(&entry.encoded_uncles());
+
+                    RlpHeader { list: true, payload_length: one.len() }
+                        .encode(&mut entries_payload);
+                    entries_payload.extend_from_slice(&one);
+                }
+
+                let mut params = Vec::new();
+                r.id.encode(&mut params);
+                RlpHeader { list: true, payload_length: entries_payload.len() }
+                    .encode(&mut params);
+                params.extend_from_slice(&entries_payload);
 
                 RlpHeader { list: true, payload_length: params.len() }.encode(out);
                 out.extend_from_slice(&params);
@@ -773,6 +893,83 @@ impl Decodable for RskMessage {
                 Box::new(snap::SnapBlocksResponse::decode_body(&mut body_params)?),
             ),
             26 => RskSubMessage::BlockRangeUpdate(BlockRange::decode(&mut body_params)?),
+            27 => {
+                let list_h = RlpHeader::decode(&mut body_params)?;
+                let mut list_body = &body_params[..list_h.payload_length];
+                let id = decode_u64_lenient(&mut list_body)?;
+
+                let query_h = RlpHeader::decode(&mut list_body)?;
+                let mut query_body = &list_body[..query_h.payload_length];
+                let hash = B256::decode(&mut query_body)?;
+                let count = decode_u32_lenient(&mut query_body)?;
+
+                RskSubMessage::BlockHeadersWithUnclesRequest(BlockHeadersWithUnclesRequest {
+                    id,
+                    query: BlockHeadersQuery { hash, count },
+                })
+            }
+            28 => {
+                let list_h = RlpHeader::decode(&mut body_params)?;
+                let mut list_body = &body_params[..list_h.payload_length];
+                let id = decode_u64_lenient(&mut list_body)?;
+
+                let entries_h = RlpHeader::decode(&mut list_body)?;
+                if list_body.len() < entries_h.payload_length {
+                    return Err(alloy_rlp::Error::Custom("malformed headers-with-uncles list"));
+                }
+                let mut entries_body = &list_body[..entries_h.payload_length];
+
+                let mut entries = Vec::new();
+                while !entries_body.is_empty() {
+                    let entry_h = RlpHeader::decode(&mut entries_body)?;
+                    if !entry_h.list || entries_body.len() < entry_h.payload_length {
+                        return Err(alloy_rlp::Error::Custom("malformed headers-with-uncles entry"));
+                    }
+                    let mut entry_body = &entries_body[..entry_h.payload_length];
+                    entries_body = &entries_body[entry_h.payload_length..];
+
+                    let header = Header::decode_with_hash(&mut entry_body)?;
+
+                    // Hash the uncle list exactly as it arrived. Re-encoding it
+                    // and hashing that would compare our spelling of the bytes
+                    // against a commitment the miner made over theirs, and the
+                    // two need not agree -- the same hazard that makes
+                    // `rlp_for_trie` keep original transaction bytes.
+                    let uncles_raw = entry_body;
+                    let uncles_h = RlpHeader::decode(&mut entry_body)?;
+                    if !uncles_h.list || entry_body.len() < uncles_h.payload_length {
+                        return Err(alloy_rlp::Error::Custom("malformed uncle list"));
+                    }
+                    let consumed = uncles_raw.len() - entry_body.len() + uncles_h.payload_length;
+                    let committed = alloy_primitives::keccak256(&uncles_raw[..consumed]);
+                    if committed != header.ommers_hash {
+                        // The peer sent a list this header does not name. The
+                        // difficulties in it are worthless, so the message is
+                        // refused rather than partly believed.
+                        return Err(alloy_rlp::Error::Custom(
+                            "uncle list does not match the header's ommers hash",
+                        ));
+                    }
+
+                    let mut uncles_body = &entry_body[..uncles_h.payload_length];
+                    let mut uncles = Vec::new();
+                    while !uncles_body.is_empty() {
+                        uncles.push(Header::decode_with_hash(&mut uncles_body)?);
+                    }
+                    if uncles.len() as u64 != header.uncle_count {
+                        return Err(alloy_rlp::Error::Custom(
+                            "uncle count does not match the header",
+                        ));
+                    }
+
+                    entries.push(HeaderWithUncles { header, uncles });
+                }
+
+                RskSubMessage::BlockHeadersWithUnclesResponse(BlockHeadersWithUnclesResponse {
+                    id,
+                    entries,
+                })
+            }
             other => {
                 RskSubMessage::Unknown(other)
             }
@@ -1481,5 +1678,143 @@ mod rskj_interop {
             let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
             println!("{label} {hex}");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod headers_with_uncles_tests {
+    use super::*;
+    use alloy_primitives::Address;
+
+    fn plain(number: u64, difficulty: u64) -> Header {
+        Header {
+            number,
+            parent_hash: B256::repeat_byte(number as u8),
+            ommers_hash: B256::ZERO,
+            beneficiary: Address::ZERO,
+            state_root: B256::ZERO,
+            transactions_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: Default::default(),
+            extension_data: None,
+            difficulty: U256::from(difficulty),
+            gas_limit: U256::from(8_000_000),
+            gas_used: 0,
+            timestamp: number * 15,
+            extra_data: Bytes::default(),
+            paid_fees: U256::ZERO,
+            minimum_gas_price: U256::ZERO,
+            uncle_count: 0,
+            umm_root: None,
+            bitcoin_merged_mining_header: None,
+            bitcoin_merged_mining_merkle_proof: None,
+            bitcoin_merged_mining_coinbase_transaction: None,
+            cached_hash: None,
+            cached_hash_for_merged_mining: None,
+        }
+    }
+
+    /// Build a trunk header that genuinely commits to `uncles`.
+    fn with_uncles(number: u64, difficulty: u64, uncles: Vec<Header>) -> HeaderWithUncles {
+        let mut header = plain(number, difficulty);
+        header.uncle_count = uncles.len() as u64;
+        let entry = HeaderWithUncles { header, uncles };
+        let commitment = alloy_primitives::keccak256(entry.encoded_uncles());
+        let mut header = entry.header;
+        header.ommers_hash = commitment;
+        HeaderWithUncles { header, uncles: entry.uncles }
+    }
+
+    fn roundtrip(sub: RskSubMessage) -> RskSubMessage {
+        let mut buf = Vec::new();
+        RskMessage::new(sub).encode(&mut buf);
+        RskMessage::decode(&mut buf.as_slice()).expect("decodes").sub_message
+    }
+
+    #[test]
+    fn request_roundtrips() {
+        let req = BlockHeadersWithUnclesRequest {
+            id: 42,
+            query: BlockHeadersQuery { hash: B256::repeat_byte(7), count: 192 },
+        };
+        match roundtrip(RskSubMessage::BlockHeadersWithUnclesRequest(req.clone())) {
+            RskSubMessage::BlockHeadersWithUnclesRequest(got) => assert_eq!(got, req),
+            other => panic!("wrong message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_roundtrips_and_carries_the_uncles() {
+        let entries = vec![
+            with_uncles(10, 1000, vec![plain(9, 700), plain(8, 650)]),
+            with_uncles(11, 1100, vec![]),
+        ];
+        let resp = BlockHeadersWithUnclesResponse { id: 5, entries: entries.clone() };
+
+        match roundtrip(RskSubMessage::BlockHeadersWithUnclesResponse(resp)) {
+            RskSubMessage::BlockHeadersWithUnclesResponse(got) => {
+                assert_eq!(got.id, 5);
+                assert_eq!(got.entries.len(), 2);
+                assert_eq!(got.entries[0].uncles.len(), 2);
+                assert_eq!(got.entries[1].uncles.len(), 0);
+                for e in &got.entries {
+                    assert!(e.commitment_matches(), "survives the wire");
+                }
+            }
+            other => panic!("wrong message: {other:?}"),
+        }
+    }
+
+    /// The whole point of the message: uncle difficulty joins the total.
+    #[test]
+    fn cumulative_difficulty_adds_the_uncles() {
+        let entry = with_uncles(10, 1000, vec![plain(9, 700), plain(8, 650)]);
+        assert_eq!(entry.cumulative_difficulty(), U256::from(2350u64));
+    }
+
+    /// A peer that swaps in a different uncle list is refused at the parse
+    /// boundary: the trunk header's `ommers_hash` names the list, and the
+    /// header's proof of work is what makes that name expensive to forge.
+    #[test]
+    fn a_substituted_uncle_list_is_rejected() {
+        let honest = with_uncles(10, 1000, vec![plain(9, 700)]);
+        // Keep the header, inflate the uncle's difficulty.
+        let forged = HeaderWithUncles {
+            header: honest.header.clone(),
+            uncles: vec![plain(9, 9_000_000)],
+        };
+        assert!(!forged.commitment_matches());
+
+        let mut buf = Vec::new();
+        RskMessage::new(RskSubMessage::BlockHeadersWithUnclesResponse(
+            BlockHeadersWithUnclesResponse { id: 1, entries: vec![forged] },
+        ))
+        .encode(&mut buf);
+
+        let err = RskMessage::decode(&mut buf.as_slice()).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("ommers hash"),
+            "refused for the right reason: {err:?}"
+        );
+    }
+
+    /// Dropping an uncle is the cheap way to understate a rival chain's work,
+    /// and the count check plus the commitment both catch it.
+    #[test]
+    fn a_dropped_uncle_is_rejected() {
+        let honest = with_uncles(10, 1000, vec![plain(9, 700), plain(8, 650)]);
+        let stripped = HeaderWithUncles {
+            header: honest.header.clone(),
+            uncles: vec![honest.uncles[0].clone()],
+        };
+        assert!(!stripped.commitment_matches());
+
+        let mut buf = Vec::new();
+        RskMessage::new(RskSubMessage::BlockHeadersWithUnclesResponse(
+            BlockHeadersWithUnclesResponse { id: 1, entries: vec![stripped] },
+        ))
+        .encode(&mut buf);
+        assert!(RskMessage::decode(&mut buf.as_slice()).is_err());
     }
 }

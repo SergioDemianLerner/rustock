@@ -44,6 +44,15 @@ impl PeerCapabilities {
     pub fn understands_block_range(&self) -> bool {
         self.rsk_version >= RSK_RANGE_VERSION
     }
+
+    /// Whether this peer can be asked for headers with their uncles.
+    ///
+    /// Both extensions ship at `rsk/63`, so this reads the same version today.
+    /// It is a separate predicate because they answer different questions, and
+    /// a later version may move one without the other.
+    pub fn understands_header_uncles(&self) -> bool {
+        self.rsk_version >= RSK_RANGE_VERSION
+    }
 }
 use crate::node::NodeConfig;
 use crate::codec::P2pCodec;
@@ -475,5 +484,71 @@ mod capability_tests {
             caps.iter().any(|c| c.name == "snap" && c.version == 1),
             "snap/1 is rskj's own constant, not one invented here"
         );
+    }
+}
+
+#[cfg(test)]
+mod uncle_capability_tests {
+    use super::*;
+
+    /// An rskj node today speaks `rsk/62` and would drop the connection on an
+    /// unknown message id, so it must never be asked for headers with uncles.
+    #[test]
+    fn an_rsk62_peer_is_not_asked_for_uncles() {
+        let caps = PeerCapabilities::negotiate(&[Capability {
+            name: "rsk".to_string(),
+            version: 62,
+        }]);
+        assert_eq!(caps.rsk_version, 62);
+        assert!(!caps.understands_header_uncles());
+        assert!(!caps.understands_block_range());
+    }
+
+    #[test]
+    fn an_rsk63_peer_is_asked_for_uncles() {
+        let caps = PeerCapabilities::negotiate(&[Capability {
+            name: "rsk".to_string(),
+            version: 63,
+        }]);
+        assert!(caps.understands_header_uncles());
+    }
+
+    /// The realistic case: a peer advertises the versions it speaks, and the
+    /// highest we both know wins.
+    #[test]
+    fn the_highest_shared_version_wins() {
+        let caps = PeerCapabilities::negotiate(&[
+            Capability { name: "rsk".to_string(), version: 62 },
+            Capability { name: "rsk".to_string(), version: 63 },
+            Capability { name: "rsk".to_string(), version: 64 },
+        ]);
+        assert_eq!(caps.rsk_version, RSK_RANGE_VERSION);
+        assert!(caps.understands_header_uncles());
+    }
+
+    /// A peer advertising *only* a version above ours falls back to the 62
+    /// floor, because `negotiate` filters by `<= RSK_RANGE_VERSION` before
+    /// taking the maximum.
+    ///
+    /// Note this contradicts the comment on `negotiate`, which says such a
+    /// peer "gets `rsk/63` from us". It does not. The case is unrealistic --
+    /// devp2p peers advertise every version they speak -- so this test pins
+    /// the behaviour rather than asserting it is the one we want.
+    #[test]
+    fn a_peer_advertising_only_a_newer_version_falls_back_to_the_floor() {
+        let caps = PeerCapabilities::negotiate(&[Capability {
+            name: "rsk".to_string(),
+            version: 64,
+        }]);
+        assert_eq!(caps.rsk_version, 62);
+        assert!(!caps.understands_header_uncles());
+    }
+
+    /// A peer that names no rsk capability falls back to the floor.
+    #[test]
+    fn a_peer_without_the_capability_falls_back() {
+        let caps = PeerCapabilities::negotiate(&[]);
+        assert_eq!(caps.rsk_version, 62);
+        assert!(!caps.understands_header_uncles());
     }
 }
