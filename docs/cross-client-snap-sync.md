@@ -107,7 +107,27 @@ bottleneck in either run.
 
 ## Where the time actually goes
 
-From the run that completed end to end:
+The two clients spend their time in almost opposite places, because they order
+the work differently.
+
+**rskj**, from process start to the `OutOfMemoryError`:
+
+| phase | duration | share |
+|---|---|---|
+| startup | 4 s | 0.1% |
+| status, then 6,000 blocks | 20 s | 0.4% |
+| **state download, 918 MB** | **4,495 s** | **97.7%** |
+| trie rebuild | 82 s, then died | 1.8% |
+| *(historical header check, concurrent with the state)* | *2,544 s* | *overlapped* |
+| total | **4,602 s** | |
+
+The header check is not additive: rskj requests state chunks and historical
+headers together, so its 42 minutes sit inside the 75 minutes of state
+download. They do compete, though — chunks arrived about 1 s apart while the
+header check was running and about 50 ms apart in the 22 minutes after it
+finished.
+
+**rustock**, from the run that completed end to end:
 
 | phase | duration | share |
 |---|---|---|
@@ -115,15 +135,25 @@ From the run that completed end to end:
 | **header walk to genesis** | **6,971 s** | **92.4%** |
 | state download, 875 MB | 158 s | 2.1% |
 | blocks and execution | 405 s | 5.4% |
+| total | **7,545 s** | |
 
-The state — the thing snapshot sync exists to avoid computing — took under
-three minutes. Establishing that the checkpoint deserves to be trusted took 44
-times as long. Work aimed at snapshot sync speed belongs in the header
-verification, not the state transfer.
+rustock verifies the header chain to genesis *before* asking for any state, so
+the two phases are sequential and the walk dominates. rskj overlaps them, so
+its wall clock is governed by whichever is slower — here the state transfer,
+because of the sequential chunk default.
 
-This is also why `checkHistoricalHeaders` matters: a client that turns it off
-downloads the entire state before — in fact instead of — establishing the work
-behind the checkpoint it is trusting.
+The totals are within a factor of 1.6 of each other, but for opposite reasons:
+rustock spends 92% of its time proving the checkpoint and 2% moving the state;
+rskj spends 98% moving the state and overlaps the proving inside it. Neither is
+bound by the server, which served the same 918 MB in 158 s in the other run.
+
+The implication for either implementation is the same: the state transfer is
+not the expensive part of a snapshot sync unless a client makes it so. The
+expensive part is establishing that the checkpoint deserves to be trusted, and
+it is worth being explicit about that, because it is also the part a client is
+tempted to skip. A client that sets `checkHistoricalHeaders = false` downloads
+the entire state before — in fact instead of — establishing the work behind the
+checkpoint it is trusting.
 
 ## A diagnostic gap
 
