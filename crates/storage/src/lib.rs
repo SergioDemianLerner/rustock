@@ -1442,7 +1442,19 @@ impl BlockStore {
         if header.uncle_count == 0 {
             return Ok(Some(header.difficulty));
         }
-        let Some((_txs, ommers)) = self.body(hash)? else { return Ok(None) };
+        let ommers = match self.body(hash)? {
+            Some((_txs, ommers)) => ommers,
+            None => {
+                // The body is pruned. The freezer's uncle store is the only
+                // other place these headers exist, and the whole reason it
+                // exists: without it this block's contribution is lost for
+                // good and no later pass can recover it.
+                match self.freezer().map(|f| f.uncles(header.number)).transpose()?.flatten() {
+                    Some(ommers) => ommers,
+                    None => return Ok(None),
+                }
+            }
+        };
         let mut total = header.difficulty;
         for uncle in &ommers {
             total = total.saturating_add(uncle.difficulty);
@@ -1468,11 +1480,52 @@ impl BlockStore {
         from: u64,
         to: u64,
         report_every: u64,
-        mut progress: F,
+        progress: F,
     ) -> Result<(u64, u64, u64)>
     where
         F: FnMut(u64, u64, U256),
     {
+        let (written, unchanged, absent, _) =
+            self.walk_chain_work(from, to, report_every, false, progress)?;
+        Ok((written, unchanged, absent))
+    }
+
+    /// One pass that rebuilds both halves of the chain's work: the uncle
+    /// headers go into the freezer, and the totals are recomputed from them.
+    ///
+    /// They are done together because they read the same thing -- every block
+    /// body, once. Splitting them means scanning the chain twice for data that
+    /// was already in hand the first time.
+    ///
+    /// Returns `(written, unchanged, absent, frozen)`.
+    pub fn rebuild_chain_work<F>(
+        &self,
+        from: u64,
+        to: u64,
+        report_every: u64,
+        progress: F,
+    ) -> Result<(u64, u64, u64, u64)>
+    where
+        F: FnMut(u64, u64, U256),
+    {
+        if self.freezer().is_none() {
+            bail!("no freezer is configured, so there is nowhere to put the uncle headers");
+        }
+        self.walk_chain_work(from, to, report_every, true, progress)
+    }
+
+    fn walk_chain_work<F>(
+        &self,
+        from: u64,
+        to: u64,
+        report_every: u64,
+        freeze_uncles: bool,
+        mut progress: F,
+    ) -> Result<(u64, u64, u64, u64)>
+    where
+        F: FnMut(u64, u64, U256),
+    {
+        let mut frozen = 0u64;
         let (mut written, mut unchanged, mut absent) = (0u64, 0u64, 0u64);
 
         let mut running = if from == 0 {
@@ -1494,6 +1547,23 @@ impl BlockStore {
                 absent += 1;
                 continue;
             };
+
+            if freeze_uncles {
+                // Write the uncles before the total that depends on them. If
+                // the pass dies here, a rerun still finds the uncles it needs;
+                // the other order can leave a total nothing can re-derive.
+                let ommers = match self.body(hash)? {
+                    Some((_txs, ommers)) => ommers,
+                    None if header.uncle_count == 0 => Vec::new(),
+                    None => return Err(anyhow!(
+                        "block #{number} has no body, so its uncle headers cannot be frozen"
+                    )),
+                };
+                if let Some(f) = self.freezer() {
+                    f.put_uncles(number, &ommers)?;
+                    frozen += 1;
+                }
+            }
 
             match self.cumulative_difficulty(hash, &header)? {
                 Some(contribution) => running = running.saturating_add(contribution),
@@ -1519,7 +1589,12 @@ impl BlockStore {
             }
         }
 
-        Ok((written, unchanged, absent))
+        if freeze_uncles {
+            if let Some(f) = self.freezer() {
+                f.sync()?;
+            }
+        }
+        Ok((written, unchanged, absent, frozen))
     }
 
     /// Record one Bridge event. See `CF_BRIDGE_EVENTS` for the key layout.
@@ -3424,5 +3499,108 @@ mod total_difficulty_tests {
 
         let err = store.recompute_total_difficulty(0, 3, 0, |_, _, _| {}).unwrap_err();
         assert!(err.to_string().contains("#2"), "names the block: {err}");
+    }
+}
+
+#[cfg(test)]
+mod chain_work_tests {
+    use super::*;
+    use super::tests::{dummy_header, make_chain_header};
+    use crate::freezer::Freezer;
+    use tempfile::tempdir;
+
+    /// One pass must leave both halves right: the uncles in the freezer, and
+    /// totals that counted them.
+    #[test]
+    fn one_pass_freezes_uncles_and_fixes_totals() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let fdir = tempdir().unwrap();
+        store.set_freezer(Arc::new(Freezer::open(fdir.path()).unwrap()));
+
+        let mut parent = B256::ZERO;
+        let mut wrong = U256::ZERO;
+        let mut expected = Vec::new();
+        let mut running = U256::ZERO;
+
+        for n in 0..6u64 {
+            let mut h = make_chain_header(n, parent, 100, 0x01);
+            let uncles: Vec<Header> = if n % 2 == 1 {
+                let mut u = dummy_header(n - 1);
+                u.difficulty = U256::from(30u64);
+                vec![u]
+            } else {
+                Vec::new()
+            };
+            h.uncle_count = uncles.len() as u64;
+            let hash = h.hash();
+
+            store.put_header_with_hash(hash, &h).unwrap();
+            store.put_body(hash, &[], &uncles).unwrap();
+            store.put_canonical_hash(n, hash).unwrap();
+
+            wrong += h.difficulty;
+            store.put_total_difficulty(hash, wrong).unwrap();
+
+            running += h.difficulty + U256::from(30u64) * U256::from(uncles.len() as u64);
+            expected.push((hash, running));
+            parent = hash;
+        }
+        store.set_head(parent).unwrap();
+
+        let (written, _unchanged, absent, frozen) =
+            store.rebuild_chain_work(0, 5, 0, |_, _, _| {}).unwrap();
+        assert_eq!(absent, 0);
+        assert_eq!(frozen, 6, "every block's uncle list written, empty ones included");
+        assert!(written > 0);
+
+        for (hash, want) in expected {
+            assert_eq!(store.total_difficulty(hash).unwrap(), Some(want));
+        }
+
+        let f = store.freezer().unwrap();
+        assert_eq!(f.uncles(1).unwrap().unwrap().len(), 1);
+        assert_eq!(f.uncles(2).unwrap(), Some(Vec::new()), "stored, and empty");
+    }
+
+    /// Once the uncles are frozen, a block whose body has been pruned still
+    /// yields its contribution. This is the hole the uncle store closes: before
+    /// it, a pruned node could never recompute its own chain's work.
+    #[test]
+    fn a_pruned_body_still_yields_its_contribution_from_the_freezer() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let fdir = tempdir().unwrap();
+        let freezer = Arc::new(Freezer::open(fdir.path()).unwrap());
+        store.set_freezer(freezer.clone());
+
+        let mut uncle = dummy_header(4);
+        uncle.difficulty = U256::from(30u64);
+        let mut h = make_chain_header(5, B256::ZERO, 100, 0x01);
+        h.uncle_count = 1;
+        let hash = h.hash();
+        store.put_header_with_hash(hash, &h).unwrap();
+
+        // The body is gone, as on a pruned node.
+        assert_eq!(store.cumulative_difficulty(hash, &h).unwrap(), None);
+
+        freezer.put_uncles(5, &[uncle]).unwrap();
+        freezer.sync().unwrap();
+
+        assert_eq!(
+            store.cumulative_difficulty(hash, &h).unwrap(),
+            Some(U256::from(130u64)),
+            "100 + 30, recovered from the freezer"
+        );
+    }
+
+    /// Without a freezer there is nowhere to put the uncles, and a pass that
+    /// quietly skipped them would leave totals nothing can re-derive.
+    #[test]
+    fn the_pass_refuses_to_run_without_a_freezer() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let err = store.rebuild_chain_work(0, 5, 0, |_, _, _| {}).unwrap_err();
+        assert!(err.to_string().contains("freezer"), "{err}");
     }
 }

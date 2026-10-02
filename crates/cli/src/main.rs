@@ -1360,8 +1360,25 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             "total-difficulty" => {
                 run_repair_total_difficulty(&store, args.repair_from, args.repair_to)?
             }
+            "chain-work" => {
+                // The pass writes uncle headers into the freezer, so it needs
+                // the real one attached -- the node's own startup path does
+                // this later, but a repair never reaches it.
+                let dir = std::path::Path::new(&args.data_dir).join("freezer");
+                let f = Arc::new(rustock_storage::freezer::Freezer::open(&dir)?);
+                info!(
+                    "Freezer at {}: {} header(s), {} uncle list(s), {} MB",
+                    dir.display(),
+                    f.end_number(),
+                    f.uncles_end_number(),
+                    f.data_bytes() / (1 << 20),
+                );
+                store.set_freezer(f);
+                run_repair_chain_work(&store, args.repair_from, args.repair_to)?
+            }
             other => anyhow::bail!(
-                "unknown repair task {other:?}; known tasks: tx-index, total-difficulty"
+                "unknown repair task {other:?}; known tasks: tx-index, total-difficulty, \
+                 chain-work"
             ),
         }
         return Ok(());
@@ -3412,6 +3429,74 @@ fn run_repair_total_difficulty(
             "repair total-difficulty: {absent} of {total} heights hold no block, so their totals \
              were left alone. A snap-synced node has nothing below its checkpoint and cannot \
              rebuild those totals -- it inherits them from the checkpoint it trusted."
+        );
+    }
+    Ok(())
+}
+
+/// Freeze the uncle headers and recompute total difficulty, in one pass.
+///
+/// Both read every block body, so they are done together: splitting them means
+/// scanning the chain twice for data that was already in hand. Reads bodies
+/// only -- no trie, no execution -- and the chain must be offline.
+fn run_repair_chain_work(
+    store: &Arc<BlockStore>,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    let head = match store.head()? {
+        Some(hash) => store.header(hash)?.map(|h| h.number).unwrap_or(0),
+        None => 0,
+    };
+    let from = from.unwrap_or(0);
+    let to = to.unwrap_or(head);
+    if to < from {
+        anyhow::bail!("--repair-to ({to}) is below --repair-from ({from})");
+    }
+    let total = to - from + 1;
+
+    info!("repair chain-work: blocks #{from}..#{to} ({total} blocks), chain head #{head}");
+    info!(
+        "repair chain-work: freezing uncle headers, then td(n) = td(n-1) + difficulty(n) + \
+         sum(uncle difficulties), as rskj Block.getCumulativeDifficulty does"
+    );
+    if from > 0 {
+        info!(
+            "repair chain-work: seeding from the stored total at #{}; it must already be \
+             correct, so resume where the last run stopped",
+            from - 1
+        );
+    }
+
+    let started = Instant::now();
+    let (written, unchanged, absent, frozen) =
+        store.rebuild_chain_work(from, to, 10_000, |block, done, td| {
+            let elapsed = started.elapsed().as_secs_f64();
+            let scanned = block.saturating_sub(from) + 1;
+            let pct = scanned as f64 * 100.0 / total as f64;
+            let bps = scanned as f64 / elapsed.max(0.001);
+            let eta = if bps > 0.0 { (total - scanned) as f64 / bps } else { 0.0 };
+            info!(
+                "repair chain-work: {pct:.2}% (#{block}) | {done} totals rewritten | td {td} | \
+                 {bps:.0} blocks/s | elapsed {} | ETA {}",
+                fmt_duration(elapsed),
+                fmt_duration(eta)
+            );
+        })?;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    info!(
+        "repair chain-work: DONE in {} | {frozen} blocks\' uncles frozen | {written} totals \
+         rewritten, {unchanged} already correct, {absent} heights with no block | {:.0} blocks/s",
+        fmt_duration(elapsed),
+        (written + unchanged) as f64 / elapsed.max(0.001),
+    );
+    if absent > 0 {
+        warn!(
+            "repair chain-work: {absent} of {total} heights hold no block, so neither their \
+             uncles nor their totals could be rebuilt"
         );
     }
     Ok(())
