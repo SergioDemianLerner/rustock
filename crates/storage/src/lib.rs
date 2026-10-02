@@ -1162,9 +1162,24 @@ impl BlockStore {
         let fetched = self.headers_by_hash(&hashes);
 
         let mut done = 0u64;
+        let mut lost_uncles = 0u64;
         for (i, slot) in fetched.into_iter().enumerate() {
             let Some(header) = slot else { break };
-            f.put(start + i as u64, &header)?;
+            let number = start + i as u64;
+
+            // The uncles go in with the header. They exist only in the body,
+            // so this is the last moment they can be captured -- once the
+            // pruner reaches the block they are gone for good. `plan_prune`
+            // will not let it get ahead of this, but a body already missing
+            // from an older database is still possible, so say so rather than
+            // freezing a header whose uncles are silently absent.
+            match self.body(hashes[i])? {
+                Some((_txs, ommers)) => f.put_uncles(number, &ommers)?,
+                None if header.uncle_count == 0 => f.put_uncles(number, &[])?,
+                None => lost_uncles += 1,
+            }
+
+            f.put(number, &header)?;
             done += 1;
         }
         // Syncing a batch of one -- which is what steady state is, once the
@@ -1174,6 +1189,13 @@ impl BlockStore {
         // is left to the buffer and to whoever calls `sync` when it runs out
         // of work. Losing it costs nothing: unsynced headers were never
         // published, and the next fill writes them again.
+        if lost_uncles > 0 {
+            warn!(
+                "froze {lost_uncles} header(s) whose body was already gone, so their uncle \
+                 headers could not be captured; those blocks' contribution to total \
+                 difficulty is no longer derivable"
+            );
+        }
         if done >= SYNC_AFTER_HEADERS {
             f.sync()?;
         }
