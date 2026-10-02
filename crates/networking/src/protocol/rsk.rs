@@ -35,7 +35,7 @@ impl Encodable for RskStatus {
         
         if let (Some(parent), Some(td)) = (self.best_block_parent_hash, self.total_difficulty) {
             parent.encode(&mut list);
-            td.encode(&mut list);
+            encode_difficulty(td, &mut list);
             // Only after the four rskj knows about, and only when there is
             // something to say. A node serving the whole chain adds nothing.
             if let Some(earliest) = self.earliest_block {
@@ -50,7 +50,7 @@ impl Encodable for RskStatus {
     fn length(&self) -> usize {
         let mut len = self.best_block_number.length() + self.best_block_hash.length();
         if let (Some(parent), Some(td)) = (self.best_block_parent_hash, self.total_difficulty) {
-            len += parent.length() + td.length();
+            len += parent.length() + difficulty_length(td);
         }
         RlpHeader { list: true, payload_length: len }.length() + len
     }
@@ -87,6 +87,47 @@ impl Decodable for RskStatus {
 
         Ok(status)
     }
+}
+
+/// Encode a difficulty the way rskj writes one.
+///
+/// rskj stores difficulties as `BigInteger` and puts them on the wire with
+/// `BigInteger.toByteArray()`, which is **two's complement**: a value whose
+/// top bit would otherwise be set gains a leading `0x00` sign byte. It reads
+/// them back with `new BigInteger(bytes)` and rejects a negative outright --
+/// `RLP.parseBlockDifficulty` throws "A block difficulty must be positive or
+/// zero" and the connection is dropped during decoding.
+///
+/// Canonical RLP strips every leading zero, including that sign byte, so a
+/// total difficulty large enough to set the top bit is read by rskj as
+/// negative. Mainnet's total crossed 2^95 once uncle difficulty was counted,
+/// which is when this stopped being theoretical.
+///
+/// Zero is written as a single `0x00`, as `BigInteger.ZERO.toByteArray()`
+/// does; an empty string would make `new BigInteger` throw instead.
+pub fn encode_difficulty(d: U256, out: &mut Vec<u8>) {
+    Bytes::from(difficulty_bytes(d)).encode(out);
+}
+
+/// How many bytes [`encode_difficulty`] will write, for `Encodable::length`.
+pub fn difficulty_length(d: U256) -> usize {
+    Bytes::from(difficulty_bytes(d)).length()
+}
+
+fn difficulty_bytes(d: U256) -> Vec<u8> {
+    let full = d.to_be_bytes::<32>();
+    let start = full.iter().position(|b| *b != 0).unwrap_or(full.len());
+    let magnitude = &full[start..];
+    if magnitude.is_empty() {
+        return vec![0];
+    }
+    if magnitude[0] >= 0x80 {
+        let mut out = Vec::with_capacity(magnitude.len() + 1);
+        out.push(0);
+        out.extend_from_slice(magnitude);
+        return out;
+    }
+    magnitude.to_vec()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
@@ -380,7 +421,7 @@ impl RskSubMessage {
                 s.best_block_hash.encode(&mut list);
                 if let (Some(parent), Some(td)) = (s.best_block_parent_hash, s.total_difficulty) {
                     parent.encode(&mut list);
-                    td.encode(&mut list);
+                    encode_difficulty(td, &mut list);
                     if let Some(earliest) = s.earliest_block {
                         earliest.encode(&mut list);
                     }
@@ -1816,5 +1857,89 @@ mod headers_with_uncles_tests {
         ))
         .encode(&mut buf);
         assert!(RskMessage::decode(&mut buf.as_slice()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod difficulty_encoding_tests {
+    use super::*;
+
+    /// rskj reads a difficulty with `new BigInteger(bytes)` -- signed, two's
+    /// complement -- so a value whose top bit is set must carry a leading
+    /// `0x00`, exactly as `BigInteger.toByteArray()` writes it. Without it
+    /// rskj throws "A block difficulty must be positive or zero" while
+    /// decoding and drops the connection.
+    #[test]
+    fn a_value_with_the_top_bit_set_carries_a_sign_byte() {
+        // Mainnet's total difficulty at #9,288,884 once uncle difficulty was
+        // counted. Its first byte is 0xc5, which Java reads as negative.
+        let td = U256::from_str_radix("61049215127746862789732304263", 10).unwrap();
+        let mut out = Vec::new();
+        encode_difficulty(td, &mut out);
+
+        // RLP string header, then the bytes.
+        let payload = &out[1..];
+        assert_eq!(payload[0], 0x00, "sign byte present");
+        assert_eq!(payload[1], 0xc5, "magnitude follows it");
+        assert_eq!(payload.len(), 13, "12 magnitude bytes plus the sign byte");
+    }
+
+    /// A value that does not set the top bit gains nothing -- matching
+    /// `BigInteger.toByteArray()`, which only pads when it must.
+    #[test]
+    fn a_value_below_the_sign_bit_is_unpadded() {
+        // The same chain's total before uncles were counted: first byte 0x70.
+        let td = U256::from_str_radix("34690046850504217865101415175", 10).unwrap();
+        let mut out = Vec::new();
+        encode_difficulty(td, &mut out);
+
+        let payload = &out[1..];
+        assert_eq!(payload[0], 0x70);
+        assert_eq!(payload.len(), 12);
+    }
+
+    /// `BigInteger.ZERO.toByteArray()` is a single zero byte, not an empty
+    /// array; `new BigInteger(new byte[0])` would throw.
+    #[test]
+    fn zero_is_a_single_zero_byte() {
+        let mut out = Vec::new();
+        encode_difficulty(U256::ZERO, &mut out);
+        assert_eq!(out, vec![0x00], "encodes as the single byte 0x00");
+    }
+
+    /// `length()` must agree with what `encode` writes, or the RLP list header
+    /// says one thing and the body another.
+    #[test]
+    fn the_declared_length_matches_what_is_written() {
+        for v in [
+            U256::ZERO,
+            U256::from(1u64),
+            U256::from(0x7fu64),
+            U256::from(0x80u64),
+            U256::from_str_radix("61049215127746862789732304263", 10).unwrap(),
+            U256::MAX,
+        ] {
+            let mut out = Vec::new();
+            encode_difficulty(v, &mut out);
+            assert_eq!(difficulty_length(v), out.len(), "mismatch for {v}");
+        }
+    }
+
+    /// A status message carrying such a total must still round-trip through
+    /// our own decoder, which strips the sign byte back off.
+    #[test]
+    fn status_with_a_top_bit_total_round_trips() {
+        let td = U256::from_str_radix("61049215127746862789732304263", 10).unwrap();
+        let status = RskStatus {
+            best_block_number: 9_288_884,
+            best_block_hash: B256::repeat_byte(1),
+            best_block_parent_hash: Some(B256::repeat_byte(2)),
+            total_difficulty: Some(td),
+            earliest_block: None,
+        };
+        let mut buf = Vec::new();
+        status.encode(&mut buf);
+        let back = RskStatus::decode(&mut buf.as_slice()).expect("decodes");
+        assert_eq!(back.total_difficulty, Some(td));
     }
 }

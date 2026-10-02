@@ -281,11 +281,10 @@ fn encode_blocks_and_difficulties(
 
     let mut diffs_payload = Vec::new();
     for d in difficulties {
-        // Cumulative difficulty travels as a big-endian magnitude, so the
-        // leading zero bytes have to go: rskj compares these byte-for-byte.
-        let bytes = d.to_be_bytes::<32>();
-        let start = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len());
-        Bytes::from(bytes[start..].to_vec()).encode(&mut diffs_payload);
+        // Exactly as rskj writes one: `BigInteger.toByteArray()`, two's
+        // complement, so a value whose top bit is set carries a leading 0x00.
+        // See `rsk::encode_difficulty`.
+        super::rsk::encode_difficulty(*d, &mut diffs_payload);
     }
     as_list(&diffs_payload, out);
 }
