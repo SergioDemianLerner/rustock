@@ -142,6 +142,56 @@ the two phases are sequential and the walk dominates. rskj overlaps them, so
 its wall clock is governed by whichever is slower — here the state transfer,
 because of the sequential chunk default.
 
+## The two runs are not comparing the same work
+
+Before reading anything into the wall-clock totals: the clients did not
+download the same thing, and the difference is close to a factor of two.
+
+Both verified the header chain to genesis — rskj walked #9,268,999 down to
+block 1 in 48,277 chunks of 192, rustock #9,275,000 down to #0. What differs is
+what travelled with those headers.
+
+| | rskj | rustock |
+|---|---|---|
+| headers to genesis | 10.06 GB | 10.06 GB |
+| uncle headers alongside | — | **10.47 GB** |
+| blocks with bodies | 6,401 | 3,840 |
+| state | 0.92 GB | 0.88 GB |
+| **total** | **11.00 GB** | **21.42 GB** |
+| wall clock | 4,602 s | 7,545 s |
+| effective rate | 2.39 MB/s | 2.84 MB/s |
+
+rustock moved **1.95× the bytes** — and moved them slightly faster per second.
+The wall-clock ratio of 1.64 is *smaller* than the data ratio, so rustock is
+not slower per byte; it is fetching roughly twice as much.
+
+The extra is the uncle headers. In RSK, cumulative difficulty advances by the
+trunk block's difficulty plus every uncle's, and uncle headers exist only in
+block bodies — a header records `uncleCount` and commits to the list through
+`unclesHash`, but carries neither the uncles nor their difficulties. A client
+that wants the chain's cumulative work from a header walk must therefore fetch
+them, and at roughly one uncle per block on mainnet that doubles the header
+stream.
+
+rskj does not fetch them, and does not need to, because its historical header
+check does not compute cumulative work. `validateBlockHeaders` and
+`areBlockHeadersValid` check each header's proof of work, its parent linkage,
+and — through `BlockDifficultyRule` — that its own difficulty is correct given
+its parent. They never accumulate. `getCumulativeDifficulty` appears only in
+`areBlockPairsValid`, which runs over the 401 status blocks and the 6,000
+blocks below the checkpoint, where whole blocks are available.
+
+So the two clients are answering different questions below the 6,000-block
+window. rskj establishes that a chain of correctly-mined, correctly-difficultied
+headers reaches genesis. rustock additionally totals what that chain weighs and
+compares it against the checkpoint's claimed cumulative difficulty. The second
+costs about 10.5 GB more on mainnet today.
+
+Anyone comparing snapshot sync times between implementations should establish
+which of those two things each one is doing before reading the numbers.
+
+## Why the totals differ
+
 The totals are within a factor of 1.6 of each other, but for opposite reasons:
 rustock spends 92% of its time proving the checkpoint and 2% moving the state;
 rskj spends 98% moving the state and overlaps the proving inside it. Neither is
