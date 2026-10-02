@@ -572,7 +572,34 @@ impl SnapSession {
 
     /// Headers walking back from the checkpoint, newest first, as rskj's
     /// `BlockHeadersResponse` delivers them.
+    /// Headers delivered with their uncles, so the walk can total the work
+    /// exactly rather than bounding it from below.
+    pub fn on_headers_with_uncles(
+        &mut self,
+        point: u64,
+        entries: &[rustock_networking::protocol::HeaderWithUncles],
+    ) -> Vec<Action> {
+        let mut proven = std::collections::HashMap::with_capacity(entries.len());
+        let headers: Vec<Header> = entries
+            .iter()
+            .map(|e| {
+                proven.insert(e.header.hash(), e.cumulative_difficulty());
+                e.header.clone()
+            })
+            .collect();
+        self.ingest_headers(point, &headers, &proven)
+    }
+
     pub fn on_headers(&mut self, point: u64, headers: &[Header]) -> Vec<Action> {
+        self.ingest_headers(point, headers, &std::collections::HashMap::new())
+    }
+
+    fn ingest_headers(
+        &mut self,
+        point: u64,
+        headers: &[Header],
+        proven: &std::collections::HashMap<B256, U256>,
+    ) -> Vec<Action> {
         // While the claim is being bounded, headers are samples rather than
         // chain: each is checked against the identifier it was asked for and
         // its own proof of work, and only its difficulty is kept.
@@ -605,7 +632,7 @@ impl SnapSession {
         // Every header's own rules and every adjacent pair's, exactly as the
         // serial walk did. What has changed is when the request went out, not
         // what is accepted.
-        if let Err(e) = walk.on_headers(point, headers) {
+        if let Err(e) = walk.on_headers(point, headers, proven) {
             return self.fail(match e {
                 super::headers::WalkError::InvalidHeader { number, reason } => {
                     SnapFailure::InvalidHeader { number, reason }
@@ -725,14 +752,26 @@ impl SnapSession {
         // The walk has read every header from the checkpoint down to a block
         // this node already trusted, so the work of that chain is known. The
         // claimed cumulative difficulty may exceed it only by the checkpoint
-        // block's own difficulty -- the one header the walk never visits as a
-        // candidate.
+        // block's own contribution -- the one header the walk never visits as
+        // a candidate.
+        //
+        // That contribution includes the checkpoint's uncles, whose headers
+        // are not in hand here: only `uncle_count` is. An uncle is a sibling,
+        // computed from the same parent, so its difficulty is close to the
+        // block's own; `difficulty * (1 + uncle_count)` is therefore a sound
+        // upper bound without pretending to a precision the data does not
+        // support. Bounding it low instead would reject every honest peer
+        // whose totals are right, which is what the header-only bound did.
         //
         // The claim is written as this node's own total difficulty at the
         // checkpoint, so it is worth establishing rather than accepting.
         if let Some(established) = self.walk.as_ref().and_then(|w| w.established_difficulty()) {
-            let ceiling = established
-                .saturating_add(checkpoint.as_ref().map_or(U256::ZERO, |h| h.difficulty));
+            let ceiling = established.saturating_add(
+                checkpoint.as_ref().map_or(U256::ZERO, |h| {
+                    h.difficulty
+                        .saturating_mul(U256::from(1u64).saturating_add(U256::from(h.uncle_count)))
+                }),
+            );
             if self.checkpoint_td > ceiling {
                 return self.fail(SnapFailure::OverstatedDifficulty {
                     claimed: self.checkpoint_td,
@@ -973,7 +1012,7 @@ fn check_body_matches_header(block: &Block) -> Result<(), SnapFailure> {
 /// This is rskj's `areBlockPairsValid` in miniature. It catches a peer
 /// stitching unrelated blocks together cheaply, before any of the expensive
 /// checks run -- it is not itself evidence that the chain is the real one.
-fn check_chain_shape(blocks: &[Block], difficulties: &[U256]) -> Result<(), SnapFailure> {
+pub(crate) fn check_chain_shape(blocks: &[Block], difficulties: &[U256]) -> Result<(), SnapFailure> {
     for i in 1..blocks.len() {
         let (parent, child) = (&blocks[i - 1], &blocks[i]);
         if child.header.parent_hash != parent.header.hash() {
@@ -983,11 +1022,21 @@ fn check_chain_shape(blocks: &[Block], difficulties: &[U256]) -> Result<(), Snap
             return Err(SnapFailure::BrokenChain);
         }
         // Cumulative difficulty must grow by exactly this block's own
-        // difficulty: the pair has to agree with itself.
+        // contribution: the pair has to agree with itself.
+        //
+        // That contribution is the header difficulty *plus every uncle's*,
+        // rskj's `Block.getCumulativeDifficulty`. Comparing against the header
+        // difficulty alone rejects every honest peer whose totals are right,
+        // because an RSK chain absorbs about one uncle per block. The uncles
+        // are in hand here: the status response carries whole blocks.
         if difficulties[i] <= difficulties[i - 1] {
             return Err(SnapFailure::BadDifficulty);
         }
-        if difficulties[i] - difficulties[i - 1] != child.header.difficulty {
+        let mut contribution = child.header.difficulty;
+        for uncle in &child.ommers {
+            contribution = contribution.saturating_add(uncle.difficulty);
+        }
+        if difficulties[i] - difficulties[i - 1] != contribution {
             return Err(SnapFailure::BadDifficulty);
         }
     }

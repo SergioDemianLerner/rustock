@@ -1156,7 +1156,34 @@ impl SyncService {
         }
 
         for out in outbound {
-            self.peer_store.send_to_peer(&out.peer, out.message).await;
+            // The walk is where a snapshot's checkpoint is converted into
+            // verified work, and in RSK that work includes the uncles. The
+            // driver builds its requests synchronously and cannot look up a
+            // capability, so the upgrade happens here, where the peer is
+            // known: an `rsk/63` peer is asked for the uncles alongside, and
+            // everyone else still gets the plain request.
+            let message = match out.message {
+                P2pMessage::RskMessage(RskMessage {
+                    sub_message: RskSubMessage::BlockHeadersRequest(ref r),
+                    ..
+                }) if self
+                    .peer_store
+                    .capabilities(&out.peer)
+                    .await
+                    .is_some_and(|c| c.understands_header_uncles()) =>
+                {
+                    P2pMessage::RskMessage(RskMessage::new(
+                        RskSubMessage::BlockHeadersWithUnclesRequest(
+                            rustock_networking::protocol::BlockHeadersWithUnclesRequest {
+                                id: r.id,
+                                query: r.query.clone(),
+                            },
+                        ),
+                    ))
+                }
+                other => other,
+            };
+            self.peer_store.send_to_peer(&out.peer, message).await;
         }
 
         if let Some(driver) = self.snap.as_ref() {
@@ -3173,10 +3200,14 @@ impl SyncService {
                 self.on_headers_response(peer, headers).await;
             }
             SyncEvent::HeadersWithUnclesResponse { peer, id, entries } => {
-                // A snap header walk asks with the plain message, so an answer
-                // here is always ordinary sync; the id is kept for symmetry
-                // with `HeadersResponse` and for tracing.
-                let _ = id;
+                // The snap walk's requests are upgraded to this message too,
+                // so it is claimed by request id first, exactly as the plain
+                // headers response is.
+                if self.snap.as_ref().is_some_and(|d| d.awaits_headers(id)) {
+                    self.drive_snap(|driver, ps| driver.on_headers_with_uncles(id, peer, &entries, ps))
+                        .await;
+                    return;
+                }
                 self.on_headers_with_uncles_response(peer, entries).await;
             }
             SyncEvent::BodyResponse { peer, id, transactions, uncles } => {

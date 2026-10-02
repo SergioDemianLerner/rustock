@@ -363,7 +363,12 @@ impl HeaderWalk {
     /// Verified on its own terms here -- every header's rules, every adjacent
     /// pair, the internal chain -- and stored. Whether it belongs to *our*
     /// chain is settled by whether it links, which [`Self::advance`] decides.
-    pub fn on_headers(&mut self, point: u64, headers: &[Header]) -> Result<(), WalkError> {
+    pub fn on_headers(
+        &mut self,
+        point: u64,
+        headers: &[Header],
+        proven: &std::collections::HashMap<B256, U256>,
+    ) -> Result<(), WalkError> {
         self.headers_sent.remove(&point);
         if headers.is_empty() {
             return Ok(());
@@ -392,15 +397,24 @@ impl HeaderWalk {
         })?;
 
         for header in headers {
-            // Headers only: the uncle difficulties that also count toward the
-            // total travel in the body, which a backward header walk never
-            // fetches. `walked_difficulty` is therefore a lower bound on what
-            // the chain really accumulated, and every block that included an
-            // uncle widens the gap. See `uncles_omitted` below.
+            // Uncle difficulty counts toward the chain's work and uncle headers
+            // travel only in the body, which a backward header walk never
+            // fetches. A peer at `rsk/63` sends them alongside and the figure
+            // is exact; from anyone else `walked_difficulty` is a lower bound,
+            // widened by every block that included an uncle. See
+            // `uncles_omitted`.
             let hash = header.hash();
-            self.walked_difficulty = self.walked_difficulty.saturating_add(header.difficulty);
-            if header.uncle_count > 0 {
-                self.uncles_omitted += header.uncle_count;
+            match proven.get(&hash) {
+                Some(exact) => {
+                    self.walked_difficulty = self.walked_difficulty.saturating_add(*exact);
+                }
+                None => {
+                    self.walked_difficulty =
+                        self.walked_difficulty.saturating_add(header.difficulty);
+                    if header.uncle_count > 0 {
+                        self.uncles_omitted += header.uncle_count;
+                    }
+                }
             }
             let _ = self.store.put_header_with_hash(hash, header);
         }

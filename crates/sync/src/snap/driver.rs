@@ -403,6 +403,32 @@ impl SnapDriver {
         self.dispatch(actions, peers)
     }
 
+    /// Headers that arrived with the uncles they reference.
+    ///
+    /// The walk's whole job is to establish how much work stands behind the
+    /// checkpoint, and in RSK that work includes every uncle the chain
+    /// absorbed. Fed bare headers the walk can only compute a lower bound; fed
+    /// these it computes the figure rskj computes.
+    pub fn on_headers_with_uncles(
+        &mut self,
+        id: u64,
+        sender: B512,
+        entries: &[rustock_networking::protocol::HeaderWithUncles],
+        peers: &[B512],
+    ) -> Vec<Outbound> {
+        let Some(Pending::Headers { point, .. }) =
+            self.in_flight.get(&id).map(|r| r.what)
+        else {
+            return Vec::new();
+        };
+        self.in_flight.remove(&id);
+
+        self.session.note_in_flight(self.in_flight.len());
+        let actions = self.session.on_headers_with_uncles(point, entries);
+        self.charge_for_failure(sender);
+        self.dispatch(actions, peers)
+    }
+
     /// Block identifiers: where to ask, nothing more.
     pub fn on_skeleton(
         &mut self,

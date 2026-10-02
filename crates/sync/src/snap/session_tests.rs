@@ -1290,3 +1290,51 @@ fn a_simulated_chain_end_bounds_the_snapshot_offered() {
         );
     }
 }
+
+/// A status response whose totals count the uncles — which is what a correct
+/// peer sends — must be accepted. Checking the growth against the header
+/// difficulty alone rejected every honest RSK peer, because an RSK chain
+/// absorbs roughly one uncle per block.
+#[test]
+fn offered_totals_may_grow_by_more_than_the_header_difficulty() {
+    let parent = header(100, B256::ZERO, B256::ZERO, 1000);
+    let parent_hash = parent.hash();
+    let uncle = header(99, B256::ZERO, B256::ZERO, 400);
+    let mut child = header(101, parent_hash, B256::ZERO, 1000);
+    child.uncle_count = 1;
+
+    let blocks = vec![
+        Block { header: parent, transactions: vec![], ommers: vec![] },
+        Block { header: child, transactions: vec![], ommers: vec![uncle] },
+    ];
+    // 1000 (the child) + 400 (its uncle) = 1400.
+    let difficulties = vec![U256::from(5000u64), U256::from(6400u64)];
+
+    assert!(
+        super::session::check_chain_shape(&blocks, &difficulties).is_ok(),
+        "the uncle's difficulty counts toward the total"
+    );
+}
+
+/// The check still has teeth: a total that grows by the wrong amount is
+/// refused, so a peer cannot inflate its claimed work.
+#[test]
+fn offered_totals_that_do_not_match_the_contribution_are_refused() {
+    let parent = header(100, B256::ZERO, B256::ZERO, 1000);
+    let parent_hash = parent.hash();
+    let uncle = header(99, B256::ZERO, B256::ZERO, 400);
+    let mut child = header(101, parent_hash, B256::ZERO, 1000);
+    child.uncle_count = 1;
+
+    let blocks = vec![
+        Block { header: parent, transactions: vec![], ommers: vec![] },
+        Block { header: child, transactions: vec![], ommers: vec![uncle] },
+    ];
+    // Claims far more work than the block and its uncle actually carry.
+    let difficulties = vec![U256::from(5000u64), U256::from(99_000u64)];
+
+    assert_eq!(
+        super::session::check_chain_shape(&blocks, &difficulties),
+        Err(SnapFailure::BadDifficulty)
+    );
+}
