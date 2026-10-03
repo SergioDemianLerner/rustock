@@ -115,6 +115,64 @@ handled gracefully via `RskSubMessage::Unknown(u8)` to avoid crashing sessions.
 
 ---
 
+## 4a. Snapshot sync messages, and extension by trailing elements
+
+**Source**: `rskj/.../net/messages/Snap*Message.java`,
+`crates/networking/src/protocol/snap.rs`
+
+Snapshot sync adds six messages, ids 20-25, all framed as `RLP([id, params])`
+where `params` is an RLP string holding an encoded list -- the same
+string-not-list shape as section 4, and the thing rustock got wrong until #239.
+
+| Message | Type ID | Params |
+|---------|---------|--------|
+| `SnapStateChunkRequest` | 20 | `blockNumber`, `from`, `chunkSize` |
+| `SnapStateChunkResponse` | 21 | `chunk`, `blockNumber`, `from`, `to`, `complete` |
+| `SnapStatusRequest` | 22 | *(empty list)* |
+| `SnapStatusResponse` | 23 | `blocks[]`, `difficulties[]`, `trieSize` |
+| `SnapBlocksRequest` | 24 | `blockNumber` |
+| `SnapBlocksResponse` | 25 | `blocks[]`, `difficulties[]` |
+
+### Trailing elements are ignored, which is what makes these extensible
+
+rskj's decoders read a fixed number of elements from each message and never
+consult the list length again, so an element appended after the last one they
+read is accepted and ignored. That is what lets these messages grow without a
+flag day, and it is already relied on twice: the served-range extension appends
+a fifth element to the status message, and the refusal code below appends a
+sixth to message 21.
+
+### The refusal code (`SnapStateChunkResponse`, a sixth element)
+
+```
+params = RLP([ chunk, blockNumber, from, to, complete, refusal ])
+                                                       ^^^^^^^
+```
+
+`Refusal` in `crates/networking/src/protocol/snap.rs`:
+
+| value | variant | meaning |
+|---|---|---|
+| 0 | `None` | not a refusal -- the chunk is in the payload |
+| 1 | `UnknownBlock` | no block at that number on this chain |
+| 2 | `StateRootMismatch` | this chain has a different state root at that height |
+| 3 | `StateNotStored` | the state was known but is no longer stored |
+| 4 | `PastTheEnd` | the offset is past the end of the trie |
+| 5 | `OffsetNotOnGrid` | the offset is not a multiple of the server's chunk granularity |
+
+Without it an empty payload is ambiguous: "nothing at that offset, ask
+elsewhere", "nothing for you at all", and "your request was malformed" look
+identical, and a client can only tell them apart by retrying. None is
+misbehaviour, so none is charged against the peer -- `Refusal::worth_asking_again`
+decides only whether another round trip to the same peer is useful.
+
+rskj never reads it. A client must treat its absence as "no reason given", and
+a server that does not implement it sends rskj's five elements.
+
+Specified upstream in RSKIP-696.
+
+---
+
 ## 5. Descending Header Delivery
 
 **Source**: `rskj/.../net/NodeBlockProcessor.java` (`processBlockHeadersRequest`)
