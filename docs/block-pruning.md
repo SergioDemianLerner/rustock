@@ -68,7 +68,22 @@ understates what is held rather than claiming blocks that are already gone.
 Over-reporting is the dangerous direction: it invites a reader to ask for
 something deleted.
 
-## 5. Sweeps
+## 5. Retention is measured from the *executed* head
+
+Not from the header head. A node may hold headers far above what it has
+executed, and pruning from the header head would delete blocks the executor
+still has to read:
+
+```rust
+let Some(executed) = executed else { return Ok(None) };
+let head_number = head_number.min(executed);
+```
+
+A node that has executed nothing prunes nothing, even if it holds the whole
+chain. This is not a refinement of the depth rule — it is what stops a node
+that is importing faster than it executes from deleting its own input.
+
+## 6. Sweeps
 
 Pruning removes at most `max_batch` blocks per call and resumes from the floor,
 so the same mechanism serves either shape:
@@ -85,13 +100,19 @@ block behind on every resumed sweep, stranding data below the recorded floor
 that nothing would ever report or reclaim. This was a real bug, caught by the
 resume test — 3,993 of 4,000 blocks removed.
 
-## 6. Operating it
+## 7. Operating it
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--prune-blocks` | off | Sweep automatically as the node runs |
+| `--prune-every-secs` | 300 | Seconds between automatic sweeps |
 | `--prune-keep-depth` | 100,000 | Blocks kept below the head; clamped up to 8,000 |
 | `--prune-max-batch` | 50,000 | Most blocks one sweep may remove |
+| `--prune-frozen-headers` | off | Also delete headers the freezer already holds |
 | `--rpc-admin` | off | Required for the methods below |
+
+Without `--prune-blocks` the node prunes only when asked over RPC, which is
+what it did before the automatic sweep existed.
 
 ```bash
 # Let the node choose the boundary from its own head
@@ -108,9 +129,59 @@ rsk_storageStatus []
 `rsk_storageStatus` reports block pruning and trie collection together, because
 an operator asking what a node deletes and what it still holds wants one answer.
 
-Nothing triggers pruning automatically. The node prunes only when asked.
+### The automatic sweep
 
-## 7. Tests
+With `--prune-blocks`, the node sweeps on its own every `--prune-every-secs`
+(default 300). The flag is off by default and deliberately so: turning it on is
+not a tuning change, it deletes history that only a resync can bring back.
+
+Two gates stand in front of every automatic sweep.
+
+**The snapshot gate.** `prune_allowed` starts *closed* and is opened only once
+the sync service knows no snapshot session is coming:
+
+```rust
+if self.snap.is_none() && self.snap_restart.is_none() {
+    self.prune_allowed.store(true, Ordering::Relaxed);
+}
+```
+
+It starts closed rather than being inferred later from the absence of a
+session, because "no session yet" and "no session ever" are different states
+and only the second is safe. A snapshot sync fetches blocks below its
+checkpoint; a sweep running beside it would delete them as they arrive.
+
+**The freezer gate.** `plan_prune` will not pass the freezer's uncle progress:
+
+```rust
+if let Some(f) = self.freezer() {
+    let frozen_uncles = f.uncles_end_number();
+    if frozen_uncles == 0 { return Ok(None); }
+    target = target.min(frozen_uncles - 1);
+}
+```
+
+Uncle headers exist only in block bodies, so deleting a body before the freezer
+has copied them destroys the chain's own record of the work it absorbed, and no
+later pass can rebuild it. This is a real race rather than a theoretical one:
+the freezer works below `head − FREEZE_DEPTH` (20,000) while the pruner works
+below `head − keep_depth` (8,000 floor). The pruner's range is the shallower,
+so left alone it reaches every block first. See
+[`freezer-estimates.md`](./freezer-estimates.md).
+
+### Announce before deleting
+
+A sweep tells peers the range is narrowing *before* it narrows it. `plan_prune`
+is the single source of truth shared by the announcement and the deletion, so
+the range a node advertises and the range it deletes cannot disagree.
+
+The ordering matters in one direction only. Announcing first means a peer may
+briefly believe we hold less than we do, and ask elsewhere for something we
+still have — wasteful, harmless. Deleting first means a peer believes we hold
+something already gone, and asks us for it. The announcement is an upper bound;
+the floor recorded after the sweep is what was actually achieved.
+
+## 8. Tests
 
 `crates/storage/src/pruner.rs`:
 
@@ -120,15 +191,34 @@ Nothing triggers pruning automatically. The node prunes only when asked.
 | `genesis_is_never_pruned` | §2 |
 | `prunes_nothing_on_a_chain_shorter_than_the_retention_depth` | short chains are not an error |
 | `removes_headers_bodies_receipts_and_the_transaction_index` | what is actually deleted |
+| `receipts_are_pruned_with_their_blocks` | receipts go |
+| `bridge_events_survive_the_blocks_they_came_from` | bridge events stay |
 | `records_a_floor_that_can_be_read_back` | §4, including the difficulty anchor |
-| `pruning_is_resumable_and_idempotent` | §5, and the off-by-one it caught |
+| `pruning_is_resumable_and_idempotent` | §6, and the off-by-one it caught |
 | `the_chain_above_the_floor_stays_walkable_by_parent_hash` | §3 |
+| `a_sweep_starts_where_the_block_database_begins` | a pruned or imported store sweeps from its real bottom |
+| `an_ordinary_node_still_sweeps_from_the_bottom` | that the above did not change the ordinary case |
+| `retention_is_measured_from_the_executed_head_not_the_header_head` | §5 |
+| `a_node_that_has_executed_nothing_prunes_nothing` | §5, the degenerate case |
+| `a_node_that_is_keeping_up_prunes_as_before` | that §5 did not change the ordinary case |
+| `the_plan_matches_what_the_sweep_does` | announcement and deletion share one source |
+| `planning_changes_nothing` | `plan_prune` has no side effects |
+| `the_announced_floor_is_never_below_the_achieved_one` | the safe direction of the announcement |
+| `a_node_with_nothing_to_prune_has_no_plan` | nothing to say means nothing announced |
+| `pruning_waits_for_the_freezer_to_copy_the_uncles` | the freezer gate |
+| `nothing_is_pruned_before_the_freezer_has_started` | an empty uncle store stops the sweep |
+| `the_keep_depth_still_binds_once_the_freezer_is_ahead` | the gate holds the pruner back, it does not replace the depth rule |
 
-## 8. Not yet done
+## 9. Not yet done
 
-- **No automatic trigger.** Pruning happens only on request.
 - **Not measured on a real database.** The tests use synthetic chains; timings
-  and reclaimed bytes on a mainnet-sized store are unknown.
+  and reclaimed bytes on a mainnet-sized store are unknown. No production node
+  has run with `--prune-blocks`.
+- **A node without a freezer is unguarded.** `--no-freezer` with
+  `--prune-blocks` discards the uncle headers along with the bodies, and the
+  chain's accumulated work becomes unrecomputable below the floor. Correct —
+  there is no second copy to wait for — but it is a configuration that quietly
+  gives something up.
 - **Log filtering is unexamined.** `eth_getLogs` over a pruned range returns
   nothing rather than an error saying the range is gone, which is honest but
   may not be what a caller expects.
