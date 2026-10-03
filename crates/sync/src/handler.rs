@@ -3,7 +3,8 @@ use crate::manager::SyncManager;
 use alloy_primitives::B512;
 use crate::snap::server::SnapServer;
 use rustock_networking::protocol::{
-    BlockHashResponse, BlockHeadersResponse, BlockIdentifier, BodyResponse,
+    BlockHashResponse, BlockHeadersResponse, BlockHeadersWithUnclesResponse, BlockIdentifier,
+    BodyResponse, HeaderWithUncles,
     P2pHandler, P2pMessage, RskMessage, RskSubMessage, SkeletonResponse,
 };
 use std::sync::Arc;
@@ -286,6 +287,77 @@ impl SyncHandler {
         )))
     }
 
+    /// Respond to a `BlockHeadersWithUnclesRequest`: the same run of headers
+    /// the plain request would return, each paired with the uncle headers it
+    /// references.
+    ///
+    /// The uncles come out of the body, which is the only place they exist. A
+    /// block whose body this node no longer holds therefore ends the run --
+    /// never an empty uncle list, which would be a quiet lie about the chain's
+    /// work. Peers learn which blocks are answerable from the served range this
+    /// node announces.
+    fn serve_headers_with_uncles_request(
+        &self,
+        request_id: u64,
+        hash: alloy_primitives::B256,
+        count: u32,
+    ) -> Option<P2pMessage> {
+        let count = count.min(MAX_HEADERS_SERVE);
+        let store = &self.manager.store;
+
+        let first = store.header(hash).ok()??;
+        if !self.may_serve(first.number) {
+            return None;
+        }
+        let mut headers = canonical_run(store, &first, count)
+            .unwrap_or_else(|| walk_by_parent(store, first, count));
+        headers.retain(|h| self.may_serve(h.number));
+
+        let mut entries: Vec<HeaderWithUncles> = Vec::with_capacity(headers.len());
+        for header in headers {
+            let uncles = if header.uncle_count == 0 {
+                Vec::new()
+            } else {
+                match store.body(header.hash()) {
+                    Ok(Some((_txs, ommers))) => ommers,
+                    _ => break,
+                }
+            };
+
+            let entry = HeaderWithUncles { header, uncles };
+            // Never put on the wire a pairing this node cannot itself justify:
+            // the receiver refuses it at the parse boundary anyway, and a
+            // mismatch here means our own stored body disagrees with our own
+            // stored header.
+            if !entry.commitment_matches() {
+                warn!(
+                    target: "rustock::sync",
+                    "Refusing to serve #{}: stored uncles do not match its ommers hash",
+                    entry.header.number
+                );
+                break;
+            }
+            entries.push(entry);
+        }
+
+        if entries.is_empty() {
+            return None;
+        }
+
+        trace!(
+            target: "rustock::sync",
+            "Serving {} headers with uncles (starting from {:?})",
+            entries.len(), hash
+        );
+
+        Some(P2pMessage::RskMessage(RskMessage::new(
+            RskSubMessage::BlockHeadersWithUnclesResponse(BlockHeadersWithUnclesResponse {
+                id: request_id,
+                entries,
+            }),
+        )))
+    }
+
     /// Respond to a BlockHashRequest by looking up the canonical hash at the
     /// requested height.
     fn serve_block_hash_request(
@@ -467,6 +539,13 @@ impl P2pHandler for SyncHandler {
                         headers: r.headers.clone(),
                     });
                 }
+                RskSubMessage::BlockHeadersWithUnclesResponse(r) => {
+                    let _ = self.event_tx.send(SyncEvent::HeadersWithUnclesResponse {
+                        peer: id,
+                        id: r.id,
+                        entries: r.entries.clone(),
+                    });
+                }
                 RskSubMessage::NewBlockHashes(blocks) => {
                     let _ = self.event_tx.send(SyncEvent::NewBlockHashes {
                         peer: id,
@@ -491,6 +570,13 @@ impl P2pHandler for SyncHandler {
                 // --- Serve data to peers ---
                 RskSubMessage::BlockHeadersRequest(r) => {
                     return self.serve_headers_request(r.id, r.query.hash, r.query.count);
+                }
+                RskSubMessage::BlockHeadersWithUnclesRequest(r) => {
+                    return self.serve_headers_with_uncles_request(
+                        r.id,
+                        r.query.hash,
+                        r.query.count,
+                    );
                 }
                 RskSubMessage::BlockHashRequest(r) => {
                     return self.serve_block_hash_request(r.id, r.height);

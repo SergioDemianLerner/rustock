@@ -64,8 +64,9 @@
 //! where a reorg goes looking for them.
 
 use alloy_primitives::B256;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rustock_core::Header;
+use alloy_rlp::{Decodable, Encodable};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -116,6 +117,70 @@ pub const MAX_DATA_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// 20,000 is 20x the first and 2.5x the second, so a frozen block is one the
 /// rest of the node has already stopped expecting to change.
 pub const FREEZE_DEPTH: u64 = 20_000;
+
+/// Opens one of the parallel stores, repairing an interrupted append.
+///
+/// The index is the authority. Anything in the data file past the furthest
+/// point any entry accounts for is a partial write from a process that died,
+/// and is discarded: an unreferenced tail costs nothing, while an index entry
+/// pointing past the data is unreadable.
+fn open_store(dir: &Path, prefix: &str, kind: &str) -> Result<Writable> {
+    let index_path = dir.join(format!("{prefix}{kind}.cidx"));
+    let mut index = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&index_path)
+        .with_context(|| format!("opening {}", index_path.display()))?;
+
+    let mut index_len = index.metadata()?.len();
+
+    // A torn index write leaves a partial entry; drop it.
+    let ragged = index_len % INDEX_ENTRY_BYTES;
+    if ragged != 0 {
+        index_len -= ragged;
+        index.set_len(index_len)?;
+        index.sync_all()?;
+    }
+    let end_number = index_len / INDEX_ENTRY_BYTES;
+
+    // Find the newest data file on disk; the index does not record which one
+    // is being appended to, only where each block landed.
+    let mut file_number = 0u16;
+    for n in 0..=u16::MAX {
+        if dir.join(format!("{prefix}{kind}-{n:04}.cdat")).exists() {
+            file_number = n;
+        } else if n > 0 {
+            break;
+        }
+    }
+
+    let data_path = dir.join(format!("{prefix}{kind}-{file_number:04}.cdat"));
+    let data = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&data_path)
+        .with_context(|| format!("opening {}", data_path.display()))?;
+
+    let covered = furthest_end(&mut index, end_number, file_number)?;
+    if data.metadata()?.len() > covered as u64 {
+        data.set_len(covered as u64)?;
+        data.sync_all()?;
+    }
+
+    Ok(Writable {
+        index,
+        data,
+        file_number,
+        data_len: covered,
+        end_number,
+        pending_data: Vec::with_capacity(WRITE_BUFFER_BYTES),
+        pending_index: Vec::new(),
+    })
+}
 
 /// Where one block's data is: which file, and the byte range within it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,7 +241,20 @@ pub struct Freezer {
     /// anything that finds them later.
     prefix: String,
     write: Mutex<Writable>,
+    /// The uncle headers each frozen block references, in parallel files.
+    ///
+    /// Uncle headers live nowhere else once a body is pruned: the header
+    /// commits to them through `ommers_hash` and records only `uncle_count`,
+    /// and an uncle is never canonical so it has no height slot of its own.
+    /// Without this, a node that has frozen its headers and pruned its bodies
+    /// can neither recompute total difficulty nor prove the uncles its chain
+    /// absorbed ever existed.
+    uncles: Mutex<Writable>,
 }
+
+/// File-name stems for the two parallel stores.
+const HEADERS: &str = "headers";
+const UNCLES: &str = "uncles";
 
 impl Freezer {
     /// Opens, or creates, a freezer in `dir`.
@@ -223,68 +301,18 @@ impl Freezer {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating freezer directory {}", dir.display()))?;
 
-        let index_path = dir.join(format!("{prefix}headers.cidx"));
-        let mut index = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&index_path)
-            .with_context(|| format!("opening {}", index_path.display()))?;
-
-        let mut index_len = index.metadata()?.len();
-
-        // A torn index write leaves a partial entry; drop it.
-        let ragged = index_len % INDEX_ENTRY_BYTES;
-        if ragged != 0 {
-            index_len -= ragged;
-            index.set_len(index_len)?;
-            index.sync_all()?;
-        }
-        let end_number = index_len / INDEX_ENTRY_BYTES;
-
-        // Find the newest data file on disk; the index does not record which
-        // one is being appended to, only where each block landed.
-        let mut file_number = 0u16;
-        for n in 0..=u16::MAX {
-            if dir.join(format!("{prefix}headers-{n:04}.cdat")).exists() {
-                file_number = n;
-            } else if n > 0 {
-                break;
-            }
-        }
-
-        let data_path = dir.join(format!("{prefix}headers-{file_number:04}.cdat"));
-        let data = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&data_path)
-            .with_context(|| format!("opening {}", data_path.display()))?;
-
-        // The index is the authority. Anything in the data file past the
-        // furthest point any entry accounts for is a partial write from a
-        // process that died, and is discarded: an unreferenced tail costs
-        // nothing, while an index entry pointing past the data is unreadable.
-        let covered = furthest_end(&mut index, end_number, file_number)?;
-        if data.metadata()?.len() > covered as u64 {
-            data.set_len(covered as u64)?;
-            data.sync_all()?;
-        }
+        let headers = open_store(&dir, &prefix, HEADERS)?;
+        // The uncle store is addressed by the same block numbers and repaired
+        // by the same rules, so it is the same format -- only the payload
+        // differs. Keeping it in its own files means the header files, which
+        // hold ten gigabytes on a mainnet node, are never rewritten to add it.
+        let uncles = open_store(&dir, &prefix, UNCLES)?;
 
         Ok(Self {
             dir,
             prefix,
-            write: Mutex::new(Writable {
-                index,
-                data,
-                file_number,
-                data_len: covered,
-                end_number,
-                pending_data: Vec::with_capacity(WRITE_BUFFER_BYTES),
-                pending_index: Vec::new(),
-            }),
+            write: Mutex::new(headers),
+            uncles: Mutex::new(uncles),
         })
     }
 
@@ -294,11 +322,19 @@ impl Freezer {
     }
 
     fn index_path(&self) -> PathBuf {
-        self.dir.join(format!("{}headers.cidx", self.prefix))
+        self.kind_index_path(HEADERS)
     }
 
     fn data_path(&self, file: u16) -> PathBuf {
-        self.dir.join(format!("{}headers-{file:04}.cdat", self.prefix))
+        self.kind_data_path(HEADERS, file)
+    }
+
+    fn kind_index_path(&self, kind: &str) -> PathBuf {
+        self.dir.join(format!("{}{kind}.cidx", self.prefix))
+    }
+
+    fn kind_data_path(&self, kind: &str, file: u16) -> PathBuf {
+        self.dir.join(format!("{}{kind}-{file:04}.cdat", self.prefix))
     }
 
     /// Whether this freezer holds nothing.
@@ -321,24 +357,27 @@ impl Freezer {
             return Ok(());
         }
         self.sync()?;
-        let w = self.write.lock().unwrap();
-        let files = w.file_number;
-        drop(w);
 
-        // Data before index, as everywhere else here: an index naming data
-        // that has not arrived is unreadable, while data nothing names yet is
-        // merely unreferenced.
-        for f in 0..=files {
-            let from = self.data_path(f);
+        // Both stores, each data-before-index as everywhere else here: an
+        // index naming data that has not arrived is unreadable, while data
+        // nothing names yet is merely unreferenced.
+        for (store, kind) in [(&self.write, HEADERS), (&self.uncles, UNCLES)] {
+            let files = store.lock().unwrap().file_number;
+            for f in 0..=files {
+                let from = self.kind_data_path(kind, f);
+                if from.exists() {
+                    let to = self.dir.join(format!("{kind}-{f:04}.cdat"));
+                    std::fs::rename(&from, &to)
+                        .with_context(|| format!("promoting {}", from.display()))?;
+                }
+            }
+            let from = self.kind_index_path(kind);
             if from.exists() {
-                let to = self.dir.join(format!("headers-{f:04}.cdat"));
+                let to = self.dir.join(format!("{kind}.cidx"));
                 std::fs::rename(&from, &to)
-                    .with_context(|| format!("promoting {}", from.display()))?;
+                    .with_context(|| format!("promoting {}", to.display()))?;
             }
         }
-        let to = self.dir.join("headers.cidx");
-        std::fs::rename(self.index_path(), &to)
-            .with_context(|| format!("promoting {}", to.display()))?;
         Ok(())
     }
 
@@ -393,8 +432,36 @@ impl Freezer {
     /// Writing a number twice overwrites its index entry and orphans the old
     /// data, which is wasteful but not wrong.
     pub fn put(&self, number: u64, header: &Header) -> Result<()> {
-        let encoded = crate::encode_header(header);
-        let mut w = self.write.lock().unwrap();
+        self.put_bytes(&self.write, HEADERS, number, crate::encode_header(header))
+    }
+
+    /// Stores the uncle headers `number` references.
+    ///
+    /// Written as the RLP list the header's `ommers_hash` commits to, so a
+    /// reader can recompute the commitment and a peer can be served the bytes
+    /// directly. A block with no uncles stores the empty list, `0xc0`, rather
+    /// than nothing: a zero-length run would be indistinguishable from an
+    /// index entry that was never written, and "this block has no uncles" and
+    /// "this block is not frozen" must not be the same answer.
+    pub fn put_uncles(&self, number: u64, uncles: &[Header]) -> Result<()> {
+        let mut payload = Vec::new();
+        for uncle in uncles {
+            uncle.encode(&mut payload);
+        }
+        let mut encoded = Vec::with_capacity(payload.len() + 9);
+        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut encoded);
+        encoded.extend_from_slice(&payload);
+        self.put_bytes(&self.uncles, UNCLES, number, encoded)
+    }
+
+    fn put_bytes(
+        &self,
+        store: &Mutex<Writable>,
+        kind: &str,
+        number: u64,
+        encoded: Vec<u8>,
+    ) -> Result<()> {
+        let mut w = store.lock().unwrap();
 
         // Roll before writing, never across: a header must be contiguous
         // within one file, or one read cannot answer for it. The pending
@@ -402,12 +469,12 @@ impl Freezer {
         // before the roll.
         let after = w.data_len as u64 + w.pending_data.len() as u64 + encoded.len() as u64;
         if after > MAX_DATA_FILE_BYTES {
-            self.flush_locked(&mut w)?;
+            self.flush_locked(kind, &mut w)?;
             let next = w
                 .file_number
                 .checked_add(1)
                 .context("freezer is out of data files")?;
-            let path = self.data_path(next);
+            let path = self.kind_data_path(kind, next);
             w.data = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -427,7 +494,7 @@ impl Freezer {
         w.end_number = w.end_number.max(number + 1);
 
         if w.pending_data.len() >= WRITE_BUFFER_BYTES {
-            self.flush_locked(&mut w)?;
+            self.flush_locked(kind, &mut w)?;
         }
         Ok(())
     }
@@ -439,7 +506,7 @@ impl Freezer {
     /// unreferenced and `open` discards it; an index entry with no data behind
     /// it would be an unreadable header that nothing detects until a peer asks
     /// for it.
-    fn flush_locked(&self, w: &mut Writable) -> Result<()> {
+    fn flush_locked(&self, _kind: &str, w: &mut Writable) -> Result<()> {
         if w.pending_data.is_empty() {
             return Ok(());
         }
@@ -468,9 +535,71 @@ impl Freezer {
     /// does not have them, and whatever fills it will write them again.
     pub fn sync(&self) -> Result<()> {
         let mut w = self.write.lock().unwrap();
-        self.flush_locked(&mut w)?;
+        self.flush_locked(HEADERS, &mut w)?;
         w.index.sync_all()?;
+        drop(w);
+
+        let mut u = self.uncles.lock().unwrap();
+        self.flush_locked(UNCLES, &mut u)?;
+        u.index.sync_all()?;
         Ok(())
+    }
+
+    /// The uncle headers for one block, if they are frozen.
+    ///
+    /// `Some(vec![])` means the block referenced no uncles; `None` means this
+    /// block's uncles are not in the freezer at all. The two are different
+    /// answers and a caller computing total difficulty must not confuse them.
+    pub fn uncles(&self, number: u64) -> Result<Option<Vec<Header>>> {
+        let Some(bytes) = self.read_one(&self.uncles, UNCLES, number)? else {
+            return Ok(None);
+        };
+        let mut buf = bytes.as_slice();
+        let h = alloy_rlp::Header::decode(&mut buf)
+            .map_err(|e| anyhow!("decoding frozen uncle list for #{number}: {e:?}"))?;
+        if !h.list || buf.len() < h.payload_length {
+            bail!("frozen uncle list for #{number} is malformed");
+        }
+        let mut body = &buf[..h.payload_length];
+        let mut out = Vec::new();
+        while !body.is_empty() {
+            out.push(
+                Header::decode_with_hash(&mut body)
+                    .map_err(|e| anyhow!("decoding frozen uncle for #{number}: {e:?}"))?,
+            );
+        }
+        Ok(Some(out))
+    }
+
+    /// One block's stored bytes from `store`, flushing first so that a value
+    /// written moments ago is visible.
+    fn read_one(
+        &self,
+        store: &Mutex<Writable>,
+        kind: &str,
+        number: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        {
+            let mut w = store.lock().unwrap();
+            self.flush_locked(kind, &mut w)?;
+        }
+        let mut index = match File::open(self.kind_index_path(kind)) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        let entry = match read_entry_at(&mut index, number) {
+            Ok(e) if !e.is_absent() => e,
+            _ => return Ok(None),
+        };
+        let mut data = match File::open(self.kind_data_path(kind, entry.file)) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        let len = entry.end.saturating_sub(entry.start) as usize;
+        let mut buf = vec![0u8; len];
+        data.seek(SeekFrom::Start(entry.start as u64))?;
+        data.read_exact(&mut buf)?;
+        Ok(Some(buf))
     }
 
     /// The header for one block, if it is frozen.
@@ -552,26 +681,51 @@ impl Freezer {
     /// order there is no single offset above which everything belongs to the
     /// dropped blocks, and unreferenced bytes cost only space.
     pub fn truncate_head(&self, number: u64) -> Result<()> {
-        let mut w = self.write.lock().unwrap();
-        if number >= w.end_number {
-            return Ok(());
+        // Both stores are addressed by block number, so a head that is rolled
+        // back must drop the same range from each. Leaving uncles behind for a
+        // header that no longer exists would make the uncle store answer for
+        // blocks the freezer has disowned.
+        for store in [&self.write, &self.uncles] {
+            let mut w = store.lock().unwrap();
+            if number >= w.end_number {
+                continue;
+            }
+            w.index.set_len(number * INDEX_ENTRY_BYTES)?;
+            w.index.sync_all()?;
+            w.end_number = number;
         }
-        w.index.set_len(number * INDEX_ENTRY_BYTES)?;
-        w.index.sync_all()?;
-        w.end_number = number;
         Ok(())
     }
 
-    /// Bytes held across all data files.
+    /// Bytes held across all data files, headers and uncles together.
     pub fn data_bytes(&self) -> u64 {
-        let w = self.write.lock().unwrap();
+        self.kind_data_bytes(&self.write, HEADERS) + self.kind_data_bytes(&self.uncles, UNCLES)
+    }
+
+    /// Bytes held by the header files alone.
+    pub fn header_bytes(&self) -> u64 {
+        self.kind_data_bytes(&self.write, HEADERS)
+    }
+
+    /// Bytes held by the uncle files alone.
+    pub fn uncle_bytes(&self) -> u64 {
+        self.kind_data_bytes(&self.uncles, UNCLES)
+    }
+
+    fn kind_data_bytes(&self, store: &Mutex<Writable>, kind: &str) -> u64 {
+        let w = store.lock().unwrap();
         let mut total = w.data_len as u64;
         for f in 0..w.file_number {
-            if let Ok(m) = std::fs::metadata(self.data_path(f)) {
+            if let Ok(m) = std::fs::metadata(self.kind_data_path(kind, f)) {
                 total += m.len();
             }
         }
         total
+    }
+
+    /// One past the highest block whose uncles are frozen.
+    pub fn uncles_end_number(&self) -> u64 {
+        self.uncles.lock().unwrap().end_number
     }
 }
 
@@ -1159,5 +1313,115 @@ mod staging_tests {
         f.put(0, &test_header(0)).unwrap();
         f.sync().unwrap();
         assert!(!f.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod uncle_store_tests {
+    use super::*;
+    use super::tests::test_header;
+    use tempfile::tempdir;
+
+    fn uncle(number: u64, difficulty: u64) -> Header {
+        let mut h = test_header(number);
+        h.difficulty = alloy_primitives::U256::from(difficulty);
+        h
+    }
+
+    #[test]
+    fn uncles_round_trip() {
+        let dir = tempdir().unwrap();
+        let f = Freezer::open(dir.path()).unwrap();
+
+        let uncles = vec![uncle(9, 700), uncle(8, 650)];
+        f.put_uncles(10, &uncles).unwrap();
+        f.sync().unwrap();
+
+        let got = f.uncles(10).unwrap().expect("frozen");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].difficulty, alloy_primitives::U256::from(700u64));
+        assert_eq!(got[1].difficulty, alloy_primitives::U256::from(650u64));
+    }
+
+    /// "No uncles" and "not frozen" are different answers. A caller computing
+    /// total difficulty that confused them would silently undercount, which is
+    /// the whole reason the uncle store exists.
+    #[test]
+    fn no_uncles_is_not_the_same_as_not_frozen() {
+        let dir = tempdir().unwrap();
+        let f = Freezer::open(dir.path()).unwrap();
+
+        f.put_uncles(10, &[]).unwrap();
+        f.sync().unwrap();
+
+        assert_eq!(f.uncles(10).unwrap(), Some(Vec::new()), "frozen, none referenced");
+        assert_eq!(f.uncles(11).unwrap(), None, "never frozen");
+    }
+
+    /// The empty list is stored as `0xc0`, so its index entry is non-empty and
+    /// cannot be mistaken for the absent sentinel even at offset zero.
+    #[test]
+    fn the_empty_list_occupies_a_byte_at_offset_zero() {
+        let dir = tempdir().unwrap();
+        let f = Freezer::open(dir.path()).unwrap();
+
+        // Block 0 is written first, so it lands at offset 0 -- exactly where a
+        // zero-length run would be indistinguishable from "never written".
+        f.put_uncles(0, &[]).unwrap();
+        f.sync().unwrap();
+
+        assert_eq!(f.uncles(0).unwrap(), Some(Vec::new()));
+        assert!(f.uncle_bytes() >= 1, "the empty list took a byte");
+    }
+
+    /// The two stores are independent: freezing a header does not claim to
+    /// know its uncles, and vice versa.
+    #[test]
+    fn the_stores_are_addressed_separately() {
+        let dir = tempdir().unwrap();
+        let f = Freezer::open(dir.path()).unwrap();
+
+        f.put(10, &test_header(10)).unwrap();
+        f.sync().unwrap();
+
+        assert!(f.header(10).unwrap().is_some());
+        assert_eq!(f.uncles(10).unwrap(), None, "header frozen, uncles not yet");
+
+        f.put_uncles(10, &[uncle(9, 700)]).unwrap();
+        f.sync().unwrap();
+        assert_eq!(f.uncles(10).unwrap().unwrap().len(), 1);
+    }
+
+    /// Rolling the head back must drop the same range from both stores, or the
+    /// uncle store answers for blocks the freezer has disowned.
+    #[test]
+    fn truncating_the_head_drops_uncles_too() {
+        let dir = tempdir().unwrap();
+        let f = Freezer::open(dir.path()).unwrap();
+
+        for n in 0..5u64 {
+            f.put(n, &test_header(n)).unwrap();
+            f.put_uncles(n, &[uncle(n, 100)]).unwrap();
+        }
+        f.sync().unwrap();
+        assert_eq!(f.uncles(4).unwrap().unwrap().len(), 1);
+
+        f.truncate_head(3).unwrap();
+        assert_eq!(f.uncles(4).unwrap(), None, "dropped with the header");
+        assert_eq!(f.uncles(2).unwrap().unwrap().len(), 1, "below the cut, kept");
+    }
+
+    /// Reopening finds both stores where they were left.
+    #[test]
+    fn uncles_survive_a_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let f = Freezer::open(dir.path()).unwrap();
+            f.put_uncles(7, &[uncle(6, 999)]).unwrap();
+            f.sync().unwrap();
+        }
+        let f = Freezer::open(dir.path()).unwrap();
+        let got = f.uncles(7).unwrap().expect("still there");
+        assert_eq!(got[0].difficulty, alloy_primitives::U256::from(999u64));
     }
 }

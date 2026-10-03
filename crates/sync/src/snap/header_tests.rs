@@ -125,7 +125,7 @@ impl Fixture {
                 match want {
                     Want::Skeleton { start } => walk.on_skeleton(&self.skeleton(start)),
                     Want::Headers { point, count, .. } => {
-                        walk.on_headers(point, &self.headers(point, count)).expect("honest")
+                        walk.on_headers(point, &self.headers(point, count), &Default::default()).expect("honest")
                     }
                 }
             }
@@ -180,20 +180,20 @@ fn a_skeleton_pointing_at_another_chain_does_not_move_the_walk() {
 
     // Take the honest run above the grid, so the walk is now waiting for the
     // header at 960 and naming the hash it must have.
-    walk.on_headers(1000, &f.headers(1000, (1000 - 960) as u32)).expect("honest");
+    walk.on_headers(1000, &f.headers(1000, (1000 - 960) as u32), &Default::default()).expect("honest");
     walk.advance().expect("links");
     assert_eq!(walk.frontier(), 960, "the walk should be waiting at the grid top");
 
     // Now answer 960 from the fork: right height, wrong chain.
     let run: Vec<Header> = (769..=960).rev().map(|i| forked[i as usize].clone()).collect();
-    walk.on_headers(960, &run).expect("internally valid");
+    walk.on_headers(960, &run, &Default::default()).expect("internally valid");
     walk.advance().expect("no error, just no progress");
 
     assert_eq!(walk.frontier(), 960, "a foreign run moved the walk");
     assert!(!walk.is_done());
 
     // And the honest run for the same height is still accepted afterwards.
-    walk.on_headers(960, &f.headers(960, HEADER_CHUNK as u32)).expect("honest");
+    walk.on_headers(960, &f.headers(960, HEADER_CHUNK as u32), &Default::default()).expect("honest");
     walk.advance().expect("links");
     assert_eq!(walk.frontier(), 768, "the honest run was not taken after the fork");
 }
@@ -208,7 +208,7 @@ fn a_run_that_is_not_a_chain_is_refused() {
     run[5] = header(379, B256::repeat_byte(0x55));
 
     assert!(matches!(
-        walk.on_headers(384, &run),
+        walk.on_headers(384, &run, &Default::default()),
         Err(WalkError::BrokenChunk { point: 384 })
     ));
 }
@@ -230,7 +230,7 @@ fn every_header_is_still_validated() {
     let mut walk = f.walk(500, HeaderVerifier::new().with_static_rule(RefuseEverything));
 
     assert!(matches!(
-        walk.on_headers(384, &f.headers(384, 192)),
+        walk.on_headers(384, &f.headers(384, 192), &Default::default()),
         Err(WalkError::InvalidHeader { .. })
     ));
 }
@@ -263,7 +263,7 @@ fn a_foreign_genesis_is_refused() {
             match want {
                 Want::Skeleton { start } => walk.on_skeleton(&f.skeleton(start)),
                 Want::Headers { point, count, .. } => {
-                    walk.on_headers(point, &f.headers(point, count)).expect("valid")
+                    walk.on_headers(point, &f.headers(point, count), &Default::default()).expect("valid")
                 }
             }
         }
@@ -315,7 +315,7 @@ fn answers_may_arrive_out_of_order() {
             continue;
         }
         let count = if point == 1000 { 1000 - 960 } else { HEADER_CHUNK };
-        let _ = walk.on_headers(point, &f.headers(point, count as u32));
+        let _ = walk.on_headers(point, &f.headers(point, count as u32), &Default::default());
     }
     walk.advance().expect("links");
 
@@ -349,9 +349,9 @@ fn the_established_difficulty_counts_from_genesis_not_from_the_anchor() {
     let mut walk = f.walk(1000, HeaderVerifier::new());
     assert_eq!(walk.established_difficulty(), None, "nothing is established yet");
 
-    walk.on_headers(1000, &f.headers(1000, (1000 - 960) as u32)).expect("honest");
+    walk.on_headers(1000, &f.headers(1000, (1000 - 960) as u32), &Default::default()).expect("honest");
     walk.advance().expect("links");
-    walk.on_headers(960, &f.headers(960, HEADER_CHUNK as u32)).expect("honest");
+    walk.on_headers(960, &f.headers(960, HEADER_CHUNK as u32), &Default::default()).expect("honest");
     walk.advance().expect("links");
 
     assert!(walk.is_done(), "the walk should have anchored at #{anchor}");

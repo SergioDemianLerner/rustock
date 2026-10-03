@@ -126,6 +126,11 @@ pub struct HeaderWalk {
     /// chain actually walked. The walk reads every header anyway; adding them
     /// up costs nothing and makes the claim checkable.
     walked_difficulty: U256,
+    /// Uncles seen during the walk whose difficulty could not be added,
+    /// because a header walk never carries bodies. Non-zero means
+    /// `walked_difficulty` understates the chain and the totals derived from
+    /// it need `--repair total-difficulty` once bodies are present.
+    uncles_omitted: u64,
 
     /// Total difficulty this node had already established at the block the
     /// walk anchored on.
@@ -205,6 +210,7 @@ impl HeaderWalk {
             need_hash: top_hash,
             done: false,
             walked_difficulty: U256::ZERO,
+            uncles_omitted: 0,
             anchor_difficulty: None,
             freeze_horizon: number.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
             staging,
@@ -218,6 +224,11 @@ impl HeaderWalk {
     /// it by more than the checkpoint block's own difficulty.
     pub fn walked_difficulty(&self) -> U256 {
         self.walked_difficulty
+    }
+
+    /// How many uncles the walk could not account for. See `uncles_omitted`.
+    pub fn uncles_omitted(&self) -> u64 {
+        self.uncles_omitted
     }
 
     /// The cumulative difficulty the walked chain implies at the checkpoint,
@@ -352,7 +363,12 @@ impl HeaderWalk {
     /// Verified on its own terms here -- every header's rules, every adjacent
     /// pair, the internal chain -- and stored. Whether it belongs to *our*
     /// chain is settled by whether it links, which [`Self::advance`] decides.
-    pub fn on_headers(&mut self, point: u64, headers: &[Header]) -> Result<(), WalkError> {
+    pub fn on_headers(
+        &mut self,
+        point: u64,
+        headers: &[Header],
+        proven: &std::collections::HashMap<B256, U256>,
+    ) -> Result<(), WalkError> {
         self.headers_sent.remove(&point);
         if headers.is_empty() {
             return Ok(());
@@ -381,8 +397,26 @@ impl HeaderWalk {
         })?;
 
         for header in headers {
-            self.walked_difficulty = self.walked_difficulty.saturating_add(header.difficulty);
-            let _ = self.store.put_header_with_hash(header.hash(), header);
+            // Uncle difficulty counts toward the chain's work and uncle headers
+            // travel only in the body, which a backward header walk never
+            // fetches. A peer at `rsk/63` sends them alongside and the figure
+            // is exact; from anyone else `walked_difficulty` is a lower bound,
+            // widened by every block that included an uncle. See
+            // `uncles_omitted`.
+            let hash = header.hash();
+            match proven.get(&hash) {
+                Some(exact) => {
+                    self.walked_difficulty = self.walked_difficulty.saturating_add(*exact);
+                }
+                None => {
+                    self.walked_difficulty =
+                        self.walked_difficulty.saturating_add(header.difficulty);
+                    if header.uncle_count > 0 {
+                        self.uncles_omitted += header.uncle_count;
+                    }
+                }
+            }
+            let _ = self.store.put_header_with_hash(hash, header);
         }
 
         // The headers are in hand and verified against each other; writing

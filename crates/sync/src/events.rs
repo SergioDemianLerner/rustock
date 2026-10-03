@@ -3,6 +3,7 @@ use rustock_core::types::header::Header;
 use rustock_core::types::transaction::Transaction;
 use alloy_primitives::U256;
 use rustock_core::types::block::Block;
+use rustock_networking::protocol::HeaderWithUncles;
 use rustock_networking::protocol::snap::{ChunkPayload, Refusal};
 use rustock_networking::protocol::BlockIdentifier;
 
@@ -25,6 +26,16 @@ pub enum SyncEvent {
         /// tell its own header walk apart from everything else in flight.
         id: u64,
         headers: Vec<Header>,
+    },
+    /// Headers that arrived with the uncles they reference (`rsk/63`).
+    ///
+    /// Kept apart from [`Self::HeadersResponse`] because only this one can
+    /// yield an exact total difficulty: uncle difficulty counts toward it and
+    /// uncle headers travel nowhere but the body.
+    HeadersWithUnclesResponse {
+        peer: B512,
+        id: u64,
+        entries: Vec<HeaderWithUncles>,
     },
     BodyResponse {
         peer: B512,

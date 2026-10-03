@@ -2,11 +2,12 @@ use rustock_core::validation::HeaderVerifier;
 use rustock_core::types::header::Header;
 use rustock_storage::BlockStore;
 use rustock_networking::protocol::{
-    BlockHeadersQuery, BlockHeadersRequest, P2pMessage, RskMessage, RskSubMessage,
+    BlockHeadersQuery, BlockHeadersRequest, BlockHeadersWithUnclesRequest, HeaderWithUncles,
+    P2pMessage, RskMessage, RskSubMessage,
 };
 use alloy_primitives::{B256, B512, U256};
 use anyhow::Result;
-// HashMap no longer needed — sequential TD propagation replaces hash-based parent lookup
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{debug, trace, warn};
@@ -37,7 +38,21 @@ pub struct SyncManager {
     /// Evidence that a peer is offering a chain we cannot connect to. Never a
     /// chain itself: see [`crate::unlinked`].
     unlinked: Mutex<UnlinkedHeaders>,
+    /// Cumulative difficulties proved by uncles a peer sent with the header.
+    ///
+    /// A header alone cannot yield one: uncle difficulty counts toward total
+    /// difficulty and uncle headers travel only in the body. When a peer at
+    /// `rsk/63` supplies them, the figure is recorded here so the ordinary
+    /// ingest path -- which receives only headers -- can use it instead of the
+    /// header difficulty. Bounded, because it is an optimisation and a peer
+    /// could otherwise grow it without limit.
+    proven: Mutex<HashMap<B256, U256>>,
 }
+
+/// How many proved cumulative difficulties to keep. A skeleton chunk is 192
+/// headers and several are in flight at once, so this holds many chunks'
+/// worth while staying a fixed, small cost.
+const MAX_PROVEN: usize = 8192;
 
 impl SyncManager {
     pub fn new(
@@ -50,6 +65,7 @@ impl SyncManager {
             verifier,
             peer_store,
             unlinked: Mutex::new(UnlinkedHeaders::new()),
+            proven: Mutex::new(HashMap::new()),
         }
     }
 
@@ -58,6 +74,28 @@ impl SyncManager {
     /// We reverse them, validate, and store in a single atomic RocksDB WriteBatch.
     pub fn handle_headers_response(&self, headers: Vec<Header>, peer: B512) -> Result<Ingested> {
         self.ingest_headers(headers, Some(peer))
+    }
+
+    /// Record the cumulative difficulties proved by `entries`, and hand back
+    /// the bare headers for the ordinary ingest path.
+    ///
+    /// The decoder has already refused any entry whose uncle list does not
+    /// match the trunk header's `ommers_hash`, so these figures are as sound
+    /// as the header's own proof of work.
+    pub fn note_proven_difficulties(&self, entries: Vec<HeaderWithUncles>) -> Vec<Header> {
+        let mut proven = self.proven.lock().unwrap();
+        if proven.len() + entries.len() > MAX_PROVEN {
+            // Everything in here is re-derivable from a later request, so
+            // dropping the lot is cheaper than tracking an eviction order.
+            proven.clear();
+        }
+        entries
+            .into_iter()
+            .map(|entry| {
+                proven.insert(entry.header.hash(), entry.cumulative_difficulty());
+                entry.header
+            })
+            .collect()
     }
 
     /// The body of [`Self::handle_headers_response`], with the peer optional so
@@ -187,7 +225,27 @@ impl SyncManager {
                 }
             }
 
-            let new_td = parent_td + header.difficulty;
+            // Total difficulty counts the uncle difficulties too, and those
+            // live only in the body -- a header records `uncle_count` and
+            // nothing more. During header-first sync the body has usually not
+            // arrived, so this is the header difficulty alone: a lower bound,
+            // corrected once the body lands. A block that declares no uncles
+            // needs no body, and `cumulative_difficulty` says so without a read.
+            // Total difficulty counts uncle difficulty too, and uncle headers
+            // live only in the body. In order of what can actually be proved:
+            // the uncles this peer sent with the header, then a body this node
+            // already holds, then -- during plain header-first sync, where
+            // neither exists -- the header difficulty alone, which is a lower
+            // bound and the reason `rsk/63` carries the uncles at all.
+            let contribution = self
+                .proven
+                .lock()
+                .unwrap()
+                .get(&hash)
+                .copied()
+                .or_else(|| self.store.cumulative_difficulty(hash, header).ok().flatten())
+                .unwrap_or(header.difficulty);
+            let new_td = parent_td + contribution;
 
             // For NEW headers with a known parent, run full verification.
             // Already-stored headers skip verification (they were validated on first store).
@@ -285,5 +343,20 @@ impl SyncManager {
             },
         };
         P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersRequest(req)))
+    }
+
+    /// The same request, asking for each header's uncles alongside it.
+    ///
+    /// Only for peers that negotiated `rsk/63`: an rskj node at `rsk/62`
+    /// throws out of `MessageType.valueOfType` on an unknown id and drops the
+    /// connection, so the caller checks capabilities first.
+    pub fn create_headers_with_uncles_request(&self, start_hash: B256, count: u32) -> P2pMessage {
+        let req = BlockHeadersWithUnclesRequest {
+            id: rand::random::<u64>() & 0x7FFFFFFFFFFFFFFF,
+            query: BlockHeadersQuery { hash: start_hash, count },
+        };
+        P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersWithUnclesRequest(
+            req,
+        )))
     }
 }

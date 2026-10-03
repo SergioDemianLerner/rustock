@@ -194,7 +194,29 @@ impl BlockStore {
         let Some(executed) = executed else { return Ok(None) };
         let head_number = head_number.min(executed);
 
-        let Some(target) = head_number.checked_sub(keep) else { return Ok(None) };
+        let Some(mut target) = head_number.checked_sub(keep) else { return Ok(None) };
+
+        // Never delete a body whose uncle headers the freezer has not taken a
+        // copy of. The body is the only place they exist, so pruning ahead of
+        // the freezer destroys the chain's own record of the work it absorbed,
+        // and no later pass can rebuild it.
+        //
+        // This is a real race rather than a theoretical one: the freezer works
+        // below `head - FREEZE_DEPTH` while the pruner works below
+        // `head - keep_depth`, and the default keep depth is the shallower of
+        // the two. Left alone, the pruner reaches every block first.
+        if let Some(f) = self.freezer() {
+            let frozen_uncles = f.uncles_end_number();
+            if frozen_uncles == 0 {
+                debug!(
+                    target: "rustock::prune",
+                    "holding off: the freezer holds no uncle headers yet, and the bodies \
+                     are the only other copy"
+                );
+                return Ok(None);
+            }
+            target = target.min(frozen_uncles - 1);
+        }
 
         let floor = self.prune_floor()?;
         let mut from = floor.as_ref().map(|f| f.number).unwrap_or(1).max(1);
@@ -923,5 +945,86 @@ mod plan_tests {
 
         let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 1_000 };
         assert_eq!(store.plan_prune(&cfg, 999).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod freezer_guard_tests {
+    use super::tests::chain;
+    use super::*;
+    use crate::freezer::Freezer;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn config() -> PruneConfig {
+        PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000, ..Default::default() }
+    }
+
+    /// The pruner must not delete a body whose uncle headers the freezer has
+    /// not copied. The body is the only other place they exist, so pruning
+    /// first destroys the chain's record of the work it absorbed.
+    ///
+    /// This is the default arrangement, not a corner case: the freezer works
+    /// below `head - FREEZE_DEPTH` (20,000) while the pruner works below
+    /// `head - keep_depth` (8,000), so the pruner reaches every block first.
+    #[test]
+    fn pruning_waits_for_the_freezer_to_copy_the_uncles() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain(&store, 30_000);
+
+        let fdir = tempdir().unwrap();
+        let f = Arc::new(Freezer::open(fdir.path()).unwrap());
+        store.set_freezer(f.clone());
+
+        // The freezer has copied uncles up to #5,000.
+        for n in 0..5_000u64 {
+            f.put_uncles(n, &[]).unwrap();
+        }
+        f.sync().unwrap();
+
+        let plan = store.plan_prune(&config(), 30_000).unwrap().expect("something to prune");
+        assert!(
+            plan.to < 5_000,
+            "must not pass the freezer's uncle progress; planned to #{}",
+            plan.to
+        );
+    }
+
+    /// With nothing copied at all, there is nothing safe to delete.
+    #[test]
+    fn nothing_is_pruned_before_the_freezer_has_started() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain(&store, 30_000);
+
+        let fdir = tempdir().unwrap();
+        store.set_freezer(Arc::new(Freezer::open(fdir.path()).unwrap()));
+
+        assert!(store.plan_prune(&config(), 30_000).unwrap().is_none());
+    }
+
+    /// Once the freezer is well ahead, the keep depth is what binds again --
+    /// the guard holds the pruner back, it does not replace the depth rule.
+    #[test]
+    fn the_keep_depth_still_binds_once_the_freezer_is_ahead() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain(&store, 30_000);
+
+        let fdir = tempdir().unwrap();
+        let f = Arc::new(Freezer::open(fdir.path()).unwrap());
+        store.set_freezer(f.clone());
+        for n in 0..29_999u64 {
+            f.put_uncles(n, &[]).unwrap();
+        }
+        f.sync().unwrap();
+
+        let plan = store.plan_prune(&config(), 30_000).unwrap().expect("something to prune");
+        assert!(
+            plan.to <= 30_000 - MIN_KEEP_DEPTH,
+            "the minimum keep depth is still honoured; planned to #{}",
+            plan.to
+        );
     }
 }
