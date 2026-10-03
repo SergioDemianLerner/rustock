@@ -25,9 +25,13 @@ each side has that the other does not.
 - **Transaction pool**: Validates pending transactions against the live state (nonce, balance, intrinsic gas, chain ID), tracks pending nonces per sender, and exposes status to the RPC layer.
 - **P2P networking**: Full RLPx encryption (inbound and outbound), Kademlia-based UDP discovery, peer exchange, and persistent node tables.
 - **Transaction relay**: Receives transaction messages from peers, validates and admits them to the pool, and rebroadcasts to all other connected peers.
-- **Serving peers**: Responds to `BlockHeadersRequest`, `BlockHashRequest`, `SkeletonRequest`, and `BodyRequest` messages from other nodes.
+- **Serving peers**: Responds to `BlockHeadersRequest`, `BlockHashRequest`, `SkeletonRequest` and `BodyRequest`, and — for peers that negotiated them — the six snapshot messages and the `rsk/63` extensions.
 - **JSON-RPC server**: rskj-compatible HTTP API with `eth`, `net`, `web3`, `rpc`, and `rsk` modules — including state queries, `eth_call` / `eth_estimateGas`, transaction and receipt lookups, log filtering, and persistent filters.
-- **Storage**: RocksDB-backed persistence for headers, bodies, receipts, total difficulty, canonical chain mappings, and Unitrie nodes.
+- **Snapshot sync**: Joins the chain by downloading a recent state trie instead of executing from genesis — as a client and as a server. The header chain to the checkpoint is verified first under the same proof-of-work rules as a full sync, and every chunk of state is checked against that chain's state root. Interoperates with rskj in both directions ([docs/cross-client-snap-sync.md](docs/cross-client-snap-sync.md)).
+- **Header freezer**: Settled headers, and the uncle headers they reference, move out of RocksDB into append-only files with a fixed-width index, so a run of consecutive blocks is a run of adjacent bytes ([docs/freezer.md](docs/freezer.md)).
+- **Block pruning**: Deletes history below a configurable depth, automatically or on request, clamped to a floor the block-info precompiles and reorg re-execution require ([docs/block-pruning.md](docs/block-pruning.md)).
+- **Protocol extensions (`rsk/63`)**: Announces the range of blocks this node can serve, and can carry the uncle headers a trunk header references — which is what lets a node compute cumulative work from a header walk, since in RSK uncle difficulty counts toward total difficulty.
+- **Storage**: RocksDB-backed persistence for headers, bodies, receipts, total difficulty, canonical chain mappings, Bridge events, and Unitrie nodes.
 
 ## Getting Started
 
@@ -81,6 +85,27 @@ Logs are written to `<data-dir>/rustock.log` by default (with daily rotation). U
 | `--rpc-host` | `127.0.0.1` | JSON-RPC bind address |
 | `--no-rpc` | `false` | Disable the JSON-RPC server |
 | `--external-ip` | none | External IP to advertise in discovery (e.g. `203.0.113.42`) |
+
+Commonly used beyond the basics:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--snap-sync` | `false` | Join by downloading a recent state instead of executing from genesis |
+| `--snap-server` | `false` | Serve snapshots of this node's state to peers that ask |
+| `--prune-blocks` | `false` | Delete block history below `--prune-keep-depth` as the node runs |
+| `--prune-keep-depth` | `100000` | Blocks of history to keep; clamped up to 8,000 |
+| `--no-freezer` | `false` | Keep settled headers in RocksDB instead of the freezer |
+| `--read-only` | `false` | Open both databases read-only and write nothing |
+| `--follow-up` | `true` | `false` serves what is held and does not sync, execute or follow |
+| `--mine` | `false` | Build blocks and serve the `mnr_*` merged-mining namespace |
+| `--rpc-admin` | `false` | Enable the administrative RPC methods |
+| `--bootnodes` | network default | Peers to dial; with `--closed-network`, the only ones |
+
+That is a selection. The node has ~96 flags, every one of them documented with
+its default in [`node.example.toml`](node.example.toml), which is the reference
+rather than this table. [`node-light.example.toml`](node-light.example.toml) is
+a smaller starting point, and [`alerts.example.toml`](alerts.example.toml)
+configures peg-out and node-health alerting.
 
 ### Testing
 
@@ -236,6 +261,7 @@ crates/
   networking/   P2P protocol (RLPx, discovery, sessions, peer management)
   sync/         Sync state machine, header + body pipeline, transaction pool, transaction relay
   rpc/          JSON-RPC HTTP server (axum-based) with state, call, log, and filter support
+  alerts/       Peg-out and node-health alerting; an observer with no hook in execution or sync
 ```
 
 ### Log timestamps and timezones
@@ -269,7 +295,7 @@ shifts that one, with no node configuration at all.
 Rustock executes blocks and maintains full state, but it is not yet feature-complete relative to rskj. Notable gaps:
 
 - **Mining is single-node only.** Rustock builds blocks, serves the `mnr_*` merged-mining namespace and imports solutions (`--mine`, see [docs/merged-mining.md](docs/merged-mining.md)), but it has no outbound block announcement, so a mined block reaches peers only when they ask for it.
-- **No archive mode.** The trie store keeps every node it writes (so historical state is queryable as long as the underlying nodes have not been pruned), but there is no explicit archive-vs-pruning policy and no snap/state-sync support — initial sync executes every block from genesis.
+- **No archive mode.** The trie store keeps every node it writes, so historical state is queryable as long as the underlying nodes have not been collected, but there is no explicit archive-vs-pruning policy.
 - **Bridge methods are complete but unevenly exercised.** All 70 methods in the Bridge table are dispatched, transaction-callable and local-only alike. The transaction-callable ones are proven by whole-chain replay against mainnet; the local-only getters are proven only by unit tests, because mainnet history does not call them.
 - **Tracing needs recent state.** `debug_trace*` and `trace_*` re-execute a
   transaction's block from its parent's state, so they answer only within the
