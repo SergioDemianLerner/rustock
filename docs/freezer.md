@@ -10,23 +10,44 @@ building it, written before it existed. This document describes what was built.
 
 ## 1. Why
 
-RocksDB answers a header lookup by reading far more than the header. Measured
-while serving headers to one syncing client:
+A header lives in RocksDB under its hash. Hashes are uniformly distributed, so
+consecutive blocks land in unrelated places, and answering a request for 192
+consecutive headers means 192 unrelated point lookups — each of which reads a
+whole SST block, and often an index block above it, to return 1.1 KB.
 
-| | before #185 | after #185 |
+Measured while serving headers to one syncing client:
+
+| | dependent reads | concurrent reads |
 |---|---|---|
 | throughput | 934 KB/s | 5,600–7,100 KB/s |
 | server disk read | 6.5 MB/s | 37.4 MB/s |
 | **amplification** | **7.0×** | **6.5×** |
 
-**~7.1 KB of disk read to deliver 1.1 KB of header.** #185 raised queue depth,
-which changed *when* the reads happen and not *what* is read — throughput went
-up 7× and amplification barely moved. The freezer attacks the other half.
+**~7.1 KB of disk read to deliver 1.1 KB of header.**
 
-Headers are the right target because they are what a syncing peer asks for
-most, they are immutable once settled, and they are read in *runs* — a peer
-asking for 192 consecutive headers is the normal case, and a run of consecutive
-blocks is a run of adjacent bytes in a flat file.
+The two columns are the design argument. Issuing those 192 lookups
+concurrently instead of one after another raised throughput sevenfold and left
+amplification where it was. That is the general shape of the thing:
+
+> **Concurrency hides latency. It does not reduce the bytes read.**
+> Only the layout does.
+
+A node can keep buying throughput with queue depth until the device saturates,
+and still be reading seven times what it delivers. The freezer attacks the
+other half — not how fast the reads are issued, but how many bytes they have to
+touch.
+
+Headers are the right place to attack it:
+
+- they are what a syncing peer asks for most;
+- they are immutable once settled, so a format that cannot be updated in place
+  costs nothing;
+- they are read in **runs**, and a run of consecutive blocks can be made a run
+  of adjacent bytes, which turns 192 lookups into one read.
+
+The last point is the one that matters. Everything in §2 follows from wanting
+"the next 192 headers" to be a single contiguous read rather than a
+scattered-gather over a B-tree.
 
 ## 2. How it works
 
@@ -104,7 +125,7 @@ bodies could no longer:
 - serve those uncles to a peer.
 
 Permanently — the inputs were gone. That is what made the total-difficulty
-defect in #240 expensive to repair rather than merely wrong: the fix was four
+defect expensive to repair rather than merely wrong: the fix was four
 lines, and rebuilding mainnet's stored totals took 7 h 31 m because every block
 body had to be read back for its uncle difficulties.
 
