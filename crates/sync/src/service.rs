@@ -1132,8 +1132,20 @@ impl SyncService {
             &[B512],
         ) -> Vec<crate::snap::driver::Outbound>,
     {
-        let peers: Vec<B512> = self.peer_store.peers().await;
+        // Only peers that announced `snap`. Sending one of the six snapshot
+        // messages to a peer that did not is not a wasted request -- rskj
+        // throws out of `MessageType.valueOfType` on an unknown id and closes
+        // the connection, so an unfiltered round robin sheds every
+        // non-snap-capable peer, which on mainnet is most of them.
+        let peers: Vec<B512> = self.peer_store.peers_serving_snapshots().await;
         if peers.is_empty() {
+            // Say so rather than falling back to every peer: a snapshot sync
+            // with nobody to ask should stall visibly and let the ordinary
+            // sync take over, not quietly disconnect the peer set.
+            debug!(
+                target: "rustock::snap",
+                "no peer has announced the snap capability; nothing to drive"
+            );
             return;
         }
         let Some(driver) = self.snap.as_mut() else { return };

@@ -937,7 +937,15 @@ async fn a_bad_peer_does_not_end_snapshot_sync() {
     let peers = Arc::new(PeerStore::new());
     let liar = B512::repeat_byte(9);
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    peers.add_peer(liar, tx).await;
+    // A snapshot session only ever talks to peers that announced `snap`;
+    // the service filters on it, so the fixture has to say so.
+    peers
+        .add_peer_with(
+            liar,
+            tx,
+            rustock_networking::handshake::PeerCapabilities { rsk_version: 62, snap: true },
+        )
+        .await;
 
     let manager = Arc::new(SyncManager::new(
         f.store.clone(),
@@ -994,7 +1002,15 @@ async fn a_charge_reaches_peer_scoring() {
     let peers = Arc::new(PeerStore::new());
     let liar = B512::repeat_byte(9);
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    peers.add_peer(liar, tx).await;
+    // A snapshot session only ever talks to peers that announced `snap`;
+    // the service filters on it, so the fixture has to say so.
+    peers
+        .add_peer_with(
+            liar,
+            tx,
+            rustock_networking::handshake::PeerCapabilities { rsk_version: 62, snap: true },
+        )
+        .await;
 
     let scoring = Arc::new(ScoringService::in_memory());
     let before = scoring.with(|m| m.node_has_good_reputation(liar));
