@@ -10,10 +10,35 @@ building it, written before it existed. This document describes what was built.
 
 ## 1. Why
 
-A header lives in RocksDB under its hash. Hashes are uniformly distributed, so
-consecutive blocks land in unrelated places, and answering a request for 192
-consecutive headers means 192 unrelated point lookups — each of which reads a
-whole SST block, and often an index block above it, to return 1.1 KB.
+### The request this is about
+
+A node catching up does not ask for headers one at a time. It asks for a
+**skeleton** — every 192nd block, up to 20 of them in an answer — and then
+fills the gaps between those points. Both numbers come from rskj
+(`chunkSize = 192`, `maxSkeletonChunks = 20`) and are matched here as
+`SKELETON_STEP` and `MAX_SKELETON_ENTRIES`; `MAX_HEADERS_SERVE` caps a single
+answer at the same 192.
+
+So the unit of work on the serving side is: **"give me the 192 headers below
+this hash"**, and a catching-up peer issues many such requests at once, each
+answered independently. This is the ordinary forward sync — the same shape a
+snapshot sync's header walk uses, which is why the walk is 92% of a snapshot
+sync (see [`cross-client-snap-sync.md`](./cross-client-snap-sync.md)).
+
+Serving nine million headers therefore means answering roughly **48,000 of
+these requests**, each one a 192-header run.
+
+### Why that is expensive
+
+A header lives in RocksDB under its **hash**. Hashes are uniformly distributed,
+so 192 consecutive blocks live in 192 unrelated places. One request is
+192 independent point lookups, each reading a whole SST block — and often an
+index block above it — to return 1.1 KB.
+
+Worse, they were originally issued *serially*: each lookup waited for the one
+before it, so a single request cost 192 round trips to the device, one at a
+time. `headers_by_hash` now issues them through a thread pool
+(`--read-threads`, default 16) so they overlap.
 
 Measured while serving headers to one syncing client:
 
@@ -25,9 +50,9 @@ Measured while serving headers to one syncing client:
 
 **~7.1 KB of disk read to deliver 1.1 KB of header.**
 
-The two columns are the design argument. Issuing those 192 lookups
-concurrently instead of one after another raised throughput sevenfold and left
-amplification where it was. That is the general shape of the thing:
+The two columns are the design argument. Issuing those 192 lookups through a
+16-deep queue instead of one after another raised throughput sevenfold and
+left amplification where it was. That is the general shape of the thing:
 
 > **Concurrency hides latency. It does not reduce the bytes read.**
 > Only the layout does.
@@ -42,12 +67,18 @@ Headers are the right place to attack it:
 - they are what a syncing peer asks for most;
 - they are immutable once settled, so a format that cannot be updated in place
   costs nothing;
-- they are read in **runs**, and a run of consecutive blocks can be made a run
-  of adjacent bytes, which turns 192 lookups into one read.
+- they are read in **runs** of exactly the shape above, and a run of
+  consecutive blocks can be made a run of adjacent bytes.
 
-The last point is the one that matters. Everything in §2 follows from wanting
-"the next 192 headers" to be a single contiguous read rather than a
-scattered-gather over a B-tree.
+The last point is the one that matters, and it is what makes the fix
+disproportionate to the effort. The request is already "192 consecutive
+blocks"; it is only the storage that scatters them. Key the same data by
+*number* in a flat file and that request becomes **one index read of 1,920
+bytes followed by one data read of about 203 KB** — two reads where there were
+192, and no amplification beyond the page granularity of the device.
+
+Everything in §2 follows from wanting that, and nothing in §2 would be worth
+doing for a workload that read headers one at a time in random order.
 
 ## 2. How it works
 
