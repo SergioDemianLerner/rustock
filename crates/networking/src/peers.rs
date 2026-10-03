@@ -108,6 +108,25 @@ impl PeerStore {
             .collect()
     }
 
+    /// Peers that announced the `snap` capability.
+    ///
+    /// The gate on all six snapshot messages, for the same reason as
+    /// `peers_understanding_block_range`: rskj resolves an incoming id through
+    /// `MessageType.valueOfType`, which throws on an unknown one, and the
+    /// connection is dropped during decoding. A peer that did not negotiate
+    /// `snap` therefore does not ignore a snapshot request -- it disconnects.
+    /// Spreading requests over every connected peer costs peers rather than
+    /// spreading load.
+    pub async fn peers_serving_snapshots(&self) -> Vec<B512> {
+        self.connected_peers
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, p)| p.caps.snap)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Whether this peer can serve a block at `number`.
     ///
     /// A peer that never stated a range serves everything: that is what every
@@ -458,5 +477,71 @@ mod served_range_tests {
         assert!(store.serves(&id, 100).await);
         store.set_earliest_block(&id, 9_275_000).await;
         assert!(!store.serves(&id, 100).await);
+    }
+}
+
+#[cfg(test)]
+mod snap_capability_tests {
+    use super::*;
+    use crate::handshake::PeerCapabilities;
+
+    fn caps(snap: bool) -> PeerCapabilities {
+        PeerCapabilities { rsk_version: 62, snap }
+    }
+
+    async fn store_with(peers: &[(u8, bool)]) -> (PeerStore, Vec<B512>) {
+        let store = PeerStore::new();
+        let mut ids = Vec::new();
+        for (tag, snap) in peers {
+            let id = B512::repeat_byte(*tag);
+            let (tx, _rx) = mpsc::channel(4);
+            store.add_peer_with(id, tx, caps(*snap)).await;
+            ids.push(id);
+        }
+        (store, ids)
+    }
+
+    /// The six snapshot messages must go only to peers that announced `snap`.
+    /// rskj closes the connection on an unknown message id, so asking the
+    /// wrong peer loses it rather than merely wasting a request.
+    #[tokio::test]
+    async fn only_snap_capable_peers_are_offered_for_snapshot_work() {
+        let (store, ids) = store_with(&[(1, true), (2, false), (3, true), (4, false)]).await;
+
+        let mut serving = store.peers_serving_snapshots().await;
+        serving.sort();
+        let mut want = vec![ids[0], ids[2]];
+        want.sort();
+
+        assert_eq!(serving, want, "only the snap-capable peers");
+        assert_eq!(store.peers().await.len(), 4, "all four are still connected");
+    }
+
+    /// With nobody snap-capable the answer is an empty set, not everyone.
+    /// Falling back to all peers is what would disconnect them.
+    #[tokio::test]
+    async fn no_snap_capable_peers_yields_nothing_rather_than_everyone() {
+        let (store, _) = store_with(&[(1, false), (2, false)]).await;
+        assert!(store.peers_serving_snapshots().await.is_empty());
+        assert_eq!(store.peers().await.len(), 2);
+    }
+
+    /// The two capability gates are independent: `snap` is its own
+    /// announcement and does not follow from the rsk protocol version.
+    #[tokio::test]
+    async fn the_snap_gate_is_independent_of_the_rsk_version() {
+        let store = PeerStore::new();
+        let id = B512::repeat_byte(9);
+        let (tx, _rx) = mpsc::channel(4);
+        // rsk/63 -- understands the range extension -- but no snap capability.
+        store
+            .add_peer_with(id, tx, PeerCapabilities { rsk_version: 63, snap: false })
+            .await;
+
+        assert_eq!(store.peers_understanding_block_range().await, vec![id]);
+        assert!(
+            store.peers_serving_snapshots().await.is_empty(),
+            "rsk/63 does not imply snap"
+        );
     }
 }
