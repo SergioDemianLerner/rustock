@@ -192,6 +192,13 @@ pub struct SnapSession {
     /// Bounds the peer's claimed cumulative difficulty before the walk is
     /// committed to. `None` once the verdict is in.
     gate: Option<crate::sampler::SamplingGate>,
+    /// Whether this session's peer negotiated `rsk/63` and will send uncle
+    /// headers alongside trunk headers.
+    ///
+    /// Set by the service, which is where a peer's capabilities can be looked
+    /// up. It decides whether the sampling gate is worth running at all: see
+    /// [`crate::sampler::WALK_INSTEAD_BELOW`].
+    peer_serves_uncles: bool,
     /// When the current phase began, and when it last said so.
     phase_started: Instant,
     last_report: Instant,
@@ -226,6 +233,7 @@ impl SnapSession {
             blocks_cursor: 0,
             blocks_in_flight: false,
             gate: None,
+            peer_serves_uncles: false,
             phase_started: Instant::now(),
             last_report: Instant::now(),
             fruitless_blocks: 0,
@@ -544,9 +552,31 @@ impl SnapSession {
         // sampling refutes only a claim made at or below the checkpoint
         // height, which an attacker steps around for free. The two are one
         // switch for that reason.
+        //
+        // One case skips it. Each sampled height costs a message -- scattered
+        // heights cannot be batched -- while the walk carries `HEADER_CHUNK`
+        // per message, so over a short enough window sampling spends the same
+        // requests to see a fraction of the data and ends with a bound where
+        // the walk ends with the exact number. That is only true of a peer
+        // that sends the uncles: from an `rsk/62` peer the walk sums header
+        // difficulty alone and computes a *lower* bound, which is worse than
+        // the gate's upper one. So the capability decides, not the window.
         let defence = self.config.checkpoint_defence;
         if let Some(checkpoint) = self.config.checkpoint.filter(|_| defence.any()) {
-            if header.number > checkpoint.number {
+            let window = header.number.saturating_sub(checkpoint.number);
+            let walk_is_cheaper =
+                self.peer_serves_uncles && window < crate::sampler::WALK_INSTEAD_BELOW;
+            if walk_is_cheaper {
+                info!(
+                    target: "rustock::snap",
+                    "skipping the sampling gate: {} blocks above the checkpoint is under \
+                     the {} where walking costs the same requests, and this peer serves \
+                     uncle headers, so the walk establishes the work exactly",
+                    window,
+                    crate::sampler::WALK_INSTEAD_BELOW
+                );
+            }
+            if header.number > checkpoint.number && !walk_is_cheaper {
                 self.gate = Some(crate::sampler::SamplingGate::new(
                     checkpoint,
                     self.checkpoint_td,
@@ -580,6 +610,14 @@ impl SnapSession {
     /// `BlockHeadersResponse` delivers them.
     /// Headers delivered with their uncles, so the walk can total the work
     /// exactly rather than bounding it from below.
+    /// Record whether this session's peer serves headers-with-uncles.
+    ///
+    /// Must be called before the status response is handled, since that is
+    /// where the gate is built or skipped.
+    pub fn set_peer_serves_uncles(&mut self, yes: bool) {
+        self.peer_serves_uncles = yes;
+    }
+
     pub fn on_headers_with_uncles(
         &mut self,
         point: u64,

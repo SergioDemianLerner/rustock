@@ -1151,6 +1151,82 @@ fn a_checkpoint_gates_the_walk() {
     );
 }
 
+/// Builds a gated session offering a checkpoint `window` blocks above the
+/// shipped one, and reports the phase the status left it in.
+#[cfg(test)]
+fn phase_for_window(window: u64, peer_serves_uncles: bool) -> Phase {
+    use rustock_core::checkpoint::MAINNET_CHECKPOINT;
+
+    let cp = MAINNET_CHECKPOINT;
+    let f = fixture(4);
+    let mut session = SnapSession::new(
+        SnapConfig {
+            client_enabled: true,
+            checkpoint: Some(cp),
+            checkpoint_defence: rustock_core::checkpoint::CheckpointDefence {
+                verify_hash: false,
+                bound_work: true,
+            },
+            ..SnapConfig::default()
+        },
+        f.store.clone(),
+        Arc::new(MemoryTrieStore::new()) as Arc<dyn TrieStore>,
+        Arc::new(rustock_core::validation::HeaderVerifier::new()),
+    );
+    session.set_peer_serves_uncles(peer_serves_uncles);
+    let offered = block(header(cp.number + window, B256::ZERO, f.state_root, 100));
+    let _ = session.on_status(
+        std::slice::from_ref(&offered),
+        &[cp.cumulative_difficulty],
+        1024,
+        0,
+    );
+    session.phase()
+}
+
+/// Over a short window, a peer that serves uncle headers is walked rather than
+/// sampled.
+///
+/// Each sampled height costs one message, so below `WALK_INSTEAD_BELOW` the
+/// gate spends a walk's worth of requests to see a fraction of the data — and
+/// ends with a bound where the walk, fed uncles, ends with the exact number.
+#[test]
+fn a_short_window_walks_a_peer_that_serves_uncles() {
+    let window = crate::sampler::WALK_INSTEAD_BELOW - 1_000;
+    assert_eq!(
+        phase_for_window(window, true),
+        Phase::VerifyingHeaders,
+        "under the crossover an rsk/63 peer should be walked, not sampled"
+    );
+}
+
+/// The same window, but the peer speaks `rsk/62`.
+///
+/// The crossover turns on the capability, not the window. Walking an rsk/62
+/// peer sums header difficulty alone, which is a *lower* bound on the chain's
+/// work — worse than the gate's upper one, not better.
+#[test]
+fn a_short_window_still_samples_a_peer_without_uncles() {
+    let window = crate::sampler::WALK_INSTEAD_BELOW - 1_000;
+    assert_eq!(
+        phase_for_window(window, false),
+        Phase::SamplingClaim,
+        "without the uncle capability the walk cannot establish the work, so sample"
+    );
+}
+
+/// Past the crossover the walk costs more requests than the gate and vastly
+/// more bytes, so sampling is right again even for a peer that serves uncles.
+#[test]
+fn a_long_window_samples_even_a_peer_that_serves_uncles() {
+    let window = crate::sampler::WALK_INSTEAD_BELOW + 50_000;
+    assert_eq!(
+        phase_for_window(window, true),
+        Phase::SamplingClaim,
+        "above the crossover sampling is the cheaper vetting, uncles or not"
+    );
+}
+
 /// Without a checkpoint — any chain but mainnet — the walk runs as before.
 #[test]
 fn no_checkpoint_means_no_gate() {

@@ -142,13 +142,13 @@
 
 # What this node does with the difficulty checkpoint it ships.
 #
-# Two independent switches. Both are off by default, which is no defence:
+# Two independent switches. `bound_work` is on by default; `verify_hash` is not:
 #
 #   verify_hash  bound_work   what you get
 #   -----------  ----------   ------------------------------------------------
 #   false        false        nothing
 #   true         false        a peer must be on the checkpointed chain
-#   false        true         a peer's claimed work is bounded, and this build
+#   false        true         a peer's claimed work is bounded, and this build  <- default
 #                             declares no winning fork
 #   true         true         both
 #
@@ -164,14 +164,18 @@
 # verify_hash = false              # default — off; see the note above
 
 # Bound a peer's claimed cumulative difficulty, sampling its chain above the
-# checkpoint to do it. Costs about 340 header requests per peer judged.
+# checkpoint to do it. Costs about 585 messages per peer judged.
 #
 # The bound and the sampling are one setting on purpose. Bounding without
 # sampling refutes a claim only for a height at or below the checkpoint, which
 # an attacker avoids for free by claiming a height above it — and would claim
 # anyway, since a sync peer wants to look like the longest chain. A setting
 # that bounded without sampling would read as a defence and be none.
-# bound_work = false               # default — off; bound and sampling together
+#
+# On by default: it is the only half with adversarial value, and unlike
+# verify_hash it does not ask this node to declare which fork is canonical.
+# Set false here, or pass `--checkpoint-bound-work false`, to turn it off.
+# bound_work = true                # default — on; bound and sampling together
 
 # Snapshot sync: catch up by downloading a state rather than executing into
 # one. The header chain is verified to the snapshot point first — a snapshot is

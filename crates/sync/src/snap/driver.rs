@@ -364,6 +364,12 @@ impl SnapDriver {
         out
     }
 
+    /// Passed through to the session before the status is handled: the
+    /// service is the only place a peer's capabilities can be looked up.
+    pub fn set_peer_serves_uncles(&mut self, yes: bool) {
+        self.session.set_peer_serves_uncles(yes);
+    }
+
     pub fn on_status(
         &mut self,
         id: u64,
