@@ -95,15 +95,44 @@ says 358 — above the truth, which is what an upper bound has to be.
 ### Why not a rise-then-fall shape
 
 The intuitive model is a triangle: rise as fast as possible, turn, fall onto
-the next sample. It is wrong, because **consensus also permits difficulty to
-stay unchanged**, and a triangle cannot express a block that does not move — it
+the next sample. It is wrong, and the reason is sharper than "it is less
+accurate" — **for an important case it has no valid path at all.**
+
+A rise and a fall do not cancel:
+
+```
+rise x fall  =  (1 + 1/divisor) x (1 - 1/divisor)  =  1 - 1/divisor²
+```
+
+At `divisor = 4` that is 15/16: a rise followed by a fall lands a sixteenth
+*below* where it started. So when two consecutive samples carry the **same**
+difficulty, no sequence of max-rate moves can return to it. Every such path
+ends somewhere other than `to`.
+
+The one path that does land is the flat one — difficulty unchanged the whole
+way, which consensus permits. A triangle cannot express it, because a triangle
 is always rising or falling.
 
-Taking the lower of two ceilings admits flat chains for free: once the rise
-limit exceeds the cap, `d` simply tracks the cap, which may sit level. The
-triangle version produced bounds *below* a flat chain's real work on short
-spans, and a bound below reality rejects honest peers — the one failure an
-upper bound must never have.
+Worked, with `from = to = 100`, `span = 2`, `divisor = 4`:
+
+| path | ends at | sum | lands on `to`? |
+|---|---|---|---|
+| rise, rise | 156.25 | 281.25 | no |
+| rise, fall | 93.75 | 218.75 | no |
+| fall, rise | 93.75 | 168.75 | no |
+| fall, fall | 56.25 | 131.25 | no |
+| **flat** | **100** | **200** | **yes** |
+
+Note the rise-then-fall path sums *above* the flat chain, not below. The
+triangle's problem is not that it undercounts — it is that it cannot land, and
+an implementation forced to produce something anyway can easily return a figure
+below the flat chain's real 200. A bound below reality rejects honest peers,
+which is the one failure an upper bound must never have.
+
+Taking the lower of two ceilings avoids all of this without needing a concept
+for "unchanged": once the rise limit exceeds the cap, `d` simply tracks the
+cap, which may sit level. That *is* the flat chain, arrived at by arithmetic
+rather than by special-casing.
 
 ### Why the `min_difficulty` clamp is safe
 
