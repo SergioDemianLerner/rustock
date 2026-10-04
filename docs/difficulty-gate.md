@@ -291,11 +291,27 @@ number of distinct heights a skeleton walk can ask about over the window caps
 `k` in the low thousands, and with it the allowance at roughly **1.4×** the
 truth. No amount of sampling closes the rest.
 
-Closing it is a consensus question. If a block header committed to its own
-cumulative difficulty, the quantity would be exact and the uncle term would
-disappear for any client that walks the headers it is judging — and the 10.5 GB
-of uncle headers a header-only sync currently needs, purely to add up
-difficulty, would disappear with it. That is proposed separately.
+What closes it is **seeing the uncles** -- `BlockHeadersWithUncles`, RSKIP-698
+-- because then the uncle work is not estimated at all. An uncle header carries
+its own proof of work, `unclesHash` binds the list to a block whose proof of
+work covers it, and the uncle rules are checkable against the trunk chain
+already in hand. That costs about 10.5 GB on mainnet today.
+
+**A header field stating the total does not close it**, and an earlier revision
+of this document said it would. That was wrong. Such a field is data, not work:
+a miner can mine a header with valid proof of work and write any cumulative
+total into it, because the rule binding the field to its parent's value is
+enforced by nodes that validate the parent's *body*. Trusting it would be worse
+than the bound it replaced --
+
+```
+  honest chain claims   1.91 x its trunk work   (measured mainnet uncle rate)
+  attacker claims      11.00 x its trunk work   (uncleListLimit, fabricated)
+  attacker needs        1.91 / 11 = 17.4%  of the honest chain's trunk hashpower
+```
+
+-- so no field makes proving work cheaper. Work is proven by exhibiting it, and
+shrinking the proof needs a different proof *system*, not another field.
 
 ## What it costs
 
@@ -525,7 +541,8 @@ trade, not an oversight:
   gate exists to refuse a fabricated chain, not to referee a close race;
 - raising `RANDOM_SAMPLES` tightens it slowly and runs out near 1.4x the truth,
   because the bound is dominated by a range term that shrinks only as `1/k`;
-- closing the rest is a consensus question (RSKIP-699), not a sampling one.
+- closing the rest means seeing the uncles (RSKIP-698), not sampling harder
+  and not a header field -- see *The limit of sampling* above.
 
 ## Tests
 
