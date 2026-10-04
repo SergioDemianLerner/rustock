@@ -58,9 +58,35 @@ is an unarmed one.
 
 ### The sampled half
 
-Above the checkpoint, the node asks the peer for **one header every 768 blocks**
-(`SAMPLE_INTERVAL`), verifies each one's proof of work, and feeds the
-difficulties to `ceiling_for`.
+Above the checkpoint, the node picks heights in two stages, asks the peer for a
+header at each, verifies every one's proof of work, and feeds the results to
+`ceiling_for`.
+
+1. **A random draw** of `RANDOM_SAMPLES = 340` heights, uniformly, from
+   whatever the peer's skeleton has named.
+2. **Gap filling**: evenly spaced extra heights until no gap exceeds
+   `SAMPLE_INTERVAL = 768` blocks.
+
+The two do different jobs and `choose_samples` keeps them separate on purpose.
+
+The random draw is what the **uncle allowance** rests on. The peer is committed
+to its chain before it learns where it will be checked, so the heights it is
+asked about are a uniform sample of a population it has already fixed. A fixed
+grid of `checkpoint + k*768` destroys that: a peer mines real uncles at exactly
+those heights and fabricates between them, for a fraction of a percent of the
+work it claims.
+
+The gap filling proves nothing about uncles. It exists so that no stretch is
+wide enough for the difficulty bound to compound out of usefulness, and it is a
+deterministic function of the draw — counting those positions toward the sample
+count would overstate what the method proves. Evenly spaced rather than
+recursively bisected: bisection yields only power-of-two subdivisions, so a gap
+just over `768 * 2^m` costs nearly twice the requests it needs to.
+
+A skeleton arrives in pieces, so selection runs repeatedly as more heights
+become known. `ChainSampler` keeps the draw it has made and only tops it up
+toward 340 — redrawing from scratch would union one draw onto the next and the
+request count would grow without bound.
 
 The samples must come **from the peer being judged**. If its chain is
 fabricated, nobody else holds those blocks — so a peer that cannot produce them
@@ -171,15 +197,95 @@ unconstrained growth. **This is why the newest sample should sit close to the
 head** — the further the head is beyond the last sample, the looser the
 ceiling.
 
+## The uncle allowance
+
+`max_work_between` bounds **header difficulty**. The quantity a peer claims is
+**cumulative difficulty**, which in RSK is header difficulty plus the
+difficulty of every uncle the block references. Those are not the same number,
+and the gap is not small: measured over 276,000 blocks above the shipped
+checkpoint, uncles add **90.9%** to the work.
+
+A bound on the smaller quantity compared against a claim of the larger one is
+the bug that `uncle_allowance_per_mille` exists to close. Before it, the
+retarget bound of 1.68× header work came to **0.88×** the real work — below the
+honest chain, so every truthful peer would have been judged impossible and the
+node would have bounded itself out of the network. Tightening the sampling
+interval, the obvious optimisation, made it worse.
+
+### How the allowance is computed
+
+Each sampled header carries its `uncle_count`, which is inside what its proof
+of work commits to and so cannot be overstated for a block we looked at.
+Because the heights were drawn at random from a population the peer had already
+fixed, those counts are a uniform sample of it, and a concentration inequality
+turns them into a bound on the mean. The code uses **empirical Bernstein**:
+
+```
+mean <= mean_hat + sqrt(2 * V_hat * L / k) + 3 * R * L / k,   L = ln(3/delta)
+```
+
+with `R = UNCLE_LIST_LIMIT = 10`, `delta = 1e-9`. Empirical Bernstein rather
+than Hoeffding because mainnet's uncle counts are tightly clustered against
+that range of 10 — it pays for the observed *variance* in the square-root term
+and relegates the range to a term in `1/k`.
+
+Every gap bound is then multiplied by `1 + that`.
+
+### What is and is not being claimed
+
+Not that any particular stretch is free of uncles. A peer can hold a run of
+ten-uncle blocks between two samples and no amount of sampling will see it.
+
+What the ceiling needs is weaker: it is a bound on the **sum** over every gap,
+and the allowance multiplies every gap alike, so the quantity that has to be
+bounded is the population mean. A stretch running hot is paid for by the
+stretches that do not. That is why the per-segment objection does not bite, and
+it is also why the allowance must be applied globally rather than per gap.
+
 ### How tight is it
 
-The bound loosens roughly as `(1 + 1/divisor)^(N/2)` across a gap of `N`
-blocks. At `SAMPLE_INTERVAL = 768` and the post-Papyrus divisor of 400, the
-ceiling is about **1.68× the true work** — loose enough to admit any honest
-chain, tight enough that an inflated claim has nowhere to hide.
+Against measured mainnet counts:
 
-That ratio is the knob. A shorter interval tightens the bound and costs more
-requests; a longer one is cheaper and admits more.
+| samples | allowance | vs. the true 1.91 | vs. the 11.0 cap |
+|---|---|---|---|
+| 340 | 4.20 | 2.20× | 0.38× |
+| 1,000 | 2.78 | 1.45× | 0.25× |
+| 3,400 | 2.22 | 1.16× | 0.20× |
+
+So sampling is worth doing — at 340 samples it is nearly three times tighter
+than assuming ten uncles everywhere. But the gain decays slowly, because at
+these counts the bound is dominated by the range term `3*R*L/k`, which does not
+depend on what was observed and shrinks only as `1/k`: at `k = 340` it
+contributes 1.93 of the 3.20.
+
+### End to end
+
+The retarget bound loosens roughly as `(1 + 1/divisor)^(N/2)` across a gap of
+`N` blocks; the uncle allowance multiplies on top, and at reachable sample
+counts it is the larger factor.
+
+With 340 samples over 276,000 blocks and a divisor of 400, the ceiling sits
+about **3.9× the real work in the sampled window**. That window is about 6% of
+the cumulative total, the rest being exact, so against the figure a peer
+actually claims the slack is about **17%**.
+
+That is the honest number and it is not small: a peer can overstate its work by
+a sixth and be judged plausible. The gate is still worth having, because the
+claim an attacker needs to make is not 17% high but orders of magnitude high.
+It exists to refuse a fabricated chain, not to referee a close race.
+
+### The limit of sampling, and the way past it
+
+More samples is the lever, not a different inequality — but it runs out. The
+number of distinct heights a skeleton walk can ask about over the window caps
+`k` in the low thousands, and with it the allowance at roughly **1.4×** the
+truth. No amount of sampling closes the rest.
+
+Closing it is a consensus question. If a block header committed to its own
+cumulative difficulty, the quantity would be exact and the uncle term would
+disappear for any client that walks the headers it is judging — and the 10.5 GB
+of uncle headers a header-only sync currently needs, purely to add up
+difficulty, would disappear with it. That is proposed separately.
 
 ## What it costs
 
@@ -187,8 +293,10 @@ The samples come from one peer, so the budget is the **number of requests**,
 not bytes — rskj's inbound limit is 1,000 messages per minute per peer.
 
 With a checkpoint refreshed each release, the window above it is small: three
-months of chain at 768-block intervals is about **340 samples**, roughly twenty
-seconds against that limit. Sampling the whole chain instead would take about
+months of chain is about **340 samples** after gap filling, roughly twenty
+seconds against that limit. `RANDOM_SAMPLES` is set to that figure for the same
+reason — it is what the request budget affords, and the uncle allowance is as
+tight as that budget allows it to be. Sampling the whole chain instead would take about
 34 minutes, which is the reason the checkpoint exists.
 
 ## The three verdicts

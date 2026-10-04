@@ -35,7 +35,8 @@ use alloy_primitives::{B256, U256};
 use rustock_core::checkpoint::{ceiling_for, CheckpointVerdict, DifficultyCheckpoint};
 use rustock_core::validation::HeaderVerifier;
 use rustock_core::Header;
-use std::collections::BTreeMap;
+use rand::SeedableRng;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Blocks between samples above the checkpoint.
 ///
@@ -51,6 +52,129 @@ pub const SAMPLE_INTERVAL: u64 = 768;
 /// outcome: a peer that will not substantiate its claim is as useless as one
 /// that cannot, and eliminating it costs nothing.
 pub const MISSING_SAMPLES_ALLOWED: usize = 4;
+
+/// How many positions to draw at random before capping the gaps.
+///
+/// This is the number the detection guarantee rests on. A peer fabricating
+/// uncle work at a fraction `f` of its blocks is caught with probability
+/// `1 - (1-f)^k`; at `k = 340` a cheat touching more than about 6% of blocks
+/// survives with probability below 1e-9.
+pub const RANDOM_SAMPLES: usize = 340;
+
+/// Choose which of `available` heights to sample.
+///
+/// Two properties, and they want opposite things:
+///
+/// * **unpredictable** -- the positions must not be a function the peer can
+///   evaluate in advance. It is already committed to its chain when we choose,
+///   so if it cannot know where we will look it must hold the uncles
+///   everywhere or be caught where it does not. A fixed grid of
+///   `checkpoint + k*interval` destroys this: a peer mines real uncles at those
+///   heights and fabricates between them for a fraction of a percent of the
+///   work it claims.
+/// * **no wide gaps** -- `max_work_between` compounds as
+///   `(1 + 1/divisor)^(N/2)`, so a gap left by an unlucky draw makes the
+///   ceiling useless.
+///
+/// So: draw `want` positions uniformly at random, then close any gap wider
+/// than `max_gap` with evenly spaced extras. Evenly spaced rather than
+/// recursively bisected -- bisection only produces power-of-two subdivisions,
+/// so a gap just above `max_gap * 2^m` costs nearly twice what it needs to.
+///
+/// **Only the random draw carries the detection guarantee.** The gap-filling
+/// positions are a deterministic function of it and serve the difficulty bound
+/// alone; counting them toward the sample count would overstate what the
+/// method proves.
+pub fn choose_samples(
+    available: &[u64],
+    want: usize,
+    max_gap: u64,
+    rng: &mut impl rand::Rng,
+) -> Vec<u64> {
+    if available.is_empty() {
+        return Vec::new();
+    }
+    let chosen = draw_random(available, want, rng);
+    fill_gaps(available, chosen, max_gap)
+}
+
+/// The unpredictable half: `want` heights drawn uniformly without replacement.
+pub fn draw_random(available: &[u64], want: usize, rng: &mut impl rand::Rng) -> Vec<u64> {
+    let mut chosen: Vec<u64> = if want >= available.len() {
+        available.to_vec()
+    } else {
+        let mut pool: Vec<u64> = available.to_vec();
+        // Partial Fisher-Yates: the first `want` entries become the draw.
+        for i in 0..want {
+            let j = i + (rng.next_u64() as usize) % (pool.len() - i);
+            pool.swap(i, j);
+        }
+        pool.truncate(want);
+        pool
+    };
+    chosen.sort_unstable();
+    chosen.dedup();
+    chosen
+}
+
+/// The deterministic half: add evenly spaced heights until no gap exceeds
+/// `max_gap`. Proves nothing about uncles; it is what keeps the difficulty
+/// bound from compounding over a stretch nobody looked at.
+pub fn fill_gaps(available: &[u64], chosen: Vec<u64>, max_gap: u64) -> Vec<u64> {
+    if available.is_empty() {
+        return Vec::new();
+    }
+    if max_gap == 0 {
+        return chosen;
+    }
+
+    // Close every gap, including the one before the first chosen height and
+    // after the last: an unbounded run at either end bounds nothing.
+    let lowest = *available.first().unwrap();
+    let highest = *available.last().unwrap();
+    let mut filled = Vec::with_capacity(chosen.len() + 16);
+    let mut previous = lowest.saturating_sub(1);
+    for &at in chosen.iter().chain(std::iter::once(&highest)) {
+        let gap = at.saturating_sub(previous);
+        if gap > max_gap {
+            // `ceil(gap / max_gap) - 1` interior points, evenly spaced.
+            let pieces = gap.div_ceil(max_gap);
+            for piece in 1..pieces {
+                let want_at = previous + (gap * piece) / pieces;
+                if let Some(&nearest) = nearest_available(available, want_at) {
+                    if nearest > previous && nearest < at {
+                        filled.push(nearest);
+                    }
+                }
+            }
+        }
+        filled.push(at);
+        previous = at;
+    }
+    filled.sort_unstable();
+    filled.dedup();
+    filled
+}
+
+/// The available height closest to `target`. Positions can only be sampled
+/// where the peer's skeleton gave a hash, so a computed offset is rounded to
+/// one that can actually be asked for.
+fn nearest_available(available: &[u64], target: u64) -> Option<&u64> {
+    match available.binary_search(&target) {
+        Ok(i) => available.get(i),
+        Err(i) => {
+            let before = i.checked_sub(1).and_then(|j| available.get(j));
+            let after = available.get(i);
+            match (before, after) {
+                (Some(b), Some(a)) => {
+                    Some(if target - *b <= *a - target { b } else { a })
+                }
+                (Some(b), None) => Some(b),
+                (None, a) => a,
+            }
+        }
+    }
+}
 
 /// Where a sample sits and what was asked of the peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,8 +192,15 @@ pub struct ChainSampler {
     min_difficulty: U256,
     /// Heights still to hear about, and the hash each was asked for.
     outstanding: BTreeMap<u64, B256>,
-    /// Verified difficulties, by height.
-    collected: BTreeMap<u64, U256>,
+    /// Every height the peer's skeleton has named, with its hash. The pool
+    /// that samples are drawn from.
+    known: BTreeMap<u64, B256>,
+    /// Verified samples, by height: difficulty and uncle count.
+    ///
+    /// The uncle count is what makes the ceiling cover cumulative difficulty
+    /// rather than header difficulty alone. It comes from the header, so it is
+    /// inside what the block's proof of work commits to.
+    collected: BTreeMap<u64, (U256, u64)>,
     pub(crate) missing: usize,
     /// Whether the checkpoint block itself was demanded.
     verify_hash: bool,
@@ -77,6 +208,17 @@ pub struct ChainSampler {
     /// build ships. Starts `true` when `verify_hash` is off, since then the
     /// question was never asked.
     on_checkpoint_chain: bool,
+    /// The random half of the selection, kept across calls.
+    ///
+    /// A skeleton arrives in pieces, so selection runs repeatedly. Redrawing
+    /// from scratch each time would union one draw onto the next and the
+    /// request count would grow without bound; keeping the draw means later
+    /// calls only top it up toward [`RANDOM_SAMPLES`].
+    drawn: BTreeSet<u64>,
+    /// Seeded once, from the OS. The peer must not be able to predict or
+    /// replay where it will be checked, so this is never seeded from anything
+    /// it can see.
+    rng: rand::rngs::StdRng,
 }
 
 impl ChainSampler {
@@ -105,24 +247,22 @@ impl ChainSampler {
             outstanding.insert(checkpoint.number, checkpoint.hash);
         }
 
-        let mut next = checkpoint.number.saturating_add(SAMPLE_INTERVAL);
-        for &(number, hash) in skeleton {
-            if number > checkpoint.number && number >= next {
-                outstanding.insert(number, hash);
-                next = number.saturating_add(SAMPLE_INTERVAL);
-            }
-        }
-        Self {
+        let mut sampler = Self {
             checkpoint,
             head,
             divisor,
             min_difficulty,
             outstanding,
+            known: BTreeMap::new(),
             collected: BTreeMap::new(),
             missing: 0,
             verify_hash,
             on_checkpoint_chain: !verify_hash,
-        }
+            drawn: BTreeSet::new(),
+            rng: rand::rngs::StdRng::from_entropy(),
+        };
+        sampler.absorb_skeleton(skeleton);
+        sampler
     }
 
     /// Whether the peer showed it is on the checkpointed chain.
@@ -134,17 +274,51 @@ impl ChainSampler {
         self.on_checkpoint_chain
     }
 
-    /// Adds skeleton identifiers, picking the ones that fall on the sampling
-    /// interval. Called as identifiers arrive rather than all at once,
-    /// because a skeleton response covers only part of the window.
+    /// Adds skeleton identifiers and chooses which of them to sample.
+    ///
+    /// Called as identifiers arrive rather than all at once, because a
+    /// skeleton response covers only part of the window.
+    ///
+    /// Selection is [`choose_samples`]: an unpredictable draw, then enough
+    /// evenly spaced extras to cap every gap at [`SAMPLE_INTERVAL`]. It
+    /// replaces picking every height on a fixed multiple of the interval,
+    /// which a peer could evaluate in advance and prepare for.
     pub fn absorb_skeleton(&mut self, identifiers: &[(u64, B256)]) {
         for &(number, hash) in identifiers {
             if number <= self.checkpoint.number || self.collected.contains_key(&number) {
                 continue;
             }
-            let since = number - self.checkpoint.number;
-            if since % SAMPLE_INTERVAL == 0 {
-                self.outstanding.entry(number).or_insert(hash);
+            self.known.insert(number, hash);
+        }
+        self.reselect();
+    }
+
+    /// Recompute which known heights to ask for.
+    ///
+    /// Anything already answered stays answered; this only adds to
+    /// `outstanding`, so a selection that shifts as more of the skeleton
+    /// arrives never discards work already done.
+    fn reselect(&mut self) {
+        let heights: Vec<u64> = self.known.keys().copied().collect();
+        if heights.is_empty() {
+            return;
+        }
+        // Top the draw up rather than remaking it, so that the heights already
+        // asked for keep whatever answers they have.
+        let want = RANDOM_SAMPLES.saturating_sub(self.drawn.len());
+        if want > 0 {
+            let fresh: Vec<u64> =
+                heights.iter().copied().filter(|h| !self.drawn.contains(h)).collect();
+            self.drawn.extend(draw_random(&fresh, want, &mut self.rng));
+        }
+        let chosen: Vec<u64> = self.drawn.iter().copied().collect();
+        let picked = fill_gaps(&heights, chosen, SAMPLE_INTERVAL);
+        for at in picked {
+            if self.collected.contains_key(&at) {
+                continue;
+            }
+            if let Some(&hash) = self.known.get(&at) {
+                self.outstanding.entry(at).or_insert(hash);
             }
         }
     }
@@ -190,7 +364,8 @@ impl ChainSampler {
             // it is asked for to be answered, not to be counted.
             self.on_checkpoint_chain = true;
         }
-        self.collected.insert(number, header.difficulty);
+        self.collected
+            .insert(number, (header.difficulty, header.uncle_count));
         true
     }
 
@@ -208,8 +383,13 @@ impl ChainSampler {
 
     /// The ceiling implied by the checkpoint and the samples gathered.
     pub fn ceiling(&self) -> U256 {
-        let samples: Vec<(u64, U256)> =
-            self.collected.iter().map(|(&n, &d)| (n, d)).collect();
+        let samples: Vec<rustock_core::checkpoint::Sample> = self
+            .collected
+            .iter()
+            .map(|(&number, &(difficulty, uncle_count))| {
+                rustock_core::checkpoint::Sample { number, difficulty, uncle_count }
+            })
+            .collect();
         ceiling_for(
             &self.checkpoint,
             &samples,
@@ -877,5 +1057,93 @@ mod low_height_high_claim_tests {
             assert!(defence.any(), "{defence:?} should be armed");
         }
         assert!(!CheckpointDefence::NONE.any(), "NONE is the no-defence row");
+    }
+}
+
+#[cfg(test)]
+mod choose_samples_tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    fn rng(seed: u64) -> rand::rngs::StdRng {
+        rand::rngs::StdRng::seed_from_u64(seed)
+    }
+
+    /// Heights the peer's skeleton makes askable, at 192-block granularity.
+    fn available(from: u64, blocks: u64) -> Vec<u64> {
+        (1..=blocks / 192).map(|i| from + i * 192).collect()
+    }
+
+    /// The property the whole method rests on: a peer must not be able to
+    /// compute where it will be checked. A fixed grid is exactly what it could.
+    #[test]
+    fn positions_differ_between_runs() {
+        let a = available(9_020_000, 239_524);
+        let first = choose_samples(&a, RANDOM_SAMPLES, 768, &mut rng(1));
+        let second = choose_samples(&a, RANDOM_SAMPLES, 768, &mut rng(2));
+        assert_ne!(first, second, "two draws produced identical positions");
+    }
+
+    /// After filling, no two consecutive samples are more than `max_gap`
+    /// apart — which is what keeps `max_work_between` from compounding without
+    /// bound.
+    #[test]
+    fn no_gap_exceeds_the_cap() {
+        for seed in 0..25u64 {
+            for &window in &[29_952u64, 79_841, 239_524] {
+                let a = available(9_020_000, window);
+                let picked = choose_samples(&a, RANDOM_SAMPLES, 768, &mut rng(seed));
+                let mut previous = a[0] - 192;
+                for at in &picked {
+                    assert!(
+                        at - previous <= 768,
+                        "gap of {} at #{at} (window {window}, seed {seed})",
+                        at - previous
+                    );
+                    previous = *at;
+                }
+            }
+        }
+    }
+
+    /// Filling a gap costs `ceil(gap / max_gap) - 1` points, not the
+    /// power-of-two count a recursive bisection would spend.
+    #[test]
+    fn filling_is_evenly_spaced_not_bisected() {
+        // One available height every block, so the fill is unconstrained by
+        // what can be asked for and the arithmetic shows through.
+        let a: Vec<u64> = (0..=6_200).collect();
+        // A single chosen point at the far end leaves one 6,200-wide gap.
+        let picked = choose_samples(&a, 1, 768, &mut rng(99));
+        assert!(
+            picked.len() <= 10,
+            "a 6,200 gap needs 8 interior points; bisection would spend 15, got {}",
+            picked.len()
+        );
+    }
+
+    /// Asking for more than exists yields everything, not a panic or a short
+    /// draw that silently weakens the guarantee.
+    #[test]
+    fn wanting_more_than_is_available_takes_all_of_it() {
+        let a = available(9_020_000, 19_960); // ~104 askable heights
+        let picked = choose_samples(&a, RANDOM_SAMPLES, 768, &mut rng(5));
+        assert_eq!(picked.len(), a.len());
+    }
+
+    /// An empty skeleton is not a crash.
+    #[test]
+    fn nothing_available_is_nothing_chosen() {
+        assert!(choose_samples(&[], RANDOM_SAMPLES, 768, &mut rng(1)).is_empty());
+    }
+
+    /// Every chosen height must be one the peer can actually be asked for.
+    #[test]
+    fn every_choice_is_askable() {
+        let a = available(9_020_000, 79_841);
+        let picked = choose_samples(&a, RANDOM_SAMPLES, 768, &mut rng(7));
+        for at in &picked {
+            assert!(a.contains(at), "#{at} is not in the skeleton");
+        }
     }
 }
