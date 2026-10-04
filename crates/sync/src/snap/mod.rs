@@ -35,12 +35,15 @@
 
 pub mod client;
 pub mod driver;
+pub mod forward;
 pub mod headers;
 pub mod indexer;
 pub mod rate;
 pub mod server;
 pub mod session;
 
+#[cfg(test)]
+mod forward_tests;
 #[cfg(test)]
 mod header_tests;
 #[cfg(test)]
