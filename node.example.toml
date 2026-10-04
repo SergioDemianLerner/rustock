@@ -197,6 +197,14 @@
 # Without it this node can answer RPC about its window only, and cannot help
 # anyone else sync past it.
 # index_history = true              # default
+# Establish the header chain by ascending from a block this node already holds,
+# with the uncles alongside (rsk/63, RSKIP-698), instead of descending from the
+# peer's offered checkpoint. Totals cumulative difficulty exactly, so the
+# sampling gate and the claimed-work ceiling are not needed — the offered
+# checkpoint is checked against the chain this node proved for itself. A peer at
+# rsk/62 cannot serve it and the session falls back to the descending walk.
+# Experimental: the descending walk is what has been run against mainnet.
+# forward_headers = false           # default
 # peer_rate = 8388608               # default — state bytes/s served to ONE peer
 # total_rate = 33554432             # default — state bytes/s this server produces in total
 

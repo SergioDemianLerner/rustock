@@ -143,6 +143,9 @@ pub enum Phase {
     SamplingClaim,
     /// Walking the header chain back toward a block we already trust.
     VerifyingHeaders,
+    /// Establishing the chain by ascending from ground already held, the
+    /// alternative to `VerifyingHeaders`. See `super::forward`.
+    AscendingHeaders,
     /// Downloading the state under the checkpoint's root.
     DownloadingState,
     /// Filling in the block bodies behind the checkpoint.
@@ -192,6 +195,9 @@ pub struct SnapSession {
     /// Bounds the peer's claimed cumulative difficulty before the walk is
     /// committed to. `None` once the verdict is in.
     gate: Option<crate::sampler::SamplingGate>,
+    /// The ascending walk, when `SnapConfig::forward_headers` chose it.
+    /// Mutually exclusive with `walk`.
+    ascent: Option<super::forward::ForwardSync>,
     /// Whether this session's peer negotiated `rsk/63` and will send uncle
     /// headers alongside trunk headers.
     ///
@@ -233,6 +239,7 @@ impl SnapSession {
             blocks_cursor: 0,
             blocks_in_flight: false,
             gate: None,
+            ascent: None,
             peer_serves_uncles: false,
             phase_started: Instant::now(),
             last_report: Instant::now(),
@@ -323,6 +330,25 @@ impl SnapSession {
         let elapsed = self.phase_started.elapsed().as_secs_f64();
 
         match self.phase {
+            Phase::AscendingHeaders => {
+                let Some(ascent) = self.ascent.as_ref() else { return };
+                let Some(top) = self.checkpoint.as_ref().map(|c| c.number) else { return };
+                let at = ascent.frontier();
+                if top == 0 {
+                    return;
+                }
+                let done = at as f64 / top as f64;
+                let eta = if done > 0.0 { elapsed * (1.0 - done) / done } else { 0.0 };
+                info!(
+                    target: "rustock::snap",
+                    "ascending the header chain: {:.1}% (at #{at} of #{top}), \
+                     {:.0}s elapsed, ~{:.0}s left",
+                    done * 100.0,
+                    elapsed,
+                    eta
+                );
+            }
+
             Phase::VerifyingHeaders => {
                 let Some(walk) = self.walk.as_ref() else { return };
                 let top = walk.top_number();
@@ -436,6 +462,26 @@ impl SnapSession {
                         }
                     },
                 }
+            }
+
+            Phase::AscendingHeaders => {
+                let Some(ascent) = self.ascent.as_mut() else { return Vec::new() };
+                ascent
+                    .wants(budget)
+                    .into_iter()
+                    .map(|want| match want {
+                        super::forward::Want::Skeleton { start } => {
+                            Action::RequestSkeleton { start }
+                        }
+                        // Emitted as a plain header request: the service
+                        // upgrades it to `BlockHeadersWithUnclesRequest` for a
+                        // peer that negotiated `rsk/63`, which is the only kind
+                        // this phase runs against.
+                        super::forward::Want::Headers { from, count, point } => {
+                            Action::RequestHeaders { from, count, point }
+                        }
+                    })
+                    .collect()
             }
 
             Phase::VerifyingHeaders => {
@@ -590,6 +636,39 @@ impl SnapSession {
             }
         }
 
+        // The ascent is the alternative shape, and it needs two things the
+        // descending walk does not: a peer that sends uncles, because it totals
+        // the work exactly rather than bounding it, and ground to stand on.
+        // Genesis is that ground for a node with nothing else.
+        let ascending = self.config.forward_headers && self.peer_serves_uncles;
+        if ascending {
+            match self.anchor() {
+                Some((number, hash, work)) if number < header.number => {
+                    info!(
+                        target: "rustock::snap",
+                        "ascending the header chain from #{number} to #{}, with uncles",
+                        header.number
+                    );
+                    self.ascent = Some(super::forward::ForwardSync::new(
+                        number,
+                        hash,
+                        work,
+                        header.number,
+                        self.store.clone(),
+                        self.verifier.clone(),
+                    ));
+                }
+                _ => {
+                    warn!(
+                        target: "rustock::snap",
+                        "forward headers asked for, but this node has no anchor below \
+                         #{}; falling back to the descending walk",
+                        header.number
+                    );
+                }
+            }
+        }
+
         self.walk = Some(super::headers::HeaderWalk::new(
             header.clone(),
             self.store.clone(),
@@ -601,9 +680,69 @@ impl SnapSession {
         // decides whether it runs. Only move to the walk if nothing is
         // bounding the claim first.
         if self.phase != Phase::SamplingClaim {
-            self.set_phase(Phase::VerifyingHeaders);
+            self.set_phase(if self.ascent.is_some() {
+                Phase::AscendingHeaders
+            } else {
+                Phase::VerifyingHeaders
+            });
         }
         self.poll()
+    }
+
+    /// Once the ascent reaches the checkpoint, check the offer against the
+    /// chain this node just established for itself, and move to the state.
+    ///
+    /// This is what replaces the sampling gate and the `OverstatedDifficulty`
+    /// ceiling in this shape. Neither is needed: the work is not bounded, it is
+    /// counted, and the offered block is either the one at that height on the
+    /// chain we proved or it is not.
+    fn finish_ascent_or_continue(&mut self) -> Vec<Action> {
+        let Some(ascent) = self.ascent.as_ref() else { return Vec::new() };
+        if !ascent.done() {
+            return self.poll();
+        }
+        let established = ascent.work();
+        let Some(checkpoint) = self.checkpoint.clone() else { return Vec::new() };
+
+        // The ascent wrote every header it proved, so the question is whether
+        // the block offered is the one it arrived at.
+        if ascent.frontier() != checkpoint.number {
+            return self.fail(SnapFailure::NoCommonAncestor);
+        }
+
+        if self.checkpoint_td > established {
+            return self.fail(SnapFailure::OverstatedDifficulty {
+                claimed: self.checkpoint_td,
+                ceiling: established,
+            });
+        }
+
+        info!(
+            target: "rustock::snap",
+            "header chain established to #{} by ascent: cumulative difficulty {} \
+             (exact, uncles proven); downloading state",
+            checkpoint.number, established
+        );
+        self.set_phase(Phase::DownloadingState);
+        self.poll()
+    }
+
+    /// The highest block this node already accepts, with the work behind it.
+    ///
+    /// What the ascent stands on. Everything above it is this peer's word
+    /// until the links reach up to it.
+    ///
+    /// This is the node's *head*, not a common ancestor with the peer. On a
+    /// fresh node -- which is the case snapshot sync runs in -- head is genesis
+    /// and the distinction does not arise. On a node whose head is already on
+    /// another branch the ascent simply never links and the session fails over,
+    /// which is honest but blunt; finding the fork point first would be the
+    /// improvement.
+    fn anchor(&self) -> Option<(u64, B256, U256)> {
+        let hash = self.store.head().ok().flatten()?;
+        let header = self.store.header(hash).ok().flatten()?;
+        let work = self.store.total_difficulty(hash).ok().flatten().unwrap_or(U256::ZERO);
+        Some((header.number, hash, work))
     }
 
     /// Headers walking back from the checkpoint, newest first, as rskj's
@@ -623,6 +762,19 @@ impl SnapSession {
         point: u64,
         entries: &[rustock_networking::protocol::HeaderWithUncles],
     ) -> Vec<Action> {
+        if self.phase == Phase::AscendingHeaders {
+            let Some(ascent) = self.ascent.as_mut() else { return Vec::new() };
+            if let Err(e) = ascent.on_headers_with_uncles(point, entries) {
+                // Every one of these means the peer sent something it could
+                // not have got from the real chain, so there is nothing to
+                // salvage by asking it again.
+                return self.fail(SnapFailure::InvalidHeader {
+                    number: point,
+                    reason: e.to_string(),
+                });
+            }
+            return self.finish_ascent_or_continue();
+        }
         let mut proven = std::collections::HashMap::with_capacity(entries.len());
         let headers: Vec<Header> = entries
             .iter()
@@ -698,6 +850,11 @@ impl SnapSession {
                     identifiers.iter().map(|i| (i.number, i.hash)).collect();
                 gate.on_skeleton(&ids);
             }
+            return self.poll();
+        }
+        if self.phase == Phase::AscendingHeaders {
+            let Some(ascent) = self.ascent.as_mut() else { return Vec::new() };
+            ascent.on_skeleton(identifiers);
             return self.poll();
         }
         if self.phase != Phase::VerifyingHeaders {

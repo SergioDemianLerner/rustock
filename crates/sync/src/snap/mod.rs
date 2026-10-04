@@ -171,6 +171,19 @@ pub struct SnapConfig {
     /// Blocks per `SnapBlocks` response (rskj `BLOCK_CHUNK_SIZE`).
     pub block_chunk_size: u64,
 
+    /// Establish the header chain by ascending from ground this node already
+    /// holds, instead of descending from the peer's offered checkpoint.
+    ///
+    /// Off by default: the descending walk in `snap::headers` is what has been
+    /// exercised against mainnet, and this changes the shape of the whole
+    /// sync. Requires a peer that serves `rsk/63` headers-with-uncles -- the
+    /// ascent totals the work exactly and cannot do that without them -- so a
+    /// session against an `rsk/62` peer falls back to the descending walk
+    /// whatever this says.
+    ///
+    /// See `docs/header-first-sync.md`.
+    pub forward_headers: bool,
+
     /// After a snapshot sync, fill in the canonical `number -> hash` index for
     /// the history below the checkpoint window.
     ///
@@ -211,6 +224,7 @@ impl Default for SnapConfig {
             peer_bytes_per_second: 8 * 1024 * 1024,
             total_bytes_per_second: 32 * 1024 * 1024,
 
+            forward_headers: false,
             blocks_required: 6_000,
             block_chunk_size: 400,
             index_history: true,

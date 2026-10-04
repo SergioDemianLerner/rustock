@@ -1436,3 +1436,72 @@ fn offered_totals_that_do_not_match_the_contribution_are_refused() {
         Err(SnapFailure::BadDifficulty)
     );
 }
+
+/// The ascent engages only when it is asked for *and* the peer can serve it.
+///
+/// `forward_headers` alone is not enough: the walk totals cumulative difficulty
+/// exactly and cannot do that without the uncles, so an `rsk/62` peer must get
+/// the descending walk however the node is configured. Getting this backwards
+/// would compute a lower bound and call it exact.
+mod ascent_tests {
+    use super::*;
+
+    fn session_with(forward: bool, peer_serves_uncles: bool) -> (SnapSession, Fixture) {
+        let f = fixture(4);
+        // A real node sets its head to genesis at startup (`setup_genesis`),
+        // which is the ground the ascent stands on.
+        let genesis = f.with_genesis();
+        f.store.set_head(genesis).expect("head");
+        let mut session = SnapSession::new(
+            SnapConfig { client_enabled: true, forward_headers: forward, ..SnapConfig::default() },
+            f.store.clone(),
+            Arc::new(MemoryTrieStore::new()) as Arc<dyn TrieStore>,
+            Arc::new(rustock_core::validation::HeaderVerifier::new()),
+        );
+        session.set_peer_serves_uncles(peer_serves_uncles);
+        (session, f)
+    }
+
+    fn offer(session: &mut SnapSession, f: &Fixture) {
+        let offered = block(header(5_000, B256::ZERO, f.state_root, 100));
+        let _ = session.on_status(
+            std::slice::from_ref(&offered),
+            &[U256::from(1_000u64)],
+            1024,
+            0,
+        );
+    }
+
+    #[test]
+    fn an_rsk63_peer_is_ascended_when_forward_headers_is_on() {
+        let (mut session, f) = session_with(true, true);
+        offer(&mut session, &f);
+        assert_eq!(
+            session.phase(),
+            Phase::AscendingHeaders,
+            "asked for, and the peer can serve the uncles it needs"
+        );
+    }
+
+    #[test]
+    fn an_rsk62_peer_falls_back_to_the_descending_walk() {
+        let (mut session, f) = session_with(true, false);
+        offer(&mut session, &f);
+        assert_eq!(
+            session.phase(),
+            Phase::VerifyingHeaders,
+            "without uncles the ascent would compute a lower bound and call it exact"
+        );
+    }
+
+    #[test]
+    fn the_descending_walk_remains_the_default() {
+        let (mut session, f) = session_with(false, true);
+        offer(&mut session, &f);
+        assert_eq!(
+            session.phase(),
+            Phase::VerifyingHeaders,
+            "a peer that could serve the ascent does not by itself select it"
+        );
+    }
+}

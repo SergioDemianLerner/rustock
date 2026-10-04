@@ -113,6 +113,9 @@ pub struct SnapshotSection {
     /// Blocks to download below the checkpoint when snapshot syncing. These
     /// are the blocks the node keeps history for once the sync is done.
     pub blocks: Option<u64>,
+    /// Establish the header chain by ascending from ground already held, with
+    /// uncles, instead of descending from the peer's offered checkpoint.
+    pub forward_headers: Option<bool>,
     /// Bytes of state to ask for per chunk.
     pub chunk_bytes: Option<u64>,
     /// The offset grid chunks sit on. Changing it invalidates a server's
@@ -392,6 +395,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "snap_chunk_grid",
     "snap_parallel",
     "snap_index_history",
+    "snap_forward_headers",
     "snap_peer_rate",
     "snap_total_rate",
     "alerts_config",
