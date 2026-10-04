@@ -2135,9 +2135,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
 
+    let snap_checkpoint = snap_checkpoint_for(args.network_id);
+
     let snap_config = rustock_sync::SnapConfig {
         server_enabled: args.snap_server,
         client_enabled: args.snap_sync,
+        checkpoint: snap_checkpoint,
         chunk_bytes: args.snap_chunk_bytes,
         chunk_grid: args.snap_chunk_grid.max(1),
         index_history: args.snap_index_history,
@@ -3502,6 +3505,27 @@ fn run_repair_chain_work(
     Ok(())
 }
 
+/// The difficulty checkpoint the sampled half of the gate measures from.
+///
+/// Only mainnet has one. Other chains get `None` and behave as they did before
+/// the gate was enabled: the header walk still bounds a peer's claim, just
+/// without the cheap rejection in front of it.
+///
+/// Supplying this is what turns `Phase::SamplingClaim` on. Before it, the half
+/// that costs requests was built, tested and wired into the session but never
+/// ran, because nothing passed a checkpoint -- so a claim *above* the
+/// checkpoint height was bounded only after a header walk costing hours
+/// instead of after a few hundred headers. The free half, refuting a claim at
+/// or below the checkpoint by arithmetic, has been live independently.
+fn snap_checkpoint_for(
+    network_id: u64,
+) -> Option<rustock_core::checkpoint::DifficultyCheckpoint> {
+    match network_id {
+        30 => Some(rustock_core::checkpoint::MAINNET_CHECKPOINT),
+        _ => None,
+    }
+}
+
 /// Seconds as `2h 04m 31s`, for progress lines a human reads.
 fn fmt_duration(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
@@ -3917,5 +3941,47 @@ async fn announce_block_range(
     );
     for peer in targets {
         peer_store.send_to_peer(&peer, msg.clone()).await;
+    }
+}
+
+#[cfg(test)]
+mod snap_checkpoint_tests {
+    use super::snap_checkpoint_for;
+
+    /// Mainnet gets the shipped checkpoint, which is what enables the sampled
+    /// half of the difficulty gate. Without it `Phase::SamplingClaim` never
+    /// runs and a claim above the checkpoint height is bounded only by the
+    /// full header walk.
+    #[test]
+    fn mainnet_gets_the_checkpoint() {
+        let cp = snap_checkpoint_for(30).expect("mainnet has a checkpoint");
+        assert_eq!(cp.number, rustock_core::checkpoint::MAINNET_CHECKPOINT.number);
+    }
+
+    /// Every other chain gets none, and behaves as it did before: the walk
+    /// still bounds the claim. Shipping mainnet's checkpoint to testnet or
+    /// regtest would measure those chains against a height they do not share.
+    #[test]
+    fn other_chains_get_none() {
+        assert!(snap_checkpoint_for(31).is_none(), "testnet");
+        assert!(snap_checkpoint_for(33).is_none(), "regtest");
+        assert!(snap_checkpoint_for(0).is_none());
+    }
+
+    /// The checkpoint must not contradict a node's own chain, or every node
+    /// reports `SelfExceeds` — which means "this build is wrong", not "this
+    /// peer is lying", and halts rather than blaming anyone.
+    ///
+    /// This is the check that caught the stale value: the shipped figure
+    /// predated total difficulty counting uncle difficulty, and the chain
+    /// carries 1.748x it at that height.
+    #[test]
+    fn the_shipped_checkpoint_does_not_contradict_its_own_chain() {
+        let cp = snap_checkpoint_for(30).unwrap();
+        assert_eq!(
+            rustock_core::checkpoint::audit_own_chain(&cp, cp.cumulative_difficulty),
+            None,
+            "the checkpoint contradicts the chain it was read from"
+        );
     }
 }

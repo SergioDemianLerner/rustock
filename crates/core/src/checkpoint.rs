@@ -94,16 +94,23 @@ pub const MAINNET_CHECKPOINT: DifficultyCheckpoint = DifficultyCheckpoint {
         0x8f, 0xd3, 0x01, 0x2c, 0xe9, 0xb7, 0xce, 0xfc, 0x9c, 0x7d, 0x4a, 0xc2, 0x32, 0x2b, 0x47,
         0x2c, 0xc5,
     ]),
-    // 32959497588810990020280199750 == 0x6a7f75187db0eeb538802a46
+    // 57604442870340920504421561134 == 0xba2147413df62dc93cc9b32e
     //
     // Written as limbs rather than a literal because `U256` has no const
     // decimal constructor. `checkpoint_value_tests` checks these against the
     // decimal values read off the chain -- an earlier hand-written version of
     // this was wrong in both fields, and the difficulty silently truncated
     // because it does not fit in a u64.
+    //
+    // Re-read after total difficulty began counting uncle difficulty. The
+    // earlier value, 32959497588810990020280199750, was recorded when a block
+    // contributed only its header difficulty; the chain carries 1.748x that at
+    // this height once uncles are counted. The number and hash did not change,
+    // and neither did `difficulty` -- it is the block's own, which uncles
+    // never affected.
     cumulative_difficulty: U256::from_limbs([
-        0x7db0eeb538802a46,
-        0x000000006a7f7518,
+        0x3df62dc93cc9b32e,
+        0x00000000ba214741,
         0x0000000000000000,
         0x0000000000000000,
     ]),
@@ -438,8 +445,8 @@ mod checkpoint_value_tests {
         );
         assert_eq!(
             cp.cumulative_difficulty,
-            "32959497588810990020280199750".parse::<U256>().unwrap(),
-            "cumulative difficulty (0x6a7f75187db0eeb538802a46)"
+            "57604442870340920504421561134".parse::<U256>().unwrap(),
+            "cumulative difficulty (0xba2147413df62dc93cc9b32e)"
         );
         assert_eq!(
             cp.difficulty,
@@ -506,7 +513,13 @@ mod real_chain_tests {
     ];
 
     /// Total difficulty at #9049952, read from the same node.
-    const REAL_TD_AT_HEAD: &str = "33174492501805418000770231962";
+    /// Re-read after total difficulty began counting uncle difficulty. The
+    /// earlier figure, 33174492501805418000770231962, was recorded when a
+    /// block contributed only its header difficulty. It and the checkpoint
+    /// must come from the same chain, or the base includes uncles while the
+    /// work above it does not, and every bound derived from the pair is
+    /// nonsense.
+    const REAL_TD_AT_HEAD: &str = "57930075977936206832660598923";
     const HEAD: u64 = 9049952;
 
     fn parse(s: &str) -> U256 {
