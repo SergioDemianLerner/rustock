@@ -52,20 +52,68 @@ Difficulty cannot move arbitrarily between blocks — the retarget rule limits
 each step. So given two sampled blocks, the work in the gap between them is
 bounded even though those blocks were never seen.
 
-`max_work_between` computes that bound for one gap. Each block in the span
-takes the highest difficulty it could have while still being able to fall to
-the next sample's difficulty by the end. `ceiling_for` tiles these gaps across
-the chain and adds the exact work below the checkpoint.
+`max_work_between` computes that bound for one gap; `ceiling_for` tiles the
+gaps across the chain and adds the exact work below the checkpoint.
 
-Two details in `max_work_between` are worth knowing, because both were
-necessary to make the bound correct rather than merely plausible:
+### Two ceilings per block, take the lower
 
-- It is expressed as a **per-block maximum**, not a rise-then-fall turning
-  point. The consensus rule also permits difficulty to stay *unchanged*, which
-  a strict rise-then-fall model cannot express — and such a model produces a
-  "bound" below a flat chain's real work, which would reject honest peers.
-- `min_difficulty` clamps the fall exactly as consensus does. The clamp only
-  ever raises a value, so including it keeps the result an upper bound.
+Every block between two samples faces two separate limits:
+
+- **the retarget rule** — it cannot exceed the previous block by more than
+  `1/divisor`;
+- **the landing constraint** — it cannot be so high that even falling as fast
+  as the rule allows, it would still overshoot the next sample's difficulty by
+  the end of the gap.
+
+The lower of the two is the most that block could have been. `cap[]` holds the
+second limit, built backwards from the next sample.
+
+```rust
+for step in 1..=span {
+    let risen = d + d / divisor;        // the retarget ceiling
+    d = risen.min(cap[step]);           // the landing ceiling
+    if d < min_difficulty { d = min_difficulty; }
+    total += d;
+}
+```
+
+A worked example, with `divisor = 4` (±25% a block, rather than the real
+0.25%, so the numbers stay legible), `from = to = 100`, `span = 3`:
+
+```
+cap, built backwards from `to`:   cap[3]=100   cap[2]=133   cap[1]=177
+
+step 1:   risen = 125    cap = 177   ->   min = 125
+step 2:   risen = 156    cap = 133   ->   min = 133
+step 3:   risen = 166    cap = 100   ->   min = 100
+                                          total = 358
+```
+
+A chain that stayed flat at 100 across that gap really carries 300. The bound
+says 358 — above the truth, which is what an upper bound has to be.
+
+### Why not a rise-then-fall shape
+
+The intuitive model is a triangle: rise as fast as possible, turn, fall onto
+the next sample. It is wrong, because **consensus also permits difficulty to
+stay unchanged**, and a triangle cannot express a block that does not move — it
+is always rising or falling.
+
+Taking the lower of two ceilings admits flat chains for free: once the rise
+limit exceeds the cap, `d` simply tracks the cap, which may sit level. The
+triangle version produced bounds *below* a flat chain's real work on short
+spans, and a bound below reality rejects honest peers — the one failure an
+upper bound must never have.
+
+### Why the `min_difficulty` clamp is safe
+
+Consensus will not let difficulty fall below a floor, but `cap[]` is built
+assuming maximal falls, so it can compute values below that floor — positions
+no real chain could occupy.
+
+The clamp raises those back to the floor. The **direction** is the point: it
+only ever raises a term, and raising terms in an upper bound keeps it an upper
+bound. It can make the ceiling more generous, never too tight.
 
 Past the newest sample there is no later difficulty to aim for, so the bound is
 unconstrained growth. **This is why the newest sample should sit close to the
