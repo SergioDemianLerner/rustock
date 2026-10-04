@@ -59,6 +59,20 @@ pub const MISSING_SAMPLES_ALLOWED: usize = 4;
 /// uncle work at a fraction `f` of its blocks is caught with probability
 /// `1 - (1-f)^k`; at `k = 340` a cheat touching more than about 6% of blocks
 /// survives with probability below 1e-9.
+///
+/// # It also sets where sampling stops being worth doing
+///
+/// Each sampled height costs one message -- scattered heights cannot be
+/// batched, which is the price of unpredictability -- while a header walk
+/// carries 192 per message. So below a window of
+/// `RANDOM_SAMPLES * SKELETON_STEP = 65,280` blocks, roughly twenty-three days
+/// of chain, [`choose_samples`] finds fewer available heights than this and
+/// returns all of them: it spends a walk's worth of messages to retrieve a
+/// hundred and ninety-second of the data, and ends with a bound where the walk
+/// would have ended with the exact number.
+///
+/// Nothing here detects that. See `docs/difficulty-gate.md`, *When to sample,
+/// and when to just download the window*.
 pub const RANDOM_SAMPLES: usize = 340;
 
 /// Choose which of `available` heights to sample.
@@ -218,6 +232,22 @@ pub struct ChainSampler {
     /// Seeded once, from the OS. The peer must not be able to predict or
     /// replay where it will be checked, so this is never seeded from anything
     /// it can see.
+    ///
+    /// Two rules travel with it, and neither is enforced by the type:
+    ///
+    /// * **One draw per peer.** Requests go out concurrently, so an attacker
+    ///   running `N` identities learns the positions as soon as the first is
+    ///   queried. Sharing a draw across peers would let one set of mined
+    ///   headers answer for all `N` -- `O(k)` instead of `O(kN)`. Each peer
+    ///   also has its own head and its own skeleton, so there is no shared set
+    ///   to ask for in the first place.
+    /// * **Never reused across sessions with the same peer**, or a peer that
+    ///   failed once learns where to be honest next time. This holds today
+    ///   only because each retry builds a fresh session.
+    ///
+    /// Verified *answers* may be shared between peers -- a header is bound by
+    /// its hash, so one that two skeletons agree on needs its proof of work
+    /// checked once. Positions may not.
     rng: rand::rngs::StdRng,
 }
 

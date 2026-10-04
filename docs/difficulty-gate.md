@@ -17,7 +17,7 @@ filters who is worth talking to.
 | | bounds a claim | cost | adversarial value |
 |---|---|---|---|
 | free half | at or below the checkpoint height | arithmetic, no requests | **none** |
-| sampled half | above the checkpoint height | ~340 header requests | the whole of it |
+| sampled half | above the checkpoint height | ~585 messages, 0.6 MB | the whole of it |
 
 The split exists because the two cases are not alike. Below the checkpoint the
 work is *known*, so refuting a claim is subtraction. Above it there is nothing
@@ -289,15 +289,138 @@ difficulty, would disappear with it. That is proposed separately.
 
 ## What it costs
 
-The samples come from one peer, so the budget is the **number of requests**,
-not bytes — rskj's inbound limit is 1,000 messages per minute per peer.
+The samples come from one peer, so the first budget is the **number of
+requests** — rskj's inbound limit is 1,000 messages per minute per peer.
 
-With a checkpoint refreshed each release, the window above it is small: three
-months of chain is about **340 samples** after gap filling, roughly twenty
-seconds against that limit. `RANDOM_SAMPLES` is set to that figure for the same
-reason — it is what the request budget affords, and the uncle allowance is as
-tight as that budget allows it to be. Sampling the whole chain instead would take about
-34 minutes, which is the reason the checkpoint exists.
+Each sampled height costs **one message**. Scattered heights cannot be batched:
+`GetBlockHeaders(start, count, skip)` can walk a fixed stride, and the random
+draw is specifically not a fixed stride. Paying one message per header is the
+price of unpredictability, and it is what the cost model below turns on.
+
+Over the window `W` above the checkpoint:
+
+```
+  sample messages = max(RANDOM_SAMPLES, W / SAMPLE_INTERVAL)   one header each
+                  + W / (SKELETON_STEP * MAX_SKELETON_ENTRIES) skeleton walk
+```
+
+At today's 276,000-block window that is 513 sampled heights plus 72 skeleton
+messages, about **585 messages** and **0.6 MB** — roughly thirty-five seconds
+against rskj's limit. Samples need only headers, never uncles: `uncle_count` is
+a header field.
+
+## When to sample, and when to just download the window
+
+Sampling is not always the cheaper move, and nothing in the code currently
+notices when it is not.
+
+The alternative is to download every header **and its uncles** over the window
+— RSKIP-698's `BlockHeadersWithUncles` — and compute the cumulative difficulty
+exactly. No ceiling, no allowance, no concentration argument. A header walk
+alone cannot do this: uncle difficulty counts toward the total and uncle headers
+travel only in block bodies, which is what RSKIP-698 exists to fix.
+
+A walk batches **192 headers per message** (`MAX_HEADERS_SERVE`), against the
+sampler's one. So:
+
+```
+  walk messages   = W / 192
+  sample messages = max(340, W / 768)
+```
+
+### The crossover
+
+The two meet at **W = RANDOM_SAMPLES * SKELETON_STEP = 65,280 blocks**, about
+twenty-three days of chain.
+
+Below it, `choose_samples` finds fewer available heights than `RANDOM_SAMPLES`
+and returns *all* of them — it stops being a sampler. It then spends the same
+number of messages as the batched walk to retrieve one hundred and ninety-second
+of the data, and ends with a 4.2x bound where the walk ends with the exact
+number. **In that regime the gate is strictly dominated.**
+
+| window | days | sample msgs | walk msgs | walk bytes | |
+|---|---|---|---|---|---|
+| 40,000 | 14 | 208 | 209 | 96 MB | walk |
+| 65,280 | 23 | 338 | 340 | 157 MB | walk |
+| 100,000 | 35 | 349 | 521 | 240 MB | marginal |
+| 276,000 | 96 | 513 | 1,438 | 663 MB | sample |
+
+### But bytes never favour the walk
+
+Sampling wins on bytes everywhere, by about a thousandfold — 0.6 MB against
+663 MB at today's window, and even at the crossover 0.39 MB against 157 MB.
+
+That matters because **the cost is paid per candidate peer**. Vetting is what
+you do to a peer you do not yet trust, and you want to do it to several. Five
+peers cost 3 MB sampled and 3.3 GB walked; the second number is larger than the
+state download the whole sync exists to perform.
+
+So the rule is not one-dimensional:
+
+- **Window under ~65,000 blocks** — walk it. Same messages, exact total, no
+  allowance. The gate buys nothing here.
+- **Window over ~100,000 blocks** — sample. Bytes diverge fast and the divergence
+  multiplies by the number of peers under consideration.
+- **Between** — judgment. The walk buys exactness for a few hundred megabytes.
+
+The uncomfortable corollary: with a checkpoint refreshed each release, a node on
+a current build sits in the first regime. **The gate matters least when the
+checkpoint is fresh and most for nodes on stale builds** — which is where it is
+least likely to have been configured.
+
+Sampling the whole chain rather than a window would take about 34 minutes, which
+is the reason the checkpoint exists at all.
+
+## Vetting more than one peer
+
+Not implemented today: `service.rs` builds one `SnapSession` holding one
+`SamplingGate` for one peer, and on failure puts that peer in `snap_avoid` and
+opens a fresh session against another. Vetting is sequential.
+
+When it is built, **each peer gets its own independent draw.** Three reasons, in
+increasing order of importance.
+
+**The heights do not mean the same thing.** `ChainSampler::new` takes *that
+peer's* head and *that peer's* skeleton. Two peers at different heads have
+different windows, and if they are on different chains — which is the case being
+vetted for — a given height is a different block for each. There is no shared
+set to ask for.
+
+**Sybil cost must scale with identities.** Requests go out concurrently, so an
+attacker running `N` identities sees the draw as soon as the first of them is
+queried. With a shared draw, all `N` then need valid proof of work only at those
+same 340 heights: one set of mined headers, reused `N` times. With independent
+draws they need `N` independent sets. Shared is `O(340)`; independent is
+`O(340N)`.
+
+**Do not let it become a vote.** The tempting shortcut is to ask every peer the
+same heights and compare their answers. That is majority voting among peers, and
+voting is exactly what sybils are cheap against. The gate judges each peer
+against arithmetic and never against other peers; that property is worth
+protecting deliberately.
+
+### What may be shared: answers, not positions
+
+If peer B's skeleton names `(h, H)` and a header with hash `H` at height `h` was
+already verified from peer A, it is reusable — proof of work does not need
+rechecking and the hash is what binds it. An answer cache keyed by hash is sound
+and saves real work in the common case where honest peers agree.
+
+The **draw** must still be independent per peer. Caching answers leaks no
+positions; sharing positions does.
+
+### Seeding
+
+The draw must come from a CSPRNG seeded from the OS and never from anything a
+peer can see or influence — `StdRng::from_entropy()` in `ChainSampler::new`,
+which is ChaCha12.
+
+It must also not be reused across sessions with the same peer, or a peer that
+failed once learns where to be honest next time. Today that holds for free
+because each retry builds a fresh session. It is incidental rather than
+enforced, and it should survive anyone who later tries to "optimise" the gate by
+caching a sampler.
 
 ## The three verdicts
 
@@ -325,6 +448,13 @@ abandoned in seconds rather than at the end.
 
 The walk remains the authority. The gate only decides whether the walk is worth
 starting.
+
+Note which walk that is. This one descends from the peer's claimed head to the
+first block this node already holds — genesis on a fresh node, so the whole
+chain, hours and tens of gigabytes. That is not the window-sized walk weighed
+against sampling in *When to sample*, which covers only the blocks above the
+checkpoint. The gate is cheap against the first and, below the crossover,
+pointless against the second.
 
 ## Current state
 
