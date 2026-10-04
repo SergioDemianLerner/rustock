@@ -51,6 +51,18 @@ pub struct SyncHandler {
     /// simulated head has not run the test that was intended, and the result
     /// is not comparable with one that could not.
     serve_ceiling: Option<u64>,
+    /// Which checkpoint-based defences this node runs.
+    ///
+    /// The cheap refutation runs whenever either switch is on. It costs
+    /// nothing and follows from having a checkpoint at all: a peer at a height
+    /// at or below it, claiming more work than exists there, is refuted by
+    /// arithmetic whatever else the node is doing.
+    ///
+    /// What it must not be is the *only* check, which `NONE` prevents. Alone
+    /// it secures nothing -- an attacker claims a height above the checkpoint
+    /// and steps around it for free -- and leaving it always-on made the gate
+    /// look armed when it was not.
+    checkpoint_defence: rustock_core::checkpoint::CheckpointDefence,
 }
 
 impl SyncHandler {
@@ -61,7 +73,17 @@ impl SyncHandler {
             snap: None,
             snap_late: std::sync::RwLock::new(None),
             serve_ceiling: None,
+            checkpoint_defence: rustock_core::checkpoint::CheckpointDefence::NONE,
         }
+    }
+
+    /// Run these checkpoint defences. See [`Self::checkpoint_defence`].
+    pub fn with_checkpoint_defence(
+        mut self,
+        defence: rustock_core::checkpoint::CheckpointDefence,
+    ) -> Self {
+        self.checkpoint_defence = defence;
+        self
     }
 
     /// Serve nothing above `height`. See [`Self::serve_ceiling`].
@@ -470,7 +492,9 @@ impl P2pHandler for SyncHandler {
                     // metadata is what peer selection reads, so refusing to
                     // store it is enough to stop this node syncing from the
                     // peer. Disconnecting is the scoring layer's decision.
-                    if refuted_by_checkpoint(claimed, s.best_block_number) {
+                    if self.checkpoint_defence.any()
+                        && refuted_by_checkpoint(claimed, s.best_block_number)
+                    {
                         warn!(
                             target: "rustock::sync",
                             "Peer {:?} claims total difficulty {} at #{}, which is more than \
@@ -734,6 +758,14 @@ pub(crate) fn canonical_run(
 /// Only the free case: a claim for a height at or below the checkpoint, where
 /// the work is known exactly and nothing may exceed it. Heights above the
 /// checkpoint need sampling (`crate::sampler`), which costs requests.
+///
+/// Gated on *either* switch, not on `bound_work` alone. It costs nothing and
+/// it is the arithmetic consequence of having a checkpoint at all, so any node
+/// that uses its checkpoint for anything should refuse a claim the checkpoint
+/// already disproves. What must not happen is this running as the *only*
+/// check, which is what `CheckpointDefence::NONE` prevents: alone it secures
+/// nothing, because an attacker sidesteps it by claiming a height above the
+/// checkpoint.
 fn refuted_by_checkpoint(claimed: alloy_primitives::U256, height: u64) -> bool {
     crate::sampler::ChainSampler::refuted_by_checkpoint_alone(
         &rustock_core::checkpoint::MAINNET_CHECKPOINT,

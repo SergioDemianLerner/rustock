@@ -140,6 +140,39 @@
 # frozen_headers = false            # default
 # no_freezer = false                # default — do not run the header freezer at all
 
+# What this node does with the difficulty checkpoint it ships.
+#
+# Two independent switches. Both are off by default, which is no defence:
+#
+#   verify_hash  bound_work   what you get
+#   -----------  ----------   ------------------------------------------------
+#   false        false        nothing
+#   true         false        a peer must be on the checkpointed chain
+#   false        true         a peer's claimed work is bounded, and this build
+#                             declares no winning fork
+#   true         true         both
+#
+# The third row is why these are separate. A checkpoint *hash* states which
+# chain is canonical, so shipping one asks whoever builds the node to choose a
+# fork — a governance act. Bounding the work makes no such statement: it says
+# only that a claim exceeds what any chain could carry.
+[checkpoint]
+# Ask a peer for the header at the checkpoint height and check its hash.
+# Without this, the work below the checkpoint — over 99% of mainnet's
+# cumulative total — is credited to any peer, including one on a fork that
+# diverged below it and never did that work.
+# verify_hash = false              # default — off; see the note above
+
+# Bound a peer's claimed cumulative difficulty, sampling its chain above the
+# checkpoint to do it. Costs about 340 header requests per peer judged.
+#
+# The bound and the sampling are one setting on purpose. Bounding without
+# sampling refutes a claim only for a height at or below the checkpoint, which
+# an attacker avoids for free by claiming a height above it — and would claim
+# anyway, since a sync peer wants to look like the longest chain. A setting
+# that bounded without sampling would read as a defence and be none.
+# bound_work = false               # default — off; bound and sampling together
+
 # Snapshot sync: catch up by downloading a state rather than executing into
 # one. The header chain is verified to the snapshot point first — a snapshot is
 # only trustworthy because the walk vouches for the checkpoint it hangs from.

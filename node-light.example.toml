@@ -172,6 +172,23 @@ no_freezer = true                   # light: the single biggest saving here, and
                                     # makes serving headers to peers cheap; this node does not
                                     # serve them. Default false (freezer on).
 
+# What this node does with the difficulty checkpoint it ships. Two independent
+# switches, both off by default:
+#
+#   verify_hash  bound_work   what you get
+#   -----------  ----------   ------------------------------------------------
+#   false        false        nothing
+#   true         false        a peer must be on the checkpointed chain
+#   false        true         a peer's claimed work is bounded, and this build
+#                             declares no winning fork
+#   true         true         both
+#
+# They are separate because a checkpoint *hash* states which chain is
+# canonical — a governance act — while bounding work does not.
+[checkpoint]
+# verify_hash = false              # default — off; see the note above
+# bound_work = false               # default — off; bound and sampling together
+
 # Snapshot sync: catch up by downloading a state rather than executing into
 # one. The header chain is verified to the snapshot point first — a snapshot is
 # only trustworthy because the walk vouches for the checkpoint it hangs from.
