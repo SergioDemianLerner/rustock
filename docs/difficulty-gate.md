@@ -337,7 +337,8 @@ Below it, `choose_samples` finds fewer available heights than `RANDOM_SAMPLES`
 and returns *all* of them — it stops being a sampler. It then spends the same
 number of messages as the batched walk to retrieve one hundred and ninety-second
 of the data, and ends with a 4.2x bound where the walk ends with the exact
-number. **In that regime the gate is strictly dominated.**
+number. **In that regime the gate is strictly dominated**, and
+`WALK_INSTEAD_BELOW` is where it stops running.
 
 | window | days | sample msgs | walk msgs | walk bytes | |
 |---|---|---|---|---|---|
@@ -363,6 +364,31 @@ So the rule is not one-dimensional:
 - **Window over ~100,000 blocks** — sample. Bytes diverge fast and the divergence
   multiplies by the number of peers under consideration.
 - **Between** — judgment. The walk buys exactness for a few hundred megabytes.
+
+### It turns on the capability, not just the window
+
+The walk only produces the exact number if the peer sends the uncles. From an
+`rsk/62` peer — every rskj node today — the walk sums header difficulty alone,
+which is a **lower** bound on the chain's work. That is worse than the gate's
+upper bound, not better: see `headers.rs` `uncles_omitted`, and issue #258.
+
+Capabilities are negotiated per peer and known before the status response is
+handled, so this is decidable at run time rather than something to wait for a
+network-wide upgrade on. `SnapSession::on_status` skips the gate when
+
+```rust
+peer_serves_uncles && window < WALK_INSTEAD_BELOW     // 340 * 192 = 65,280
+```
+
+and logs the reason. `peer_serves_uncles` comes from
+`capabilities(peer).understands_header_uncles()`, resolved in `service.rs`
+where a lookup can be awaited; the walk's own header requests are already
+upgraded to `BlockHeadersWithUnclesRequest` for such a peer at the send site,
+and `on_headers_with_uncles` feeds the walk exact cumulative difficulties
+through `proven`.
+
+The effect is that the gate stops running precisely where it was dominated,
+against the peers that can replace it — and keeps running everywhere else.
 
 The uncomfortable corollary: with a checkpoint refreshed each release, a node on
 a current build sits in the first regime. **The gate matters least when the

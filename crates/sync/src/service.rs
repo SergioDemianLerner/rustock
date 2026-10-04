@@ -3233,6 +3233,18 @@ impl SyncService {
                 trie_size,
                 chunk_grid,
             } => {
+                // Resolved here rather than in the driver, which builds its
+                // requests synchronously and cannot await a capability lookup.
+                // The session needs it before `on_status`, which is where the
+                // sampling gate is built or skipped.
+                let serves_uncles = self
+                    .peer_store
+                    .capabilities(&peer)
+                    .await
+                    .is_some_and(|c| c.understands_header_uncles());
+                if let Some(driver) = self.snap.as_mut() {
+                    driver.set_peer_serves_uncles(serves_uncles);
+                }
                 self.drive_snap(|driver, ps| {
                     driver.on_status(id, peer, &blocks, &difficulties, trie_size, chunk_grid, ps)
                 })

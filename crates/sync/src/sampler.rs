@@ -75,6 +75,25 @@ pub const MISSING_SAMPLES_ALLOWED: usize = 4;
 /// and when to just download the window*.
 pub const RANDOM_SAMPLES: usize = 340;
 
+/// The window below which walking the headers beats sampling them outright.
+///
+/// `RANDOM_SAMPLES * HEADER_CHUNK`. Each sampled height costs one message,
+/// because scattered heights cannot be batched; a walk carries
+/// [`HEADER_CHUNK`][hc] per message. Below this window [`choose_samples`] finds
+/// fewer available heights than [`RANDOM_SAMPLES`] and returns all of them --
+/// it is no longer a sample -- so it spends a walk's worth of messages to
+/// retrieve a hundred and ninety-second of the data, and ends with a bound
+/// where the walk ends with the exact number.
+///
+/// **This only applies to a peer that serves `rsk/63` headers-with-uncles.**
+/// From an `rsk/62` peer the walk sums header difficulty alone and so computes
+/// a *lower* bound on the chain's work, which is worse than the gate's upper
+/// one, not better. The capability decides; see `SnapSession::on_status`.
+///
+/// [hc]: ../snap/headers/constant.HEADER_CHUNK.html
+pub const WALK_INSTEAD_BELOW: u64 =
+    RANDOM_SAMPLES as u64 * crate::snap::headers::HEADER_CHUNK;
+
 /// Choose which of `available` heights to sample.
 ///
 /// Two properties, and they want opposite things:
