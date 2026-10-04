@@ -109,15 +109,54 @@ RPC:
 | 6,000 bodies | ~8 MB |
 | *(for comparison: every block, full sync)* | *22.8 GB* |
 
-The uncle headers are the whole of the extra cost, and they are needed for one
-reason: cumulative difficulty in RSK counts uncle difficulty, and uncle headers
-travel only in bodies. That is the same 10.5 GB the current walk must also pay
-to compute an exact total -- it does not pay it today, which is #258, and the
-consequence is that `walked_difficulty` understates the chain.
+The uncle headers are the whole of the extra cost, and **they are not
+optional**. Cumulative difficulty in RSK counts uncle difficulty, and the only
+way to know that work was performed is to see the proof of work that performed
+it. An uncle header carries its own merged-mining proof; nothing else does.
 
-**With RSKIP-699 the uncle download disappears**: the header states its own
-cumulative difficulty, so the pass is 10.1 GB and about 130 MB of that is the
-new field. That is the combination this shape is really aiming at.
+Downloading them yields a *proof*, not an assertion, because three things line
+up:
+
+- `unclesHash` is in the trunk header and so is covered by its proof of work,
+  which binds the uncle list to that block;
+- each uncle header carries its own proof of work, so its difficulty is work
+  that was really done;
+- the uncle rules -- the generation limit, and that an uncle is not referenced
+  twice -- are checkable against the trunk chain the pass already holds.
+
+This is the same 10.5 GB the current walk would have to pay for an exact total.
+It does not pay it today, which is #258, and the consequence is that
+`walked_difficulty` understates the chain.
+
+### RSKIP-699 does not remove this
+
+An earlier revision of this note claimed it did. That was wrong, and badly so.
+
+A header field stating the cumulative total is *data*, not work. A miner can
+mine a header with valid trunk proof of work and write any `cumulativeDifficulty`
+into it; the rule binding the field to the parent's value is enforced by nodes
+that validate the parent's **body**, which a header-only pass by definition does
+not have. Reading the field instead of exhibiting the uncles replaces a proof
+with an assertion.
+
+The cost of doing so is not a rounding error. An attacker who claims the
+consensus maximum of ten uncles in every block multiplies its claim by 11 while
+doing only the trunk work:
+
+```
+  honest chain claims   1.91 x its trunk work   (measured mainnet uncle rate)
+  attacker claims      11.00 x its trunk work   (uncleListLimit, fabricated)
+  attacker needs        1.91 / 11 = 17.4%  of the honest chain's trunk hashpower
+```
+
+So a client trusting the field without the uncles drops the threshold for
+out-claiming the honest chain from above 50% to about **17%**. Exhibiting the
+uncles restores it: every uncle's difficulty must be backed by its own proof of
+work, so there is no multiplier to exploit.
+
+**RSKIP-698 is what this shape needs; RSKIP-699 is not a substitute for it.**
+698 makes the uncles available over the wire at header-sync speed. 699 makes a
+number readable, and a readable number is not a proven one.
 
 ## What disappears
 
@@ -151,8 +190,9 @@ noticed, not by a twenty-five minute commitment made in advance. That is what
 
 **Time to first state byte is not better, and may be worse.** The header pass
 must finish before the trie download starts, exactly as the walk does today,
-and carrying uncles roughly doubles its bytes. Without RSKIP-699 this shape is
-slower end to end unless the parallelism above is actually realised.
+and carrying uncles roughly doubles its bytes. This shape is slower end to end
+than the current one unless the parallelism above is actually realised -- and
+no header field changes that, for the reason given under *What it costs*.
 
 **The tip moves during the pass.** Twenty-five minutes is about 3,000 blocks.
 The pass ends at whatever tip it reached, and the checkpoint a server offers is
@@ -168,7 +208,9 @@ them is the bulk of the work and is where regressions would come from.
 **It still walks from genesis.** This shape does not enable syncing from a
 recent checkpoint without touching old history -- neither does the current one,
 so it is not a regression, but it is not the thing an MMR would buy either. See
-RSKIP-699's rationale for why an MMR is not proposed.
+RSKIP-699's rationale for why an MMR is not proposed -- noting that an MMR
+with recursive verification is one of the few things that *could* shrink this,
+because it changes the proof system rather than adding a field.
 
 **Storage before any state.** 20.6 GB of headers and uncles land before the
 trie is requested. The freezer already holds both in parallel stores, so this
@@ -181,9 +223,11 @@ requirement that arrives earlier in the sync than it does today.
   and is implemented. Against an `rsk/62` peer the pass can still run, but it
   computes a lower bound and the checkpoint check falls back to what exists
   today.
-- **RSKIP-699** (cumulative difficulty in the header) removes the uncle
-  download, which is what makes this shape cheaper than the current one rather
-  than merely sounder.
+- **RSKIP-699** (cumulative difficulty in the header) does **not** help here,
+  for the reason given above: it makes the total readable, not proven. It is
+  under reconsideration for exactly that.
 
-Neither is required to start. The pass can be built against RSKIP-698 alone and
-improves when 699 lands.
+So this shape rests on RSKIP-698 alone, and its cost is the full 20.6 GB. There
+is no header field that makes proving work cheaper, because work is proven by
+exhibiting it. Shrinking the proof needs a different proof *system* -- an MMR
+with recursive verification, or a succinct argument -- not another field.
