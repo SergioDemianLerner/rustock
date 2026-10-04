@@ -274,6 +274,16 @@ a sixth and be judged plausible. The gate is still worth having, because the
 claim an attacker needs to make is not 17% high but orders of magnitude high.
 It exists to refuse a fabricated chain, not to referee a close race.
 
+### A shape in which none of this is needed
+
+Worth knowing while reading the rest of this document: snapshot sync already
+downloads every header to genesis, so the gate is a filter protecting a cost
+that is paid anyway. A sync that did the header pass first -- with uncles, no
+bodies, no execution -- would know the exact cumulative difficulty and would
+check a peer's offered checkpoint with an index lookup instead of all of this.
+
+That is a design note, not a plan: `docs/header-first-sync.md`.
+
 ### The limit of sampling, and the way past it
 
 More samples is the lever, not a different inequality — but it runs out. The
