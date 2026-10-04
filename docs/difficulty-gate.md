@@ -12,27 +12,49 @@ The gate answers one question: **could any valid chain carry this much work?**
 It does not answer "is this peer honest" or "is this the best chain". It
 filters who is worth talking to.
 
-## Two halves, with very different costs
+## Two halves, and only one of them is a defence
 
-| | bounds a claim | cost | runs today |
+| | bounds a claim | cost | adversarial value |
 |---|---|---|---|
-| **free half** | at or below the checkpoint height | arithmetic, no requests | yes, always |
-| **sampled half** | above the checkpoint height | ~340 header requests | only when a checkpoint is configured |
+| free half | at or below the checkpoint height | arithmetic, no requests | **none** |
+| sampled half | above the checkpoint height | ~340 header requests | the whole of it |
 
 The split exists because the two cases are not alike. Below the checkpoint the
 work is *known*, so refuting a claim is subtraction. Above it there is nothing
 to check against — and that window is where a lie lives.
 
-### The free half
+### The free half, and why it secures nothing
 
 `ChainSampler::refuted_by_checkpoint_alone`, reached from
-`handler::refuted_by_checkpoint`. A shipped `DifficultyCheckpoint`
-(`MAINNET_CHECKPOINT`) records a height, its cumulative difficulty and its
-difficulty. A peer claiming more work than that at a height at or below it is
-claiming something arithmetically impossible, and its metadata is never
-recorded.
+`handler::refuted_by_checkpoint`:
 
-This costs nothing and is always on.
+```rust
+claimed_height <= checkpoint.number && claimed > checkpoint.cumulative_difficulty
+```
+
+A peer claiming more work than the checkpoint allows, *for a height at or below
+it*, is refuted by arithmetic and its metadata is never recorded — which is
+what stops this node syncing from it, since peer selection reads exactly that.
+
+**Against an adversary this is worth nothing**, and it is important to say so
+rather than count it as half a defence:
+
+- the sidestep is free — claim a height above the checkpoint;
+- and it is what an attacker would do anyway. To be chosen as a sync peer you
+  want to look like the longest, best-worked chain, so you claim a *high*
+  height and high work. The trigger condition here is low height with high
+  work, which is the opposite of the incentive. A peer would have to go out of
+  its way to trip it.
+
+A control that neither raises an attacker's cost nor removes an option from
+them is not a security control. What this one catches is a peer that is
+**broken rather than hostile**: a miscomputed total, a corrupted import, a bug
+on the other side of the wire. That is robustness, it is free, and it is worth
+keeping — but it is not a bound on what a lying peer may claim.
+
+The consequence is that **until the sampled half runs, the difficulty gate has
+no adversarial value on the sync path at all.** It is not a partial defence; it
+is an unarmed one.
 
 ### The sampled half
 

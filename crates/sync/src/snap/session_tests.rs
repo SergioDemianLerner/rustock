@@ -1117,6 +1117,12 @@ fn a_checkpoint_gates_the_walk() {
         SnapConfig {
             client_enabled: true,
             checkpoint: Some(cp),
+            // The gate is opt-in: a checkpoint alone no longer arms it, since
+            // bounding without sampling secures nothing.
+            checkpoint_defence: rustock_core::checkpoint::CheckpointDefence {
+                verify_hash: false,
+                bound_work: true,
+            },
             ..SnapConfig::default()
         },
         f.store.clone(),

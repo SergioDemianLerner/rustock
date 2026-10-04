@@ -540,7 +540,12 @@ impl SnapSession {
         // accumulated work is better evidence than a shipped constant, and
         // more recent. The checkpoint is the fallback for a node with nothing
         // of its own, which is the case snapshot sync runs in.
-        if let Some(checkpoint) = self.config.checkpoint {
+        // `bound_work` carries the sampling with it: bounding without
+        // sampling refutes only a claim made at or below the checkpoint
+        // height, which an attacker steps around for free. The two are one
+        // switch for that reason.
+        let defence = self.config.checkpoint_defence;
+        if let Some(checkpoint) = self.config.checkpoint.filter(|_| defence.any()) {
             if header.number > checkpoint.number {
                 self.gate = Some(crate::sampler::SamplingGate::new(
                     checkpoint,
@@ -549,6 +554,7 @@ impl SnapSession {
                     self.config.difficulty_divisor,
                     self.config.min_difficulty,
                     super::headers::HEADER_CHUNK * super::headers::SKELETON_POINTS,
+                    defence,
                 ));
                 self.set_phase(Phase::SamplingClaim);
             }

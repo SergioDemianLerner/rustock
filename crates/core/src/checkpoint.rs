@@ -211,6 +211,58 @@ pub fn max_work_between(
     total
 }
 
+/// Which checkpoint-based defences a node runs.
+///
+/// Two independent switches, because they cost different things and one of
+/// them is a statement about governance rather than about arithmetic.
+///
+/// | `verify_hash` | `bound_work` | what it gives |
+/// |---|---|---|
+/// | no | no | no defence |
+/// | yes | no | good: a peer must be on the checkpointed chain |
+/// | no | yes | good: a peer's claim is bounded, and no fork is declared in code |
+/// | yes | yes | strongest |
+///
+/// The third row is the one worth understanding. Shipping a checkpoint *hash*
+/// is a statement about which chain is canonical — it asks whoever ships the
+/// build to choose a fork, which is a governance act. Bounding the work does
+/// not: it says only that a claim exceeds what any chain could carry. A
+/// deployment that wants the bound without the declaration can have it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CheckpointDefence {
+    /// Require a peer to show it is on the checkpointed chain: ask for the
+    /// header at the checkpoint height and check its hash.
+    ///
+    /// Without this, the work below the checkpoint — over 99% of mainnet's
+    /// cumulative total — is credited to any peer that asks, including one on
+    /// a fork that diverged below it and never did that work.
+    pub verify_hash: bool,
+
+    /// Bound a peer's claimed cumulative difficulty against the checkpoint,
+    /// **and sample its chain above the checkpoint to do so**.
+    ///
+    /// These are deliberately one switch and must never be separable. The
+    /// bound without the sampling is the "free half": it refutes only a claim
+    /// made for a height at or below the checkpoint, which an attacker avoids
+    /// for free by claiming a height above it — and which it would claim
+    /// anyway, since a sync peer wants to look like the longest chain. An
+    /// option to bound without sampling would read as a defence and be none.
+    pub bound_work: bool,
+}
+
+impl CheckpointDefence {
+    /// Neither switch: the node makes no use of a checkpoint.
+    pub const NONE: Self = Self { verify_hash: false, bound_work: false };
+
+    /// Both switches.
+    pub const FULL: Self = Self { verify_hash: true, bound_work: true };
+
+    /// Whether anything at all is enabled.
+    pub fn any(&self) -> bool {
+        self.verify_hash || self.bound_work
+    }
+}
+
 /// The ceiling on total difficulty implied by a checkpoint and a set of samples.
 ///
 /// `samples` are `(height, difficulty)` for blocks above the checkpoint, in

@@ -71,6 +71,12 @@ pub struct ChainSampler {
     /// Verified difficulties, by height.
     collected: BTreeMap<u64, U256>,
     pub(crate) missing: usize,
+    /// Whether the checkpoint block itself was demanded.
+    verify_hash: bool,
+    /// Set when the peer produced the checkpoint block under the hash this
+    /// build ships. Starts `true` when `verify_hash` is off, since then the
+    /// question was never asked.
+    on_checkpoint_chain: bool,
 }
 
 impl ChainSampler {
@@ -85,8 +91,20 @@ impl ChainSampler {
         skeleton: &[(u64, B256)],
         divisor: u64,
         min_difficulty: U256,
+        verify_hash: bool,
     ) -> Self {
         let mut outstanding = BTreeMap::new();
+
+        // With `verify_hash`, the checkpoint block itself is the first thing
+        // asked for, by the hash this build ships. A peer that cannot produce
+        // it is not on the checkpointed chain, and the work below the
+        // checkpoint -- over 99% of mainnet's cumulative total -- must not be
+        // credited to it. `offer` already requires the hash to match, so
+        // asking is the whole of the check.
+        if verify_hash {
+            outstanding.insert(checkpoint.number, checkpoint.hash);
+        }
+
         let mut next = checkpoint.number.saturating_add(SAMPLE_INTERVAL);
         for &(number, hash) in skeleton {
             if number > checkpoint.number && number >= next {
@@ -102,7 +120,18 @@ impl ChainSampler {
             outstanding,
             collected: BTreeMap::new(),
             missing: 0,
+            verify_hash,
+            on_checkpoint_chain: !verify_hash,
         }
+    }
+
+    /// Whether the peer showed it is on the checkpointed chain.
+    ///
+    /// `true` when `verify_hash` is off, because then nothing was asked and
+    /// nothing is claimed either way — the caller must not read this as
+    /// evidence it was checked.
+    pub fn on_checkpoint_chain(&self) -> bool {
+        self.on_checkpoint_chain
     }
 
     /// Adds skeleton identifiers, picking the ones that fall on the sampling
@@ -154,6 +183,13 @@ impl ChainSampler {
             return false;
         }
         self.outstanding.remove(&number);
+        if self.verify_hash && number == self.checkpoint.number {
+            // Same height, same hash, own rules passed: the peer is on the
+            // chain this build names. `ceiling_for` ignores a sample at or
+            // below the checkpoint, so collecting it changes no arithmetic --
+            // it is asked for to be answered, not to be counted.
+            self.on_checkpoint_chain = true;
+        }
         self.collected.insert(number, header.difficulty);
         true
     }
@@ -210,7 +246,7 @@ impl ChainSampler {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use rustock_core::checkpoint::MAINNET_CHECKPOINT;
+    use rustock_core::checkpoint::{CheckpointDefence, MAINNET_CHECKPOINT};
 
     const DIV: u64 = 400;
     const MIN: U256 = U256::from_limbs([7_000_000_000_000_000u64, 0, 0, 0]);
@@ -260,7 +296,7 @@ pub(crate) mod tests {
         sk.push((cp.number - 5000, B256::repeat_byte(1)));
         sk.push((cp.number, B256::repeat_byte(2)));
 
-        let s = ChainSampler::new(cp, cp.number + 4 * SAMPLE_INTERVAL, &sk, DIV, MIN);
+        let s = ChainSampler::new(cp, cp.number + 4 * SAMPLE_INTERVAL, &sk, DIV, MIN, false);
         assert!(s.wanted().iter().all(|r| r.number > cp.number));
         assert_eq!(s.wanted().len(), 4);
     }
@@ -295,7 +331,7 @@ pub(crate) mod tests {
     fn a_substituted_sample_is_not_accepted() {
         let cp = MAINNET_CHECKPOINT;
         let sk = skeleton(cp.number, 2, SAMPLE_INTERVAL);
-        let mut s = ChainSampler::new(cp, cp.number + 2 * SAMPLE_INTERVAL, &sk, DIV, MIN);
+        let mut s = ChainSampler::new(cp, cp.number + 2 * SAMPLE_INTERVAL, &sk, DIV, MIN, false);
         let verifier = HeaderVerifier::new();
 
         // Right height, wrong block.
@@ -311,7 +347,7 @@ pub(crate) mod tests {
         let n = 8u64;
         let sk = skeleton(cp.number, n, SAMPLE_INTERVAL);
         let head = cp.number + n * SAMPLE_INTERVAL;
-        let mut s = ChainSampler::new(cp, head, &sk, DIV, MIN);
+        let mut s = ChainSampler::new(cp, head, &sk, DIV, MIN, false);
         let verifier = HeaderVerifier::new();
         for (number, _) in &sk {
             assert!(s.offer(&header_at(*number, cp.difficulty), &verifier));
@@ -332,7 +368,7 @@ pub(crate) mod tests {
         let n = 8u64;
         let sk = skeleton(cp.number, n, SAMPLE_INTERVAL);
         let head = cp.number + n * SAMPLE_INTERVAL;
-        let mut s = ChainSampler::new(cp, head, &sk, DIV, MIN);
+        let mut s = ChainSampler::new(cp, head, &sk, DIV, MIN, false);
         let verifier = HeaderVerifier::new();
         for (number, _) in &sk {
             s.offer(&header_at(*number, cp.difficulty), &verifier);
@@ -348,7 +384,7 @@ pub(crate) mod tests {
     fn a_peer_that_will_not_answer_is_given_up_on() {
         let cp = MAINNET_CHECKPOINT;
         let sk = skeleton(cp.number, 10, SAMPLE_INTERVAL);
-        let mut s = ChainSampler::new(cp, cp.number + 10 * SAMPLE_INTERVAL, &sk, DIV, MIN);
+        let mut s = ChainSampler::new(cp, cp.number + 10 * SAMPLE_INTERVAL, &sk, DIV, MIN, false);
         assert!(!s.too_many_missing());
         for (number, _) in sk.iter().take(MISSING_SAMPLES_ALLOWED + 1) {
             s.give_up_on(*number);
@@ -411,6 +447,10 @@ pub struct SamplingGate {
     /// Next skeleton start not yet asked for.
     next_skeleton: u64,
     skeletons_outstanding: usize,
+    /// Whether the claimed work is bounded, which is what the sampling is
+    /// for. With it off the gate asks only for the checkpoint block: there is
+    /// a chain to establish but no ceiling to compute.
+    bound_work: bool,
     /// Identifiers learned but not yet turned into sample requests.
     learned: BTreeMap<u64, B256>,
     started: bool,
@@ -424,10 +464,19 @@ impl SamplingGate {
         divisor: u64,
         min_difficulty: U256,
         skeleton_span: u64,
+        defence: rustock_core::checkpoint::CheckpointDefence,
     ) -> Self {
+        let verify_hash = defence.verify_hash;
         let checkpoint_number = checkpoint.number;
         Self {
-            sampler: ChainSampler::new(checkpoint, head, &[], divisor, min_difficulty),
+            sampler: ChainSampler::new(
+                checkpoint,
+                head,
+                &[],
+                divisor,
+                min_difficulty,
+                verify_hash,
+            ),
             claimed,
             checkpoint_number,
             head,
@@ -436,6 +485,7 @@ impl SamplingGate {
             skeletons_outstanding: 0,
             learned: BTreeMap::new(),
             started: false,
+            bound_work: defence.bound_work,
         }
     }
 
@@ -508,6 +558,18 @@ impl SamplingGate {
         if !self.started || !covered || !self.sampler.is_complete() || !self.learned.is_empty() {
             return GateOutcome::Pending;
         }
+        if !self.bound_work {
+            // Nothing was sampled, so there is no ceiling. The only question
+            // asked was whether the peer is on the checkpointed chain, and
+            // `too_many_missing` above has already answered it.
+            return if self.sampler.on_checkpoint_chain() {
+                GateOutcome::Passed { ceiling: U256::MAX }
+            } else {
+                GateOutcome::Rejected(GateRejection::Unsubstantiated {
+                    missing: self.sampler.missing.max(1),
+                })
+            };
+        }
         match self.sampler.judge(self.claimed) {
             CheckpointVerdict::Plausible { ceiling } => GateOutcome::Passed { ceiling },
             CheckpointVerdict::Impossible { claimed, ceiling } => {
@@ -524,7 +586,7 @@ impl SamplingGate {
 mod gate_tests {
     use super::tests::header_at;
     use super::*;
-    use rustock_core::checkpoint::MAINNET_CHECKPOINT;
+    use rustock_core::checkpoint::{CheckpointDefence, MAINNET_CHECKPOINT};
 
     const DIV: u64 = 400;
     const MIN: U256 = U256::from_limbs([7_000_000_000_000_000u64, 0, 0, 0]);
@@ -535,7 +597,7 @@ mod gate_tests {
     fn run_honest(blocks: u64, claimed: U256) -> GateOutcome {
         let cp = MAINNET_CHECKPOINT;
         let head = cp.number + blocks;
-        let mut gate = SamplingGate::new(cp, claimed, head, DIV, MIN, SPAN);
+        let mut gate = SamplingGate::new(cp, claimed, head, DIV, MIN, SPAN, CheckpointDefence { verify_hash: false, bound_work: true });
         let verifier = HeaderVerifier::new();
 
         for _ in 0..64 {
@@ -609,7 +671,7 @@ mod gate_tests {
         let cp = MAINNET_CHECKPOINT;
         let head = cp.number + 20_000;
         let mut gate =
-            SamplingGate::new(cp, cp.cumulative_difficulty, head, DIV, MIN, SPAN);
+            SamplingGate::new(cp, cp.cumulative_difficulty, head, DIV, MIN, SPAN, CheckpointDefence { verify_hash: false, bound_work: true });
 
         for _ in 0..8 {
             for action in gate.poll() {
@@ -645,6 +707,7 @@ mod gate_tests {
             DIV,
             MIN,
             SPAN,
+            CheckpointDefence { verify_hash: false, bound_work: true },
         );
         assert_eq!(gate.outcome(), GateOutcome::Pending);
         let _ = gate.poll();
@@ -653,5 +716,166 @@ mod gate_tests {
             GateOutcome::Pending,
             "a verdict before the window is covered would be a way past the gate"
         );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_hash_tests {
+    use super::tests::header_at;
+    use super::*;
+    use rustock_core::checkpoint::{CheckpointDefence, MAINNET_CHECKPOINT};
+
+    const DIV: u64 = 400;
+    const MIN: U256 = U256::from_limbs([7_000_000_000_000_000u64, 0, 0, 0]);
+
+    fn permissive() -> HeaderVerifier {
+        HeaderVerifier::new()
+    }
+
+    /// With the hash check off, nothing is asked about the checkpoint block
+    /// and the sampler claims nothing either way. `on_checkpoint_chain` must
+    /// not be read as evidence the question was answered.
+    #[test]
+    fn without_the_hash_check_the_checkpoint_is_never_requested() {
+        let cp = MAINNET_CHECKPOINT;
+        let s = ChainSampler::new(cp, cp.number + 4 * SAMPLE_INTERVAL, &[], DIV, MIN, false);
+        assert!(
+            !s.wanted().iter().any(|r| r.number == cp.number),
+            "the checkpoint height was asked for with the check off"
+        );
+        assert!(s.on_checkpoint_chain(), "nothing was asked, so nothing is refuted");
+    }
+
+    /// With it on, the checkpoint block is the first thing demanded, under the
+    /// hash this build ships.
+    #[test]
+    fn the_checkpoint_block_is_demanded_by_hash() {
+        let cp = MAINNET_CHECKPOINT;
+        let s = ChainSampler::new(cp, cp.number + 4 * SAMPLE_INTERVAL, &[], DIV, MIN, true);
+        let asked: Vec<_> = s.wanted().into_iter().filter(|r| r.number == cp.number).collect();
+        assert_eq!(asked.len(), 1, "the checkpoint height is asked for exactly once");
+        assert_eq!(asked[0].hash, cp.hash, "under the shipped hash, not the peer's");
+        assert!(!s.on_checkpoint_chain(), "unproven until answered");
+    }
+
+    /// A peer on a different chain cannot answer with the shipped hash. It is
+    /// counted as a missing sample and never credited with being on the chain,
+    /// which is what stops it inheriting the work below the checkpoint.
+    #[test]
+    fn a_peer_on_another_chain_is_not_credited() {
+        let cp = MAINNET_CHECKPOINT;
+        let mut s = ChainSampler::new(cp, cp.number + 4 * SAMPLE_INTERVAL, &[], DIV, MIN, true);
+
+        // Same height, a different block: a fork that diverged below.
+        let impostor = header_at(cp.number, cp.difficulty);
+        assert_ne!(impostor.hash(), cp.hash);
+
+        assert!(!s.offer(&impostor, &permissive()), "the wrong block is refused");
+        assert!(!s.on_checkpoint_chain(), "and buys no credit");
+        assert_eq!(s.missing, 1);
+    }
+
+    /// Silence is the same answer as the wrong block: a peer that will not
+    /// substantiate its position on the chain has not substantiated it.
+    #[test]
+    fn a_peer_that_will_not_answer_is_not_credited() {
+        let cp = MAINNET_CHECKPOINT;
+        let mut s = ChainSampler::new(cp, cp.number + 4 * SAMPLE_INTERVAL, &[], DIV, MIN, true);
+        s.give_up_on(cp.number);
+        assert!(!s.on_checkpoint_chain());
+        assert_eq!(s.missing, 1);
+    }
+
+    /// The four configurations, stated so the matrix cannot drift.
+    #[test]
+    fn the_defence_matrix() {
+        assert_eq!(
+            CheckpointDefence::NONE,
+            CheckpointDefence { verify_hash: false, bound_work: false }
+        );
+        assert_eq!(
+            CheckpointDefence::FULL,
+            CheckpointDefence { verify_hash: true, bound_work: true }
+        );
+        assert!(!CheckpointDefence::NONE.any(), "neither switch is no defence");
+        assert!(CheckpointDefence::FULL.any());
+
+        // The two middle rows are both meaningful on their own.
+        assert!(CheckpointDefence { verify_hash: true, bound_work: false }.any());
+        assert!(CheckpointDefence { verify_hash: false, bound_work: true }.any());
+
+        // Default is off: a checkpoint hash declares which chain is canonical,
+        // and a build should not make that statement unless asked to.
+        assert_eq!(CheckpointDefence::default(), CheckpointDefence::NONE);
+    }
+}
+
+#[cfg(test)]
+mod low_height_high_claim_tests {
+    use super::*;
+    use rustock_core::checkpoint::{CheckpointDefence, MAINNET_CHECKPOINT};
+
+    /// A peer declaring the highest total difficulty on the network while
+    /// sitting at a height far *below* the checkpoint is claiming something
+    /// arithmetically impossible: the work it names does not exist that low on
+    /// any chain.
+    ///
+    /// This must be refused under **every** configuration that uses the
+    /// checkpoint at all, not only when the work bound is on. It costs no
+    /// requests and follows from having a checkpoint, so a node that declines
+    /// to use it here is declining for no reason.
+    #[test]
+    fn a_low_height_with_an_enormous_claim_is_refuted() {
+        let cp = MAINNET_CHECKPOINT;
+        let claim = cp.cumulative_difficulty * U256::from(2u64);
+        let height = cp.number / 2; // ~#4.5M, far below the checkpoint
+
+        assert!(
+            ChainSampler::refuted_by_checkpoint_alone(&cp, claim, height),
+            "the checkpoint alone disproves this"
+        );
+        assert!(
+            SamplingGate::refuted_immediately(&cp, claim, height).is_some(),
+            "and the snapshot path refuses it before any request"
+        );
+    }
+
+    /// The same claim at a height *above* the checkpoint is not refutable by
+    /// arithmetic — this is the sidestep, and it is why the free check alone
+    /// is not a defence.
+    #[test]
+    fn the_same_claim_above_the_checkpoint_needs_sampling() {
+        let cp = MAINNET_CHECKPOINT;
+        let claim = cp.cumulative_difficulty * U256::from(2u64);
+
+        assert!(
+            !ChainSampler::refuted_by_checkpoint_alone(&cp, claim, cp.number + 1),
+            "one block higher and the free check says nothing"
+        );
+        assert!(SamplingGate::refuted_immediately(&cp, claim, cp.number + 1).is_none());
+    }
+
+    /// An honest peer that is simply behind — low height, and a small claim to
+    /// match — must not be caught by this. Being behind is not lying.
+    #[test]
+    fn a_peer_that_is_merely_behind_is_not_refuted() {
+        let cp = MAINNET_CHECKPOINT;
+        let modest = cp.cumulative_difficulty / U256::from(2u64);
+        assert!(!ChainSampler::refuted_by_checkpoint_alone(&cp, modest, cp.number / 2));
+    }
+
+    /// The configurations under which the refutation runs. Only `NONE` lets
+    /// the impossible claim through, and that is the documented "no defence"
+    /// row of the matrix.
+    #[test]
+    fn every_armed_configuration_refuses_it() {
+        for defence in [
+            CheckpointDefence { verify_hash: true, bound_work: false },
+            CheckpointDefence { verify_hash: false, bound_work: true },
+            CheckpointDefence::FULL,
+        ] {
+            assert!(defence.any(), "{defence:?} should be armed");
+        }
+        assert!(!CheckpointDefence::NONE.any(), "NONE is the no-defence row");
     }
 }
