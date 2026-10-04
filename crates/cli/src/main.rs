@@ -873,6 +873,35 @@ struct Args {
     #[arg(long, default_value_t = false)]
     prune_blocks: bool,
 
+    /// Require a peer to show it is on the checkpointed chain.
+    ///
+    /// Asks for the header at the checkpoint height and checks its hash. A
+    /// peer that cannot produce it is on a different chain, and the work below
+    /// the checkpoint -- over 99% of mainnet's cumulative total -- is not
+    /// credited to it.
+    ///
+    /// Off by default: a checkpoint hash is a statement about which chain is
+    /// canonical, and shipping one asks whoever builds the node to choose a
+    /// fork. That is a governance decision, so it is opt-in.
+    /// `--checkpoint-bound-work` gives much of the benefit without it.
+    #[arg(long, default_value_t = false)]
+    checkpoint_verify_hash: bool,
+
+    /// Bound a peer's claimed cumulative difficulty, sampling its chain above
+    /// the checkpoint to do it.
+    ///
+    /// The bound and the sampling are one switch and cannot be separated. The
+    /// bound alone refutes a claim only for a height at or below the
+    /// checkpoint, which an attacker avoids for free by claiming a height
+    /// above it -- and would claim anyway, since a sync peer wants to look
+    /// like the longest chain. An option to bound without sampling would look
+    /// like a defence and be none.
+    ///
+    /// Costs about 340 header requests per peer judged, against rskj's limit
+    /// of 1,000 messages per minute.
+    #[arg(long, default_value_t = false)]
+    checkpoint_bound_work: bool,
+
     /// Seconds between prune sweeps.
     #[arg(long, default_value_t = 300, value_name = "SECONDS")]
     prune_every_secs: u64,
@@ -984,6 +1013,10 @@ fn apply_file_config(
     apply(matches, "no_rpc", f.rpc.disabled.as_ref(), &mut a.no_rpc);
     apply(matches, "ws", f.rpc.ws.as_ref(), &mut a.ws);
     apply(matches, "ws_port", f.rpc.ws_port.as_ref(), &mut a.ws_port);
+    apply(matches, "checkpoint_verify_hash", f.checkpoint.verify_hash.as_ref(),
+        &mut a.checkpoint_verify_hash);
+    apply(matches, "checkpoint_bound_work", f.checkpoint.bound_work.as_ref(),
+        &mut a.checkpoint_bound_work);
     apply(matches, "snap_server", f.snapshot.server.as_ref(), &mut a.snap_server);
     apply(matches, "snap_sync", f.snapshot.sync.as_ref(), &mut a.snap_sync);
     apply(matches, "snap_blocks", f.snapshot.blocks.as_ref(), &mut a.snap_blocks);
@@ -1662,10 +1695,18 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let sync_manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
 
+    // Both switches, read once: the handler needs `bound_work` for the cheap
+    // refutation, and the snapshot session needs both.
+    let checkpoint_defence = rustock_core::checkpoint::CheckpointDefence {
+        verify_hash: args.checkpoint_verify_hash,
+        bound_work: args.checkpoint_bound_work,
+    };
+
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let sync_handler = Arc::new(
         SyncHandler::new(sync_manager.clone(), event_tx)
-            .with_serve_ceiling(args.simulate_height),
+            .with_serve_ceiling(args.simulate_height)
+            .with_checkpoint_defence(checkpoint_defence),
     );
     let gc_config = rustock_storage::epoch_store::EpochConfig {
         epochs: args.gc_epochs,
@@ -2136,11 +2177,24 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
 
     let snap_checkpoint = snap_checkpoint_for(args.network_id);
+    if checkpoint_defence.any() && snap_checkpoint.is_none() {
+        warn!(
+            "Checkpoint defences were asked for, but this chain ships no checkpoint; \
+             they will not run"
+        );
+    } else if checkpoint_defence.any() {
+        info!(
+            "Checkpoint defences: hash check {}, work bound {}",
+            if checkpoint_defence.verify_hash { "on" } else { "off" },
+            if checkpoint_defence.bound_work { "on" } else { "off" },
+        );
+    }
 
     let snap_config = rustock_sync::SnapConfig {
         server_enabled: args.snap_server,
         client_enabled: args.snap_sync,
         checkpoint: snap_checkpoint,
+        checkpoint_defence,
         chunk_bytes: args.snap_chunk_bytes,
         chunk_grid: args.snap_chunk_grid.max(1),
         index_history: args.snap_index_history,

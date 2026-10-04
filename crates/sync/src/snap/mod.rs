@@ -80,6 +80,13 @@ pub struct SnapConfig {
     /// is committed to. `None` on a chain with no checkpoint, where the walk
     /// simply runs as before.
     pub checkpoint: Option<rustock_core::checkpoint::DifficultyCheckpoint>,
+    /// Which checkpoint-based defences run. Has no effect without a
+    /// `checkpoint` to run them against.
+    ///
+    /// See `rustock_core::checkpoint::CheckpointDefence` for the matrix: the
+    /// hash check and the work bound are separate because one declares which
+    /// chain is canonical and the other does not.
+    pub checkpoint_defence: rustock_core::checkpoint::CheckpointDefence,
     /// The retarget divisor for the sampled window. That window sits entirely
     /// above the checkpoint, which is itself far above RSKIP156, so it is the
     /// post-RSKIP156 value -- but it is configuration rather than a constant
@@ -183,6 +190,7 @@ impl Default for SnapConfig {
 
             checkpoint_distance: 10_000,
             checkpoint: None,
+            checkpoint_defence: rustock_core::checkpoint::CheckpointDefence::NONE,
             serve_ceiling: None,
             // Post-RSKIP156, which is what the sampled window is by
             // construction.

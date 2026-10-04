@@ -56,6 +56,8 @@ pub struct FileConfig {
     pub alerts: AlertsSection,
     #[serde(default)]
     pub snapshot: SnapshotSection,
+    #[serde(default)]
+    pub checkpoint: CheckpointSection,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -171,6 +173,22 @@ pub struct GcSection {
     pub rotate_mb: Option<u64>,
     pub burial: Option<u64>,
     pub check_secs: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointSection {
+    /// Require a peer to show it is on the checkpointed chain, by asking for
+    /// the header at the checkpoint height and checking its hash.
+    ///
+    /// Off by default: a checkpoint hash states which chain is canonical, and
+    /// shipping one asks whoever builds the node to choose a fork.
+    pub verify_hash: Option<bool>,
+    /// Bound a peer's claimed cumulative difficulty, sampling its chain above
+    /// the checkpoint to do it. The bound and the sampling are one setting:
+    /// bounding without sampling refutes only a claim made at or below the
+    /// checkpoint, which an attacker avoids for free.
+    pub bound_work: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -345,6 +363,8 @@ pub const CONFIGURABLE: &[&str] = &[
     "prune_max_batch",
     "prune_blocks",
     "prune_every_secs",
+    "checkpoint_verify_hash",
+    "checkpoint_bound_work",
     "rpc_logs_max_blocks",
     "dev_rpc",
     "mine",
