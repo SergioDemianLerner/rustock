@@ -897,9 +897,22 @@ struct Args {
     /// like the longest chain. An option to bound without sampling would look
     /// like a defence and be none.
     ///
-    /// Costs about 340 header requests per peer judged, against rskj's limit
-    /// of 1,000 messages per minute.
-    #[arg(long, default_value_t = false)]
+    /// Costs about 585 messages per peer judged, against rskj's limit of 1,000
+    /// per minute. On by default: it is the only half of the gate with any
+    /// adversarial value, and unlike `--checkpoint-verify-hash` it does not
+    /// ask this node to declare which fork is canonical. Has no effect on a
+    /// chain that ships no checkpoint.
+    ///
+    /// Takes a value because it defaults on: `--checkpoint-bound-work false`
+    /// reaches the "no defence" corner of the matrix, and the bare flag still
+    /// means on.
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
     checkpoint_bound_work: bool,
 
     /// Seconds between prune sweeps.
@@ -1706,7 +1719,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let sync_handler = Arc::new(
         SyncHandler::new(sync_manager.clone(), event_tx)
             .with_serve_ceiling(args.simulate_height)
-            .with_checkpoint_defence(checkpoint_defence),
+            .with_checkpoint_defence(checkpoint_defence)
+            .with_checkpoint(snap_checkpoint_for(args.network_id)),
     );
     let gc_config = rustock_storage::epoch_store::EpochConfig {
         epochs: args.gc_epochs,

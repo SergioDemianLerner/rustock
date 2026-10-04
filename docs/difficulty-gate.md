@@ -484,19 +484,38 @@ pointless against the second.
 
 ## Current state
 
-**The sampled half does not run by default.** `SamplingGate` is constructed
-only when `SnapConfig.checkpoint` is `Some`, and `SnapConfig::default()` sets
-it to `None`, so no caller supplies one. The free half is unaffected and always
-runs.
+Both halves run by default on mainnet.
 
-The consequence is not "no early rejection" but "early rejection only below the
-checkpoint height". Above it, an impossible claim costs a full header walk to
-reject instead of about twenty seconds.
+| switch | default | |
+|---|---|---|
+| `--checkpoint-bound-work` | **on** | the work bound, and the sampling that gives it adversarial value |
+| `--checkpoint-verify-hash` | off | requires a peer to show it is on the checkpointed chain |
 
-Tracked as issue #230. `MAINNET_CHECKPOINT` exists and is verified against this
-project's own synced node; `ChainSampler` and `SamplingGate` are implemented
-and tested against simulated honest, inflated and silent peers. What is missing
-is a caller.
+`--checkpoint-bound-work` defaults on because it is the only half with any
+adversarial value and, unlike the hash check, it does not ask this node to
+declare which fork is canonical — that is a governance decision and stays
+opt-in. `--no-checkpoint-bound-work` reaches the "no defence" corner of the
+matrix.
+
+The checkpoint itself is network-scoped: `snap_checkpoint_for(network_id)`
+returns one for mainnet and `None` elsewhere, and it is passed to both the
+handler and the snapshot session. Neither reads `MAINNET_CHECKPOINT` directly.
+That matters more now that the switch defaults on — a hard-coded constant would
+arm mainnet's view of history against every testnet and regtest peer. It would
+happen to be harmless, because those chains' totals are too small to trip the
+arithmetic, but by luck rather than design.
+
+### What the gate is worth, stated plainly
+
+The ceiling sits about **17% above the real chain** at 340 samples. A peer can
+overstate its work by a sixth and be judged plausible. This is a deliberate
+trade, not an oversight:
+
+- the claim an attacker needs is orders of magnitude high, not 17% high — the
+  gate exists to refuse a fabricated chain, not to referee a close race;
+- raising `RANDOM_SAMPLES` tightens it slowly and runs out near 1.4x the truth,
+  because the bound is dominated by a range term that shrinks only as `1/k`;
+- closing the rest is a consensus question (RSKIP-699), not a sampling one.
 
 ## Tests
 

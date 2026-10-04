@@ -63,6 +63,13 @@ pub struct SyncHandler {
     /// and steps around it for free -- and leaving it always-on made the gate
     /// look armed when it was not.
     checkpoint_defence: rustock_core::checkpoint::CheckpointDefence,
+    /// The checkpoint the defences run against, or `None` on a chain that
+    /// ships none.
+    ///
+    /// Network-scoped on purpose. A checkpoint is a statement about one chain;
+    /// applying mainnet's to a testnet peer is a category error that happens to
+    /// be harmless only because testnet totals are too small to trip it.
+    checkpoint: Option<rustock_core::checkpoint::DifficultyCheckpoint>,
 }
 
 impl SyncHandler {
@@ -74,7 +81,18 @@ impl SyncHandler {
             snap_late: std::sync::RwLock::new(None),
             serve_ceiling: None,
             checkpoint_defence: rustock_core::checkpoint::CheckpointDefence::NONE,
+            checkpoint: None,
         }
+    }
+
+    /// The checkpoint to judge claims against. Without one, nothing is
+    /// refuted however the defences are configured.
+    pub fn with_checkpoint(
+        mut self,
+        checkpoint: Option<rustock_core::checkpoint::DifficultyCheckpoint>,
+    ) -> Self {
+        self.checkpoint = checkpoint;
+        self
     }
 
     /// Run these checkpoint defences. See [`Self::checkpoint_defence`].
@@ -493,7 +511,11 @@ impl P2pHandler for SyncHandler {
                     // store it is enough to stop this node syncing from the
                     // peer. Disconnecting is the scoring layer's decision.
                     if self.checkpoint_defence.any()
-                        && refuted_by_checkpoint(claimed, s.best_block_number)
+                        && refuted_by_checkpoint(
+                            self.checkpoint.as_ref(),
+                            claimed,
+                            s.best_block_number,
+                        )
                     {
                         warn!(
                             target: "rustock::sync",
@@ -502,7 +524,7 @@ impl P2pHandler for SyncHandler {
                             &id.0[..4],
                             claimed,
                             s.best_block_number,
-                            rustock_core::checkpoint::MAINNET_CHECKPOINT.number
+                            self.checkpoint.as_ref().map_or(0, |cp| cp.number)
                         );
                         // Refusing to record the metadata is what stops this
                         // node syncing from the peer: peer selection reads
@@ -766,10 +788,43 @@ pub(crate) fn canonical_run(
 /// check, which is what `CheckpointDefence::NONE` prevents: alone it secures
 /// nothing, because an attacker sidesteps it by claiming a height above the
 /// checkpoint.
-fn refuted_by_checkpoint(claimed: alloy_primitives::U256, height: u64) -> bool {
-    crate::sampler::ChainSampler::refuted_by_checkpoint_alone(
-        &rustock_core::checkpoint::MAINNET_CHECKPOINT,
-        claimed,
-        height,
-    )
+fn refuted_by_checkpoint(
+    checkpoint: Option<&rustock_core::checkpoint::DifficultyCheckpoint>,
+    claimed: alloy_primitives::U256,
+    height: u64,
+) -> bool {
+    checkpoint.is_some_and(|cp| {
+        crate::sampler::ChainSampler::refuted_by_checkpoint_alone(cp, claimed, height)
+    })
+}
+
+#[cfg(test)]
+mod checkpoint_scope_tests {
+    use super::refuted_by_checkpoint;
+    use alloy_primitives::U256;
+    use rustock_core::checkpoint::MAINNET_CHECKPOINT;
+
+    /// A claim the mainnet checkpoint disproves is refused when that
+    /// checkpoint is the one in force.
+    #[test]
+    fn the_mainnet_checkpoint_refutes_an_impossible_mainnet_claim() {
+        let cp = MAINNET_CHECKPOINT;
+        let claim = cp.cumulative_difficulty * U256::from(2);
+        assert!(refuted_by_checkpoint(Some(&cp), claim, cp.number - 1));
+    }
+
+    /// The same claim is not refused on a chain that ships no checkpoint.
+    ///
+    /// This is why the checkpoint is plumbed in rather than read from a
+    /// constant. `--checkpoint-bound-work` defaults on, so a hard-coded
+    /// `MAINNET_CHECKPOINT` here would arm mainnet's view of history against
+    /// every testnet and regtest peer. It happens to be harmless today only
+    /// because those chains' totals are too small to trip it, which is luck
+    /// rather than design.
+    #[test]
+    fn no_checkpoint_refutes_nothing() {
+        let cp = MAINNET_CHECKPOINT;
+        let claim = cp.cumulative_difficulty * U256::from(2);
+        assert!(!refuted_by_checkpoint(None, claim, cp.number - 1));
+    }
 }
