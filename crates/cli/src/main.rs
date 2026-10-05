@@ -208,6 +208,20 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     snap_index_history: bool,
 
+    /// Establish the header chain by ascending from a block this node already
+    /// holds, instead of descending from the peer's offered checkpoint.
+    ///
+    /// Takes the uncles alongside the headers (`rsk/63`, RSKIP-698) and totals
+    /// cumulative difficulty exactly, so the sampling gate and the claimed-work
+    /// ceiling are not needed: the offered checkpoint is checked against the
+    /// chain this node proved for itself. A peer at `rsk/62` cannot serve this
+    /// and the session falls back to the descending walk.
+    ///
+    /// Experimental. The descending walk is what has been run against mainnet.
+    /// See `docs/header-first-sync.md`.
+    #[arg(long, default_value_t = false)]
+    snap_forward_headers: bool,
+
     /// Blocks to download below the checkpoint when snapshot syncing.
     ///
     /// These are the blocks the node holds history for once the sync is done.
@@ -1038,6 +1052,8 @@ fn apply_file_config(
     apply(matches, "snap_server", f.snapshot.server.as_ref(), &mut a.snap_server);
     apply(matches, "snap_sync", f.snapshot.sync.as_ref(), &mut a.snap_sync);
     apply(matches, "snap_blocks", f.snapshot.blocks.as_ref(), &mut a.snap_blocks);
+    apply(matches, "snap_forward_headers", f.snapshot.forward_headers.as_ref(),
+        &mut a.snap_forward_headers);
     apply(matches, "snap_chunk_bytes", f.snapshot.chunk_bytes.as_ref(), &mut a.snap_chunk_bytes);
     apply(matches, "snap_chunk_grid", f.snapshot.chunk_grid.as_ref(), &mut a.snap_chunk_grid);
     apply(matches, "snap_parallel", f.snapshot.parallel.as_ref(), &mut a.snap_parallel);
@@ -2222,6 +2238,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         total_bytes_per_second: args.snap_total_rate,
         max_in_flight: args.snap_parallel.max(1),
         blocks_required: args.snap_blocks,
+        forward_headers: args.snap_forward_headers,
         serve_ceiling: args.simulate_height,
         ..rustock_sync::SnapConfig::default()
     };

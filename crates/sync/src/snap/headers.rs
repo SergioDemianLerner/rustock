@@ -245,7 +245,7 @@ impl HeaderWalk {
     /// The height the walk started from.
     ///
     /// With `frontier`, this is how far it has descended -- the walk runs for
-    /// twenty-five minutes on a mainnet chain, so whatever drives it needs
+    /// about two hours on a mainnet chain, so whatever drives it needs
     /// something exact to report.
     pub fn top_number(&self) -> u64 {
         self.top.number

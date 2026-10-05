@@ -28,8 +28,9 @@ to assume.
 **Snapshot sync already downloads every header.** `HeaderWalk` descends from
 the peer's offered checkpoint to "the first block this node already holds,
 which is usually but not always genesis" -- and on a fresh node that is
-genesis. The walk is about 92% of a snapshot sync (#244) and takes roughly
-twenty-five minutes on mainnet. What snapshot sync saves against a full sync is
+genesis. The walk is 92.4% of a snapshot sync (#244) and took **6,971 s --
+nearly two hours** on the measured mainnet run, against 7,545 s for the sync as
+a whole. What snapshot sync saves against a full sync is
 **bodies and execution**, not headers.
 
 So the difficulty gate is a filter protecting a cost that is paid anyway. It
@@ -92,8 +93,9 @@ risk appetite:
   20.6 GB at 100 MB/s aggregate           =  about 3.5 minutes
 ```
 
-against the twenty-five minutes the current walk takes. #244 already tracks
-that headroom; this shape makes it safer to use.
+against the **6,971 s** the descending walk measured on mainnet -- an effective
+2.84 MB/s over the 21.4 GB it moved, which is nowhere near a bandwidth limit and
+is the headroom #244 tracks. This shape makes that headroom safer to use.
 
 ## What it costs
 
@@ -216,6 +218,23 @@ because it changes the proof system rather than adding a field.
 trie is requested. The freezer already holds both in parallel stores, so this
 is served by existing machinery rather than needing new, but it is a disk
 requirement that arrives earlier in the sync than it does today.
+
+## Status
+
+Implemented behind `--snap-forward-headers`, off by default, in
+`crates/sync/src/snap/forward.rs`. The descending walk is untouched.
+
+The first real run (2026-10-05) reached **#9,281,664 of #9,285,000 in 6,991 s**
+and then stalled, against **6,971 s** for the descending walk over the whole
+distance -- so the two are within a percent of each other on a single peer,
+which is what this note predicted, since the argument here was never
+single-peer speed. Three defects were found and fixed: unanswered requests were
+never reissued during an ascent, a target off the 192-block grid could not be
+reached at all, and a run that failed to link made its height permanently
+unaskable. Recorded in issue #262.
+
+That run used a live server and so does not measure what it set out to.
+`docs/snap-sync-test-method.md` says how to run the next one.
 
 ## Relationship to the wire proposals
 
