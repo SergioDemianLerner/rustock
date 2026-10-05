@@ -530,3 +530,29 @@ fn a_gap_the_skeleton_missed_is_bridged_from_the_run_above() {
         "the bridge links the prefix through both runs"
     );
 }
+
+/// The uncle-reuse ledger is a window, not a ledger.
+///
+/// Consensus lets a block reference an uncle only within
+/// `UNCLE_GENERATION_LIMIT` generations of it, so nothing older can ever
+/// collide. Keeping every hash instead is one `B256` per uncle for the whole
+/// chain -- on mainnet about 8.4 million of them.
+#[test]
+fn the_uncle_ledger_does_not_grow_with_the_chain() {
+    let anchor = header(0, B256::ZERO, 100);
+    let (mut s, _d) = sync(&anchor, 400, HeaderVerifier::new());
+
+    // 400 blocks, each referencing its own distinct uncle.
+    let entries = run_of(1, 400, anchor.hash(), 100, |n| {
+        vec![header(n - 1, B256::repeat_byte((n % 251) as u8), 50)]
+    });
+    s.on_headers_with_uncles(400, &entries).expect("honest run");
+    assert_eq!(s.frontier(), 400);
+
+    assert!(
+        s.counted_uncles_len() <= 64,
+        "the ledger must stay inside the consensus window, not grow with the \
+         chain; held {} after 400 blocks",
+        s.counted_uncles_len()
+    );
+}

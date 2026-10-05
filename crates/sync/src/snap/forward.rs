@@ -45,6 +45,7 @@ use alloy_primitives::{B256, U256};
 use rustock_core::validation::HeaderVerifier;
 use rustock_core::Header;
 use rustock_networking::protocol::{BlockIdentifier, HeaderWithUncles};
+use rustock_core::validation::uncles::UNCLE_GENERATION_LIMIT;
 use rustock_storage::BlockStore;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -88,9 +89,10 @@ struct Run {
     oldest_parent: B256,
     /// Exact cumulative difficulty of the run: trunk plus proven uncles.
     work: U256,
-    /// Uncle hashes this run counted, so reuse across runs is caught when the
-    /// run is consumed rather than when it arrives.
-    uncles: Vec<B256>,
+    /// `(including height, uncle hash)` for every uncle this run counted, so
+    /// reuse across runs is caught when the run is consumed rather than when it
+    /// arrives -- and so the ledger below can be pruned by height.
+    uncles: Vec<(u64, B256)>,
     /// `(number, hash)` for every block in the run, oldest first.
     ///
     /// Kept so the canonical index can be written when the run is *consumed*
@@ -144,8 +146,16 @@ pub struct ForwardSync {
 
     /// Exact cumulative difficulty accumulated over the proven prefix.
     work: U256,
-    /// Every uncle hash counted so far, for the reuse rule.
-    counted_uncles: HashSet<B256>,
+    /// Uncles counted recently, for the reuse rule, as
+    /// `(including height, uncle hash)` oldest first.
+    ///
+    /// A window, not a ledger. Consensus lets a block reference an uncle only
+    /// within [`UNCLE_GENERATION_LIMIT`] generations of it, so two references
+    /// to the same uncle are at most that far apart and nothing older can ever
+    /// collide. Keeping every hash instead would be one `B256` per uncle for
+    /// the whole chain -- on mainnet about 8.4 million of them, a few hundred
+    /// megabytes, for a rule that needs eight heights.
+    counted_uncles: std::collections::VecDeque<(u64, B256)>,
     done: bool,
 }
 
@@ -189,7 +199,7 @@ impl ForwardSync {
             runs: BTreeMap::new(),
             satisfied: HashSet::new(),
             work: anchor_work,
-            counted_uncles: HashSet::new(),
+            counted_uncles: std::collections::VecDeque::new(),
             done: anchor_number >= target,
         }
     }
@@ -201,6 +211,13 @@ impl ForwardSync {
     /// The highest height the proven prefix reaches.
     pub fn frontier(&self) -> u64 {
         self.have_number
+    }
+
+    /// How many uncles the reuse window currently holds. For tests that assert
+    /// it stays bounded.
+    #[cfg(test)]
+    pub fn counted_uncles_len(&self) -> usize {
+        self.counted_uncles.len()
     }
 
     /// Exact cumulative difficulty of the proven prefix.
@@ -431,13 +448,17 @@ impl ForwardSync {
                         reason: e.to_string(),
                     }
                 })?;
-                if self.counted_uncles.contains(&hash) || !seen.insert(hash) {
+                if self.counted_uncles.iter().any(|(_, h)| *h == hash) || !seen.insert(hash) {
                     return Err(AscentError::UncleReused { hash });
                 }
-                uncles.push(hash);
+                uncles.push((entry.header.number, hash));
             }
             work = work.saturating_add(entry.cumulative_difficulty());
         }
+
+        // Entries arrive newest first; the ledger is pruned from its oldest
+        // end, so what goes into it has to be the other way round.
+        uncles.reverse();
 
         let newest = &headers[0];
         let oldest = headers.last().expect("non-empty");
@@ -537,6 +558,14 @@ impl ForwardSync {
             self.have_number = run.newest_number;
             self.have_hash = run.newest;
 
+            // Drop what is now too old to be referenced again. After the
+            // frontier moves, not before: the floor is measured from where the
+            // prefix now ends.
+            let floor = self.have_number.saturating_sub(UNCLE_GENERATION_LIMIT);
+            while self.counted_uncles.front().is_some_and(|(at, _)| *at < floor) {
+                self.counted_uncles.pop_front();
+            }
+
             // Commit the run now that it is part of the proven prefix.
             //
             // This is what makes the shape worth its name. A descending walk
@@ -555,10 +584,9 @@ impl ForwardSync {
                 info!(
                     target: "rustock::snap",
                     "forward header sync complete at #{}: cumulative difficulty {} \
-                     over {} proven uncles",
+                     with uncle work proven throughout",
                     self.have_number,
-                    self.work,
-                    self.counted_uncles.len()
+                    self.work
                 );
                 return;
             }
