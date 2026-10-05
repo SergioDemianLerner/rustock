@@ -378,3 +378,88 @@ fn a_non_linking_run_releases_its_height() {
         "the skeleton naming that height must be asked again, or it is unreachable"
     );
 }
+
+/// A consumed run is committed, so a restart resumes instead of starting over.
+///
+/// The whole argument for ascending is that a chunk is permanently valuable the
+/// moment it links. Keeping that only in memory throws the argument away: the
+/// first run of this against mainnet stored 8.9 GB of headers and would have
+/// re-fetched every one of them, because the head was still genesis.
+#[test]
+fn a_consumed_run_is_committed_so_the_next_start_resumes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(BlockStore::open(dir.path()).expect("open"));
+    let anchor = header(0, B256::ZERO, 100);
+    store.put_header_with_hash(anchor.hash(), &anchor).expect("anchor");
+    store.put_canonical_hash(0, anchor.hash()).expect("index");
+    store.set_head(anchor.hash()).expect("head");
+
+    let mut s = ForwardSync::new(
+        0,
+        anchor.hash(),
+        U256::ZERO,
+        8,
+        B256::repeat_byte(0xff),
+        store.clone(),
+        Arc::new(HeaderVerifier::new()),
+    );
+
+    let entries = run_of(1, 4, anchor.hash(), 100, |n| {
+        if n == 2 { vec![header(1, B256::repeat_byte(9), 50)] } else { Vec::new() }
+    });
+    s.on_headers_with_uncles(4, &entries).expect("honest run");
+    assert_eq!(s.frontier(), 4);
+
+    // The canonical index names every block of the run...
+    for e in entries.iter() {
+        assert_eq!(
+            store.canonical_hash(e.header.number).unwrap(),
+            Some(e.header.hash()),
+            "#{} must be indexed once the prefix reaches it",
+            e.header.number
+        );
+    }
+
+    // ...and the head and the work moved with it, which is what the next start
+    // reads to know where to pick up.
+    let head = store.head().unwrap().expect("a head");
+    assert_eq!(head, entries[0].header.hash(), "the head is the top of the proven prefix");
+    assert_eq!(
+        store.total_difficulty(head).unwrap(),
+        Some(U256::from(4 * 100 + 50)),
+        "and carries the work counted so far, uncles included"
+    );
+}
+
+/// A run that has not linked yet is *not* committed.
+///
+/// Until it links it is only a peer's word, and publishing it would put an
+/// unproven chain in the canonical index for everything else to read.
+#[test]
+fn an_unlinked_run_is_not_committed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(BlockStore::open(dir.path()).expect("open"));
+    let anchor = header(0, B256::ZERO, 100);
+
+    let mut s = ForwardSync::new(
+        0,
+        anchor.hash(),
+        U256::ZERO,
+        8,
+        B256::repeat_byte(0xff),
+        store.clone(),
+        Arc::new(HeaderVerifier::new()),
+    );
+
+    // Rooted somewhere this node does not trust: internally valid, never links.
+    let elsewhere = run_of(1, 4, B256::repeat_byte(0xaa), 100, |_| Vec::new());
+    s.on_headers_with_uncles(4, &elsewhere).expect("internally valid");
+
+    assert_eq!(s.frontier(), 0, "the prefix does not move");
+    assert_eq!(
+        store.canonical_hash(1).unwrap(),
+        None,
+        "and nothing unproven reaches the canonical index"
+    );
+    assert_eq!(store.head().unwrap(), None, "nor the head");
+}

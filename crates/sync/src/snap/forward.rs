@@ -48,7 +48,7 @@ use rustock_networking::protocol::{BlockIdentifier, HeaderWithUncles};
 use rustock_storage::BlockStore;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Headers per request, matching [`super::headers::HEADER_CHUNK`].
 pub use super::headers::{HEADER_CHUNK, SKELETON_POINTS};
@@ -91,6 +91,12 @@ struct Run {
     /// Uncle hashes this run counted, so reuse across runs is caught when the
     /// run is consumed rather than when it arrives.
     uncles: Vec<B256>,
+    /// `(number, hash)` for every block in the run, oldest first.
+    ///
+    /// Kept so the canonical index can be written when the run is *consumed*
+    /// rather than when it arrives: a run that has not linked yet is still
+    /// only a peer's word, and writing it would publish an unproven chain.
+    blocks: Vec<(u64, B256)>,
 }
 
 /// Ascends from an anchor toward a target height, proving the work as it goes.
@@ -274,6 +280,29 @@ impl ForwardSync {
         out
     }
 
+    /// Write a consumed run to the canonical index, and move the head and the
+    /// accumulated work with it.
+    ///
+    /// The head is what `SnapSession::anchor` reads on the next start, so this
+    /// is the whole of resuming. The work is recorded against the new head for
+    /// the same reason: it is the figure the ascent would otherwise have to
+    /// re-derive by walking from genesis again.
+    fn commit(&self, run: &Run) {
+        for (number, hash) in &run.blocks {
+            if let Err(e) = self.store.put_canonical_hash(*number, *hash) {
+                warn!(
+                    target: "rustock::snap",
+                    "forward sync: could not index #{number}: {e}"
+                );
+                return;
+            }
+        }
+        let _ = self.store.put_total_difficulty(run.newest, self.work);
+        if let Err(e) = self.store.set_head(run.newest) {
+            warn!(target: "rustock::snap", "forward sync: could not move the head: {e}");
+        }
+    }
+
     /// The skeleton request whose answer would name a point at `number`.
     fn skeleton_start_covering(&self, number: u64) -> u64 {
         let span = self.skeleton_span.max(1);
@@ -367,6 +396,9 @@ impl ForwardSync {
 
         let newest = &headers[0];
         let oldest = headers.last().expect("non-empty");
+        let mut blocks: Vec<(u64, B256)> =
+            headers.iter().map(|h| (h.number, h.hash())).collect();
+        blocks.reverse(); // oldest first, the order the index wants
         self.satisfied.insert(point);
         self.runs.insert(
             oldest.number,
@@ -377,6 +409,7 @@ impl ForwardSync {
                 oldest_parent: oldest.parent_hash,
                 work,
                 uncles,
+                blocks,
             },
         );
 
@@ -455,9 +488,20 @@ impl ForwardSync {
             }
             let run = self.runs.remove(&(self.have_number + 1)).expect("just read");
             self.work = self.work.saturating_add(run.work);
-            self.counted_uncles.extend(run.uncles);
+            self.counted_uncles.extend(run.uncles.iter().copied());
             self.have_number = run.newest_number;
             self.have_hash = run.newest;
+
+            // Commit the run now that it is part of the proven prefix.
+            //
+            // This is what makes the shape worth its name. A descending walk
+            // cannot do it -- nothing it fetches is worth anything until the
+            // links reach ground -- so it stages everything and promotes at
+            // the end, and a walk that dies has established nothing. Ascending,
+            // every run that links is permanently true, and writing it means a
+            // sync that is interrupted resumes from where it stopped instead
+            // of starting again at genesis.
+            self.commit(&run);
             self.points.remove(&run.newest_number);
             self.satisfied.remove(&run.newest_number);
 
