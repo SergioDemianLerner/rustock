@@ -57,6 +57,24 @@ use std::sync::Mutex;
 const TX_WINDOW_SIZE: usize = 512;
 /// Blocks sampled for fullness. rskj `BLOCK_WINDOW_SIZE`.
 const BLOCK_WINDOW_SIZE: usize = 50;
+
+/// How far back priming will walk before giving up on filling the transaction
+/// window.
+///
+/// Without it the walk is bounded only by finding 512 non-REMASC transactions,
+/// and a chain with no bodies never does. A node that has synced headers but
+/// not bodies -- which is every node part-way through a snapshot sync -- walks
+/// to genesis on startup, accumulating every header it passes in memory.
+///
+/// On mainnet 2026-10-05 that was 9.28M headers and about 3.6 GB, which
+/// exhausted RAM and swap on an 8 GB host before the node finished starting.
+/// The node logged nothing between opening the trie store and dying, because
+/// this runs in between.
+///
+/// 10,000 blocks is two hundred times `BLOCK_WINDOW_SIZE` and about three days
+/// of chain. If the transaction window is not full by then, the estimate is as
+/// good as it is going to get and a wider scan would not improve it.
+const MAX_PRIME_SCAN: usize = 10_000;
 /// Average fullness at which the fee market counts as working. rskj
 /// `BLOCK_COMPLETION_PERCENT_FOR_FEE_MARKET_WORKING`.
 const FEE_MARKET_FULLNESS: f64 = 0.9;
@@ -201,7 +219,10 @@ impl GasPriceTracker {
         let mut tx_count = 0usize;
         let mut cursor = Some(head_hash);
 
-        while (tx_count < TX_WINDOW_SIZE || blocks.len() < BLOCK_WINDOW_SIZE) && cursor.is_some() {
+        while (tx_count < TX_WINDOW_SIZE || blocks.len() < BLOCK_WINDOW_SIZE)
+            && cursor.is_some()
+            && blocks.len() < MAX_PRIME_SCAN
+        {
             let hash = cursor.take().unwrap();
             let Ok(Some(header)) = store.header(hash) else { break };
             let transactions = store
@@ -235,6 +256,15 @@ impl GasPriceTracker {
             self.on_block(header, transactions);
         }
 
+        if blocks.len() >= MAX_PRIME_SCAN && tx_count < TX_WINDOW_SIZE {
+            tracing::warn!(
+                target: "rustock::sync",
+                "Gas price tracker gave up priming after {} block(s) with only {} \
+                 transaction(s); this chain has headers but no bodies over that \
+                 range, so the estimate is thin until blocks arrive",
+                blocks.len(), tx_count
+            );
+        }
         tracing::info!(
             target: "rustock::sync",
             "Gas price tracker primed from {} block(s), {} transaction(s); fee market working: {}",

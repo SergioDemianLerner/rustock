@@ -463,3 +463,96 @@ fn an_unlinked_run_is_not_committed() {
     );
     assert_eq!(store.head().unwrap(), None, "nor the head");
 }
+
+/// A gap the skeleton never covered is bridged from the run above it.
+///
+/// The prefix can only absorb a run beginning at `have + 1`, which needs a
+/// point exactly 192 above. If that one point never arrives, every run above is
+/// misaligned by 192 and none of them can ever link: they pile up marked
+/// satisfied, `wants` empties, and the sync stops with a peer still connected
+/// and no error. The mainnet run of 2026-10-05 sat at #9,281,664 for three
+/// hours that way, 3,336 blocks short of its target.
+///
+/// Every run carries its oldest header's parent hash, which is the one hash
+/// known for the block below it. That is the way out.
+#[test]
+fn a_gap_the_skeleton_missed_is_bridged_from_the_run_above() {
+    let anchor = header(0, B256::ZERO, 100);
+    let (mut s, _d) = sync(&anchor, HEADER_CHUNK * 4, HeaderVerifier::new());
+
+    // Build two chunks, but only ever tell the sync about the upper one --
+    // as if the skeleton naming the lower point was lost.
+    let lower = run_of(1, HEADER_CHUNK as usize, anchor.hash(), 100, |_| Vec::new());
+    let lower_top = lower[0].header.hash();
+    let upper = run_of(
+        HEADER_CHUNK + 1,
+        HEADER_CHUNK as usize,
+        lower_top,
+        100,
+        |_| Vec::new(),
+    );
+
+    s.on_skeleton(&[BlockIdentifier {
+        number: HEADER_CHUNK * 2,
+        hash: upper[0].header.hash(),
+    }]);
+    let _ = s.wants(8);
+    s.on_headers_with_uncles(HEADER_CHUNK * 2, &upper).expect("internally valid");
+
+    // It cannot link -- its oldest is #193, the prefix is at #0.
+    assert_eq!(s.frontier(), 0, "the upper run is 192 blocks too high to absorb");
+
+    // The sync must still have something to ask for: the bridge, addressed by
+    // the upper run's oldest parent.
+    let bridge: Vec<Want> = s
+        .wants(8)
+        .into_iter()
+        .filter(|w| matches!(w, Want::Headers { from, .. } if *from == upper.last().unwrap().header.parent_hash))
+        .collect();
+    assert_eq!(
+        bridge.len(),
+        1,
+        "the gap below an unlinked run must be asked for, or the sync stops dead"
+    );
+    match bridge[0] {
+        Want::Headers { count, point, .. } => {
+            assert_eq!(point, HEADER_CHUNK, "the block immediately below the stranded run");
+            assert_eq!(count as u64, HEADER_CHUNK, "closing as much of the gap as a chunk allows");
+        }
+        _ => unreachable!(),
+    }
+
+    // And once it lands, everything above it absorbs in one go.
+    s.on_headers_with_uncles(HEADER_CHUNK, &lower).expect("the bridge");
+    assert_eq!(
+        s.frontier(),
+        HEADER_CHUNK * 2,
+        "the bridge links the prefix through both runs"
+    );
+}
+
+/// The uncle-reuse ledger is a window, not a ledger.
+///
+/// Consensus lets a block reference an uncle only within
+/// `UNCLE_GENERATION_LIMIT` generations of it, so nothing older can ever
+/// collide. Keeping every hash instead is one `B256` per uncle for the whole
+/// chain -- on mainnet about 8.4 million of them.
+#[test]
+fn the_uncle_ledger_does_not_grow_with_the_chain() {
+    let anchor = header(0, B256::ZERO, 100);
+    let (mut s, _d) = sync(&anchor, 400, HeaderVerifier::new());
+
+    // 400 blocks, each referencing its own distinct uncle.
+    let entries = run_of(1, 400, anchor.hash(), 100, |n| {
+        vec![header(n - 1, B256::repeat_byte((n % 251) as u8), 50)]
+    });
+    s.on_headers_with_uncles(400, &entries).expect("honest run");
+    assert_eq!(s.frontier(), 400);
+
+    assert!(
+        s.counted_uncles_len() <= 64,
+        "the ledger must stay inside the consensus window, not grow with the \
+         chain; held {} after 400 blocks",
+        s.counted_uncles_len()
+    );
+}
