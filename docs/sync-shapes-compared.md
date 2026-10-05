@@ -102,11 +102,79 @@ recorded **no hard stalls**. 18 reorgs and 3 pipeline restarts in that window,
 which is the ordinary sibling-reorg churn of this chain and not specific to
 either shape. Peak RSS 415 MB.
 
+## How the ascent scales across peers
+
+The argument for ascending was never single-peer speed: it was that a chunk is
+permanently valuable as soon as it links, so wide fan-out is cheap to attempt.
+That is now measured.
+
+Method and harness: `docs/snap-sync-test-method.md` and
+`tools/snap-scale-test/`. Each figure is a 180-second steady-state window on a
+client ascending from genesis, three repeats per group, interleaved.
+
+| servers | runs (blocks/s) | mean | sd | vs 1 | per server |
+|---|---|---|---|---|---|
+| 1 | 952, 998, 1,035 | 995 | 42 | 1.00x | 995 |
+| 2 | 2,406, 2,437, 2,514 | 2,452 | 56 | **2.46x** | 1,226 |
+| 3 | 3,549, 3,796, 3,715 | 3,687 | 126 | **3.71x** | 1,229 |
+| 4 | 4,873, 4,974, 3,730 | 4,526 | 691 | **4.55x** | 1,131 |
+
+It scales, and close to linearly: adding a fourth server still bought 23% over
+three. At four servers the header phase would finish in roughly half an hour
+rather than two.
+
+### Why it scales, which is not the obvious reason
+
+Not bandwidth, and not disk. Before building the rig the bottleneck was
+measured directly:
+
+- the whole exchange moves about **4 MB/s**, which is nothing;
+- the client sits at **13-24% of one core**, the server at **~22%**;
+- raising `--snap-parallel` from 8 to 32 -- four times the in-flight budget --
+  changed the rate by **8%**.
+
+What is actually serialised is the server. Sampling its threads shows **one
+thread doing all the serving** at ~23%, every other thread near zero, and each
+response taking ~116 ms of which only ~27 ms is CPU. The rest is blocking on
+disk reads, one at a time.
+
+So each additional server adds an independent serving pipeline. That is also
+why several servers can share one disk without competing: they are bound by
+I/O *latency*, not throughput, and their waits overlap.
+
+### Where it stops
+
+Per-server throughput is flat from two to three (1,226 then 1,229) and falls at
+four (1,131), where the spread also widens sharply -- sd 691 against 56 and
+126. That is the first sign of the four-core host contending, not of the
+protocol running out. Four servers, four client connections and a client on
+four cores is the limit of what this machine can say.
+
+### What it implies
+
+The single-threaded serving path is the thing worth fixing. It caps what any
+one peer can give a client, descending or ascending, and it is the likeliest
+explanation for the state download taking 805 s here against 158 s in the
+earlier run. A client with four peers works around it; a client with one
+cannot.
+
+### Superlinear, and not explained
+
+Two servers gave 2.46x and three gave 3.71x -- about 1.23x per server above
+linear. The single-server baseline appears depressed rather than the multi-peer
+cases inflated, most likely because one connection leaves gaps in the client's
+request pipeline that further connections fill. That is a hypothesis, not a
+measurement, and it is recorded as one.
+
 ## Verdict
 
-Ascending is sound, now completes end to end, and gives an exact total
-difficulty and a resumable sync that descending cannot. It is not yet proven
-faster, and the one clean number it has is an extrapolation.
+Ascending is sound, completes end to end, and gives an exact total difficulty
+and a resumable sync that descending cannot. Against a single peer it is not
+yet proven faster, and the one clean number it has is an extrapolation.
+
+Against several peers it is a different proposition: 4.55x on four servers,
+which no amount of tuning gets from one. That is the case for the shape, and it
+is now measured rather than argued.
 
 What would settle it is a single uninterrupted run of each shape on an unloaded
 host against the same frozen server. Neither has had that.

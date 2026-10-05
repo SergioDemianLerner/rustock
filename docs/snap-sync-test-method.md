@@ -136,6 +136,64 @@ And alongside them: bytes on the wire per category, peak RSS, and the server's
 dropped -- they are not blocks of this chain -- so a client that moved 20 GB
 may hold 9 GB. Measure the wire if the wire is what you mean.
 
+## Measuring how it scales with several servers
+
+`tools/snap-scale-test/` runs the sweep. It exists because the setup has three
+traps and all three produce a plausible-looking wrong number rather than an
+error.
+
+```sh
+tools/snap-scale-test/run-all.sh 4 3     # 1..4 servers, 3 repeats, interleaved
+```
+
+Or by hand:
+
+```sh
+tools/snap-scale-test/server.sh 1 &      # port 30310, discovery 30311
+tools/snap-scale-test/server.sh 2 &      # port 30320, discovery 30321
+tools/snap-scale-test/measure.sh 2       # one 180s window against both
+```
+
+### Several servers may share one database
+
+They must all be `--read-only`, which they are anyway to be a fixed fixture.
+There is no need to copy anything: at these rates a server moves about 4 MB/s
+and is bound by I/O *latency*, not bandwidth, so several on one disk overlap
+their waits rather than competing for throughput. A full copy would be ~57 GB
+and buys nothing.
+
+### Each server needs `--secret-key`
+
+The node identity lives in `<data-dir>/node.key`. Servers sharing a database
+therefore present the **same node id**, and a client collapses them into one
+peer: the peer count reads 1 when you asked for 2, and the measurement is of a
+single server while appearing to be of several. `server.sh` derives a distinct
+key per index, deterministically, so a rerun reproduces the same identities.
+
+### The client must have settled before the window opens
+
+A client that starts measuring before every server has connected measures
+fewer servers than it thinks. That produced a 973 blocks/s reading in a group
+whose other samples were 3,549 and 3,796 -- and nothing in the log said so;
+it was only visible by sampling each server's CPU and finding one at 23% and
+the rest at 1%.
+
+`measure.sh` settles for 150s and checks the peer count against the number of
+servers asked for, printing `** DISCARD **` when they disagree. Check that each
+server is actually working if a number looks wrong:
+
+```sh
+top -b -n2 -d10 -p $(pgrep -d, -f simulate-height) | grep rustock
+```
+
+Healthy is every server at a similar percentage. One high and the rest idle
+means the client is talking to one of them.
+
+### Interleave the repeats
+
+Run `1,2,3,4` then `1,2,3,4` again, not three of each in turn, so drift in
+machine load falls on every group rather than on whichever ran last.
+
 ## Comparing against the recorded baseline
 
 `docs/cross-client-snap-sync.md` holds the 2026-10-01/02 run: rustock client,
