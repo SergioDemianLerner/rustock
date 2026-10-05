@@ -247,6 +247,51 @@ impl ForwardSync {
             }
         }
 
+        // Bridge a gap the skeleton did not cover.
+        //
+        // The prefix can only absorb a run that begins exactly at
+        // `have_number + 1`, which needs a point exactly 192 above it. If that
+        // one point is missing -- a skeleton answer that never arrived, or a
+        // peer that would not serve it -- then every run above is misaligned:
+        // a 192-chunk fetched from the next point along starts 192 blocks too
+        // high and can never link. They pile up in `runs`, marked satisfied,
+        // and `wants` has nothing left to ask for. The sync stops dead with a
+        // peer still connected and no error.
+        //
+        // That is exactly how the mainnet run of 2026-10-05 stalled at
+        // #9,281,664 for three hours, 3,336 blocks short.
+        //
+        // The way out is the hash every run already carries: its oldest
+        // header's parent. Asking from there lands a chunk whose newest block
+        // is the one immediately below, closing the gap by up to 192 blocks a
+        // time without needing a skeleton at all.
+        if out.len() < budget {
+            if let Some((_, run)) = self
+                .runs
+                .iter()
+                .find(|(oldest, _)| **oldest > self.have_number + 1)
+            {
+                let point = run.oldest_number - 1;
+                let count = (point - self.have_number).min(HEADER_CHUNK);
+                if count > 0 && !self.headers_sent.contains(&point) {
+                    debug!(
+                        target: "rustock::snap",
+                        "forward sync: bridging #{}..#{point} from the run above",
+                        self.have_number + 1
+                    );
+                    self.headers_sent.insert(point);
+                    out.push(Want::Headers {
+                        from: run.oldest_parent,
+                        count: count as u32,
+                        point,
+                    });
+                    if out.len() >= budget {
+                        return out;
+                    }
+                }
+            }
+        }
+
         // The stretch above the last grid point, which no skeleton identifier
         // covers. Asked for from the target's own hash, the one hash that is
         // known without a skeleton. Without this the ascent can never satisfy
