@@ -219,6 +219,23 @@ trie is requested. The freezer already holds both in parallel stores, so this
 is served by existing machinery rather than needing new, but it is a disk
 requirement that arrives earlier in the sync than it does today.
 
+## Status
+
+Implemented behind `--snap-forward-headers`, off by default, in
+`crates/sync/src/snap/forward.rs`. The descending walk is untouched.
+
+The first real run (2026-10-05) reached **#9,281,664 of #9,285,000 in 6,991 s**
+and then stalled, against **6,971 s** for the descending walk over the whole
+distance -- so the two are within a percent of each other on a single peer,
+which is what this note predicted, since the argument here was never
+single-peer speed. Three defects were found and fixed: unanswered requests were
+never reissued during an ascent, a target off the 192-block grid could not be
+reached at all, and a run that failed to link made its height permanently
+unaskable. Recorded in issue #262.
+
+That run used a live server and so does not measure what it set out to.
+`docs/snap-sync-test-method.md` says how to run the next one.
+
 ## Relationship to the wire proposals
 
 - **RSKIP-698** (headers with uncles) is a prerequisite for the exact total,

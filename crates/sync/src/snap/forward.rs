@@ -107,8 +107,18 @@ pub struct ForwardSync {
     have_number: u64,
     have_hash: B256,
 
-    /// The height being ascended toward.
+    /// The height being ascended toward, and its hash.
+    ///
+    /// The hash matters because the target need not sit on the chunk grid:
+    /// skeleton identifiers land on multiples of [`HEADER_CHUNK`], so for a
+    /// target that is not one, no identifier will ever name it. The remainder
+    /// is asked for from the target's own hash instead.
     target: u64,
+    target_hash: B256,
+
+    /// Where skeleton starts are measured from, and how far apart.
+    skeleton_base: u64,
+    skeleton_span: u64,
 
     skeleton_todo: Vec<u64>,
     skeleton_sent: HashSet<u64>,
@@ -119,6 +129,12 @@ pub struct ForwardSync {
     /// Verified runs waiting for the prefix to reach them, keyed by the height
     /// their *oldest* header sits at -- which is what the prefix must reach.
     runs: BTreeMap<u64, Run>,
+    /// Points a run is already in hand for, so `wants` does not ask twice.
+    ///
+    /// Kept beside `runs` rather than derived from it: runs are keyed by their
+    /// oldest height and a point is their newest, so deriving this meant
+    /// scanning every run for every candidate point.
+    satisfied: HashSet<u64>,
 
     /// Exact cumulative difficulty accumulated over the proven prefix.
     work: U256,
@@ -135,6 +151,7 @@ impl ForwardSync {
         anchor_hash: B256,
         anchor_work: U256,
         target: u64,
+        target_hash: B256,
         store: Arc<BlockStore>,
         verifier: Arc<HeaderVerifier>,
     ) -> Self {
@@ -156,11 +173,15 @@ impl ForwardSync {
             have_number: anchor_number,
             have_hash: anchor_hash,
             target,
+            target_hash,
+            skeleton_base: anchor_number,
+            skeleton_span: span,
             skeleton_todo,
             skeleton_sent: HashSet::new(),
             points: BTreeMap::new(),
             headers_sent: HashSet::new(),
             runs: BTreeMap::new(),
+            satisfied: HashSet::new(),
             work: anchor_work,
             counted_uncles: HashSet::new(),
             done: anchor_number >= target,
@@ -203,7 +224,7 @@ impl ForwardSync {
             .filter(|(p, _)| {
                 **p > self.have_number
                     && !self.headers_sent.contains(*p)
-                    && !self.runs.values().any(|r| r.newest_number == **p)
+                    && !self.satisfied.contains(*p)
             })
             .map(|(p, _)| *p)
             .take(budget)
@@ -220,6 +241,30 @@ impl ForwardSync {
             }
         }
 
+        // The stretch above the last grid point, which no skeleton identifier
+        // covers. Asked for from the target's own hash, the one hash that is
+        // known without a skeleton. Without this the ascent can never satisfy
+        // `have_number >= target` for a target off the grid, and stalls at
+        // 99.9% having done all the work.
+        let grid_top = (self.target / HEADER_CHUNK) * HEADER_CHUNK;
+        if self.target > grid_top
+            && self.have_number < self.target
+            && out.len() < budget
+            && !self.headers_sent.contains(&self.target)
+            && !self.satisfied.contains(&self.target)
+        {
+            let count = (self.target - grid_top).min(self.target - self.have_number);
+            self.headers_sent.insert(self.target);
+            out.push(Want::Headers {
+                from: self.target_hash,
+                count: count as u32,
+                point: self.target,
+            });
+            if out.len() >= budget {
+                return out;
+            }
+        }
+
         while out.len() < budget {
             let Some(start) = self.skeleton_todo.pop() else { break };
             if self.skeleton_sent.insert(start) {
@@ -227,6 +272,28 @@ impl ForwardSync {
             }
         }
         out
+    }
+
+    /// The skeleton request whose answer would name a point at `number`.
+    fn skeleton_start_covering(&self, number: u64) -> u64 {
+        let span = self.skeleton_span.max(1);
+        self.skeleton_base + ((number.saturating_sub(self.skeleton_base)) / span) * span
+    }
+
+    /// Forget a point and everything derived from it, so it can be learned
+    /// again -- from another peer if there is one.
+    ///
+    /// A height the ascent has given up on is otherwise unreachable: the point
+    /// is gone, so `wants` will not ask, and nothing re-queues the skeleton
+    /// that would name it again. With one peer that is a permanent stall.
+    fn forget_point(&mut self, point: u64) {
+        self.points.remove(&point);
+        self.satisfied.remove(&point);
+        self.headers_sent.remove(&point);
+        let start = self.skeleton_start_covering(point);
+        if self.skeleton_sent.remove(&start) {
+            self.skeleton_todo.push(start);
+        }
     }
 
     /// Give up on an outstanding request so it can be asked of someone else.
@@ -300,6 +367,7 @@ impl ForwardSync {
 
         let newest = &headers[0];
         let oldest = headers.last().expect("non-empty");
+        self.satisfied.insert(point);
         self.runs.insert(
             oldest.number,
             Run {
@@ -352,18 +420,37 @@ impl ForwardSync {
     /// frontier's hash as its oldest header's parent. Both conditions, not
     /// either: the height alone would let a run from another chain through.
     fn advance(&mut self) {
+        // Runs wholly below the prefix can no longer contribute; a later run
+        // overtook them. Dropping them keeps the map from growing and stops a
+        // stale entry masking a point that still needs asking for.
+        let frontier = self.have_number;
+        let stale: Vec<u64> = self
+            .runs
+            .iter()
+            .filter(|(_, r)| r.newest_number <= frontier)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in stale {
+            if let Some(run) = self.runs.remove(&key) {
+                self.satisfied.remove(&run.newest_number);
+            }
+        }
+
         while let Some(run) = self.runs.get(&(self.have_number + 1)) {
             if run.oldest_parent != self.have_hash {
-                // A run at the right height from the wrong chain. Drop it and
-                // let the point be asked of someone else.
+                // A run at the right height from the wrong chain. Forget the
+                // point entirely -- the identifier that produced it was wrong,
+                // so asking again with the same hash would return the same
+                // run -- and re-queue the skeleton that would name it afresh.
                 debug!(
                     target: "rustock::snap",
-                    "forward sync: run at #{} does not link to the proven prefix",
+                    "forward sync: run at #{} does not link to the proven prefix; \
+                     re-asking for that height",
                     self.have_number + 1
                 );
                 let point = run.newest_number;
                 self.runs.remove(&(self.have_number + 1));
-                self.points.remove(&point);
+                self.forget_point(point);
                 return;
             }
             let run = self.runs.remove(&(self.have_number + 1)).expect("just read");
@@ -372,6 +459,7 @@ impl ForwardSync {
             self.have_number = run.newest_number;
             self.have_hash = run.newest;
             self.points.remove(&run.newest_number);
+            self.satisfied.remove(&run.newest_number);
 
             if self.have_number >= self.target {
                 self.done = true;

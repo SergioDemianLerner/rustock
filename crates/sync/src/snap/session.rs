@@ -656,6 +656,7 @@ impl SnapSession {
                         hash,
                         work,
                         header.number,
+                        header.hash(),
                         self.store.clone(),
                         self.verifier.clone(),
                     ));
@@ -902,16 +903,29 @@ impl SnapSession {
     }
 
     /// Ask again for a header range nobody answered.
+    /// Ask again for headers nobody answered.
+    ///
+    /// Both header phases, not just the descending walk. An earlier version
+    /// released only `walk`, so during an ascent a single dropped response
+    /// left its request marked outstanding for ever: `wants` would not reissue
+    /// it, nothing else could, and the frontier stopped where it stood. That
+    /// is what stalled the first real run at 99.96%.
     pub fn release_header_request(&mut self, point: u64, from: B256, count: u32) {
         if let Some(walk) = self.walk.as_mut() {
             walk.release(&super::headers::Want::Headers { from, count, point });
         }
+        if let Some(ascent) = self.ascent.as_mut() {
+            ascent.release(&super::forward::Want::Headers { from, count, point });
+        }
     }
 
-    /// Ask again for a skeleton nobody answered.
+    /// Ask again for a skeleton nobody answered. See above: both phases.
     pub fn release_skeleton_request(&mut self, start: u64) {
         if let Some(walk) = self.walk.as_mut() {
             walk.release(&super::headers::Want::Skeleton { start });
+        }
+        if let Some(ascent) = self.ascent.as_mut() {
+            ascent.release(&super::forward::Want::Skeleton { start });
         }
     }
 

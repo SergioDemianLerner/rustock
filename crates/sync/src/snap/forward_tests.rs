@@ -78,6 +78,7 @@ fn sync(anchor: &Header, target: u64, verifier: HeaderVerifier) -> (ForwardSync,
             anchor.hash(),
             U256::ZERO,
             target,
+            B256::repeat_byte(0xff),
             store,
             Arc::new(verifier),
         ),
@@ -258,4 +259,122 @@ fn requests_are_lowest_first_and_do_not_overlap_the_prefix() {
         Want::Headers { count, .. } => assert_eq!(count as u64, HEADER_CHUNK),
         _ => panic!("expected headers"),
     }
+}
+
+/// The target need not sit on the chunk grid, and the ascent must still reach
+/// it.
+///
+/// Skeleton identifiers land on multiples of `HEADER_CHUNK`, so for a target
+/// that is not one, no identifier ever names it. The first real run stalled at
+/// 99.96% for exactly this reason: it had every header up to the last grid
+/// point and no way to ask for the 72 blocks above it.
+#[test]
+fn a_target_off_the_grid_is_still_asked_for() {
+    let anchor = header(0, B256::ZERO, 100);
+    let target = HEADER_CHUNK * 3 + 72; // deliberately not a multiple of 192
+    let (mut s, _d) = sync(&anchor, target, HeaderVerifier::new());
+
+    let wants = s.wants(8);
+    let bespoke: Vec<&Want> = wants
+        .iter()
+        .filter(|w| matches!(w, Want::Headers { point, .. } if *point == target))
+        .collect();
+    assert_eq!(bespoke.len(), 1, "the stretch above the grid must be asked for: {wants:?}");
+
+    match bespoke[0] {
+        Want::Headers { count, from, .. } => {
+            assert_eq!(*count as u64, 72, "exactly the remainder above the last grid point");
+            assert_eq!(*from, B256::repeat_byte(0xff), "asked for by the target's own hash");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// A target *on* the grid needs no bespoke chunk: the skeleton names it.
+#[test]
+fn a_target_on_the_grid_gets_no_bespoke_chunk() {
+    let anchor = header(0, B256::ZERO, 100);
+    let target = HEADER_CHUNK * 3;
+    let (mut s, _d) = sync(&anchor, target, HeaderVerifier::new());
+
+    let asked_by_hash = s
+        .wants(8)
+        .into_iter()
+        .any(|w| matches!(w, Want::Headers { from, .. } if from == B256::repeat_byte(0xff)));
+    assert!(!asked_by_hash, "nothing above the grid, so nothing to ask for by hash");
+}
+
+/// A request nobody answers is asked again after it is released.
+///
+/// This is what actually stalled the first real run: the session released only
+/// the descending walk, so during an ascent a dropped response left its
+/// request outstanding for ever and the frontier stopped where it stood.
+#[test]
+fn a_released_request_is_asked_again() {
+    let anchor = header(0, B256::ZERO, 100);
+    let (mut s, _d) = sync(&anchor, HEADER_CHUNK * 4, HeaderVerifier::new());
+    s.on_skeleton(&[BlockIdentifier { number: HEADER_CHUNK, hash: B256::repeat_byte(1) }]);
+
+    let headers_in = |ws: Vec<Want>| -> Vec<Want> {
+        ws.into_iter().filter(|w| matches!(w, Want::Headers { .. })).collect()
+    };
+
+    let first = headers_in(s.wants(8));
+    assert_eq!(first.len(), 1, "one known point, one header request");
+    assert!(
+        headers_in(s.wants(8)).is_empty(),
+        "and it is not asked for again while it is outstanding"
+    );
+
+    s.release(&first[0]);
+    assert_eq!(headers_in(s.wants(8)), first, "but it is once released");
+}
+
+/// A skeleton nobody answers is re-queued too, not just a header request.
+#[test]
+fn a_released_skeleton_is_asked_again() {
+    let anchor = header(0, B256::ZERO, 100);
+    let (mut s, _d) = sync(&anchor, HEADER_CHUNK * 4, HeaderVerifier::new());
+
+    let skeletons: Vec<Want> = s
+        .wants(8)
+        .into_iter()
+        .filter(|w| matches!(w, Want::Skeleton { .. }))
+        .collect();
+    assert!(!skeletons.is_empty(), "a fresh ascent asks for a skeleton");
+
+    s.release(&skeletons[0]);
+    let again = s.wants(8);
+    assert!(
+        again.iter().any(|w| *w == skeletons[0]),
+        "a released skeleton comes back round"
+    );
+}
+
+/// A run that does not link gives its height back, so another peer can answer.
+///
+/// Dropping the run alone is not enough: the identifier that produced it is
+/// also wrong, so the point and the skeleton that named it must go too, or the
+/// height is unreachable for the rest of the sync.
+#[test]
+fn a_non_linking_run_releases_its_height() {
+    let anchor = header(0, B256::ZERO, 100);
+    let (mut s, _d) = sync(&anchor, HEADER_CHUNK * 4, HeaderVerifier::new());
+    s.on_skeleton(&[BlockIdentifier { number: HEADER_CHUNK, hash: B256::repeat_byte(1) }]);
+    let _ = s.wants(8);
+
+    // Internally consistent, but rooted somewhere this node does not trust.
+    let elsewhere = run_of(1, HEADER_CHUNK as usize, B256::repeat_byte(0xaa), 100, |_| Vec::new());
+    s.on_headers_with_uncles(HEADER_CHUNK, &elsewhere).expect("internally valid");
+    assert_eq!(s.frontier(), 0, "it links to nothing, so the prefix stands still");
+
+    let skeletons: Vec<Want> = s
+        .wants(8)
+        .into_iter()
+        .filter(|w| matches!(w, Want::Skeleton { start: 0 }))
+        .collect();
+    assert!(
+        !skeletons.is_empty(),
+        "the skeleton naming that height must be asked again, or it is unreachable"
+    );
 }
