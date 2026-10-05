@@ -764,6 +764,40 @@ impl SnapSession {
     /// `BlockHeadersResponse` delivers them.
     /// Headers delivered with their uncles, so the walk can total the work
     /// exactly rather than bounding it from below.
+    /// Whether the uncles sent with a header are the ones it commits to, and
+    /// each did the work it claims.
+    ///
+    /// A header failing either check still goes through as a bare header. Only
+    /// its uncle-derived difficulty is withheld, which understates the chain
+    /// rather than overstating it -- and understated is the direction that
+    /// refuses a liar rather than admitting one.
+    fn uncles_are_proven(
+        &self,
+        entry: &rustock_networking::protocol::HeaderWithUncles,
+    ) -> bool {
+        if !entry.commitment_matches() {
+            warn!(
+                target: "rustock::snap",
+                "block #{} came with uncles its header does not commit to; \
+                 not crediting the difficulty they would have proved",
+                entry.header.number
+            );
+            return false;
+        }
+        for uncle in &entry.uncles {
+            if let Err(e) = self.verifier.verify(uncle, None) {
+                warn!(
+                    target: "rustock::snap",
+                    "uncle {:?} of block #{} has no valid proof of work ({e}); \
+                     not crediting the difficulty it would have proved",
+                    uncle.hash(), entry.header.number
+                );
+                return false;
+            }
+        }
+        true
+    }
+
     /// Record whether this session's peer serves headers-with-uncles.
     ///
     /// Must be called before the status response is handled, since that is
@@ -790,11 +824,25 @@ impl SnapSession {
             }
             return self.finish_ascent_or_continue();
         }
+        // The same two checks the ordinary path makes, and for the same
+        // reason: `cumulative_difficulty()` is the sender's arithmetic over
+        // the uncles it chose to send, and only `ommers_hash` plus each
+        // uncle's own proof of work turn that into a figure this node may
+        // believe.
+        //
+        // It matters more here than there. These values flow into
+        // `walked_difficulty`, hence `established_difficulty`, hence the
+        // `OverstatedDifficulty` ceiling -- so a peer that fabricates uncles
+        // *raises the very ceiling* its claim is checked against. The one
+        // guard against an overstated claim could be widened by the peer it
+        // was guarding against.
         let mut proven = std::collections::HashMap::with_capacity(entries.len());
         let headers: Vec<Header> = entries
             .iter()
             .map(|e| {
-                proven.insert(e.header.hash(), e.cumulative_difficulty());
+                if self.uncles_are_proven(e) {
+                    proven.insert(e.header.hash(), e.cumulative_difficulty());
+                }
                 e.header.clone()
             })
             .collect();

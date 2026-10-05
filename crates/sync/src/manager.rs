@@ -92,10 +92,65 @@ impl SyncManager {
         entries
             .into_iter()
             .map(|entry| {
-                proven.insert(entry.header.hash(), entry.cumulative_difficulty());
+                // Record the proven figure only when it *is* proven. Two
+                // things have to hold, and neither is implied by the other:
+                //
+                //  - `ommers_hash` is inside what the trunk header's proof of
+                //    work commits to, so a list matching it cannot have been
+                //    added to, dropped from or altered;
+                //  - each uncle carries its own merged-mining proof of work,
+                //    because a matching commitment only proves the block's
+                //    miner *chose* this list, not that the difficulty each
+                //    uncle states was ever performed.
+                //
+                // Without both, `cumulative_difficulty()` is whatever the
+                // sender wrote. A peer could take real headers off the real
+                // chain, attach fabricated uncles, and inflate the total
+                // difficulty this node records for them -- the input to chain
+                // selection -- by up to the consensus uncle limit, without
+                // mining anything.
+                //
+                // A header that fails either check still goes through as a
+                // bare header: it is a header like any other and the ordinary
+                // path verifies it. Only the uncle-derived difficulty is
+                // withheld, which leaves the total understated rather than
+                // overstated, and understated is the safe direction.
+                if self.uncles_are_proven(&entry) {
+                    proven.insert(entry.header.hash(), entry.cumulative_difficulty());
+                }
                 entry.header
             })
             .collect()
+    }
+
+    /// Whether the uncles sent with a header are the ones it commits to, and
+    /// each did the work it claims.
+    fn uncles_are_proven(&self, entry: &HeaderWithUncles) -> bool {
+        if !entry.commitment_matches() {
+            warn!(
+                target: "rustock::sync",
+                "Block #{} came with uncles its header does not commit to; \
+                 ignoring the difficulty they would have proved",
+                entry.header.number
+            );
+            return false;
+        }
+        for uncle in &entry.uncles {
+            // Static rules only. An uncle's parent is not on the trunk, so the
+            // parent-relative rules cannot run here -- but the merged-mining
+            // proof of work is among the static ones, and it is the part that
+            // makes the difficulty work rather than a number.
+            if let Err(e) = self.verifier.verify(uncle, None) {
+                warn!(
+                    target: "rustock::sync",
+                    "Uncle {:?} of block #{} has no valid proof of work ({e}); \
+                     ignoring the difficulty it would have proved",
+                    uncle.hash(), entry.header.number
+                );
+                return false;
+            }
+        }
+        true
     }
 
     /// The body of [`Self::handle_headers_response`], with the peer optional so

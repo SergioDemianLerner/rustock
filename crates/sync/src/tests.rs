@@ -6320,3 +6320,122 @@ async fn headers_without_uncles_yield_only_a_lower_bound() {
         "1 + 10, with the two uncles' difficulty missing for want of a body"
     );
 }
+
+/// A peer may not inflate total difficulty with uncles the header never
+/// committed to.
+///
+/// `cumulative_difficulty()` is the sender's arithmetic over the uncles the
+/// sender chose to send. `ommers_hash` is inside what the trunk header's proof
+/// of work covers, so a matching list cannot have been added to, dropped from
+/// or altered -- and a list that does not match is simply whatever the peer
+/// wanted the total to be.
+///
+/// Unchecked, this needs no mining at all: take real headers off the real
+/// chain, attach fabricated uncles, and the total difficulty this node records
+/// -- the input to chain selection -- rises by up to the consensus uncle limit.
+#[tokio::test]
+async fn forged_uncles_do_not_prove_a_difficulty() {
+    use rustock_networking::protocol::HeaderWithUncles;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(
+        HeaderVerifier::new()
+            .with_parent_rule(rustock_core::validation::BlockNumberRule)
+            .with_parent_rule(rustock_core::validation::ParentHashRule),
+    );
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    // An honest header committing to no uncles at all...
+    let mut b1 = dummy_header(1, genesis_hash, U256::from(10));
+    b1.uncle_count = 0;
+    b1.ommers_hash = alloy_primitives::keccak256(
+        HeaderWithUncles { header: b1.clone(), uncles: Vec::new() }.encoded_uncles(),
+    );
+    b1.cached_hash = None;
+    let hash = b1.hash();
+
+    // ...delivered with a fat uncle bolted on by the sender.
+    let forged = HeaderWithUncles {
+        header: b1,
+        uncles: vec![dummy_header(0, B256::ZERO, U256::from(1_000_000))],
+    };
+    assert!(!forged.commitment_matches(), "the fixture must be a real forgery");
+
+    let headers = manager.note_proven_difficulties(vec![forged]);
+    manager.handle_headers_response(headers, test_peer()).unwrap();
+
+    // 1 (genesis) + 10, and not a unit of the million that was claimed.
+    assert_eq!(
+        store.total_difficulty(hash).unwrap(),
+        Some(U256::from(11)),
+        "a forged uncle list must prove nothing; the header still counts for \
+         its own difficulty"
+    );
+}
+
+/// An uncle the header *does* commit to still has to have done the work.
+///
+/// A matching commitment only proves the block's miner chose this list. The
+/// uncle's own merged-mining proof of work is what makes the difficulty it
+/// states work rather than a number, and a miner is free to commit to an uncle
+/// that never had one.
+#[tokio::test]
+async fn a_committed_uncle_without_proof_of_work_proves_nothing() {
+    use rustock_networking::protocol::HeaderWithUncles;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    /// Rejects the marked header, standing in for a failed merged-mining check.
+    struct RejectMarked;
+    impl rustock_core::validation::HeaderValidator for RejectMarked {
+        fn validate(
+            &self,
+            h: &rustock_core::Header,
+        ) -> Result<(), rustock_core::validation::ValidationError> {
+            if h.difficulty == U256::from(999u64) {
+                return Err(rustock_core::validation::ValidationError::BitcoinPowInvalid {
+                    hash: h.hash(),
+                    target: U256::ZERO,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    let verifier = Arc::new(
+        HeaderVerifier::new()
+            .with_static_rule(RejectMarked)
+            .with_parent_rule(rustock_core::validation::BlockNumberRule)
+            .with_parent_rule(rustock_core::validation::ParentHashRule),
+    );
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    let uncle = dummy_header(0, B256::ZERO, U256::from(999));
+    let mut b1 = dummy_header(1, genesis_hash, U256::from(10));
+    b1.uncle_count = 1;
+    let entry = HeaderWithUncles { header: b1, uncles: vec![uncle] };
+    let mut header = entry.header.clone();
+    header.ommers_hash = alloy_primitives::keccak256(entry.encoded_uncles());
+    header.cached_hash = None;
+    let entry = HeaderWithUncles { header, uncles: entry.uncles };
+    assert!(entry.commitment_matches(), "the commitment is honest; the work is not");
+
+    let hash = entry.header.hash();
+    let headers = manager.note_proven_difficulties(vec![entry]);
+    manager.handle_headers_response(headers, test_peer()).unwrap();
+
+    assert_eq!(
+        store.total_difficulty(hash).unwrap(),
+        Some(U256::from(11)),
+        "a committed uncle with no proof of work must not be credited"
+    );
+}
