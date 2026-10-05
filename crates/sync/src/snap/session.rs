@@ -136,7 +136,7 @@ pub enum Phase {
     /// Bounding the peer's claimed cumulative difficulty before committing to
     /// the walk.
     ///
-    /// The walk costs about twenty-five minutes and ten gigabytes on a
+    /// The walk costs about two hours and twenty gigabytes on a
     /// mainnet chain, all of it on the strength of a checkpoint this peer
     /// offered. Sampling a few hundred headers first turns that into a
     /// verdict up front.
@@ -318,7 +318,7 @@ impl SnapSession {
     /// Say how the current phase is going, at most every five seconds.
     ///
     /// Every phase that can run for minutes reports. The header walk ran for
-    /// twenty-five minutes and the state download for ten, both in silence,
+    /// about two hours and the state download for three, both in silence,
     /// and silence is indistinguishable from a hang -- which is how #187 was
     /// found, twice, before the same lesson was applied here (#208).
     fn report_progress(&mut self) {
@@ -424,7 +424,8 @@ impl SnapSession {
             Phase::SamplingClaim => {
                 use crate::sampler::{GateAction, GateOutcome, GateRejection};
                 let Some(gate) = self.gate.as_mut() else {
-                    self.set_phase(Phase::VerifyingHeaders);
+                    let next = self.header_phase();
+                    self.set_phase(next);
                     return self.poll();
                 };
                 let actions = gate.poll();
@@ -447,7 +448,8 @@ impl SnapSession {
                              carry (ceiling {ceiling}); verifying its header chain"
                         );
                         self.gate = None;
-                        self.set_phase(Phase::VerifyingHeaders);
+                        let next = self.header_phase();
+                        self.set_phase(next);
                         self.poll()
                     }
                     GateOutcome::Rejected(why) => match why {
@@ -587,7 +589,7 @@ impl SnapSession {
         self.offered = blocks.iter().cloned().zip(difficulties.iter().copied()).collect();
 
         // Bound the claim before committing to the walk. The walk costs about
-        // twenty-five minutes on a mainnet chain and rests entirely on this
+        // about two hours on a mainnet chain and rests entirely on this
         // peer's offer; a few hundred sampled headers settle it first.
         //
         // The anchor is this node's own chain where it has one -- its own
@@ -680,11 +682,8 @@ impl SnapSession {
         // decides whether it runs. Only move to the walk if nothing is
         // bounding the claim first.
         if self.phase != Phase::SamplingClaim {
-            self.set_phase(if self.ascent.is_some() {
-                Phase::AscendingHeaders
-            } else {
-                Phase::VerifyingHeaders
-            });
+            let next = self.header_phase();
+            self.set_phase(next);
         }
         self.poll()
     }
@@ -725,6 +724,21 @@ impl SnapSession {
         );
         self.set_phase(Phase::DownloadingState);
         self.poll()
+    }
+
+    /// Whichever header phase this session was configured for.
+    ///
+    /// Every transition out of `SamplingClaim` goes through here. Hard-coding
+    /// `VerifyingHeaders` at those sites would build an ascent in `on_status`
+    /// and then silently never run it, falling back to the descending walk
+    /// with no sign that anything was ignored.
+    #[cfg(test)]
+    pub(crate) fn header_phase_for_test(&self) -> Phase {
+        self.header_phase()
+    }
+
+    fn header_phase(&self) -> Phase {
+        if self.ascent.is_some() { Phase::AscendingHeaders } else { Phase::VerifyingHeaders }
     }
 
     /// The highest block this node already accepts, with the work behind it.

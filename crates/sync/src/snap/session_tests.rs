@@ -1505,3 +1505,51 @@ mod ascent_tests {
         );
     }
 }
+
+/// The gate and the ascent coexist: passing the gate must land in the phase the
+/// session was configured for, not always the descending walk.
+///
+/// `--checkpoint-bound-work` defaults on, so with `forward_headers` the gate
+/// runs *first* and then hands over. Hard-coding `VerifyingHeaders` at that
+/// hand-off built an ascent and silently never ran it.
+#[test]
+fn a_passed_gate_hands_over_to_the_ascent_not_the_walk() {
+    use rustock_core::checkpoint::MAINNET_CHECKPOINT;
+
+    let cp = MAINNET_CHECKPOINT;
+    let f = fixture(4);
+    let genesis = f.with_genesis();
+    f.store.set_head(genesis).expect("head");
+
+    let mut session = SnapSession::new(
+        SnapConfig {
+            client_enabled: true,
+            forward_headers: true,
+            checkpoint: Some(cp),
+            checkpoint_defence: rustock_core::checkpoint::CheckpointDefence {
+                verify_hash: false,
+                bound_work: true,
+            },
+            ..SnapConfig::default()
+        },
+        f.store.clone(),
+        Arc::new(MemoryTrieStore::new()) as Arc<dyn TrieStore>,
+        Arc::new(rustock_core::validation::HeaderVerifier::new()),
+    );
+    session.set_peer_serves_uncles(true);
+
+    // Above the checkpoint, so the gate engages rather than being skipped.
+    let offered = block(header(cp.number + 500_000, B256::ZERO, f.state_root, 100));
+    let _ = session.on_status(
+        std::slice::from_ref(&offered),
+        &[cp.cumulative_difficulty],
+        1024,
+        0,
+    );
+    assert_eq!(session.phase(), Phase::SamplingClaim, "the gate runs first");
+    assert_eq!(
+        session.header_phase_for_test(),
+        Phase::AscendingHeaders,
+        "and hands over to the ascent, not the walk"
+    );
+}
