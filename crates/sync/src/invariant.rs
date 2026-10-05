@@ -318,13 +318,18 @@ pub fn check_with_cursor(
 }
 
 #[cfg(test)]
+pub(crate) mod tests_support {
+    pub(crate) use super::tests::{chain as coherent_chain, header as test_header};
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::{Address, Bytes, U256};
     use rustock_core::Header;
     use tempfile::tempdir;
 
-    fn header(number: u64, parent: B256) -> Header {
+    pub(crate) fn header(number: u64, parent: B256) -> Header {
         Header {
             number,
             parent_hash: parent,
@@ -355,7 +360,7 @@ mod tests {
     /// A coherent chain of `len` blocks (0..=len-1), head and executed head
     /// both at the top. Returns the store, the temp dir (which must outlive
     /// it) and the hashes by height.
-    fn chain(len: u64) -> (BlockStore, tempfile::TempDir, Vec<B256>) {
+    pub(crate) fn chain(len: u64) -> (BlockStore, tempfile::TempDir, Vec<B256>) {
         let dir = tempdir().unwrap();
         let store = BlockStore::open(dir.path()).unwrap();
         let mut hashes = Vec::new();
@@ -545,5 +550,46 @@ mod tests {
         let err = check(&store, None, Scope::Full).unwrap_err();
         assert_eq!(err.relation(), "I8");
         assert_eq!(err.at(), Some(9));
+    }
+}
+
+#[cfg(test)]
+mod lookback_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    /// A stale canonical pointer *below* the executed head is reported.
+    ///
+    /// This is the relation that went unchecked on mainnet 2026-10-04. I3 was
+    /// always correct; the window it ran over started at the executed head, so
+    /// a reorg that rewrote a pointer underneath left nothing to notice. Seven
+    /// of them accumulated, and the first to mature through REMASC's
+    /// 4,000-block delay stopped the node for good.
+    #[test]
+    fn a_stale_pointer_below_the_executed_head_is_caught() {
+        let (store, _dir, hashes) = coherent_chain(40);
+
+        // A sibling at #20: same parent, different block. Exactly what a reorg
+        // leaves behind when the lineage walk stops above it.
+        let mut sibling = test_header(20, hashes[19]);
+        sibling.timestamp += 1;
+        sibling.cached_hash = None;
+        let sibling_hash = sibling.hash();
+        store.put_header_with_hash(sibling_hash, &sibling).unwrap();
+        store.put_canonical_hash(20, sibling_hash).unwrap();
+
+        // Checked from well below the executed head, as the service now does.
+        let v = check(&store, None, Scope::Delta { from: 10, to: 39 })
+            .expect_err("a chain that does not link must be reported");
+        assert!(
+            matches!(v, Violation::ParentMismatch { at: 21, .. }),
+            "expected the break named at the height above it, got {v:?}"
+        );
+
+        // And the window that shipped before would have missed it entirely.
+        assert!(
+            check(&store, None, Scope::Delta { from: 30, to: 39 }).is_ok(),
+            "a window starting above the damage cannot see it -- which is the bug"
+        );
     }
 }

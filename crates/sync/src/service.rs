@@ -225,6 +225,25 @@ pub(crate) fn backlog_needs_executing(has_processor: bool, downloaded: u64, exec
 
 const CANONICAL_REPAIR_MARGIN: u64 = 64;
 
+/// How far *below* the executed head the coherence check looks.
+///
+/// The delta window between the executed head and the validated head is where
+/// disagreements were assumed to live, and for I4..I8 that is true. I3 -- the
+/// canonical chain links to itself -- is different: a reorg rewrites pointers
+/// at and below the fork point, and `ensure_canonical_lineage` stops walking
+/// at the first consistent pair, so a pointer left stale underneath that point
+/// is never revisited by anything.
+///
+/// On mainnet 2026-10-04 seven such pointers accumulated. Nothing noticed for
+/// 33 hours, because the only thing that looks at a settled height again is
+/// REMASC, 4,000 blocks later -- and what it does then is compute a different
+/// state root and stop the node for good.
+///
+/// A reorg cannot move the chain further than `MAX_REORG_DEPTH`, so looking
+/// that far below the executed head covers the whole of where the damage can
+/// be done. It costs two point lookups per height per sweep.
+const COHERENCE_LOOKBACK: u64 = 1_000;
+
 const MAX_BODY_REQUESTS_PER_PEER: usize = 16;
 
 /// Ceiling on body requests outstanding across all peers at once. Bounds memory
@@ -2023,7 +2042,7 @@ impl SyncService {
         // consider downloaded, which is where every disagreement so far has
         // lived. The I4..I7 relations are checked whatever the scope.
         let scope = Scope::Delta {
-            from: cursor.executed.number,
+            from: cursor.executed.number.saturating_sub(COHERENCE_LOOKBACK),
             to: cursor.validated_head.number,
         };
         let trie = self.trie_store.as_deref();
@@ -2065,6 +2084,29 @@ impl SyncService {
                     // ancestry to the first block that is both canonical and
                     // still has state, which for a one-deep sibling fork is
                     // the shared parent: one block re-executed.
+                    // I3: the canonical chain does not link to itself. One
+                    // height names a block that is not the parent of the block
+                    // above it, so every consumer walking the index gets a
+                    // chain that was never mined.
+                    //
+                    // Repaired rather than only reported, because nothing else
+                    // will: `ensure_canonical_lineage` stops at the first
+                    // consistent pair and so never descends to it, and the
+                    // only existing repair trigger fires on a *missing* entry.
+                    // A stale one is not missing.
+                    //
+                    // Left alone it is silent until REMASC settles that height
+                    // 4,000 blocks later, computes a different state root from
+                    // the rest of the network and wedges the node permanently.
+                    // That is mainnet 2026-10-04, and it cost 33 hours before
+                    // anything said a word.
+                    Violation::ParentMismatch { at, .. } => {
+                        warn!(
+                            target: "rustock::sync",
+                            "Canonical index does not link at #{at}; repairing lineage"
+                        );
+                        self.repair_canonical_gap(cursor.validated_head.number, at.saturating_sub(1));
+                    }
                     Violation::ExecutedOffChain { at, hash, canonical } => {
                         if self.violation_held_for(&v, EXECUTION_OFF_CHAIN_GRACE) {
                             warn!(
