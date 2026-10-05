@@ -318,6 +318,11 @@ struct Args {
     ///              eth_getTransactionByHash and eth_getTransactionReceipt can
     ///              find transactions in blocks that were imported rather than
     ///              executed. Touches no trie and executes nothing.
+    ///   canonical  rebuild the canonical number -> hash index by walking the
+    ///              head's own ancestry down through --repair-from, so every
+    ///              height names the block the one above it actually builds
+    ///              on. An index rebuild, not a re-download: the headers are
+    ///              already stored. Touches no trie and executes nothing.
     #[arg(long, value_name = "TASK")]
     repair: Option<String>,
 
@@ -1422,9 +1427,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 store.set_freezer(f);
                 run_repair_chain_work(&store, args.repair_from, args.repair_to)?
             }
+            "canonical" => run_repair_canonical(&store, args.repair_from)?,
             other => anyhow::bail!(
                 "unknown repair task {other:?}; known tasks: tx-index, total-difficulty, \
-                 chain-work"
+                 chain-work, canonical"
             ),
         }
         return Ok(());
@@ -3443,6 +3449,66 @@ fn run_repair_tx_index(
 ///
 /// Reads bodies only -- no trie, no execution. The chain must be offline: this
 /// rewrites the values the sync layer ranks chains with.
+/// Rebuild the canonical `number -> hash` index from the head's own ancestry.
+///
+/// The authority is `parent_hash`. Every block names its parent, and the head
+/// is on the chain this node accepted, so walking down from it yields the one
+/// chain the index should describe -- whatever the index currently says.
+///
+/// An index rebuild, not a re-download: the headers are already stored. What
+/// was wrong is which of them each height pointed at.
+///
+/// # Why this exists
+///
+/// A reorg rewrites canonical pointers at and below the fork point.
+/// `ensure_canonical_lineage` stops walking at the first consistent pair, so a
+/// pointer left stale beneath a healthy stretch is never revisited, and the
+/// live repair only ever fired on a *missing* entry -- a stale one is not
+/// missing. On mainnet 2026-10-04 seven such pointers accumulated, and the
+/// first to mature through REMASC's 4,000-block settlement delay made the node
+/// compute a state root the rest of the network does not share, and stop.
+fn run_repair_canonical(store: &Arc<BlockStore>, from: Option<u64>) -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    let head_hash = store
+        .head()?
+        .ok_or_else(|| anyhow::anyhow!("this database has no head to walk down from"))?;
+    let head = store
+        .header(head_hash)?
+        .ok_or_else(|| anyhow::anyhow!("the head names a header this database does not hold"))?;
+
+    // Deep enough to cover any reorg by default: a reorg cannot move the chain
+    // further than MAX_REORG_DEPTH, so damage cannot begin below that.
+    let from = from.unwrap_or_else(|| head.number.saturating_sub(10_000));
+    if from > head.number {
+        anyhow::bail!("--repair-from ({from}) is above the head (#{})", head.number);
+    }
+    let depth = head.number - from;
+
+    info!(
+        "repair canonical: walking #{} down to #{from} ({depth} blocks) from {:?}",
+        head.number, head_hash
+    );
+
+    let started = Instant::now();
+    let report = store.repair_canonical_lineage(head_hash, depth)?;
+    let elapsed = started.elapsed();
+
+    info!(
+        "repair canonical: {} pointer(s) rewritten, {} hole(s) filled over {} block(s) \
+         down to #{:?} in {:.1}s",
+        report.corrected,
+        report.filled,
+        report.walked,
+        report.lowest,
+        elapsed.as_secs_f64()
+    );
+    if report.corrected == 0 && report.filled == 0 {
+        info!("repair canonical: the index already linked; nothing changed");
+    }
+    Ok(())
+}
+
 fn run_repair_total_difficulty(
     store: &Arc<BlockStore>,
     from: Option<u64>,
