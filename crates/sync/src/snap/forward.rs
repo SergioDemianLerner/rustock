@@ -93,6 +93,13 @@ struct Run {
     /// reuse across runs is caught when the run is consumed rather than when it
     /// arrives -- and so the ledger below can be pruned by height.
     uncles: Vec<(u64, B256)>,
+    /// The uncle headers each block referenced, oldest block first.
+    ///
+    /// Carried so they can be written to the freezer when the run is
+    /// committed. Bounded by what is in flight -- a few hundred kilobytes --
+    /// and the alternative is throwing away the only copy that will ever reach
+    /// this node.
+    uncle_headers: Vec<(u64, Vec<Header>)>,
     /// `(number, hash)` for every block in the run, oldest first.
     ///
     /// Kept so the canonical index can be written when the run is *consumed*
@@ -359,6 +366,33 @@ impl ForwardSync {
                 return;
             }
         }
+        // Keep the uncles, do not just count them.
+        //
+        // They arrive once, over the wire, and nothing else will ever hand
+        // them to this node: uncle headers live in block bodies, and a header
+        // sync has no bodies. Dropping them leaves a node that cannot sum its
+        // own chain's work and cannot serve `rsk/63` to anyone else -- which
+        // is to say, cannot serve the sync it just performed.
+        //
+        // Only below the freeze horizon. Nearer the target the chain can still
+        // move, and the freezer is for settled history; those blocks are
+        // inside the body window the sync fetches anyway, so their uncles
+        // arrive with the bodies.
+        if let Some(freezer) = self.store.freezer() {
+            let horizon = self.target.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH);
+            for (number, uncles) in &run.uncle_headers {
+                if *number < horizon {
+                    if let Err(e) = freezer.put_uncles(*number, uncles) {
+                        warn!(
+                            target: "rustock::snap",
+                            "forward sync: could not store the uncles of #{number}: {e}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
         let _ = self.store.put_total_difficulty(run.newest, self.work);
         if let Err(e) = self.store.set_head(run.newest) {
             warn!(target: "rustock::snap", "forward sync: could not move the head: {e}");
@@ -465,6 +499,9 @@ impl ForwardSync {
         let mut blocks: Vec<(u64, B256)> =
             headers.iter().map(|h| (h.number, h.hash())).collect();
         blocks.reverse(); // oldest first, the order the index wants
+        let mut uncle_headers: Vec<(u64, Vec<Header>)> =
+            entries.iter().map(|e| (e.header.number, e.uncles.clone())).collect();
+        uncle_headers.reverse();
         self.satisfied.insert(point);
         self.runs.insert(
             oldest.number,
@@ -476,6 +513,7 @@ impl ForwardSync {
                 work,
                 uncles,
                 blocks,
+                uncle_headers,
             },
         );
 

@@ -447,6 +447,28 @@ impl HeaderWalk {
     /// Only blocks below the freeze horizon: anything younger can still be
     /// replaced by a reorg, and a file addressed by height has no way to say
     /// "this height means something else now".
+    /// Stage the uncles a run of headers referenced, beside the headers.
+    ///
+    /// Same provisional footing as the headers: the chain is a peer's word
+    /// until the walk reaches ground, so these go to the staging freezer and
+    /// are promoted with everything else or discarded with it.
+    ///
+    /// Without this a descending-synced node ends up with every trunk header
+    /// and none of the uncles, which is a node that can neither sum its own
+    /// chain's work nor serve `rsk/63` -- the sync it just performed.
+    pub fn stage_uncles(&mut self, uncles: &[(u64, Vec<rustock_core::Header>)]) {
+        let Some(staging) = self.staging.as_ref() else { return };
+        let horizon = self.freeze_horizon;
+        if horizon == 0 {
+            return;
+        }
+        for (number, list) in uncles {
+            if *number < horizon {
+                let _ = staging.put_uncles(*number, list);
+            }
+        }
+    }
+
     fn freeze_provisionally(&mut self, headers: &[rustock_core::Header]) {
         let Some(staging) = self.staging.as_ref() else { return };
         let horizon = self.freeze_horizon;
