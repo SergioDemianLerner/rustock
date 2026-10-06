@@ -202,6 +202,20 @@ impl HeaderVerifier {
             .with_parent_rule(DifficultyRule { config })
     }
 
+    /// The rules that judge a header on its own, proof of work among them.
+    ///
+    /// Exposed so an uncle can be put through exactly the same rules as a
+    /// trunk header. An uncle that is not checked as hard as a trunk block is
+    /// a way to credit work nobody did.
+    pub fn static_rules(&self) -> &[Box<dyn HeaderValidator>] {
+        &self.static_rules
+    }
+
+    /// The rules that judge a header against its parent.
+    pub fn parent_rules(&self) -> &[Box<dyn ParentHeaderValidator>] {
+        &self.parent_rules
+    }
+
     pub fn with_static_rule(mut self, rule: impl HeaderValidator + 'static) -> Self {
         self.static_rules.push(Box::new(rule));
         self

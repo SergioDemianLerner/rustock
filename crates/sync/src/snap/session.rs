@@ -195,6 +195,9 @@ pub struct SnapSession {
     /// Bounds the peer's claimed cumulative difficulty before the walk is
     /// committed to. `None` once the verdict is in.
     gate: Option<crate::sampler::SamplingGate>,
+    /// The uncle lists seen so far, so the full uncle rule can run on a node
+    /// that has no bodies. See [`crate::uncle_guard`].
+    uncle_guard: crate::uncle_guard::UncleGuard,
     /// The ascending walk, when `SnapConfig::forward_headers` chose it.
     /// Mutually exclusive with `walk`.
     ascent: Option<super::forward::ForwardSync>,
@@ -239,6 +242,7 @@ impl SnapSession {
             blocks_cursor: 0,
             blocks_in_flight: false,
             gate: None,
+            uncle_guard: crate::uncle_guard::UncleGuard::new(),
             ascent: None,
             peer_serves_uncles: false,
             phase_started: Instant::now(),
@@ -764,6 +768,60 @@ impl SnapSession {
     /// `BlockHeadersResponse` delivers them.
     /// Headers delivered with their uncles, so the walk can total the work
     /// exactly rather than bounding it from below.
+    /// Whether the uncles sent with a header are the ones it commits to, and
+    /// each did the work it claims.
+    ///
+    /// A header failing either check still goes through as a bare header. Only
+    /// its uncle-derived difficulty is withheld, which understates the chain
+    /// rather than overstating it -- and understated is the direction that
+    /// refuses a liar rather than admitting one.
+    fn uncles_are_proven(
+        &mut self,
+        entry: &rustock_networking::protocol::HeaderWithUncles,
+    ) -> bool {
+        // The commitment first: it binds the list to the trunk header's proof
+        // of work, and every rule after it is about a list the block really
+        // chose rather than one the sender assembled.
+        if !entry.commitment_matches() {
+            warn!(
+                target: "rustock::snap",
+                "block #{} came with uncles its header does not commit to; \
+                 not crediting the difficulty they would have proved",
+                entry.header.number
+            );
+            return false;
+        }
+
+        // Then the whole of rskj's uncle rule: list limit, generation limit,
+        // no repeats, not an ancestor, nothing an ancestor already used, a
+        // parent that is itself an ancestor, and every per-header and
+        // parent-relative rule a trunk block faces -- proof of work among
+        // them.
+        //
+        // Commitment and proof of work alone would still let a miner reference
+        // one real uncle under several of its own blocks and have the work
+        // counted once per reference.
+        if let Err(why) = self.uncle_guard.uncles_are_admissible(
+            &self.store,
+            &self.verifier,
+            &entry.header,
+            &entry.uncles,
+        ) {
+            warn!(
+                target: "rustock::snap",
+                "block #{}: uncles not admissible ({why}); not crediting the \
+                 difficulty they would have proved",
+                entry.header.number
+            );
+            return false;
+        }
+
+        // Recorded only once admissible, so a rejected list cannot seed the
+        // window that later blocks are judged against.
+        self.uncle_guard.record(&entry.header, entry.uncles.clone());
+        true
+    }
+
     /// Record whether this session's peer serves headers-with-uncles.
     ///
     /// Must be called before the status response is handled, since that is
@@ -790,14 +848,29 @@ impl SnapSession {
             }
             return self.finish_ascent_or_continue();
         }
+        // The same two checks the ordinary path makes, and for the same
+        // reason: `cumulative_difficulty()` is the sender's arithmetic over
+        // the uncles it chose to send, and only `ommers_hash` plus each
+        // uncle's own proof of work turn that into a figure this node may
+        // believe.
+        //
+        // It matters more here than there. These values flow into
+        // `walked_difficulty`, hence `established_difficulty`, hence the
+        // `OverstatedDifficulty` ceiling -- so a peer that fabricates uncles
+        // *raises the very ceiling* its claim is checked against. The one
+        // guard against an overstated claim could be widened by the peer it
+        // was guarding against.
         let mut proven = std::collections::HashMap::with_capacity(entries.len());
-        let headers: Vec<Header> = entries
-            .iter()
-            .map(|e| {
+        let mut headers: Vec<Header> = Vec::with_capacity(entries.len());
+        // Oldest first: the uncle rule judges a block against its ancestors,
+        // so the window must be filled in the order the chain was built.
+        for e in entries.iter().rev() {
+            if self.uncles_are_proven(e) {
                 proven.insert(e.header.hash(), e.cumulative_difficulty());
-                e.header.clone()
-            })
-            .collect();
+            }
+            headers.push(e.header.clone());
+        }
+        headers.reverse(); // back to newest first, as the walk expects
         self.ingest_headers(point, &headers, &proven)
     }
 

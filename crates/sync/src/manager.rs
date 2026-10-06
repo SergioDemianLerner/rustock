@@ -38,6 +38,9 @@ pub struct SyncManager {
     /// Evidence that a peer is offering a chain we cannot connect to. Never a
     /// chain itself: see [`crate::unlinked`].
     unlinked: Mutex<UnlinkedHeaders>,
+    /// The uncle lists seen so far, so the full uncle rule can run without
+    /// bodies. See [`crate::uncle_guard`].
+    uncle_guard: Mutex<crate::uncle_guard::UncleGuard>,
     /// Cumulative difficulties proved by uncles a peer sent with the header.
     ///
     /// A header alone cannot yield one: uncle difficulty counts toward total
@@ -65,6 +68,7 @@ impl SyncManager {
             verifier,
             peer_store,
             unlinked: Mutex::new(UnlinkedHeaders::new()),
+            uncle_guard: Mutex::new(crate::uncle_guard::UncleGuard::new()),
             proven: Mutex::new(HashMap::new()),
         }
     }
@@ -92,10 +96,75 @@ impl SyncManager {
         entries
             .into_iter()
             .map(|entry| {
-                proven.insert(entry.header.hash(), entry.cumulative_difficulty());
+                // Record the proven figure only when it *is* proven. Two
+                // things have to hold, and neither is implied by the other:
+                //
+                //  - `ommers_hash` is inside what the trunk header's proof of
+                //    work commits to, so a list matching it cannot have been
+                //    added to, dropped from or altered;
+                //  - each uncle carries its own merged-mining proof of work,
+                //    because a matching commitment only proves the block's
+                //    miner *chose* this list, not that the difficulty each
+                //    uncle states was ever performed.
+                //
+                // Without both, `cumulative_difficulty()` is whatever the
+                // sender wrote. A peer could take real headers off the real
+                // chain, attach fabricated uncles, and inflate the total
+                // difficulty this node records for them -- the input to chain
+                // selection -- by up to the consensus uncle limit, without
+                // mining anything.
+                //
+                // A header that fails either check still goes through as a
+                // bare header: it is a header like any other and the ordinary
+                // path verifies it. Only the uncle-derived difficulty is
+                // withheld, which leaves the total understated rather than
+                // overstated, and understated is the safe direction.
+                if self.uncles_are_proven(&entry) {
+                    proven.insert(entry.header.hash(), entry.cumulative_difficulty());
+                }
                 entry.header
             })
             .collect()
+    }
+
+    /// Whether the uncles sent with a header are the ones it commits to, and
+    /// each did the work it claims.
+    fn uncles_are_proven(&self, entry: &HeaderWithUncles) -> bool {
+        // The commitment binds the list to the trunk header's proof of work.
+        // Everything after it is about a list the block really chose rather
+        // than one the sender assembled.
+        if !entry.commitment_matches() {
+            warn!(
+                target: "rustock::sync",
+                "Block #{} came with uncles its header does not commit to; \
+                 ignoring the difficulty they would have proved",
+                entry.header.number
+            );
+            return false;
+        }
+
+        // Then the whole of rskj's uncle rule. Commitment and proof of work
+        // alone would still let a miner reference one real uncle under
+        // several of its own blocks and have the work counted each time --
+        // capped only by `uncleListLimit`, so up to eleven times the trunk
+        // work actually performed.
+        let mut guard = self.uncle_guard.lock().unwrap();
+        if let Err(why) = guard.uncles_are_admissible(
+            &self.store,
+            &self.verifier,
+            &entry.header,
+            &entry.uncles,
+        ) {
+            warn!(
+                target: "rustock::sync",
+                "Block #{}: uncles not admissible ({why}); ignoring the \
+                 difficulty they would have proved",
+                entry.header.number
+            );
+            return false;
+        }
+        guard.record(&entry.header, entry.uncles.clone());
+        true
     }
 
     /// The body of [`Self::handle_headers_response`], with the peer optional so
