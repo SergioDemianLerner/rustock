@@ -6263,28 +6263,48 @@ async fn uncles_sent_with_headers_make_total_difficulty_exact() {
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let manager = SyncManager::new(store.clone(), verifier, peer_store);
 
-    // One block worth 10, absorbing two uncles worth 7 and 5.
-    let uncle_a = dummy_header(0, B256::ZERO, U256::from(7));
-    let uncle_b = dummy_header(0, B256::ZERO, U256::from(5));
-    let mut b1 = dummy_header(1, genesis_hash, U256::from(10));
-    b1.uncle_count = 2;
+    // #1 on the trunk, then #2 absorbing two genuine siblings of #1 worth 7
+    // and 5.
+    //
+    // The uncles are siblings of #1 rather than of genesis, which this fixture
+    // used to use. An uncle's parent has to be an ancestor of the block
+    // referencing it -- that is what makes it an uncle rather than a header
+    // off an unrelated fork -- and genesis has no parent to be one. The old
+    // shape passed only because the uncle rule was never run here.
+    let commit = |h: &Header, us: &[Header]| -> Header {
+        let mut h = h.clone();
+        h.uncle_count = us.len() as u64;
+        h.ommers_hash = alloy_primitives::keccak256(
+            HeaderWithUncles { header: h.clone(), uncles: us.to_vec() }.encoded_uncles(),
+        );
+        h.cached_hash = None;
+        h
+    };
 
-    let entry = HeaderWithUncles { header: b1, uncles: vec![uncle_a, uncle_b] };
-    // The header must genuinely name these uncles, as it would on the wire.
-    let commitment = alloy_primitives::keccak256(entry.encoded_uncles());
-    let mut header = entry.header.clone();
-    header.ommers_hash = commitment;
-    let entry = HeaderWithUncles { header, uncles: entry.uncles };
-    assert!(entry.commitment_matches());
+    let b1 = commit(&dummy_header(1, genesis_hash, U256::from(10)), &[]);
+    let b1_hash = b1.hash();
 
-    let hash = entry.header.hash();
-    let headers = manager.note_proven_difficulties(vec![entry]);
+    let mut uncle_a = dummy_header(1, genesis_hash, U256::from(7));
+    uncle_a.gas_used = 1;
+    uncle_a.cached_hash = None;
+    let mut uncle_b = dummy_header(1, genesis_hash, U256::from(5));
+    uncle_b.gas_used = 2;
+    uncle_b.cached_hash = None;
+
+    let uncles = vec![uncle_a, uncle_b];
+    let b2 = commit(&dummy_header(2, b1_hash, U256::from(10)), &uncles);
+    let hash = b2.hash();
+
+    let headers = manager.note_proven_difficulties(vec![
+        HeaderWithUncles { header: b1, uncles: Vec::new() },
+        HeaderWithUncles { header: b2, uncles },
+    ]);
     manager.handle_headers_response(headers, test_peer()).unwrap();
 
-    // 1 (genesis) + 10 + 7 + 5
+    // 1 (genesis) + 10 + 10 + 7 + 5
     assert_eq!(
         store.total_difficulty(hash).unwrap(),
-        Some(U256::from(23)),
+        Some(U256::from(33)),
         "uncle difficulty is counted, as rskj's getCumulativeDifficulty does"
     );
 }
@@ -6437,5 +6457,123 @@ async fn a_committed_uncle_without_proof_of_work_proves_nothing() {
         store.total_difficulty(hash).unwrap(),
         Some(U256::from(11)),
         "a committed uncle with no proof of work must not be credited"
+    );
+}
+
+/// One real uncle may not be counted twice.
+///
+/// After #268 a peer cannot fabricate uncles: the list is bound to the trunk
+/// header by `ommers_hash` and each uncle must carry its own proof of work.
+/// What that leaves is **reuse** — referencing the same genuine uncle under
+/// several blocks and having its difficulty credited once per reference.
+///
+/// Consensus forbids it (`validateIfUncleWasNeverUsed`). Unchecked, the cap is
+/// `uncleListLimit`, so a miner inflates its claim up to elevenfold over the
+/// trunk work it actually did.
+#[tokio::test]
+async fn an_uncle_used_twice_is_only_counted_once() {
+    use rustock_networking::protocol::HeaderWithUncles;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    let commit = |h: &Header, us: &[Header]| -> Header {
+        let mut h = h.clone();
+        h.uncle_count = us.len() as u64;
+        h.ommers_hash = alloy_primitives::keccak256(
+            HeaderWithUncles { header: h.clone(), uncles: us.to_vec() }.encoded_uncles(),
+        );
+        h.cached_hash = None;
+        h
+    };
+
+    // #1 on the trunk, and a genuine sibling of it worth 500. A real uncle's
+    // parent has to be an ancestor of the block referencing it, which is what
+    // makes it an uncle rather than a block off an unrelated fork.
+    let b1 = commit(&dummy_header(1, genesis_hash, U256::from(10)), &[]);
+    let b1_hash = b1.hash();
+    let mut uncle = dummy_header(1, genesis_hash, U256::from(500));
+    uncle.gas_used = 1; // distinguishes it from b1
+    uncle.cached_hash = None;
+
+    // #2 legitimately references it; #3 references the very same uncle again.
+    let b2 = commit(&dummy_header(2, b1_hash, U256::from(10)), &[uncle.clone()]);
+    let b2_hash = b2.hash();
+    let b3 = commit(&dummy_header(3, b2_hash, U256::from(10)), &[uncle.clone()]);
+    let b3_hash = b3.hash();
+
+    let headers = manager.note_proven_difficulties(vec![
+        HeaderWithUncles { header: b1, uncles: Vec::new() },
+        HeaderWithUncles { header: b2, uncles: vec![uncle.clone()] },
+        HeaderWithUncles { header: b3, uncles: vec![uncle] },
+    ]);
+    manager.handle_headers_response(headers, test_peer()).unwrap();
+
+    // 1 + 10 + 10 + 500 — the uncle counts under #2 and nowhere else.
+    assert_eq!(
+        store.total_difficulty(b2_hash).unwrap(),
+        Some(U256::from(521)),
+        "the first, legitimate reference is credited"
+    );
+    assert_eq!(
+        store.total_difficulty(b3_hash).unwrap(),
+        Some(U256::from(531)),
+        "the second reference adds only #3's own difficulty, not the uncle's again"
+    );
+}
+
+/// An uncle older than the generation limit is not credited.
+///
+/// Consensus bounds how far back a block may reach; without the check, work
+/// from arbitrarily deep in the chain can be re-counted at the tip.
+#[tokio::test]
+async fn an_uncle_beyond_the_generation_limit_is_not_counted() {
+    use rustock_networking::protocol::HeaderWithUncles;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let mut parent = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&parent, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+    // A plain chain to #10, so the tip is well past the 7-generation reach.
+    let mut entries = Vec::new();
+    for n in 1..=10u64 {
+        let h = dummy_header(n, parent.hash(), U256::from(10));
+        parent = h.clone();
+        entries.push(HeaderWithUncles { header: h, uncles: Vec::new() });
+    }
+    let headers = manager.note_proven_difficulties(entries);
+    manager.handle_headers_response(headers, test_peer()).unwrap();
+    let tip = parent.hash();
+    let before = store.total_difficulty(tip).unwrap().unwrap();
+
+    // #11 reaches back to a sibling of #1 — ten generations, limit is seven.
+    let too_old = dummy_header(1, B256::repeat_byte(0xdd), U256::from(5_000));
+    let mut b11 = dummy_header(11, tip, U256::from(10));
+    b11.uncle_count = 1;
+    b11.ommers_hash = alloy_primitives::keccak256(
+        HeaderWithUncles { header: b11.clone(), uncles: vec![too_old.clone()] }
+            .encoded_uncles(),
+    );
+    b11.cached_hash = None;
+    let b11_hash = b11.hash();
+
+    let headers = manager
+        .note_proven_difficulties(vec![HeaderWithUncles { header: b11, uncles: vec![too_old] }]);
+    manager.handle_headers_response(headers, test_peer()).unwrap();
+
+    assert_eq!(
+        store.total_difficulty(b11_hash).unwrap(),
+        Some(before + U256::from(10)),
+        "an uncle ten generations back must not bring its 5,000 with it"
     );
 }
