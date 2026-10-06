@@ -132,6 +132,22 @@
 # `rsk_pruneBlocks` (needs rpc.admin) forces one sweep with the same clamps.
 [prune]
 # blocks = false                    # default — run sweeps at all
+# What a sweep removes. `blocks` removes everything; the four below do one part
+# each, so a node can keep a walkable, servable chain without the transactions.
+#
+# `headers` requires `bodies` and `receipts`: bodies and receipts are keyed by
+# block hash, and the canonical index that finds the hash for an old height
+# goes with the headers. Keeping them without it leaves data nothing can name.
+#
+# `uncles` is prevention, not removal. Uncles have no store of their own here --
+# they live inside bodies -- so the only separate copy is the freezer's, and the
+# freezer cannot drop from the bottom. A node that does not want uncle history
+# simply never writes it. One that already has it keeps what it has.
+# bodies = false                    # default
+# headers = false                   # default
+# receipts = false                  # default
+# uncles = false                    # default — archive uncles, so this node can
+#                                   # serve rsk/63 and re-derive its own work
 # keep_depth = 100000               # default
 # max_batch = 50000                 # default — most blocks one sweep may remove
 # every_secs = 300                  # default — seconds between sweeps

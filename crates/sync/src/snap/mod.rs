@@ -184,6 +184,16 @@ pub struct SnapConfig {
     /// See `docs/header-first-sync.md`.
     pub forward_headers: bool,
 
+    /// Archive the uncle headers a sync receives, so this node can serve
+    /// `rsk/63` and re-derive its own cumulative difficulty later.
+    ///
+    /// On by default. Off is what `--prune-uncles` asks for, and it is
+    /// prevention rather than deletion: uncles have no store of their own in
+    /// the block database -- they live inside bodies -- so the only separate
+    /// copy is the freezer's, and the freezer cannot drop from the bottom.
+    /// A node that does not want the history simply never writes it.
+    pub archive_uncles: bool,
+
     /// After a snapshot sync, fill in the canonical `number -> hash` index for
     /// the history below the checkpoint window.
     ///
@@ -225,6 +235,7 @@ impl Default for SnapConfig {
             total_bytes_per_second: 32 * 1024 * 1024,
 
             forward_headers: false,
+            archive_uncles: true,
             blocks_required: 6_000,
             block_chunk_size: 400,
             index_history: true,

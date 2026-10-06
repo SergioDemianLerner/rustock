@@ -131,6 +131,9 @@ pub struct ForwardSync {
     target: u64,
     target_hash: B256,
 
+    /// Whether to archive uncle headers; see `SnapConfig::archive_uncles`.
+    archive_uncles: bool,
+
     /// Where skeleton starts are measured from, and how far apart.
     skeleton_base: u64,
     skeleton_span: u64,
@@ -175,6 +178,7 @@ impl ForwardSync {
         anchor_work: U256,
         target: u64,
         target_hash: B256,
+        archive_uncles: bool,
         store: Arc<BlockStore>,
         verifier: Arc<HeaderVerifier>,
     ) -> Self {
@@ -197,6 +201,7 @@ impl ForwardSync {
             have_hash: anchor_hash,
             target,
             target_hash,
+            archive_uncles,
             skeleton_base: anchor_number,
             skeleton_span: span,
             skeleton_todo,
@@ -378,7 +383,8 @@ impl ForwardSync {
         // move, and the freezer is for settled history; those blocks are
         // inside the body window the sync fetches anyway, so their uncles
         // arrive with the bodies.
-        if let Some(freezer) = self.store.freezer() {
+        if self.archive_uncles {
+          if let Some(freezer) = self.store.freezer() {
             let horizon = self.target.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH);
             for (number, uncles) in &run.uncle_headers {
                 if *number < horizon {
@@ -391,6 +397,7 @@ impl ForwardSync {
                     }
                 }
             }
+          }
         }
 
         let _ = self.store.put_total_difficulty(run.newest, self.work);

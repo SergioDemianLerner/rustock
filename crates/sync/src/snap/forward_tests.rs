@@ -79,6 +79,7 @@ fn sync(anchor: &Header, target: u64, verifier: HeaderVerifier) -> (ForwardSync,
             U256::ZERO,
             target,
             B256::repeat_byte(0xff),
+            true,
             store,
             Arc::new(verifier),
         ),
@@ -400,6 +401,7 @@ fn a_consumed_run_is_committed_so_the_next_start_resumes() {
         U256::ZERO,
         8,
         B256::repeat_byte(0xff),
+        true,
         store.clone(),
         Arc::new(HeaderVerifier::new()),
     );
@@ -447,6 +449,7 @@ fn an_unlinked_run_is_not_committed() {
         U256::ZERO,
         8,
         B256::repeat_byte(0xff),
+        true,
         store.clone(),
         Arc::new(HeaderVerifier::new()),
     );
@@ -586,6 +589,7 @@ fn committed_uncles_reach_the_freezer() {
         U256::ZERO,
         target,
         B256::repeat_byte(0xff),
+        true,
         store.clone(),
         Arc::new(HeaderVerifier::new()),
     );
