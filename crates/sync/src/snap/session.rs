@@ -661,6 +661,7 @@ impl SnapSession {
                         work,
                         header.number,
                         header.hash(),
+                        self.config.archive_uncles,
                         self.store.clone(),
                         self.verifier.clone(),
                     ));
@@ -879,8 +880,10 @@ impl SnapSession {
                 .iter()
                 .map(|e| (e.header.number, e.uncles.clone()))
                 .collect();
-            if let Some(walk) = self.walk.as_mut() {
-                walk.stage_uncles(&lists);
+            if self.config.archive_uncles {
+                if let Some(walk) = self.walk.as_mut() {
+                    walk.stage_uncles(&lists);
+                }
             }
         }
         self.ingest_headers(point, &headers, &proven)

@@ -151,6 +151,17 @@ backend = "epoch"                   # light: bounds state size. This setting ALO
 # `rsk_pruneBlocks` (needs rpc.admin) forces one sweep with the same clamps.
 [prune]
 blocks = true                       # light: run sweeps. Default false -- pruning discards
+
+# What a sweep removes. `blocks` removes everything; these do one part each.
+# `headers` requires `bodies` and `receipts` -- both are keyed by block hash and
+# the canonical index that finds it goes with the headers.
+# bodies = false                    # default
+# headers = false                   # default
+# receipts = false                  # default
+uncles = true                       # light: do not archive uncle headers. Saves ~10.5 GB,
+                                    # at the cost of being unable to serve rsk/63 or to
+                                    # re-derive this node's own cumulative difficulty.
+                                    # Default false.
                                     # history that only a resync restores, so it is never on
                                     # unless an operator says so.
 keep_depth = 8000                   # light: the floor, and the least the node may keep -- 4000

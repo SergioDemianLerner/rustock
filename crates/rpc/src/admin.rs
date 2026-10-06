@@ -200,7 +200,14 @@ pub fn rsk_prune_blocks(
     let effective = depth.max(MIN_KEEP_DEPTH);
     let clamped = effective != depth;
 
-    let cfg = PruneConfig { keep_depth: effective, max_batch };
+    // An explicit prune through the admin API means the whole block: there is
+    // no way to ask it for a part, and a partial sweep here would differ from
+    // what the node's own flags were configured to do.
+    let cfg = PruneConfig {
+        keep_depth: effective,
+        max_batch,
+        ..PruneConfig::default()
+    };
     // Await the join handle rather than firing and forgetting. A panic inside a
     // detached spawn_blocking is swallowed whole: the first run of this method
     // wrote a floor, deleted nothing, and reported nothing at all, which is

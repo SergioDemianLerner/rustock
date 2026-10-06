@@ -201,7 +201,22 @@ pub struct PruneSection {
     pub max_batch: Option<u64>,
     /// Delete block history below `keep_depth` as the node runs. Off by
     /// default: it discards history that only a resync restores.
+    ///
+    /// Removes everything: headers, the canonical index, total difficulties,
+    /// bodies (and the uncles inside them), receipts and the transaction
+    /// index. The narrower keys below do one part each.
     pub blocks: Option<bool>,
+    /// Delete block bodies below the floor -- and with them the uncles, which
+    /// live inside bodies rather than in a store of their own.
+    pub bodies: Option<bool>,
+    /// Delete headers, the canonical index and total difficulties below the
+    /// floor. Requires `bodies` and `receipts`.
+    pub headers: Option<bool>,
+    /// Delete receipts and the transaction index below the floor.
+    pub receipts: Option<bool>,
+    /// Do not archive uncle headers in the freezer. Prevention rather than
+    /// removal; see the flag's help for why.
+    pub uncles: Option<bool>,
     /// Seconds between sweeps.
     pub every_secs: Option<u64>,
     /// Delete headers from the block database once the freezer holds them.
@@ -365,6 +380,10 @@ pub const CONFIGURABLE: &[&str] = &[
     "prune_keep_depth",
     "prune_max_batch",
     "prune_blocks",
+    "prune_bodies",
+    "prune_headers",
+    "prune_receipts",
+    "prune_uncles",
     "prune_every_secs",
     "checkpoint_verify_hash",
     "checkpoint_bound_work",

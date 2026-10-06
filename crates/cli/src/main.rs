@@ -889,8 +889,53 @@ struct Args {
     /// index, self-contained, and are what the peg is debugged from.
     ///
     /// Sweeps never run while a snapshot sync is in progress.
+    ///
+    /// Removes **everything** below the floor: headers, the canonical index,
+    /// total difficulties, bodies (and the uncles inside them), receipts and
+    /// the transaction index. The narrower flags below do one part each.
     #[arg(long, default_value_t = false)]
     prune_blocks: bool,
+
+    /// Remove block bodies below the floor -- and with them the uncles, which
+    /// live inside bodies rather than in a store of their own.
+    ///
+    /// Leaves the headers, so the node keeps a complete chain it can still
+    /// walk and serve, without the transactions.
+    #[arg(long, default_value_t = false)]
+    prune_bodies: bool,
+
+    /// Remove headers, the canonical index and total difficulties below the
+    /// floor.
+    ///
+    /// Requires `--prune-bodies` and `--prune-receipts`: bodies and receipts
+    /// are keyed by block hash, and the canonical index that finds the hash
+    /// for an old height goes with the headers. Keeping them without it leaves
+    /// data nothing can name.
+    #[arg(long, default_value_t = false)]
+    prune_headers: bool,
+
+    /// Remove receipts and the transaction index below the floor.
+    #[arg(long, default_value_t = false)]
+    prune_receipts: bool,
+
+    /// Do not archive uncle headers in the freezer.
+    ///
+    /// Prevention rather than removal, and the name is a little kind to
+    /// itself. Uncles have no store of their own in the block database -- they
+    /// live inside bodies -- so the only separate copy is the freezer's, and
+    /// the freezer cannot drop from the bottom: it has `truncate_head` for
+    /// reorgs and no floor, and its 2 GiB segments hold about 1.8M headers
+    /// each, so the coarsest it could prune is far larger than any keep depth.
+    ///
+    /// So a node that does not want uncle history simply never writes it. The
+    /// end state is the same. What differs is that a node which already has
+    /// uncle history keeps what it has.
+    ///
+    /// A node with this set cannot serve `rsk/63` for the heights it skipped,
+    /// and cannot re-derive its own cumulative difficulty -- uncle difficulty
+    /// counts toward it. Implied by `--prune-blocks`.
+    #[arg(long, default_value_t = false)]
+    prune_uncles: bool,
 
     /// Require a peer to show it is on the checkpointed chain.
     ///
@@ -1119,6 +1164,10 @@ fn apply_file_config(
     apply(matches, "prune_keep_depth", f.prune.keep_depth.as_ref(), &mut a.prune_keep_depth);
     apply(matches, "prune_max_batch", f.prune.max_batch.as_ref(), &mut a.prune_max_batch);
     apply(matches, "prune_blocks", f.prune.blocks.as_ref(), &mut a.prune_blocks);
+    apply(matches, "prune_bodies", f.prune.bodies.as_ref(), &mut a.prune_bodies);
+    apply(matches, "prune_headers", f.prune.headers.as_ref(), &mut a.prune_headers);
+    apply(matches, "prune_receipts", f.prune.receipts.as_ref(), &mut a.prune_receipts);
+    apply(matches, "prune_uncles", f.prune.uncles.as_ref(), &mut a.prune_uncles);
     apply(matches, "prune_every_secs", f.prune.every_secs.as_ref(), &mut a.prune_every_secs);
     apply(matches, "prune_frozen_headers", f.prune.frozen_headers.as_ref(),
         &mut a.prune_frozen_headers);
@@ -1280,6 +1329,20 @@ fn log_timer(
 /// single-threaded, and then held fixed. That is also why
 /// `--log-timezone local` cannot follow a daylight-saving transition: the
 /// offset is decided once, at start-up. A fixed `±HH:MM` says so plainly.
+/// The pruning flags as one configuration.
+///
+/// Built in one place so the start-up refusal and the sweep cannot disagree
+/// about what was asked for.
+fn prune_config_from(args: &Args) -> rustock_storage::pruner::PruneConfig {
+    rustock_storage::pruner::PruneConfig {
+        keep_depth: args.prune_keep_depth,
+        max_batch: args.prune_max_batch,
+        headers: args.prune_blocks || args.prune_headers,
+        bodies: args.prune_blocks || args.prune_bodies,
+        receipts: args.prune_blocks || args.prune_receipts,
+    }
+}
+
 fn resolve_local_offset() -> Option<time::UtcOffset> {
     time::UtcOffset::current_local_offset().ok()
 }
@@ -1312,6 +1375,13 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+
+    // Argument validation, before anything opens a database. A combination that
+    // cannot work should say so in the first second, not after a minute of
+    // start-up -- and certainly not after the first sweep has run.
+    if let Some(why) = prune_config_from(&args).refusal() {
+        anyhow::bail!("these pruning options cannot be combined: {why}");
+    }
 
     std::fs::create_dir_all(&args.data_dir).context("Failed to create data directory")?;
 
@@ -2239,6 +2309,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         max_in_flight: args.snap_parallel.max(1),
         blocks_required: args.snap_blocks,
         forward_headers: args.snap_forward_headers,
+        archive_uncles: !(args.prune_blocks || args.prune_uncles),
         serve_ceiling: args.simulate_height,
         ..rustock_sync::SnapConfig::default()
     };
@@ -2662,14 +2733,20 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     // canonical index fill writes `number -> hash` downward while this deletes
     // it below the floor; the fill now stops at the floor, so the two meet
     // rather than chase.
-    if args.prune_blocks {
+    let prune_config = rustock_storage::pruner::PruneConfig {
+        keep_depth: args.prune_keep_depth,
+        max_batch: args.prune_max_batch,
+        headers: args.prune_blocks || args.prune_headers,
+        bodies: args.prune_blocks || args.prune_bodies,
+        receipts: args.prune_blocks || args.prune_receipts,
+    };
+    let prune_any = prune_config.removes_anything();
+
+    if prune_any {
         let store_for_prune = store.clone();
         let gate = prune_gate.clone();
         let peers_for_prune = peer_store.clone();
-        let cfg = rustock_storage::pruner::PruneConfig {
-            keep_depth: args.prune_keep_depth,
-            max_batch: args.prune_max_batch,
-        };
+        let cfg = prune_config;
         let every = std::time::Duration::from_secs(args.prune_every_secs.max(1));
         info!(
             "Block pruning on: keeping {} blocks below the head, up to {} per sweep, \

@@ -83,17 +83,61 @@ pub struct PruneConfig {
     /// Most blocks to remove in one sweep, so a single call cannot stall the
     /// node for an unbounded time.
     pub max_batch: u64,
+    /// Remove the headers, the canonical index and the total difficulties.
+    pub headers: bool,
+    /// Remove the block bodies -- **and the uncles inside them**, which is
+    /// where uncles live in this database. There is no uncle column family;
+    /// `body()` returns `(transactions, ommers)`.
+    pub bodies: bool,
+    /// Remove the receipts and the transaction index that points into them.
+    pub receipts: bool,
 }
 
 impl Default for PruneConfig {
     fn default() -> Self {
-        Self { keep_depth: 100_000, max_batch: 50_000 }
+        Self {
+            keep_depth: 100_000,
+            max_batch: 50_000,
+            headers: true,
+            bodies: true,
+            receipts: true,
+        }
     }
 }
 
 impl PruneConfig {
     fn effective_keep_depth(&self) -> u64 {
         self.keep_depth.max(MIN_KEEP_DEPTH)
+    }
+
+    /// Whether this configuration would delete anything at all.
+    pub fn removes_anything(&self) -> bool {
+        self.headers || self.bodies || self.receipts
+    }
+
+    /// Why this combination cannot be run, if it cannot.
+    ///
+    /// Bodies and receipts are keyed by block hash, and the only way to reach
+    /// a hash for an old height is the canonical index -- which goes with the
+    /// headers. Deleting headers while keeping either leaves data nothing can
+    /// name: it occupies the disk it was meant to save and no read will ever
+    /// find it again.
+    pub fn refusal(&self) -> Option<String> {
+        if self.headers && !self.bodies {
+            return Some(
+                "pruning headers without bodies orphans the bodies: they are keyed by \
+                 hash, and the canonical index that finds the hash goes with the headers"
+                    .to_string(),
+            );
+        }
+        if self.headers && !self.receipts {
+            return Some(
+                "pruning headers without receipts orphans the receipts, for the same \
+                 reason: nothing can name them once the canonical index is gone"
+                    .to_string(),
+            );
+        }
+        None
     }
 }
 
@@ -292,25 +336,37 @@ impl BlockStore {
             };
 
             // The transaction index is keyed by transaction hash, so the body
-            // has to be read to know which entries belong to this block.
-            if let Ok(Some((txs, _))) = self.body(hash) {
-                for tx in &txs {
-                    let mut buf = Vec::new();
-                    alloy_rlp::Encodable::encode(tx, &mut buf);
-                    let tx_hash = B256::from_slice(&<sha3::Keccak256 as sha3::Digest>::digest(&buf));
-                    batch.delete_cf(cf_tx_index, tx_hash.as_slice());
-                    stats.transactions += 1;
+            // has to be read to know which entries belong to this block. Read
+            // it when either the body or the index is going.
+            if config.bodies || config.receipts {
+                if let Ok(Some((txs, _))) = self.body(hash) {
+                    if config.receipts {
+                        for tx in &txs {
+                            let mut buf = Vec::new();
+                            alloy_rlp::Encodable::encode(tx, &mut buf);
+                            let tx_hash = B256::from_slice(
+                                &<sha3::Keccak256 as sha3::Digest>::digest(&buf),
+                            );
+                            batch.delete_cf(cf_tx_index, tx_hash.as_slice());
+                            stats.transactions += 1;
+                        }
+                    }
+                    if config.bodies {
+                        // The uncles go with the body: they live inside it.
+                        batch.delete_cf(cf_bodies, hash.as_slice());
+                        stats.bodies += 1;
+                    }
                 }
-                batch.delete_cf(cf_bodies, hash.as_slice());
-                stats.bodies += 1;
             }
-            if matches!(self.receipts(hash), Ok(Some(_))) {
+            if config.receipts && matches!(self.receipts(hash), Ok(Some(_))) {
                 batch.delete_cf(cf_receipts, hash.as_slice());
                 stats.receipts += 1;
             }
-            batch.delete_cf(cf_headers, hash.as_slice());
-            batch.delete_cf(cf_td, hash.as_slice());
-            batch.delete_cf(cf_numbers, number.to_be_bytes());
+            if config.headers {
+                batch.delete_cf(cf_headers, hash.as_slice());
+                batch.delete_cf(cf_td, hash.as_slice());
+                batch.delete_cf(cf_numbers, number.to_be_bytes());
+            }
             stats.blocks += 1;
         }
 
@@ -449,7 +505,7 @@ mod tests {
         let store = BlockStore::open(dir.path()).unwrap();
         chain(&store, 12_000);
 
-        let cfg = PruneConfig { keep_depth: 10, max_batch: 100_000 };
+        let cfg = PruneConfig { keep_depth: 10, max_batch: 100_000, ..PruneConfig::default() };
         assert_eq!(cfg.effective_keep_depth(), MIN_KEEP_DEPTH);
 
         let stats = store.prune_blocks(&cfg, 11_999).unwrap();
@@ -484,7 +540,7 @@ mod tests {
         store.put_receipts(doomed, &[]).unwrap();
 
         let stats = store
-            .prune_blocks(&PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 }, 8_999)
+            .prune_blocks(&PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000, ..PruneConfig::default() }, 8_999)
             .unwrap();
         assert!(stats.blocks > 0, "something must have been pruned");
 
@@ -497,6 +553,66 @@ mod tests {
         assert!(store.header(survivor).unwrap().is_some(), "the head is untouched");
     }
 
+    /// Bodies may go while the headers stay: a node that keeps a walkable,
+    /// servable chain without the transactions.
+    #[test]
+    fn pruning_bodies_alone_leaves_the_chain_intact() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        chain(&store, 9_000);
+        let doomed = store.canonical_hash(5).unwrap().unwrap();
+
+        store
+            .prune_blocks(
+                &PruneConfig {
+                    keep_depth: MIN_KEEP_DEPTH,
+                    max_batch: 100_000,
+                    headers: false,
+                    bodies: true,
+                    receipts: false,
+                },
+                8_999,
+            )
+            .unwrap();
+
+        assert!(store.body(doomed).unwrap().is_none(), "the body is gone");
+        assert!(
+            store.header(doomed).unwrap().is_some(),
+            "the header stays, so the chain is still walkable"
+        );
+        assert_eq!(
+            store.canonical_hash(5).unwrap(),
+            Some(doomed),
+            "and still reachable by height"
+        );
+    }
+
+    /// Headers without bodies is refused rather than run.
+    ///
+    /// Bodies are keyed by block hash, and the only way to reach a hash for an
+    /// old height is the canonical index, which goes with the headers.
+    /// Deleting headers while keeping bodies leaves data nothing can name: it
+    /// occupies the disk it was meant to save and no read will ever find it.
+    #[test]
+    fn pruning_headers_without_bodies_is_refused() {
+        let cfg = PruneConfig {
+            keep_depth: MIN_KEEP_DEPTH,
+            max_batch: 100,
+            headers: true,
+            bodies: false,
+            receipts: true,
+        };
+        let why = cfg.refusal().expect("this combination must be refused");
+        assert!(why.contains("orphans the bodies"), "the reason must say why: {why}");
+
+        // And the coherent ones are not refused.
+        assert!(PruneConfig::default().refusal().is_none(), "prune everything is fine");
+        assert!(
+            PruneConfig { headers: false, ..PruneConfig::default() }.refusal().is_none(),
+            "keeping headers while dropping the rest is fine"
+        );
+    }
+
     #[test]
     fn genesis_is_never_pruned() {
         // Keeping block 0 costs one block and keeps every "start of the chain"
@@ -507,7 +623,7 @@ mod tests {
         let hashes = chain(&store, 12_000);
 
         store
-            .prune_blocks(&PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 }, 11_999)
+            .prune_blocks(&PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000, ..PruneConfig::default() }, 11_999)
             .unwrap();
 
         assert_eq!(store.canonical_hash(0).unwrap(), Some(hashes[0]), "genesis kept");
@@ -523,7 +639,7 @@ mod tests {
         chain(&store, 9_000);
 
         store
-            .prune_blocks(&PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 }, 8_999)
+            .prune_blocks(&PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000, ..PruneConfig::default() }, 8_999)
             .unwrap();
 
         let floor = store.prune_floor().unwrap().expect("floor recorded");
@@ -543,7 +659,7 @@ mod tests {
         chain(&store, 12_000);
 
         // Small batches, as a continuous pruner would use.
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 500 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 500, ..PruneConfig::default() };
         let mut total = 0;
         for _ in 0..20 {
             total += store.prune_blocks(&cfg, 11_999).unwrap().blocks;
@@ -567,7 +683,7 @@ mod tests {
         let store = BlockStore::open(dir.path()).unwrap();
         chain(&store, 9_500);
         store
-            .prune_blocks(&PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 }, 9_499)
+            .prune_blocks(&PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000, ..PruneConfig::default() }, 9_499)
             .unwrap();
 
         let floor = store.prune_floor().unwrap().unwrap();
@@ -629,7 +745,7 @@ mod bridge_event_tests {
                 .unwrap();
         }
 
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000, ..PruneConfig::default() };
         let stats = store.prune_blocks(&cfg, 11_999).unwrap();
         assert!(stats.blocks > 0, "the sweep must actually have removed something");
         assert!(doomed_height <= stats.to, "the peg-in's block was in the swept range");
@@ -669,7 +785,7 @@ mod bridge_event_tests {
         store.put_receipts(doomed, &[]).unwrap();
         assert!(store.receipts(doomed).unwrap().is_some());
 
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000, ..PruneConfig::default() };
         store.prune_blocks(&cfg, 11_999).unwrap();
 
         assert!(
@@ -722,7 +838,7 @@ mod snap_synced_tests {
         }
 
         // One sweep, with a batch far smaller than the distance from block 1.
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 1_000 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 1_000, ..PruneConfig::default() };
         let stats = store.prune_blocks(&cfg, height).unwrap();
 
         assert!(
@@ -746,7 +862,7 @@ mod snap_synced_tests {
         let store = BlockStore::open(dir.path()).unwrap();
         chain(&store, 12_000);
 
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100, ..PruneConfig::default() };
         let stats = store.prune_blocks(&cfg, 11_999).unwrap();
         assert_eq!(stats.from, 1, "genesis is retained, so the first prunable block is 1");
     }
@@ -797,7 +913,7 @@ mod executed_head_tests {
         let executed = 20_000u64;
         chain_executed_to(&store, 30_001, executed);
 
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000, ..PruneConfig::default() };
         let stats = store.prune_blocks(&cfg, 30_000).unwrap();
 
         let highest_removed = stats.to;
@@ -838,7 +954,7 @@ mod executed_head_tests {
         }
         // No exec head set.
 
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000, ..PruneConfig::default() };
         let stats = store.prune_blocks(&cfg, 29_999).unwrap();
         assert_eq!(stats.blocks, 0, "nothing executed means no safe reference");
         assert!(store.prune_floor().unwrap().is_none(), "and no floor was claimed");
@@ -851,7 +967,7 @@ mod executed_head_tests {
         let store = BlockStore::open(dir.path()).unwrap();
         chain_executed_to(&store, 20_000, 19_999);
 
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 100_000, ..PruneConfig::default() };
         let stats = store.prune_blocks(&cfg, 19_999).unwrap();
         assert_eq!(stats.to, 19_999 - MIN_KEEP_DEPTH);
     }
@@ -873,7 +989,7 @@ mod plan_tests {
         let store = BlockStore::open(dir.path()).unwrap();
         chain(&store, 20_000);
 
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 3_000 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 3_000, ..PruneConfig::default() };
         let plan = store.plan_prune(&cfg, 19_999).unwrap().expect("something to do");
         let stats = store.prune_blocks(&cfg, 19_999).unwrap();
 
@@ -893,7 +1009,7 @@ mod plan_tests {
         let store = BlockStore::open(dir.path()).unwrap();
         let hashes = chain(&store, 20_000);
 
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 3_000 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 3_000, ..PruneConfig::default() };
         let plan = store.plan_prune(&cfg, 19_999).unwrap().expect("something to do");
 
         assert!(store.prune_floor().unwrap().is_none(), "no floor was written");
@@ -920,7 +1036,7 @@ mod plan_tests {
             let store = BlockStore::open(dir.path()).unwrap();
             chain(&store, 20_000);
 
-            let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch };
+            let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch, ..PruneConfig::default() };
             let plan = store.plan_prune(&cfg, 19_999).unwrap().expect("something to do");
             store.prune_blocks(&cfg, 19_999).unwrap();
             let achieved = store.prune_floor().unwrap().unwrap().number;
@@ -943,7 +1059,7 @@ mod plan_tests {
         let store = BlockStore::open(dir.path()).unwrap();
         chain(&store, 1_000); // shorter than the retention depth
 
-        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 1_000 };
+        let cfg = PruneConfig { keep_depth: MIN_KEEP_DEPTH, max_batch: 1_000, ..PruneConfig::default() };
         assert_eq!(store.plan_prune(&cfg, 999).unwrap(), None);
     }
 }
