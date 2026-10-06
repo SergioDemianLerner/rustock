@@ -556,3 +556,60 @@ fn the_uncle_ledger_does_not_grow_with_the_chain() {
         s.counted_uncles_len()
     );
 }
+
+/// Uncles are kept, not merely counted.
+///
+/// They arrive once, over the wire, and nothing else will ever hand them to a
+/// node with no bodies. Dropping them leaves a node that cannot sum its own
+/// chain's work and cannot serve `rsk/63` — that is, cannot serve the sync it
+/// just performed. The first ascending sync against mainnet produced exactly
+/// that: 9.28M headers on disk and no uncles, unusable as a server.
+#[test]
+fn committed_uncles_reach_the_freezer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(BlockStore::open(dir.path()).expect("open"));
+    let fdir = dir.path().join("freezer");
+    let freezer = Arc::new(
+        rustock_storage::freezer::Freezer::open(&fdir).expect("freezer"),
+    );
+    store.set_freezer(freezer.clone());
+
+    let anchor = header(0, B256::ZERO, 100);
+    store.put_header_with_hash(anchor.hash(), &anchor).expect("anchor");
+    store.set_head(anchor.hash()).expect("head");
+
+    // A target far enough above that the run sits below the freeze horizon.
+    let target = rustock_storage::freezer::FREEZE_DEPTH + 1_000;
+    let mut s = ForwardSync::new(
+        0,
+        anchor.hash(),
+        U256::ZERO,
+        target,
+        B256::repeat_byte(0xff),
+        store.clone(),
+        Arc::new(HeaderVerifier::new()),
+    );
+
+    let the_uncle = header(1, B256::repeat_byte(7), 50);
+    let entries = run_of(1, 4, anchor.hash(), 100, |n| {
+        if n == 2 { vec![the_uncle.clone()] } else { Vec::new() }
+    });
+    s.on_headers_with_uncles(4, &entries).expect("honest run");
+    assert_eq!(s.frontier(), 4);
+
+    let stored = freezer.uncles(2).expect("read").expect("block #2 was frozen");
+    assert_eq!(stored.len(), 1, "the uncle #2 referenced must be on disk");
+    assert_eq!(
+        stored[0].hash(),
+        the_uncle.hash(),
+        "and it must be the one that arrived, byte for byte"
+    );
+
+    // A block that referenced none records an empty list, which is not the
+    // same answer as "not frozen".
+    assert_eq!(
+        freezer.uncles(3).expect("read"),
+        Some(Vec::new()),
+        "no uncles is a recorded fact, not a gap"
+    );
+}

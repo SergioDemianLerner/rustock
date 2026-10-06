@@ -871,6 +871,18 @@ impl SnapSession {
             headers.push(e.header.clone());
         }
         headers.reverse(); // back to newest first, as the walk expects
+
+        // Keep the uncles for the descending walk too. They arrive once and
+        // nothing else will hand them to a node that fetches no bodies.
+        if self.phase == Phase::VerifyingHeaders {
+            let lists: Vec<(u64, Vec<Header>)> = entries
+                .iter()
+                .map(|e| (e.header.number, e.uncles.clone()))
+                .collect();
+            if let Some(walk) = self.walk.as_mut() {
+                walk.stage_uncles(&lists);
+            }
+        }
         self.ingest_headers(point, &headers, &proven)
     }
 
