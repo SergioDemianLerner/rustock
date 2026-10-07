@@ -567,9 +567,17 @@ mod tests {
         let first = compress_coinbase(&coinbase, false).unwrap();
         // Both tags are inside the first block here, so choosing the first one
         // changes only the byte count, not which bytes survive.
+        // `(8 / 64) * 64` is the same round-down-to-a-64-byte-block formula as
+        // the assertion below, with the first tag's offset of 8 substituted. It
+        // is zero because that tag sits inside the first block -- written out
+        // rather than as `0` so both assertions read as the same rule.
+        // Bound to a local because the attribute does not reach inside the
+        // `assert_eq!` expansion.
+        #[allow(clippy::erasing_op)]
+        let first_tag_block_start: u64 = (8 / 64) * 64;
         assert_eq!(
             u64::from_be_bytes(first[0..8].try_into().unwrap()),
-            (8 / 64) * 64
+            first_tag_block_start
         );
         assert_eq!(
             u64::from_be_bytes(last[0..8].try_into().unwrap()),

@@ -3223,7 +3223,6 @@ impl SyncService {
                     );
                     return;
                 }
-                _ => {}
             }
         }
 

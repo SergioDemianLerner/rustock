@@ -66,7 +66,7 @@
 use alloy_primitives::B256;
 use anyhow::{anyhow, bail, Context, Result};
 use rustock_core::Header;
-use alloy_rlp::{Decodable, Encodable};
+use alloy_rlp::Encodable;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};

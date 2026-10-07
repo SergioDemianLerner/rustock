@@ -148,7 +148,7 @@ pub fn punishment_duration(
     punishment_counter: u32,
     score: i32,
 ) -> Duration {
-    let mut result = params.duration.as_millis() as u128;
+    let mut result = params.duration.as_millis();
     let rate = 100u128 + params.increment_rate as u128;
     let max = params.maximum.map(|d| d.as_millis());
 

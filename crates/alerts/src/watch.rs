@@ -161,7 +161,7 @@ pub fn check_in_transit(
         .collect();
     let total: u64 = still_in_transit.iter().map(|(_, v)| *v).sum();
     let threshold = cfg.in_transit_alert_sats();
-    let alert = (total > threshold).then(|| Alert::InTransitAboveThreshold {
+    let alert = (total > threshold).then_some(Alert::InTransitAboveThreshold {
         block,
         total_sats: total,
         threshold_sats: threshold,

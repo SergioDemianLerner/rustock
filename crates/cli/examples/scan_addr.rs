@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
 
     let store = BlockStore::open(&data_dir)?;
     let tip = store.exec_head()?.map(|(h, _)| store.header(h).ok().flatten().map(|x| x.number).unwrap_or(0)).unwrap_or(0);
-    let scan_to = tip.max(1_591_001).min(1_591_001);
+    let scan_to = tip.min(1_591_001);
     eprintln!("scanning canonical blocks 0..={scan_to} for {} target(s)", targets.len());
 
     for n in 0..=scan_to {
