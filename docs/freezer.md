@@ -178,7 +178,7 @@ have been copied out of it. `plan_prune` therefore clamps to
 `freezer.uncles_end_number()` and plans nothing while that is zero. See
 [`block-pruning.md`](./block-pruning.md).
 
-A node run with `--no-freezer` and `--prune-blocks` is unguarded, correctly:
+A node run with `--freezer false` and `--prune-blocks` is unguarded, correctly:
 there is no second copy to wait for. It also gives up the ability to recompute
 its chain's work below the floor.
 
@@ -269,7 +269,7 @@ have finality to key off instead.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--no-freezer` | off | Disable it; old headers stay in the block database |
+| `--freezer` | on | `false` disables it; old headers stay in the block database |
 | `--prune-frozen-headers` | off | Delete headers from RocksDB once the freezer holds them |
 
 The freezer fills in the background from the block database, batching and

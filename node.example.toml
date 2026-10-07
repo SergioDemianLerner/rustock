@@ -154,7 +154,7 @@
 # Delete headers from the block database once the freezer holds them. Every
 # lookup by hash for those blocks then depends on the freezer.
 # frozen_headers = false            # default
-# no_freezer = false                # default — do not run the header freezer at all
+# freezer = true                    # default — move settled headers into flat files
 
 # What this node does with the difficulty checkpoint it ships.
 #

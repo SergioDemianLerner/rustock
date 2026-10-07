@@ -222,8 +222,9 @@ pub struct PruneSection {
     /// Delete headers from the block database once the freezer holds them.
     /// Every lookup by hash for those blocks then depends on the freezer.
     pub frozen_headers: Option<bool>,
-    /// Do not run the header freezer at all.
-    pub no_freezer: Option<bool>,
+    /// Move settled headers out of the block database into flat files.
+    /// `false` keeps them in RocksDB and loses the read win.
+    pub freezer: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -406,7 +407,7 @@ pub const CONFIGURABLE: &[&str] = &[
     // while the node is running, not only by the one-shot verifier.
     "read_threads",
     "prune_frozen_headers",
-    "no_freezer",
+    "freezer",
     "closed_network",
     "log_timezone",
     "snap_server",
@@ -484,7 +485,7 @@ mod tests {
             read_threads = 7
             [prune]
             frozen_headers = true
-            no_freezer = true
+            freezer = false
             "#,
         );
         let path = file.path().to_str().unwrap();
@@ -494,7 +495,7 @@ mod tests {
         assert!(a.closed_network, "[peers] closed_network");
         assert_eq!(a.read_threads, 7, "[trie] read_threads");
         assert!(a.prune_frozen_headers, "[prune] frozen_headers");
-        assert!(a.no_freezer, "[prune] no_freezer");
+        assert!(!a.freezer, "[prune] freezer");
     }
 
     /// The subtle case, and the reason the merge consults `ValueSource` rather
@@ -943,9 +944,9 @@ mod tests {
             "[trie] backend — the only setting that turns trie collection on"
         );
         assert_eq!(
-            file.prune.no_freezer,
-            Some(true),
-            "[prune] no_freezer — without it the node keeps 9.5 GB of frozen headers \
+            file.prune.freezer,
+            Some(false),
+            "[prune] freezer — left on, the node keeps 9.5 GB of frozen headers \
              that pruning never touches"
         );
 
