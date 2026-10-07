@@ -1201,7 +1201,7 @@ mod tests {
         {
             let store = EpochTrieStore::open(dir.path(), cfg(3)).unwrap();
             build(&store, 4, 0);
-            store.flush();
+            store.flush().unwrap();
         }
         let ro = EpochTrieStore::open_read_only(dir.path(), cfg(3)).unwrap();
         ro.put(b"key", b"value");

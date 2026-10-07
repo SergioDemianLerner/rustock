@@ -58,8 +58,14 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 /// SIGKILL cannot be caught, which is why it must never be used on an import.
 pub fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
     }
 }
 

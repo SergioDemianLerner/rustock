@@ -3410,7 +3410,6 @@ async fn test_eth_gas_price_falls_back_to_the_block_minimum() {
 /// fixture that only stores a state root proves nothing.
 fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Address, Address) {
     use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
     use rustock_trie::{account_key, code_key, MemoryTrieStore, TrieKeySlice, TrieNode};
     use sha3::{Digest, Keccak256};
 
