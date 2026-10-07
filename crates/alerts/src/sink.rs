@@ -135,6 +135,7 @@ mod tests {
 
     /// Records what it was given, so the watcher's behaviour can be tested
     /// without a mail server.
+    #[allow(dead_code)] // no caller; see the dead-code issue before deleting
     pub struct RecordingSink(pub std::sync::Mutex<Vec<String>>);
     impl AlertSink for RecordingSink {
         fn deliver(&self, alert: &Alert) -> anyhow::Result<()> {

@@ -475,7 +475,7 @@ impl ChainSampler {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use rustock_core::checkpoint::{CheckpointDefence, MAINNET_CHECKPOINT};
+    use rustock_core::checkpoint::MAINNET_CHECKPOINT;
 
     const DIV: u64 = 400;
     const MIN: U256 = U256::from_limbs([7_000_000_000_000_000u64, 0, 0, 0]);

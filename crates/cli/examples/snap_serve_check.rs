@@ -263,7 +263,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        if sweep && i > 0 && i % 100 == 0 {
+        if sweep && i > 0 && i.is_multiple_of(100) {
             let reached = offsets.last().copied().unwrap_or(0);
             println!(
                 "  ... {i} chunks, {nodes} nodes, at offset {reached} ({:.1}% of the trie)",

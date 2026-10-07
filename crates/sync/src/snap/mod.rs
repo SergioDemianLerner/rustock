@@ -263,7 +263,7 @@ impl SnapConfig {
     /// refusal naming the reason rather than a silent empty answer, because
     /// the client's response should be to realign, not to give up on the peer.
     pub fn on_grid(&self, offset: u64) -> bool {
-        offset % self.chunk_grid.max(1) == 0
+        offset.is_multiple_of(self.chunk_grid.max(1))
     }
 
     /// The checkpoint a node at `best` would offer: rounded down so that

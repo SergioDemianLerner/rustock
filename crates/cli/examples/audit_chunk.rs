@@ -74,7 +74,7 @@ fn main() -> anyhow::Result<()> {
 
     let blocks = Arc::new(BlockStore::open_read_only(&block_dir)?);
     let chunk: Arc<dyn TrieStore> = Arc::new(RocksDbTrieStore::open_read_only(
-        &format!("{chunk_dir}/sealed"))?);
+        format!("{chunk_dir}/sealed"))?);
     let archive: Arc<dyn TrieStore> = Arc::new(RocksDbTrieStore::open_read_only(&archive)?);
 
     // ---- Question 2 first: precompile paths, chunk-only ----

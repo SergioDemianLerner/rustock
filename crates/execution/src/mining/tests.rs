@@ -1041,7 +1041,7 @@ mod uncle_tests {
         assert_eq!(select_uncles(&store, 11, headers[10].hash()).len(), 1);
 
         // Now let #10 have included it: rewrite #10's body with the uncle.
-        store.put_body(headers[10].hash(), &[], &[orphan.clone()]).unwrap();
+        store.put_body(headers[10].hash(), &[], std::slice::from_ref(&orphan)).unwrap();
 
         let uncles = select_uncles(&store, 11, headers[10].hash());
         assert!(

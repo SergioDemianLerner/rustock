@@ -892,6 +892,7 @@ fn execute_method<CTX: crate::RskContextTr>(
     let federation_only = match method_name {
         "updateCollections" => true,
         // receiveHeadersIsPublic() = RSKIP124 && !RSKIP200; restricted otherwise.
+        #[allow(clippy::nonminimal_bool)] // mirrors the rskj formula above
         "receiveHeaders" => {
             let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
             !(hardfork_cfg.has_rskip124(block_number) && !hardfork_cfg.has_rskip200(block_number))

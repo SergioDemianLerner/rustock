@@ -554,8 +554,8 @@ mod tests {
     /// Groundtruth from mainnet #2,426,478 tx 1 (commitFederation of the 2019
     /// federation change; receipt from public-node.rsk.co): the RSKIP146
     /// Solidity commit_federation event — 9 old keys, 15 new keys, both
-    /// federations' Base58 P2SH addresses, activation 2,444,978 (= 2,426,478
-    /// + 18,500). Verifies the 5-param ABI layout byte-for-byte.
+    /// federations' Base58 P2SH addresses, activation 2,444,978 (= 2,426,478 +
+    /// 18,500). Verifies the 5-param ABI layout byte-for-byte.
     #[test]
     fn solidity_commit_federation_event_matches_mainnet_2426478() {
         use alloy_primitives::hex;
@@ -788,6 +788,7 @@ mod tests {
     ///   2. the amount is the CALL's endowment in satoshis (10000 = 1e14 wei the
     ///      contract forwards), NOT the top-level tx value (which was 0 at
     ///      #6,223,939) — and the value is NOT refunded.
+    ///
     /// rustock previously fell through to LOW_AMOUNT(1) with the origin as sender
     /// and a refund — a state + receipts fork.
     #[test]

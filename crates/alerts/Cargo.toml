@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-storage = { version = "0.1.0", path = "../storage" }

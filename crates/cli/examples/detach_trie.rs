@@ -89,7 +89,7 @@ fn main() -> Result<()> {
                 let cf_s = src.cf_handle(CF_TRIE).context("source has no trie_nodes")?;
                 let cf_d = dst.cf_handle(CF_TRIE).context("dest has no trie_nodes")?;
                 let mut it = src.raw_iterator_cf(cf_s);
-                it.seek(&[lo]);
+                it.seek([lo]);
                 let mut batch = rocksdb::WriteBatch::default();
                 let mut pending = 0usize;
                 let mut pending_bytes = 0usize;

@@ -99,12 +99,12 @@ fn abi_decode_int256_as_u64(args: &[u8], slot: usize) -> Option<u64> {
 // Federation change methods
 // ---------------------------------------------------------------------------
 
-/// Federation-change governance (rskj FederationSupportImpl
-/// .voteFederationChange): createFederation / addFederatorPublicKey /
-/// commitFederation / rollbackFederation are VOTES in an ABICallElection
-/// keyed by (function, args); only a MAJORITY of the federation-change
-/// authorizer keys executes the action. Mainnet block #648,926 carried the
-/// first winning commit.
+// Federation-change governance (rskj FederationSupportImpl
+// .voteFederationChange): createFederation / addFederatorPublicKey /
+// commitFederation / rollbackFederation are VOTES in an ABICallElection
+// keyed by (function, args); only a MAJORITY of the federation-change
+// authorizer keys executes the action. Mainnet block #648,926 carried the
+// first winning commit.
 
 const FEDERATION_ELECTION_KEY: &str = "federationElection";
 
@@ -550,8 +550,8 @@ pub(crate) fn commit_proposed_federation<CTX: crate::RskContextTr>(
 /// from the pending keys, wipe the pending federation, and log the
 /// commit_federation event. Pre-RSKIP419 (`legacyCommitPendingFederation`) this
 /// immediately hands over to the new federation (moves the active fed's UTXOs to
-/// the old set, stores active as old / built as new, persists the retiring P2SH
-/// + next creation height). From RSKIP419 (`commitPendingFederation`) it instead
+/// the old set, stores active as old / built as new, persists the retiring P2SH +
+/// next creation height). From RSKIP419 (`commitPendingFederation`) it instead
 /// stores a *proposed* federation that must pass the SVP before being promoted
 /// by `commit_proposed_federation`; the existing federations are left untouched.
 fn commit_pending_federation<CTX: crate::RskContextTr>(

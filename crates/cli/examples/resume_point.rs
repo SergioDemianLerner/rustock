@@ -100,7 +100,7 @@ fn main() -> Result<()> {
     // Candidate rewind targets: the deepest recovery option is to re-execute
     // from a block further back, so report which depths are actually usable.
     println!("\ncandidate rewind targets (canonical + state present):");
-    println!("{:>8} {:>12}  {}", "depth", "height", "state present");
+    println!("{:>8} {:>12}  state present", "depth", "height");
     for depth in [50u64, 100, 250, 500, 1_000, 2_000, 4_000] {
         let Some(height) = exec_header.number.checked_sub(depth) else { continue };
         let Some(hash) = view.canonical_hash(height) else {

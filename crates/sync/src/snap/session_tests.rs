@@ -166,6 +166,7 @@ fn headers_for(blocks: &[Block], point: u64, count: u32) -> Vec<Header> {
 
 /// Answers every header and skeleton request the session makes, until it
 /// leaves the header phase. Returns the actions it was left with.
+#[allow(dead_code)] // no caller; see the dead-code issue before deleting
 fn answer_header_walk(
     session: &mut SnapSession,
     blocks: &[Block],
@@ -367,7 +368,7 @@ fn a_status_whose_blocks_do_not_link_is_refused() {
 fn inflated_difficulty_is_refused() {
     let f = fixture(20);
     let (blocks, mut tds) = chain(1, 4, B256::ZERO, 100, f.state_root);
-    tds[2] = tds[2] + U256::from(1_000_000u64);
+    tds[2] += U256::from(1_000_000u64);
 
     let mut session = f.session(HeaderVerifier::new());
     session.on_status(&blocks, &tds, 5_000, 0);

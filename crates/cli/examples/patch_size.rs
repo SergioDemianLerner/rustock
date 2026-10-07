@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
     let (start, end): (u64, u64) = (p[1].parse()?, p[2].parse()?);
 
     let blocks = BlockStore::open_read_only(&block_dir)?;
-    let chunk: Arc<dyn TrieStore> = Arc::new(RocksDbTrieStore::open_read_only(&format!("{chunk_dir}/sealed"))?);
+    let chunk: Arc<dyn TrieStore> = Arc::new(RocksDbTrieStore::open_read_only(format!("{chunk_dir}/sealed"))?);
     let archive: Arc<dyn TrieStore> = Arc::new(RocksDbTrieStore::open_read_only(&archive_path)?);
 
     // The key set a foreign client reads and rustock does not.

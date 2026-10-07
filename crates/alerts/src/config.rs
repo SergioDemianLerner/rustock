@@ -480,9 +480,11 @@ mod tests {
     #[test]
     fn a_live_reload_carries_thresholds_and_nothing_else() {
         let mut running = PegoutAlerts::default();
-        let mut from_disk = PegoutAlerts::default();
-        from_disk.pegout_alert_btc = 0.01;
-        from_disk.confirmations = 17;
+        let from_disk = PegoutAlerts {
+            pegout_alert_btc: 0.01,
+            confirmations: 17,
+            ..PegoutAlerts::default()
+        };
 
         running.adopt_live(&from_disk);
         assert_eq!(running.pegout_alert_btc, 0.01);

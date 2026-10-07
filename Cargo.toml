@@ -12,6 +12,21 @@ members = [
 ]
 resolver = "2"
 
+# Lints applied across every crate. Both entries below are style lints whose
+# remedy costs more than the lint is worth here.
+#
+# `too_many_arguments`: the functions that trip it are consensus entry points
+# whose arguments mirror rskj's. Bundling them into structs to satisfy an
+# arbitrary threshold of 7 would obscure that correspondence and risk
+# reordering a parameter during the refactor, for no behavioural gain.
+#
+# `type_complexity`: the types that trip it are trie and snapshot callbacks
+# whose shape is the documentation. Hiding them behind aliases moves the
+# information rather than removing it.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+
 [workspace.dependencies]
 alloy-primitives = { version = "1.5.4", features = ["serde", "rlp"] }
 alloy-rlp = { version = "0.3.13", features = ["derive"] }

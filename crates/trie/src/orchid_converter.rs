@@ -172,9 +172,11 @@ fn convert_storage_node(
         shared_path = TrieKeySlice::empty();
         value = None;
         value_hash = None;
+        #[allow(clippy::unnecessary_unwrap)] // guarded directly above; see the clippy issue
         if converted0.is_some() && converted1.is_none() {
             return converted0.unwrap();
         }
+        #[allow(clippy::unnecessary_unwrap)] // guarded directly above; see the clippy issue
         if converted0.is_none() && converted1.is_some() {
             return converted1.unwrap();
         }

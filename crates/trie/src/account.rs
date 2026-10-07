@@ -106,13 +106,13 @@ fn decode_coin(cursor: &mut &[u8]) -> anyhow::Result<U256> {
         b
     } else if first < 0xb8 {
         let len = (first - 0x80) as usize;
-        anyhow::ensure!(cursor.len() >= 1 + len, "coin: short string truncated");
+        anyhow::ensure!(cursor.len() > len, "coin: short string truncated");
         let b = &cursor[1..1 + len];
         *cursor = &cursor[1 + len..];
         b
     } else {
         let ll = (first - 0xb7) as usize;
-        anyhow::ensure!(cursor.len() >= 1 + ll, "coin: long header truncated");
+        anyhow::ensure!(cursor.len() > ll, "coin: long header truncated");
         let len = cursor[1..1 + ll].iter().fold(0usize, |a, &x| (a << 8) | x as usize);
         anyhow::ensure!(cursor.len() >= 1 + ll + len, "coin: long string truncated");
         let b = &cursor[1 + ll..1 + ll + len];

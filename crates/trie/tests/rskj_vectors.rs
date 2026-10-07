@@ -28,6 +28,7 @@ fn trie(keys: usize) -> (TrieNode, MemoryTrieStore) {
 fn vectors() -> Vec<(usize, u64, String, u64)> {
     let text = include_str!("rskj-vectors/chunks.txt");
     let mut out = Vec::new();
+    #[allow(unused_assignments)] // the initialiser is required; the file supplies the value
     let (mut keys, mut root, mut total) = (0usize, String::new(), 0u64);
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("KEYS ") {

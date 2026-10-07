@@ -215,7 +215,7 @@ mod tests {
         }
 
         let cf = db.cf_handle(CF_TRIE).unwrap();
-        let val = db.get_cf(cf, &[0u8]).unwrap();
+        let val = db.get_cf(cf, [0u8]).unwrap();
         assert_eq!(val, Some(vec![100]), "auto-flush should have written to DB");
     }
 

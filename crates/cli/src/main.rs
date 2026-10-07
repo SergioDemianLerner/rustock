@@ -2710,7 +2710,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         match start_pegout_alerts(path, store.clone(), trie_store_for_pool.clone()) {
             Ok(Some(handle)) => {
                 info!("Peg-out alert watcher started from {path}");
-                let _ = handle;
+                // Detached deliberately: dropping a tokio JoinHandle does not
+                // cancel the task, and the watcher must outlive this scope.
+                drop(handle);
             }
             Ok(None) => info!("Peg-out alerts configured but disabled in {path}"),
             // A malformed alert configuration must not stop the node: it is an
@@ -2806,8 +2808,6 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 }
 
                 let store_for_task = store_for_prune.clone();
-                let cfg_for_task = cfg.clone();
-                let number = head.number;                let store_for_task = store_for_prune.clone();
                 let cfg_for_task = cfg.clone();
                 let number = head.number;
                 match tokio::task::spawn_blocking(move || {
@@ -3426,12 +3426,17 @@ fn start_pegout_alerts(
     }
 
     // The log sink is always present, so the record exists even if mail fails.
+    // `mut` is needed only under `--features smtp`, where the push below is
+    // compiled in. Without the attribute a default build warns, and
+    // `clippy --fix` will silently remove the `mut` and break the smtp build.
+    #[cfg_attr(not(feature = "smtp"), allow(unused_mut))]
     let mut sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(LogSink)];
     if email.enabled {
         #[cfg(feature = "smtp")]
         sinks.push(Box::new(rustock_alerts::SmtpSink::new(&email)?));
         #[cfg(not(feature = "smtp"))]
         return Err(rustock_alerts::sink::smtp_unavailable());
+        #[cfg(feature = "smtp")]
         info!(
             "Peg-out alerts will be emailed to {} via {}:{}",
             email.to.join(", "), email.smtp_host, email.smtp_port
@@ -4101,6 +4106,10 @@ fn start_health_alerts(
 
     // The log sink is always present, so the record exists even if mail fails.
     // Mail reuses the peg-out transport: one configuration, one credential.
+    // `mut` is needed only under `--features smtp`, where the push below is
+    // compiled in. Without the attribute a default build warns, and
+    // `clippy --fix` will silently remove the `mut` and break the smtp build.
+    #[cfg_attr(not(feature = "smtp"), allow(unused_mut))]
     let mut sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(LogSink)];
     let email = config.alerts.email;
     if email.enabled {
@@ -4108,6 +4117,7 @@ fn start_health_alerts(
         sinks.push(Box::new(rustock_alerts::SmtpSink::new(&email)?));
         #[cfg(not(feature = "smtp"))]
         return Err(rustock_alerts::sink::smtp_unavailable());
+        #[cfg(feature = "smtp")]
         info!(
             "Node health alarms will be emailed to {} (gap {} blocks, after {} min, \
              then quiet for {} h)",

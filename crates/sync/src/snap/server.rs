@@ -389,7 +389,7 @@ impl SnapServer {
         // A request off the grid cannot be cached and cannot be compared with
         // anyone else's, so it is refused by name. The client's answer to this
         // is to realign, not to look for another peer.
-        if request.from % grid != 0 {
+        if !request.from.is_multiple_of(grid) {
             return refuse(Refusal::OffsetNotOnGrid);
         }
 

@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
             total_diff += hi - lo;
         }
         scanned += 1;
-        if scanned % 200_000 == 0 {
+        if scanned.is_multiple_of(200_000) {
             eprintln!("...scanned to #{n}");
         }
     }

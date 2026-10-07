@@ -123,7 +123,7 @@ fn main() -> anyhow::Result<()> {
         let (txs, oms) = match store.body(hash)? { Some(b) => b, None => break };
         let p = processor.execute_block(&Block { header, transactions: txs, ommers: oms }, &root, probe_dyn.clone())?;
         root = p.new_state_root;
-        if (n - start) % 5000 == 0 {
+        if (n - start).is_multiple_of(5000) {
             eprintln!("#{n} ({}/{count}) {:.2} blk/s, {} tracked keys",
                       n - start, (n - start + 1) as f64 / t0.elapsed().as_secs_f64(),
                       probe.written.lock().unwrap().len());

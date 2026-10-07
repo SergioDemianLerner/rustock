@@ -590,8 +590,8 @@ mod tests {
     }
 
     /// Ground truth from RSK Mainnet block #3,229,522 (registerBtcCoinbaseTransaction):
-    /// rskj keys coinbase information by `DataWord.fromLongString("coinbaseInformation-"
-    /// + Sha256Hash.wrap(blockHashArg).toString())`, and bitcoinj's `toString()` hex-encodes
+    /// rskj keys coinbase information by `DataWord.fromLongString("coinbaseInformation-" +
+    /// Sha256Hash.wrap(blockHashArg).toString())`, and bitcoinj's `toString()` hex-encodes
     /// the wrapped bytes WITHOUT reversing. The block-hash ABI arg below is the exact one
     /// from that block; the expected DataWord is the storage slot read from rskj's own unitrie.
     #[test]

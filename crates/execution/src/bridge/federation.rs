@@ -269,6 +269,7 @@ mod tests {
     ///     (the value rustock logged PRE-fix, i.e. the pre-RSKIP415 topic).
     ///   - canonical post-415 topic = 0xb6ffeeaa2eecaaf865d5539b85976d5892f59ab5
     ///     (derived from that member's distinct RSK public key).
+    ///
     /// The two MUST differ, which is exactly why the receipts root forked four
     /// blocks after arrowhead600 (#6,223,700). rskj
     /// `BridgeEventLoggerImpl.getFederatorRskPublicKey` (ConsensusRule.RSKIP415).

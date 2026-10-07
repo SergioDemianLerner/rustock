@@ -2526,6 +2526,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             // - RSKIP375+: the pegout creation RSK tx hash
             // - RSKIP146..RSKIP176: creation hash, falling back to this tx
             // - otherwise (incl. pre-RSKIP146): this updateCollections tx hash
+            #[allow(clippy::if_same_then_else)] // distinct rskj rules that coincide today
             let rsk_hash = if hardfork_cfg.has_rskip375(block_number) {
                 entry.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash)
             } else if use_tx_hash && !hardfork_cfg.has_rskip176(block_number) {
@@ -4608,8 +4609,8 @@ pub fn build_committed_federation_redeem_script(
 }
 
 /// Build a live federation's redeem script from its **stored format version**,
-/// mirroring rskj `BridgeSerializationUtils.deserializeFederationAccordingToVersion`
-/// + `FederationFactory`. A federation that outlives the hardfork that introduced
+/// mirroring rskj `BridgeSerializationUtils.deserializeFederationAccordingToVersion` +
+/// `FederationFactory`. A federation that outlives the hardfork that introduced
 /// a newer template keeps its original type, so the redeem script (and hence the
 /// P2SH address used to recognize peg-in outputs / peg-out inputs) must be chosen
 /// by the format the federation was stored with — NOT by the current block height.
@@ -4834,6 +4835,7 @@ fn apply_signatures_to_tx(
     let is_witness: Vec<bool> = (0..n).map(|i| !tx.input[i].witness.is_empty()).collect();
     let mut redeems = Vec::with_capacity(n);
     let mut sighashes = Vec::with_capacity(n);
+    #[allow(clippy::needless_range_loop)] // indexes several parallel collections
     for i in 0..n {
         let redeem = if is_witness[i] {
             tx.input[i].witness.last().map(|r| r.to_vec())
@@ -5574,7 +5576,7 @@ mod tests {
     #[test]
     fn mainnet_9217796_signature_is_not_der() {
         let sig = hex::decode(
-            "9f2c0070c9e4c56639df9eb25efec97a1e4886a848f49a38fcdc970c7aec9274             821124693dc8ec5c699ddee0283c71331d86b5f61b6865182e0618dfb7bb52b2             65158d1987d0e1".replace(' ', "").replace('\n', ""),
+            "9f2c0070c9e4c56639df9eb25efec97a1e4886a848f49a38fcdc970c7aec9274             821124693dc8ec5c699ddee0283c71331d86b5f61b6865182e0618dfb7bb52b2             65158d1987d0e1".replace([' ', '\n'], ""),
         )
         .unwrap();
         assert_eq!(sig.len(), 71, "the signature from the block is 71 bytes");
@@ -6360,8 +6362,9 @@ mod tests {
         }
     }
 
-    /// rskj BtcLockSenderProvider: a P2SH-multisig first input (OP_0,
-    /// signatures, multisig redeem) classifies as P2SHMULTISIG with the
+    // NOTE: truncated doc -- "rskj BtcLockSenderProvider: a P2SH-multisig first
+    // input (OP_0, signatures, multisig redeem) classifies as P2SHMULTISIG with
+    // the ..." was cut off here; see the filed issue.
     // --- peg-in sender classification -------------------------------------
     //
     // Translated from rskj's four BtcLockSender test classes:

@@ -827,7 +827,7 @@ mod fuzz {
         // Then the long-form length marker, and a varint saying 8 million bits.
         let mut message = vec![0b0101_0000u8, 255];
         message.extend_from_slice(&[254, 0x00, 0x00, 0x7A, 0x00]); // 8_000_000
-        message.extend(std::iter::repeat(0u8).take(64));
+        message.extend(std::iter::repeat_n(0u8, 64));
 
         let store = MemoryTrieStore::new();
         assert!(

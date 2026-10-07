@@ -347,6 +347,7 @@ impl MerkleBranch {
         // ABI callers supply display-order hashes (rskj Sha256Hash.wrap of
         // the bytes32 args); our merkle arithmetic uses wire (internal)
         // order throughout.
+        #[allow(clippy::redundant_locals)] // rebind to mutate the caller's copy
         let mut tx_hash = tx_hash;
         tx_hash.reverse();
         let hashes = hashes

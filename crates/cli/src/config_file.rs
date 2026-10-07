@@ -301,6 +301,7 @@ pub fn apply_opt<T: Clone>(
 /// One-shot operations: they run and exit, so they are command-line only.
 /// Listing them explicitly (rather than inferring) means adding a flag forces a
 /// decision about which kind it is -- see `every_runtime_flag_is_configurable`.
+#[allow(dead_code)] // referenced only from tests
 pub const ONE_SHOT: &[&str] = &[
     "build_bridge_index",
     "build_height_index",
@@ -343,6 +344,7 @@ pub const ONE_SHOT: &[&str] = &[
 /// Every runtime setting the file can supply. Kept beside the merge so the two
 /// cannot drift; the test below asserts it covers every flag that is not
 /// one-shot.
+#[allow(dead_code)] // referenced only from tests
 pub const CONFIGURABLE: &[&str] = &[
     "port",
     "data_dir",
@@ -666,6 +668,7 @@ mod tests {
 
     /// A TOML value unlike the one given, so that applying it moves whichever
     /// `Args` field the key drives and reveals which one that is.
+    #[allow(dead_code)] // no caller; see the dead-code issue before deleting
     fn perturb(value: &str) -> String {
         match value {
             "true" => "false".into(),

@@ -5029,7 +5029,7 @@ mod tests {
 
         // The miner (header.beneficiary) should NOT receive fees directly
         assert!(
-            result.state_changes.get(&beneficiary).is_none(),
+            !result.state_changes.contains_key(&beneficiary),
             "miner should not receive fees directly; REMASC distributes later"
         );
     }
@@ -5948,7 +5948,7 @@ mod tests {
 
         // Flat parse-failure cost, no method execution: intrinsic (RSKIP400
         // calldata prices at this height) + 23,000.
-        let mut input = vec![0u8; 36];
+        let mut input = [0u8; 36];
         input[..4].copy_from_slice(&block_header_selector(
             "getEstimatedFeesForPegOutAmount(uint256)",
         ));
@@ -5978,7 +5978,7 @@ mod tests {
         let result = call_estimated_fees_for_pegout_amount(8_804_200, U256::from(1));
         assert!(result.success, "rskj throws, but a direct tx records SUCCESS");
 
-        let mut input = vec![0u8; 36];
+        let mut input = [0u8; 36];
         input[..4].copy_from_slice(&block_header_selector(
             "getEstimatedFeesForPegOutAmount(uint256)",
         ));
@@ -6027,7 +6027,7 @@ mod tests {
         .to_vec();
         let head_len = 5 * 32;
         let btc_tx_off = head_len;
-        let pmt_off = head_len + 32 + ((btc_tx.len() + 31) / 32) * 32;
+        let pmt_off = head_len + 32 + btc_tx.len().div_ceil(32) * 32;
         // arg0: btcTx offset
         input.extend_from_slice(&U256::from(btc_tx_off).to_be_bytes::<32>());
         // arg1: blockHash (unused on this path — tx-not-in-PMT returns first)
@@ -6040,12 +6040,12 @@ mod tests {
         // btcTx: length + padded data
         input.extend_from_slice(&U256::from(btc_tx.len()).to_be_bytes::<32>());
         let mut padded = btc_tx.clone();
-        padded.resize(((btc_tx.len() + 31) / 32) * 32, 0);
+        padded.resize(btc_tx.len().div_ceil(32) * 32, 0);
         input.extend_from_slice(&padded);
         // pmt: length + padded data
         input.extend_from_slice(&U256::from(pmt.len()).to_be_bytes::<32>());
         let mut pmt_padded = pmt.clone();
-        pmt_padded.resize(((pmt.len() + 31) / 32) * 32, 0);
+        pmt_padded.resize(pmt.len().div_ceil(32) * 32, 0);
         input.extend_from_slice(&pmt_padded);
 
         let tx = rustock_core::Transaction {
@@ -7260,7 +7260,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
 
         // Miner should not have received anything
         assert!(
-            result.state_changes.get(&miner).is_none(),
+            !result.state_changes.contains_key(&miner),
             "miner should not be paid before maturity"
         );
     }
@@ -7296,7 +7296,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
 
         // Miner should NOT be paid (syntheticSpan not reached)
         assert!(
-            result.state_changes.get(&miner).is_none(),
+            !result.state_changes.contains_key(&miner),
             "miner should not be paid before syntheticSpan"
         );
     }

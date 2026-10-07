@@ -292,8 +292,8 @@ fn get_partial_chain(
     results
 }
 
-/// Update the chain head (rskj `RepositoryBtcBlockStoreWithCache.setChainHead`
-/// + `setMainChainBlock`): the height->hash main-chain index only exists from
+/// Update the chain head (rskj `RepositoryBtcBlockStoreWithCache.setChainHead` +
+/// `setMainChainBlock`): the height->hash main-chain index only exists from
 /// RSKIP199 (iris300).
 fn set_chain_head<CTX: crate::RskContextTr>(
     ctx: &mut CTX,

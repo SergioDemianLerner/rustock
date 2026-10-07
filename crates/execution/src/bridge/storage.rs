@@ -439,7 +439,7 @@ fn serialize_utxo(utxo: &BridgeUtxo) -> Vec<u8> {
 
 /// Deserialize a UTXO from bytes.
 fn deserialize_utxo(data: &[u8]) -> Option<BridgeUtxo> {
-    if data.len() < 8 + 1 + 0 + 32 + 4 + 4 + 1 {
+    if data.len() < (8 + 1) + 32 + 4 + 4 + 1 {
         return None;
     }
 

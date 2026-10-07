@@ -111,7 +111,7 @@ impl SupplyReport {
     /// The accounts that gained, largest first — what to name in an alert.
     pub fn gainers(&self) -> Vec<&AccountDelta> {
         let mut v: Vec<&AccountDelta> = self.deltas.iter().filter(|d| d.is_increase()).collect();
-        v.sort_by(|a, b| b.magnitude().cmp(&a.magnitude()));
+        v.sort_by_key(|d| std::cmp::Reverse(d.magnitude()));
         v
     }
 }
@@ -205,7 +205,7 @@ pub fn report(block: u64, report: &SupplyReport) {
         amount,
         deltas: {
             let mut d = report.deltas.clone();
-            d.sort_by(|a, b| b.magnitude().cmp(&a.magnitude()));
+            d.sort_by_key(|x| std::cmp::Reverse(x.magnitude()));
             d
         },
     };
@@ -234,6 +234,87 @@ pub fn report(block: u64, report: &SupplyReport) {
         );
     }
 
+    if let Some(obs) = OBSERVER.get() {
+        obs(&violation);
+    }
+}
+
+/// Account for the balance changes one transaction made.
+///
+/// Unlike the block-level check this needs no database reads. revm refreshes an
+/// account's `original_info` when it is cold-loaded *within a transaction*
+/// (`JournalInner::load_account_mut_optional`), so for every account a
+/// transaction touched, `info.balance - original_info.balance` is exactly that
+/// transaction's effect. `transaction_id` identifies which transaction last
+/// touched an account, so the block's accumulated state map can be filtered
+/// down to the one just executed.
+///
+/// A fee-paying transaction nets to zero: rustock credits the block beneficiary
+/// (REMASC) inside the same transaction (`RskHandler::reward_beneficiary`), so
+/// the gas leaving the sender arrives in the same accounting.
+///
+/// **This reads a revm internal.** `original_info` is public but documented as
+/// serving Block Access Lists, so a future revm could change when it is
+/// refreshed without considering it breaking. `per_transaction_baseline_holds`
+/// pins the behaviour: if it ever stops being a per-transaction baseline that
+/// test fails, rather than the check silently mis-accounting.
+pub fn transaction_supply_change(state: &EvmState, transaction_id: usize) -> SupplyReport {
+    let mut report = SupplyReport::default();
+
+    for (addr, account) in state {
+        if account.transaction_id != transaction_id {
+            continue; // untouched by this transaction
+        }
+        let before = account.original_info.balance;
+        let after = if account.status.contains(AccountStatus::SelfDestructed) {
+            U256::ZERO
+        } else {
+            account.info.balance
+        };
+        if before == after {
+            continue;
+        }
+        if after > before {
+            report.inflow += after - before;
+        } else {
+            report.outflow += before - after;
+        }
+        report.deltas.push(AccountDelta { address: *addr, before, after });
+    }
+
+    report
+}
+
+/// Log and hand on a per-transaction imbalance.
+pub fn report_transaction(block: u64, index: usize, report: &SupplyReport) {
+    let (positive, amount) = report.net();
+    if positive {
+        tracing::error!(
+            target: "rustock::supply",
+            block, tx = index, amount = %amount,
+            "SUPPLY CREATED: transaction {index} of block #{block} creates {amount} wei; rejecting the block"
+        );
+    } else {
+        tracing::warn!(
+            target: "rustock::supply",
+            block, tx = index, amount = %amount,
+            "supply destroyed: transaction {index} of block #{block} burns {amount} wei"
+        );
+    }
+    for d in report.deltas.iter().take(8) {
+        tracing::info!(
+            target: "rustock::supply",
+            block, tx = index, account = %d.address,
+            before = %d.before, after = %d.after,
+            "  {} {}", if d.is_increase() { "gained" } else { "lost" }, d.magnitude()
+        );
+    }
+    let violation = SupplyViolation {
+        block,
+        created: positive,
+        amount,
+        deltas: report.deltas.clone(),
+    };
     if let Some(obs) = OBSERVER.get() {
         obs(&violation);
     }
@@ -417,86 +498,5 @@ mod tests {
 
         let r = account_supply_change(&root, &store, &state);
         assert!(r.is_balanced(), "a peg-in must not change the total: {r:?}");
-    }
-}
-
-/// Account for the balance changes one transaction made.
-///
-/// Unlike the block-level check this needs no database reads. revm refreshes an
-/// account's `original_info` when it is cold-loaded *within a transaction*
-/// (`JournalInner::load_account_mut_optional`), so for every account a
-/// transaction touched, `info.balance - original_info.balance` is exactly that
-/// transaction's effect. `transaction_id` identifies which transaction last
-/// touched an account, so the block's accumulated state map can be filtered
-/// down to the one just executed.
-///
-/// A fee-paying transaction nets to zero: rustock credits the block beneficiary
-/// (REMASC) inside the same transaction (`RskHandler::reward_beneficiary`), so
-/// the gas leaving the sender arrives in the same accounting.
-///
-/// **This reads a revm internal.** `original_info` is public but documented as
-/// serving Block Access Lists, so a future revm could change when it is
-/// refreshed without considering it breaking. `per_transaction_baseline_holds`
-/// pins the behaviour: if it ever stops being a per-transaction baseline that
-/// test fails, rather than the check silently mis-accounting.
-pub fn transaction_supply_change(state: &EvmState, transaction_id: usize) -> SupplyReport {
-    let mut report = SupplyReport::default();
-
-    for (addr, account) in state {
-        if account.transaction_id != transaction_id {
-            continue; // untouched by this transaction
-        }
-        let before = account.original_info.balance;
-        let after = if account.status.contains(AccountStatus::SelfDestructed) {
-            U256::ZERO
-        } else {
-            account.info.balance
-        };
-        if before == after {
-            continue;
-        }
-        if after > before {
-            report.inflow += after - before;
-        } else {
-            report.outflow += before - after;
-        }
-        report.deltas.push(AccountDelta { address: *addr, before, after });
-    }
-
-    report
-}
-
-/// Log and hand on a per-transaction imbalance.
-pub fn report_transaction(block: u64, index: usize, report: &SupplyReport) {
-    let (positive, amount) = report.net();
-    if positive {
-        tracing::error!(
-            target: "rustock::supply",
-            block, tx = index, amount = %amount,
-            "SUPPLY CREATED: transaction {index} of block #{block} creates {amount} wei; rejecting the block"
-        );
-    } else {
-        tracing::warn!(
-            target: "rustock::supply",
-            block, tx = index, amount = %amount,
-            "supply destroyed: transaction {index} of block #{block} burns {amount} wei"
-        );
-    }
-    for d in report.deltas.iter().take(8) {
-        tracing::info!(
-            target: "rustock::supply",
-            block, tx = index, account = %d.address,
-            before = %d.before, after = %d.after,
-            "  {} {}", if d.is_increase() { "gained" } else { "lost" }, d.magnitude()
-        );
-    }
-    let violation = SupplyViolation {
-        block,
-        created: positive,
-        amount,
-        deltas: report.deltas.clone(),
-    };
-    if let Some(obs) = OBSERVER.get() {
-        obs(&violation);
     }
 }
