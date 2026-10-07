@@ -124,6 +124,78 @@ fn write_last_block(dir: &Path, n: u64) {
     }
 }
 
+/// Name of the store-level record holding the collection watermark: the
+/// highest `last_block` of any epoch this store has swept.
+const COLLECTED_BELOW: &str = "collected-below";
+
+/// Name of the store-level, append-only ledger of completed sweeps.
+const SWEEP_LOG: &str = "sweep-log";
+
+/// One completed sweep.
+///
+/// A swept epoch's `last_block` is the only surviving record of the floor it
+/// established -- the directory that proved it is gone. Keeping it is what lets
+/// a later missing trie node be attributed to the collector rather than to
+/// damage. See `docs/trie-gc-design.md` §4.4 "Stale branch state".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepRecord {
+    /// Sequence number of the epoch that was deleted.
+    pub seq: u64,
+    /// Highest block whose writes went into it: the floor this sweep established.
+    pub last_block: u64,
+    /// Where the chain was when the sweep ran.
+    pub swept_at: u64,
+    /// Bytes the directory removal reclaimed.
+    pub reclaimed_bytes: u64,
+}
+
+fn read_collected_below(root: &Path) -> Option<u64> {
+    let t = std::fs::read_to_string(root.join(COLLECTED_BELOW)).ok()?;
+    t.trim().parse().ok()
+}
+
+fn write_collected_below(root: &Path, n: u64) {
+    if let Err(e) = std::fs::write(root.join(COLLECTED_BELOW), n.to_string()) {
+        warn!(target: "rustock::gc", "Could not record the collection watermark: {e}");
+    }
+}
+
+fn append_sweep_record(root: &Path, r: &SweepRecord) {
+    use std::io::Write;
+    let line = format!("{} {} {} {}\n", r.seq, r.last_block, r.swept_at, r.reclaimed_bytes);
+    let opened = std::fs::OpenOptions::new().create(true).append(true).open(root.join(SWEEP_LOG));
+    match opened {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                warn!(target: "rustock::gc", "Could not append to the sweep ledger: {e}");
+            }
+        }
+        Err(e) => warn!(target: "rustock::gc", "Could not open the sweep ledger: {e}"),
+    }
+}
+
+/// Reads the ledger, oldest first.
+///
+/// A malformed line is skipped rather than failing the read. The ledger is
+/// diagnosis: a torn trailing write must not stop the node reporting what the
+/// rest of it says, and an absent file simply means nothing has been swept.
+fn read_sweep_log(root: &Path) -> Vec<SweepRecord> {
+    let Ok(text) = std::fs::read_to_string(root.join(SWEEP_LOG)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            Some(SweepRecord {
+                seq: f.next()?.parse().ok()?,
+                last_block: f.next()?.parse().ok()?,
+                swept_at: f.next()?.parse().ok()?,
+                reclaimed_bytes: f.next()?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
 /// What one collection cycle did.
 #[derive(Debug, Default, Clone)]
 pub struct CollectStats {
@@ -829,6 +901,47 @@ impl EpochTrieStore {
         Ok((scanned, drained, bytes))
     }
 
+    /// The collection watermark: the highest block whose writes were held by an
+    /// epoch this store has swept.
+    ///
+    /// A trie node missing beneath this height is **expected** -- the collector
+    /// took it, and it is not recoverable from this store. A node missing above
+    /// it is damage. `None` means no sweep has completed, so any missing node
+    /// is damage.
+    pub fn collected_below(&self) -> Option<u64> {
+        read_collected_below(&self.root)
+    }
+
+    /// Every sweep this store has completed, oldest first.
+    ///
+    /// The watermark says how deep the collector has reached; this says which
+    /// cycle reached there and when, which is what makes a report checkable
+    /// against the chain's own history.
+    pub fn sweep_log(&self) -> Vec<SweepRecord> {
+        read_sweep_log(&self.root)
+    }
+
+    /// Advances the watermark and appends to the ledger.
+    ///
+    /// Both are best-effort writes to small files. The sweep has already
+    /// happened and cannot be undone, so a failure here costs diagnosis, not
+    /// data, and must not turn a completed cycle into a reported failure.
+    fn record_sweep(&self, record: SweepRecord) {
+        if record.last_block > read_collected_below(&self.root).unwrap_or(0) {
+            write_collected_below(&self.root, record.last_block);
+        }
+        append_sweep_record(&self.root, &record);
+        info!(
+            target: "rustock::gc",
+            "Swept epoch {} (held blocks up to #{}, reclaimed {} MB); trie state at or below \
+             #{} is no longer in this store",
+            record.seq,
+            record.last_block,
+            record.reclaimed_bytes / (1 << 20),
+            record.last_block
+        );
+    }
+
     /// Deletes the oldest epoch and opens a new newest one.
     ///
     /// This is the step that reclaims, and it costs one directory removal
@@ -839,11 +952,29 @@ impl EpochTrieStore {
             let old = epochs.remove(0);
             let size = dir_size(&old.dir);
             let dir = old.dir.clone();
+            // Taken before the handle goes. This epoch's `last_block` is the
+            // floor below which state may now be absent, and once the directory
+            // is removed there is nothing else that remembers it.
+            let swept_seq = old.seq;
+            let swept_last_block = old.last_block;
             // Drop every handle before the directory goes.
             drop(old);
             std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("removing epoch {}", dir.display()))?;
             debug!(target: "rustock::gc", "Swept {} ({} MB)", dir.display(), size / (1 << 20));
+            // Only now is the state below this floor actually unrecoverable, so
+            // only now is it true to record that it is. `last_block` is always
+            // `Some` here -- `collect` refuses to sweep an epoch without one --
+            // but a `None` is dropped rather than guessed: a watermark claiming
+            // more than was collected would call real damage "expected".
+            if let Some(last_block) = swept_last_block {
+                self.record_sweep(SweepRecord {
+                    seq: swept_seq,
+                    last_block,
+                    swept_at: current_block,
+                    reclaimed_bytes: size,
+                });
+            }
             size
         } else {
             0
@@ -1437,6 +1568,134 @@ mod tests {
             before,
             "the seeded epoch must not receive writes"
         );
+    }
+
+    /// Drives `n` collection cycles against a store configured to keep
+    /// `epochs`, returning it. Each cycle writes a fresh generation, so the
+    /// oldest epoch is genuinely dead by the time it is swept.
+    fn sweep_n(dir: &Path, epochs: usize, n: u64) -> EpochTrieStore {
+        let s = EpochTrieStore::open(dir, cfg(epochs)).unwrap();
+        for i in 0..n {
+            let root = build(&s, 64, i * 10_000);
+            // root_block climbs so each cycle's collection root stays above the
+            // oldest epoch's last_block, which is what `collect` requires.
+            s.collect(root, (i + 1) * 1_000, (i + 1) * 1_000).unwrap();
+        }
+        s
+    }
+
+    /// The watermark is the whole point: without it a missing trie node cannot
+    /// be told from a damaged store. It must name the floor the collector
+    /// actually reached.
+    #[test]
+    fn a_sweep_records_the_floor_it_established() {
+        let d = tempfile::tempdir().unwrap();
+        let s = sweep_n(d.path(), 3, 5);
+
+        let log = s.sweep_log();
+        assert!(!log.is_empty(), "five cycles over three epochs must have swept");
+
+        let watermark = s.collected_below().expect("a completed sweep must set the watermark");
+        let highest = log.iter().map(|r| r.last_block).max().unwrap();
+        assert_eq!(
+            watermark, highest,
+            "the watermark must equal the highest last_block the ledger records"
+        );
+    }
+
+    /// A store that has never swept must report `None`, not zero. Zero reads as
+    /// "everything at or below block 0 was collected", which is a claim about
+    /// genesis; `None` is the truth -- nothing was collected.
+    #[test]
+    fn a_store_that_never_swept_has_no_watermark() {
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(8)).unwrap();
+        let root = build(&s, 32, 0);
+        s.collect(root, 1_000, 1_000).unwrap();
+
+        assert_eq!(s.collected_below(), None, "rotation without a sweep must not set a watermark");
+        assert!(s.sweep_log().is_empty(), "rotation without a sweep must not append a record");
+    }
+
+    /// The watermark describes what is *gone*, so it may never retreat. A lower
+    /// value would promote collected state back to "should be present", turning
+    /// an expected absence into a reported corruption.
+    #[test]
+    fn the_watermark_never_goes_backwards() {
+        let d = tempfile::tempdir().unwrap();
+        let s = sweep_n(d.path(), 3, 5);
+        let high = s.collected_below().unwrap();
+
+        // A sweep whose floor is below the watermark must leave it alone.
+        s.record_sweep(SweepRecord { seq: 99, last_block: 1, swept_at: 9, reclaimed_bytes: 0 });
+        assert_eq!(s.collected_below(), Some(high), "a lower floor must not lower the watermark");
+
+        // ...and must still be recorded, because it did happen.
+        assert!(
+            s.sweep_log().iter().any(|r| r.seq == 99),
+            "the ledger records every sweep, including one that does not move the watermark"
+        );
+    }
+
+    /// Both records live on disk precisely so they outlive the process that
+    /// swept: the node that has to explain a missing node is usually a later one.
+    #[test]
+    fn the_watermark_and_ledger_survive_a_reopen() {
+        let d = tempfile::tempdir().unwrap();
+        let (watermark, log) = {
+            let s = sweep_n(d.path(), 3, 5);
+            (s.collected_below(), s.sweep_log())
+        };
+        assert!(watermark.is_some(), "the fixture swept nothing");
+
+        let reopened = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        assert_eq!(reopened.collected_below(), watermark);
+        assert_eq!(reopened.sweep_log(), log, "the ledger must reopen in the same order");
+    }
+
+    /// The ledger is diagnosis, not consensus data. A torn trailing write -- a
+    /// crash mid-append -- must cost that one line and nothing else.
+    #[test]
+    fn a_torn_ledger_line_is_skipped_rather_than_fatal() {
+        let d = tempfile::tempdir().unwrap();
+        let s = sweep_n(d.path(), 3, 5);
+        let good = s.sweep_log();
+        assert!(!good.is_empty(), "the fixture swept nothing");
+
+        // Append a half-written record, as an interrupted write would leave.
+        let path = d.path().join(SWEEP_LOG);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("7 42\n");
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(s.sweep_log(), good, "a truncated line must be skipped, not parsed");
+
+        // A watermark file that is not a number must not panic either.
+        std::fs::write(d.path().join(COLLECTED_BELOW), "not a number").unwrap();
+        assert_eq!(s.collected_below(), None, "an unreadable watermark must read as unknown");
+    }
+
+    /// The ledger must say *which* cycle reached a floor, not merely that some
+    /// cycle did -- that is the difference between a checkable claim and a bare
+    /// assertion.
+    #[test]
+    fn the_ledger_names_the_epoch_and_where_the_chain_was() {
+        let d = tempfile::tempdir().unwrap();
+        let s = sweep_n(d.path(), 3, 5);
+
+        let log = s.sweep_log();
+        let first = log.first().expect("the fixture swept nothing");
+        assert!(first.swept_at > 0, "a record must say where the chain was when it ran");
+        assert!(
+            first.last_block <= first.swept_at,
+            "an epoch cannot hold writes for blocks above the head at sweep time"
+        );
+
+        let seqs: Vec<u64> = log.iter().map(|r| r.seq).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(seqs, sorted, "records must be oldest first");
+        sorted.dedup();
+        assert_eq!(sorted.len(), seqs.len(), "an epoch must not be recorded as swept twice");
     }
 
     #[test]
