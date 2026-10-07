@@ -294,7 +294,7 @@ impl SnapDriver {
 
     /// The peers worth asking, which is all of them minus the ones that have
     /// already said they cannot help.
-    fn worth_asking<'a>(&self, peers: &'a [B512]) -> Vec<B512> {
+    fn worth_asking(&self, peers: &[B512]) -> Vec<B512> {
         let willing: Vec<B512> =
             peers.iter().copied().filter(|p| !self.unhelpful.contains(p)).collect();
         // If that leaves nobody, ask anyway rather than stall: a peer that

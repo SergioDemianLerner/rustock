@@ -59,10 +59,7 @@ async fn connection(socket: WebSocket, state: RpcState) {
     // A receiver is taken even when the node publishes nothing, so that
     // `eth_subscribe` works on a node without an event source and simply
     // never fires.
-    let mut events = match &state.events {
-        Some(tx) => Some(tx.subscribe()),
-        None => None,
-    };
+    let mut events = state.events.as_ref().map(|tx| tx.subscribe());
 
     loop {
         tokio::select! {

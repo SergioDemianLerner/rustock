@@ -276,7 +276,7 @@ pub fn preview(v: &[u8]) -> String {
 
 /// Packs a bit path into bytes, or `None` when it is not byte-aligned.
 pub fn pack_path(bits: &[u8]) -> Option<Vec<u8>> {
-    if bits.len() % 8 != 0 {
+    if !bits.len().is_multiple_of(8) {
         return None;
     }
     Some(

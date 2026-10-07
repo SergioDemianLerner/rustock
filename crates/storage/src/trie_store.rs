@@ -12,16 +12,15 @@ use tracing::warn;
 const CF_TRIE: &str = "trie_nodes";
 
 /// Persistent trie store backed by RocksDB.
-/// Threads used to service one `get_many` batch.
-///
-/// This is a queue-depth knob, not a CPU one: the threads spend their time
-/// blocked on the device, so the useful value tracks how many concurrent
-/// requests the storage can serve rather than how many cores exist. 16 keeps a
-/// network-attached SSD busy without oversubscribing RocksDB's block cache
-/// locks.
+//
+// Threads used to service one `get_many` batch: a queue-depth knob, not a CPU
+// one. The threads spend their time blocked on the device, so the useful value
+// tracks how many concurrent requests the storage can serve rather than how
+// many cores exist. 16 keeps a network-attached SSD busy without
+// oversubscribing RocksDB's block cache locks.
+//
 // Read concurrency is one setting for the whole node; see
 // `crate::set_read_threads`.
-
 pub struct RocksDbTrieStore {
     db: Arc<DB>,
 }

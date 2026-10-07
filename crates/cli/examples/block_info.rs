@@ -28,7 +28,7 @@ fn main() -> Result<()> {
     let cf_td = db.cf_handle("total_difficulty").context("no total_difficulty cf")?;
     let cf_hdr = db.cf_handle("headers").context("no headers cf")?;
 
-    println!("{:>12}  {:<10} {:>6}  {:<22}  {}", "height", "hash", "td len", "td decoded", "header");
+    println!("{:>12}  {:<10} {:>6}  {:<22}  header", "height", "hash", "td len", "td decoded");
     for n in heights {
         let Some(hash) = db.get_cf(cf_num, n.to_be_bytes())? else {
             println!("{n:>12}  (no canonical hash)");

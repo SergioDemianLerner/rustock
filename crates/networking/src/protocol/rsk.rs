@@ -1221,7 +1221,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// A `Transactions` message as it arrives on the wire: an outer RLP list
     /// whose items are each a COMPLETE transaction -- itself an RLP list.
     ///
@@ -1276,6 +1275,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn test_rsk_message_rlp_transactions() {
         use alloy_primitives::Bytes;
 

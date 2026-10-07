@@ -462,7 +462,7 @@ mod tests {
         let mut out = vec![0xABu8; tag_offset];
         out.extend_from_slice(RSK_TAG);
         out.extend_from_slice(&[0xCD; BLOCK_HEADER_HASH_SIZE]);
-        out.extend(std::iter::repeat(0xEF).take(trailing));
+        out.extend(std::iter::repeat_n(0xEF, trailing));
         out
     }
 

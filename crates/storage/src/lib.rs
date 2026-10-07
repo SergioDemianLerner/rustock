@@ -380,11 +380,11 @@ impl BlockStore {
             }
             let mut slice: &[u8] = &v;
             if let Ok(h) = Header::decode(&mut slice) {
-                if best.map_or(true, |(n, _)| h.number > n) {
+                if best.is_none_or(|(n, _)| h.number > n) {
                     best = Some((h.number, B256::from_slice(&k)));
                 }
             }
-            if scanned % 2_000_000 == 0 {
+            if scanned.is_multiple_of(2_000_000) {
                 debug!("highest_header: scanned {scanned}, best #{}", best.map(|b| b.0).unwrap_or(0));
             }
         }
@@ -515,12 +515,12 @@ impl BlockStore {
             batch.put_cf(cf_index, height_index_key(number, hash), []);
             indexed += 1;
 
-            if indexed % 10_000 == 0 {
+            if indexed.is_multiple_of(10_000) {
                 self.db
                     .write(std::mem::take(&mut batch))
                     .context("Failed to write height index batch")?;
             }
-            if report_every > 0 && indexed % report_every == 0 {
+            if report_every > 0 && indexed.is_multiple_of(report_every) {
                 progress(indexed);
             }
         }
@@ -1762,7 +1762,8 @@ impl BlockStore {
             .collect())
     }
 
-    /// Returns a reference to the underlying RocksDB instance.
+    // NOTE: orphaned doc -- "Returns a reference to the underlying RocksDB
+    // instance" documents no item here; left as a comment pending review.
     // --- Snapshot chunk cache ---
 
     /// A snapshot cell already computed, if it is still here.
@@ -1779,10 +1780,10 @@ impl BlockStore {
         format: u8,
         index: u64,
     ) -> Result<Option<Vec<u8>>> {
-        Ok(self
+        self
             .db
             .get_cf(self.cf(CF_SNAP_CHUNKS)?, snap_chunk_key(state_root, grid, format, index))
-            .context("Failed to read a snapshot chunk")?)
+            .context("Failed to read a snapshot chunk")
     }
 
     pub fn put_snap_chunk(

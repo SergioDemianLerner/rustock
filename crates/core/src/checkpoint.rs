@@ -200,6 +200,7 @@ pub fn max_work_between(
 
     let mut total = U256::ZERO;
     let mut d = from;
+    #[allow(clippy::needless_range_loop)] // `step` is the step number, not just an index
     for step in 1..=span as usize {
         let risen = d.saturating_add(d / div);
         d = risen.min(cap[step]);

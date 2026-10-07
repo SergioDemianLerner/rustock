@@ -93,9 +93,8 @@ pub fn is_erp_redeem(redeem_script: &[u8]) -> bool {
 pub fn placeholder_scriptsig(redeem_script: &[u8], threshold: usize) -> Vec<u8> {
     let mut script = Vec::with_capacity(2 + threshold + redeem_script.len() + 3);
     script.push(0x00); // OP_0 (CHECKMULTISIG bug workaround)
-    for _ in 0..threshold {
-        script.push(0x00); // empty signature placeholder == OP_0
-    }
+    // One OP_0 per empty signature slot: the same byte, deliberately.
+    script.extend(std::iter::repeat_n(0x00, threshold));
     if is_erp_redeem(redeem_script) {
         script.push(0x00); // OP_0 selecting the OP_NOTIF default branch
     }
@@ -868,9 +867,7 @@ pub fn has_enough_signatures(tx: &BtcTransaction) -> bool {
         if chunks.len() < 1 + suffix {
             return false;
         }
-        if chunks[1..chunks.len() - suffix]
-            .iter()
-            .any(|c| *c == Chunk::OpZero)
+        if chunks[1..chunks.len() - suffix].contains(&Chunk::OpZero)
         {
             return false;
         }

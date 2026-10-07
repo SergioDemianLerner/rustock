@@ -50,6 +50,7 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         if n == 0 { 0 } else { self.next() % n }
     }
+    #[allow(dead_code)] // no caller; see the dead-code issue before deleting
     fn chance(&mut self, percent: u64) -> bool {
         self.below(100) < percent
     }

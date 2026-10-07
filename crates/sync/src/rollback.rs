@@ -582,7 +582,7 @@ mod tests {
         w.canonicalise(&fork_block);
         w.with_state(&fork_block);
 
-        let mut build = |w: &mut World, salt: u64| {
+        let build = |w: &mut World, salt: u64| {
             let mut parent = fork;
             for n in fork_height + 1..=fork_height + depth {
                 let h = header(n, parent, salt);

@@ -14,7 +14,6 @@
 //! The node must be **stopped**: read-only mode does not replay the
 //! write-ahead log, so a running node's most recent writes would be invisible.
 
-use alloy_primitives::B256;
 use anyhow::{Context, Result};
 use rustock_execution::bridge::btc_chain::{main_chain_block_at_height, MainChainLookup};
 use rustock_execution::BtcBlockCache;

@@ -57,10 +57,9 @@ struct Table {
 
 impl Table {
     fn new(start_block: u64, reserve: usize) -> Self {
-        let mut arena = Vec::new();
         // Reserve up front: doubling a 128 MB arena wastes more than the
         // saving this whole change is about.
-        arena.reserve(reserve);
+        let arena = Vec::with_capacity(reserve);
         Self { start_block, bytes: 0, arena, index: HashMap::new(), overflow: HashMap::new() }
     }
 
@@ -173,7 +172,7 @@ impl WindowStore {
     /// in block numbers, so a later reader can route by height.
     pub fn set_block(&self, n: u64) {
         self.block.store(n, Ordering::Relaxed);
-        if self.tables.read().unwrap().last().map_or(false, |t| t.bytes == 0) {
+        if self.tables.read().unwrap().last().is_some_and(|t| t.bytes == 0) {
             if let Some(t) = self.tables.write().unwrap().last_mut() {
                 if t.bytes == 0 {
                     t.start_block = n;
@@ -316,7 +315,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()

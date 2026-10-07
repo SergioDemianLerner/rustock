@@ -265,7 +265,7 @@ fn run_chunk(
         root = p.new_state_root;
         done += 1;
 
-        if done % REROOT_EVERY == 0 {
+        if done.is_multiple_of(REROOT_EVERY) {
             match win.get(p_root_hash.as_slice()) {
                 Some(data) => root = TrieNode::from_message(&data, win.as_ref()),
                 None => eprintln!("[w{id}] re-root at #{n}: root {p_root_hash:?} not readable; \
@@ -273,11 +273,11 @@ fn run_chunk(
             }
         }
 
-        if done % ckpt_every == 0 {
+        if done.is_multiple_of(ckpt_every) {
             window.checkpoint(n, p_root_hash.as_slice())?;
         }
 
-        if done % PROGRESS_EVERY == 0 || n == end {
+        if done.is_multiple_of(PROGRESS_EVERY) || n == end {
             let el = t_all.elapsed().as_secs_f64();
             let rate = (chunk_base + done) as f64 / el.max(0.001);
             let reads = window.reads.load(Ordering::Relaxed).max(1);

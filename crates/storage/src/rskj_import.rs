@@ -239,7 +239,7 @@ fn set_heads(dest: &BlockStore, tip_hash: B256, td: U256) -> Result<()> {
 /// slices of the keyspace hold roughly equal numbers of nodes. Returns
 /// `(start, end)` bounds where `end` is exclusive and `None` means open-ended.
 fn keyspace_ranges(n: usize) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
-    let n = n.max(1).min(256);
+    let n = n.clamp(1, 256);
     (0..n)
         .map(|i| {
             let start = (i * 256 / n) as u8;
@@ -337,7 +337,7 @@ pub fn import_unitrie_parallel(
                         dest.write_opt(std::mem::take(&mut batch), &wo)?;
                         in_batch = 0;
                     }
-                    if local % 50_000 == 0 {
+                    if local.is_multiple_of(50_000) {
                         scanned.fetch_add(50_000, Ordering::Relaxed);
                         local = 0;
                         if shutdown_requested() {
@@ -1313,6 +1313,7 @@ where
 /// V2 keys are `txHash ++ blockHash` and hold a single `TransactionInfo`.
 /// V1 keys are `txHash` alone and hold a list of them, one per block that
 /// included the transaction, so the right one is selected by block hash.
+#[allow(dead_code)] // no caller; see the dead-code issue before deleting
 fn lookup_receipt(src: &DB, tx_hash: &[u8], block_hash: &[u8]) -> Result<Option<Vec<u8>>> {
     use alloy_rlp::Header as RlpHeader;
     let mut combined = tx_hash.to_vec();

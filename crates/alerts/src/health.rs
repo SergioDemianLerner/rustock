@@ -298,6 +298,49 @@ impl HealthMonitor {
     }
 }
 
+/// Where a reading comes from. An interface rather than the concrete stores,
+/// so the polling loop can be tested without a chain or a network.
+#[async_trait::async_trait]
+pub trait HealthSource: Send + Sync {
+    async fn sample(&self) -> Option<Sample>;
+}
+
+/// Poll `source`, feed the monitor, and deliver what it raises.
+///
+/// Deliberately owns nothing the node needs. It reads two numbers and a peer
+/// table; if it stalls on an unreachable mail server the node does not notice,
+/// which is the same property the peg-out watcher has and for the same reason.
+pub async fn run(
+    source: std::sync::Arc<dyn HealthSource>,
+    thresholds: HealthThresholds,
+    poll_interval: Duration,
+    sinks: std::sync::Arc<Vec<Box<dyn crate::sink::AlertSink>>>,
+) {
+    let mut monitor = HealthMonitor::new(thresholds);
+    let mut ticker = tokio::time::interval(poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        let Some(sample) = source.sample().await else { continue };
+
+        for alert in monitor.observe(sample, Instant::now()) {
+            tracing::warn!(
+                target: "rustock::alerts::health",
+                "node health alert: {}", alert.subject()
+            );
+            for sink in sinks.iter() {
+                if let Err(e) = sink.deliver(&alert) {
+                    tracing::error!(
+                        target: "rustock::alerts::health",
+                        "sink {} could not deliver {:?}: {e:#}", sink.name(), alert.subject()
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,7 +434,7 @@ mod tests {
         let mut m = HealthMonitor::new(thresholds());
         let t0 = Instant::now();
         // `tick` advances both us and the network, holding the gap at `gap`.
-        let mut tick = |m: &mut HealthMonitor, secs: u64, gap: u64| {
+        let tick = |m: &mut HealthMonitor, secs: u64, gap: u64| {
             let ours = 100 + secs / 10;
             m.observe(sample(ours, ours, Some(ours + gap)), at(t0, secs))
         };
@@ -570,48 +613,5 @@ mod tests {
             !has_behind(&fired),
             "the behind alarm is still inside its 24h cooldown"
         );
-    }
-}
-
-/// Where a reading comes from. An interface rather than the concrete stores,
-/// so the polling loop can be tested without a chain or a network.
-#[async_trait::async_trait]
-pub trait HealthSource: Send + Sync {
-    async fn sample(&self) -> Option<Sample>;
-}
-
-/// Poll `source`, feed the monitor, and deliver what it raises.
-///
-/// Deliberately owns nothing the node needs. It reads two numbers and a peer
-/// table; if it stalls on an unreachable mail server the node does not notice,
-/// which is the same property the peg-out watcher has and for the same reason.
-pub async fn run(
-    source: std::sync::Arc<dyn HealthSource>,
-    thresholds: HealthThresholds,
-    poll_interval: Duration,
-    sinks: std::sync::Arc<Vec<Box<dyn crate::sink::AlertSink>>>,
-) {
-    let mut monitor = HealthMonitor::new(thresholds);
-    let mut ticker = tokio::time::interval(poll_interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        ticker.tick().await;
-        let Some(sample) = source.sample().await else { continue };
-
-        for alert in monitor.observe(sample, Instant::now()) {
-            tracing::warn!(
-                target: "rustock::alerts::health",
-                "node health alert: {}", alert.subject()
-            );
-            for sink in sinks.iter() {
-                if let Err(e) = sink.deliver(&alert) {
-                    tracing::error!(
-                        target: "rustock::alerts::health",
-                        "sink {} could not deliver {:?}: {e:#}", sink.name(), alert.subject()
-                    );
-                }
-            }
-        }
     }
 }

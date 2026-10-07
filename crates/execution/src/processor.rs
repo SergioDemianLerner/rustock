@@ -597,7 +597,7 @@ impl BlockProcessor {
             // unchanged from the 2018 genesis client through wasabi (the
             // conversion reproduces the genesis header's stateRoot), so the
             // check is valid for every pre-RSKIP126 block.
-            if header.number % interval == 0 {
+            if header.number.is_multiple_of(interval) {
                 let computed = rustock_trie::orchid_state_root(
                     &result.new_state_root,
                     trie_store.as_ref(),

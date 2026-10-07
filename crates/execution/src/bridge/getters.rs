@@ -784,8 +784,8 @@ fn parse_btc_hash_display(hex_str: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for i in 0..32 {
-        out[i] = u8::from_str_radix(hex_str.get(2 * i..2 * i + 2)?, 16).ok()?;
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex_str.get(2 * i..2 * i + 2)?, 16).ok()?;
     }
     Some(out)
 }
@@ -1042,7 +1042,6 @@ mod tests {
     use super::*;
     use crate::bridge::constants::BridgeConstants;
     use crate::bridge::federation::StoredMember;
-    use crate::bridge::storage::*;
     use crate::hardfork::RskHardforkConfig;
 
     /// A writable Bridge context at `block_number`, backed by the raw-storage
@@ -1052,8 +1051,10 @@ mod tests {
     fn ctx_at(block_number: u64) -> impl crate::RskContextTr {
         use revm::MainContext;
         let chain_ext = crate::raw_storage::RskChainExt::default();
-        let mut block_env = revm::context::BlockEnv::default();
-        block_env.number = U256::from(block_number);
+        let block_env = revm::context::BlockEnv {
+            number: U256::from(block_number),
+            ..revm::context::BlockEnv::default()
+        };
         revm::Context::mainnet().with_block(block_env).with_chain(chain_ext)
     }
 

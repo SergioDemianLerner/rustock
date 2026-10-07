@@ -212,7 +212,7 @@ fn bump(v: &mut Vec<(LeafKind, u64, u64)>, kind: LeafKind, bytes: u64) {
 /// Packs a bit path (one byte per bit) into bytes. Returns None if the path is
 /// not byte-aligned, which a well-formed leaf key always is.
 fn pack_bits(bits: &[u8]) -> Option<Vec<u8>> {
-    if bits.len() % 8 != 0 {
+    if !bits.len().is_multiple_of(8) {
         return None;
     }
     Some(
@@ -337,8 +337,10 @@ pub fn scan_with_options(
         .with_context(|| format!("state root {root_hash:?} not found in the trie store"))?;
     let root = TrieNode::from_message(&data, store);
 
-    let mut st = TrieStats::default();
-    st.size_with_dup = subtree_size(&root, store);
+    let mut st = TrieStats {
+        size_with_dup: subtree_size(&root, store),
+        ..TrieStats::default()
+    };
     let total_expanded = st.size_with_dup.max(1);
 
     let mut seen: std::collections::HashMap<B256, u64> = std::collections::HashMap::new();

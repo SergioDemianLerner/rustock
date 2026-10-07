@@ -162,7 +162,7 @@ pub async fn fill_canonical_index(store: Arc<BlockStore>, head: alloy_primitives
         }
         cursor = next_hash;
 
-        if batches % REPORT_EVERY == 0 {
+        if batches.is_multiple_of(REPORT_EVERY) {
             info!(
                 target: "rustock::snap",
                 "canonical index: {written_total} heights filled, now at #{next_number}"

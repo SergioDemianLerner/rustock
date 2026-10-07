@@ -93,7 +93,7 @@ fn main() -> anyhow::Result<()> {
     let t = Instant::now();
     let blocks = BlockStore::open_read_only(&a[1])?;
     let chunk: Arc<dyn TrieStore> =
-        Arc::new(RocksDbTrieStore::open_read_only(&format!("{}/sealed", a[2]))?);
+        Arc::new(RocksDbTrieStore::open_read_only(format!("{}/sealed", a[2]))?);
     let archive: Arc<dyn TrieStore> = Arc::new(RocksDbTrieStore::open_read_only(&a[3])?);
     eprintln!("stores open in {:.1}s", t.elapsed().as_secs_f64());
 

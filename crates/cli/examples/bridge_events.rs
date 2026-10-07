@@ -106,7 +106,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if what == "--list" {
-        println!("{:<34} {:>10}  {}", "event", "count", "first..last");
+        println!("{:<34} {:>10}  first..last", "event", "count");
         for sig in KNOWN {
             let hits = store.scan_bridge_events(topic_of(sig), 0, u64::MAX)?;
             if hits.is_empty() {

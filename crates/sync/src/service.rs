@@ -1124,6 +1124,7 @@ impl SyncService {
         self.resume_ordinary_sync();
     }
 
+    #[allow(dead_code)] // no caller; see the dead-code issue before deleting
     pub(crate) fn is_suspended_for_snap_for_test(&self) -> bool {
         self.suspended_for_snap
     }
@@ -2145,6 +2146,10 @@ impl SyncService {
                     // on never, so the node stood still -- execution asks for
                     // blocks across the break, fails, and retries from the
                     // same place.
+                    // `ParentMismatch` here is unreachable: #263 added an arm
+                    // above that claims it. Left in place deliberately -- see
+                    // issue #280, which asks whether that is correct.
+                    #[allow(unreachable_patterns)]
                     Violation::NoCanonicalEntry { at }
                     | Violation::CanonicalHeaderMissing { at, .. }
                     | Violation::ParentMismatch { at, .. } => {
@@ -4635,7 +4640,7 @@ impl SyncService {
         }
 
         // Already executed by this node? Adopt the result instead of redoing it.
-        if let Some(node) = fast_forward_state(&processor, &trie_store, header, hash) {
+        if let Some(node) = fast_forward_state(processor, &trie_store, header, hash) {
             record_execution(&self.manager.store, hash, header.state_root);
             self.credit_executed_bodies(header.number);
             self.current_state_root = Some(node);
@@ -4840,7 +4845,7 @@ fn process_downloaded_blocks(
         }
 
         // Already executed by this node? Adopt the result instead of redoing it.
-        if let Some(node) = fast_forward_state(&processor, &trie_store, header, *hash) {
+        if let Some(node) = fast_forward_state(processor, &trie_store, header, *hash) {
             current_root = node;
             last_executed = Some((*hash, header.state_root));
             processed += 1;

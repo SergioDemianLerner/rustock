@@ -131,7 +131,7 @@ fn main() -> anyhow::Result<()> {
     use std::collections::BTreeMap;
     let before: BTreeMap<Vec<u8>, Option<Vec<u8>>> = aout.into_iter().collect();
     let after: BTreeMap<Vec<u8>, Option<Vec<u8>>> = bout.into_iter().collect();
-    let hx = |o: &Option<Vec<u8>>| o.as_ref().map(|v| alloy_primitives::hex::encode(v)).unwrap_or_else(|| "<none>".into());
+    let hx = |o: &Option<Vec<u8>>| o.as_ref().map(alloy_primitives::hex::encode).unwrap_or_else(|| "<none>".into());
 
     let mut keys: Vec<&Vec<u8>> = before.keys().chain(after.keys()).collect();
     keys.sort();

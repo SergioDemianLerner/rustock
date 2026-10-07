@@ -358,6 +358,7 @@ pub(crate) const KECCAK_EMPTY: B256 = B256::new([
 ///   - account absent from the trie -> `0`;
 ///   - account present but not a contract (no code) -> `keccak256("")`;
 ///   - contract -> its code hash.
+///
 /// revm's stock EXTCODEHASH instead returns `0` whenever `AccountInfo::is_empty()`
 /// (EIP-161: balance==0 && nonce==0 && no code), so an existing-but-empty
 /// account (e.g. a zero-balance EOA that a prior tx created via a 0-value call)
@@ -500,7 +501,7 @@ fn rsk_mcopy<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let gas_params = context.host.gas_params();
     if !context
         .interpreter
-        .resize_memory(&gas_params, core::cmp::max(dst, src), len)
+        .resize_memory(gas_params, core::cmp::max(dst, src), len)
     {
         return;
     }
@@ -917,8 +918,8 @@ pub fn rsk_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// sentry, and the dynamic cost/refund use the pre-Istanbul rules — present-zero
 /// → non-zero charges SET, every other write charges RESET, and clearing a
 /// non-zero slot to zero refunds CLEAR. The required gas_params are pinned to
-/// rskj's `GasCost` values (SET=20000 split as static 5000 + 15000, RESET=5000
-/// + 0, REFUND=15000) in `make_cfg_env`. This mirrors revm's `host::sstore`
+/// rskj's `GasCost` values (SET=20000 split as static 5000 + 15000, RESET=5000 +
+/// 0, REFUND=15000) in `make_cfg_env`. This mirrors revm's `host::sstore`
 /// with the ISTANBUL branches forced off. (Mainnet #6,223,700, arrowhead600.)
 fn rsk_sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,

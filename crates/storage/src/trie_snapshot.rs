@@ -83,7 +83,7 @@ impl SnapshotMeta {
             let val = if let Some(stripped) = rest.strip_prefix('"') {
                 stripped.split('"').next()?.to_string()
             } else {
-                rest.split(|c: char| c == ',' || c == '\n' || c == '}')
+                rest.split([',', '\n', '}'])
                     .next()?
                     .trim()
                     .to_string()
@@ -109,7 +109,7 @@ impl SnapshotMeta {
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

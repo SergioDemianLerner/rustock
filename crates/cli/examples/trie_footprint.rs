@@ -154,7 +154,7 @@ fn main() -> anyhow::Result<()> {
         prev_nodes = nodes;
         prev_bytes = bytes;
 
-        if (n - start) % 100 == 0 || n == start + count - 1 {
+        if (n - start).is_multiple_of(100) || n == start + count - 1 {
             let done = n - start + 1;
             eprintln!(
                 "#{n} ({done}/{count}) | cumulative {} nodes, {:.1} MB | {:.2} blocks/s",

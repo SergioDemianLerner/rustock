@@ -287,7 +287,7 @@ impl Transaction {
     pub fn btc_sender_hash160(&self, chain_id: u64) -> Option<[u8; 20]> {
         use sha2::Digest as Sha2Digest;
         let compressed = self.recover_compressed_pubkey(chain_id)?;
-        let sha256_hash = sha2::Sha256::digest(&compressed);
+        let sha256_hash = sha2::Sha256::digest(compressed);
         let hash160 = ripemd::Ripemd160::digest(sha256_hash);
         let mut arr = [0u8; 20];
         arr.copy_from_slice(&hash160);

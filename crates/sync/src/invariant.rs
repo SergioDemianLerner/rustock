@@ -47,12 +47,10 @@ use alloy_primitives::B256;
 use rustock_storage::{BlockRef, BlockStore};
 use rustock_trie::TrieStore;
 
-/// A block, by height and hash.
-///
-/// Re-exported from the storage crate rather than defined again here: two
-/// structurally identical `BlockRef` types in one crate is exactly the kind of
-/// near-duplicate that lets a caller pass the wrong one, and this module
-/// predates `rustock_storage::position`.
+// `BlockRef` -- a block by height and hash -- is re-exported from the storage
+// crate rather than defined again here: two structurally identical `BlockRef`
+// types in one crate is exactly the kind of near-duplicate that lets a caller
+// pass the wrong one, and this module predates `rustock_storage::position`.
 
 /// The three notions of position, read together.
 ///

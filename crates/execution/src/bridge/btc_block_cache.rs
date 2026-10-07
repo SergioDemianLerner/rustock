@@ -421,7 +421,10 @@ mod tests {
         let cache = BtcBlockCache::with_default_capacity();
         assert_eq!(cache.capacity(), 10_000);
         // ~2 MB at full occupancy; the issue asks for this to be a number.
-        assert!(DEFAULT_CAPACITY * APPROX_BYTES_PER_ENTRY < 4 * 1024 * 1024);
+        // Const-evaluated on purpose: this pins the stated footprint rather
+        // than testing runtime behaviour.
+        #[allow(clippy::assertions_on_constants)]
+        const _: () = assert!(DEFAULT_CAPACITY * APPROX_BYTES_PER_ENTRY < 4 * 1024 * 1024);
     }
 
     #[test]

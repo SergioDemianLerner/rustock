@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 # Only for the chain-event broadcast channel: the sync service publishes and
 # the RPC layer's subscriptions consume, and neither crate depends on the

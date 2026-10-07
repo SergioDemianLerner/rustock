@@ -223,9 +223,9 @@ fn main() -> anyhow::Result<()> {
     let blocks = BlockStore::open_read_only(&block_dir)?;
     let archive: Arc<dyn TrieStore> = Arc::new(RocksDbTrieStore::open_read_only(&archive_path)?);
     let chunk = if dry {
-        RocksDbTrieStore::open_read_only(&format!("{chunk_dir}/sealed"))?
+        RocksDbTrieStore::open_read_only(format!("{chunk_dir}/sealed"))?
     } else {
-        RocksDbTrieStore::open(&format!("{chunk_dir}/sealed"))?
+        RocksDbTrieStore::open(format!("{chunk_dir}/sealed"))?
     };
     let cache_cap: usize = std::env::var("REPAIR_CACHE")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(400_000);
@@ -269,7 +269,7 @@ fn main() -> anyhow::Result<()> {
             walk_all(&root, &slices, &store);
         }
         done += 1;
-        if done % 2000 == 0 || nn + stride > last {
+        if done.is_multiple_of(2000) || nn + stride > last {
             if !dry { std::fs::write(&ckpt, nn.to_string())?; }
             if last_log.elapsed().as_secs() >= 30 || nn + stride > last {
                 let rate = done as f64 / t0.elapsed().as_secs_f64();
