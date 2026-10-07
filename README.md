@@ -94,7 +94,7 @@ Commonly used beyond the basics:
 | `--snap-server` | `false` | Serve snapshots of this node's state to peers that ask |
 | `--prune-blocks` | `false` | Delete block history below `--prune-keep-depth` as the node runs |
 | `--prune-keep-depth` | `100000` | Blocks of history to keep; clamped up to 8,000 |
-| `--no-freezer` | `false` | Keep settled headers in RocksDB instead of the freezer |
+| `--freezer` | `true` | `false` keeps settled headers in RocksDB instead of the freezer |
 | `--read-only` | `false` | Open both databases read-only and write nothing |
 | `--follow-up` | `true` | `false` serves what is held and does not sync, execute or follow |
 | `--mine` | `false` | Build blocks and serve the `mnr_*` merged-mining namespace |

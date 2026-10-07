@@ -173,7 +173,7 @@ keep_depth = 8000                   # light: the floor, and the least the node m
 # Delete headers from the block database once the freezer holds them. Every
 # lookup by hash for those blocks then depends on the freezer.
 # frozen_headers = false            # default
-no_freezer = true                   # light: the single biggest saving here, and the one most
+freezer = false                     # light: the single biggest saving here, and the one most
                                     # easily missed. The freezer holds every canonical header
                                     # below head-20000 in flat files -- 9.5 GB on mainnet -- and
                                     # pruning NEVER touches it, so a pruning node with a freezer

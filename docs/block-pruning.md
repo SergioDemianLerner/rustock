@@ -214,7 +214,7 @@ the floor recorded after the sweep is what was actually achieved.
 - **Not measured on a real database.** The tests use synthetic chains; timings
   and reclaimed bytes on a mainnet-sized store are unknown. No production node
   has run with `--prune-blocks`.
-- **A node without a freezer is unguarded.** `--no-freezer` with
+- **A node without a freezer is unguarded.** `--freezer false` with
   `--prune-blocks` discards the uncle headers along with the bodies, and the
   chain's accumulated work becomes unrecomputable below the floor. Correct —
   there is no second copy to wait for — but it is a configuration that quietly

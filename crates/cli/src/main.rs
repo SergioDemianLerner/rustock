@@ -497,7 +497,7 @@ struct Args {
     #[arg(long, default_value_t = 16, value_name = "N")]
     read_threads: usize,
 
-    /// Keep old headers in RocksDB instead of moving them to flat files.
+    /// Move settled headers out of RocksDB into flat files.
     ///
     /// Headers are keyed by hash, and hashes have no order, so serving the 192
     /// headers a peer asks for is 192 unrelated point lookups -- measured at
@@ -506,13 +506,13 @@ struct Args {
     /// change, so it is written to a file addressed by block number instead,
     /// where a run of headers is one contiguous read.
     ///
-    /// Freezing is on because that is the behaviour a node should have. This
-    /// exists to turn it off: to measure against it, to run on a filesystem
-    /// where the flat files are unwelcome, or to rule it out while diagnosing
-    /// something else. Nothing is deleted from RocksDB either way, so turning
-    /// it off loses the read win and costs nothing else.
-    #[arg(long)]
-    no_freezer: bool,
+    /// On by default, because that is the behaviour a node should have.
+    /// `--freezer false` turns it off: to measure against it, to run on a
+    /// filesystem where the flat files are unwelcome, or to rule it out while
+    /// diagnosing something else. Nothing is deleted from RocksDB either way,
+    /// so turning it off loses the read win and costs nothing else.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    freezer: bool,
 
     /// Learn no peers beyond the ones `--bootnodes` names.
     ///
@@ -1171,7 +1171,7 @@ fn apply_file_config(
     apply(matches, "prune_every_secs", f.prune.every_secs.as_ref(), &mut a.prune_every_secs);
     apply(matches, "prune_frozen_headers", f.prune.frozen_headers.as_ref(),
         &mut a.prune_frozen_headers);
-    apply(matches, "no_freezer", f.prune.no_freezer.as_ref(), &mut a.no_freezer);
+    apply(matches, "freezer", f.prune.freezer.as_ref(), &mut a.freezer);
     apply(matches, "dev_rpc", f.rpc.dev.as_ref(), &mut a.dev_rpc);
     apply(
         matches,
@@ -2415,7 +2415,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 
     // Old headers move to flat files addressed by block number, where a run
     // of them is one contiguous read rather than 192 scattered point lookups.
-    let freezer = if args.no_freezer {
+    let freezer = if !args.freezer {
         info!("Header freezer disabled; old headers stay in the block database");
         None
     } else {
