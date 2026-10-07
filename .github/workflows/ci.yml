@@ -1,0 +1,84 @@
+name: CI
+
+# Until this existed nothing built, tested or linted on push. That is how a
+# test lost its `#[test]` attribute and went unnoticed, how `clippy` accumulated
+# 189 warnings across 153 sites, and how `cargo fmt` drifted on 296 files.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings everywhere, not just where clippy is invoked: an unused
+  # import or an unreachable statement is the shape most of today's real
+  # findings took.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: Test (${{ matrix.features.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both configurations, deliberately. `cargo clippy --fix` once removed a
+        # `mut` that only the `smtp` build needs -- the push it guards is behind
+        # `#[cfg(feature = "smtp")]`, so a default-features build compiled and
+        # every test passed while `--features smtp` would not compile at all.
+        # That is the configuration the production node runs.
+        features:
+          - name: default
+            crate: --workspace
+            flags: ''
+          - name: smtp
+            crate: -p rustock-cli
+            flags: --features smtp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked ${{ matrix.features.crate }} ${{ matrix.features.flags }}
+      - name: Test
+        run: cargo test --locked ${{ matrix.features.crate }} ${{ matrix.features.flags }}
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --all-targets covers tests, benches and examples. The one genuine bug
+      # clippy found -- `tip.max(N).min(N)`, always the constant -- was in an
+      # example, which a bare `cargo clippy` would not have linted.
+      - name: Clippy (workspace)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Clippy (smtp)
+        run: cargo clippy --locked -p rustock-cli --all-targets --features smtp -- -D warnings
+
+  # Not gating yet: the tree is not rustfmt-clean (296 files at the time this
+  # workflow was added), and formatting it is a separate, deliberate commit
+  # rather than something to fold into an unrelated change. Reported so the
+  # number is visible and shrinking rather than silently growing.
+  fmt:
+    name: Rustfmt (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          components: rustfmt
+      - name: Report formatting drift
+        run: |
+          files=$(cargo fmt --all --check 2>/dev/null | grep -c '^Diff in' || true)
+          echo "::notice::${files} files differ from rustfmt"
+          cargo fmt --all --check
