@@ -9,6 +9,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# One run per branch. A new push cancels the one still grinding on the commit
+# it replaced, so iterating quickly costs one run rather than a queue of them.
+# Scoped by ref, so a PR and main never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
