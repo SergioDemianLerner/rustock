@@ -254,6 +254,47 @@ A pin whose root is not in the store at all is reported without being walked.
 
 With no pins, collection is exactly what it was.
 
+#### Stale branch state
+
+A sibling that loses the race for the tip is never reachable from `root(H)`:
+`H` is one block on the canonical chain, and the mark follows references from
+it alone. **Stale branch state is therefore never marked live.** It is not
+pinned either — pins exist for states the node must serve, not for branches it
+has abandoned.
+
+It survives anyway, and the mechanism is worth being exact about, because the
+obvious reading is the wrong one. Stale state is retained **by epoch age, not
+by reachability**. A sibling produced near the tip is written into `E_{N-1}`,
+the newest epoch; the sweep only ever removes `E₀`, and
+[I8](#5-invariants) forbids sweeping `E₀` while it holds writes for any block
+above `H`. So no state written above `H` — canonical or not — can be collected,
+whatever its reachability.
+
+Two consequences:
+
+**A reorg at the tip cannot lose state to the collector.** A branch abandoned
+and re-adopted within the retention window still has its nodes on disk, because
+they were written above `H` and the epoch holding them is nowhere near `E₀`.
+With `D = 4000` and the measured window below, the margin is four orders of
+magnitude larger than any reorg observed on mainnet.
+
+**Stale state is eventually reclaimed, and that is the point.** Once the epoch
+holding it ages into `E₀`, it is dropped — unmarked, unreferenced, gone in the
+same O(1) directory removal as everything else dead in that epoch. The
+collector never needs to know a branch was abandoned; it only needs to not have
+marked it.
+
+Measured on the RSK mainnet node (archive blocks, `N = 4`, rotate 1024 MB,
+`D = 4000`): historical state is present at 10,000 and 60,000 blocks below the
+head and gone by 70,000. The retention window is set by epoch rotation volume,
+not by `D`; `D` is only the floor beneath which the sweep may not reach.
+
+> A client that keeps a single *executed head* marker, as rustock does, rolls
+> execution back when a sibling wins and re-executes forward. That interacts
+> with this section but does not change it: the state it rolls back onto was
+> written above `H` and is still present. See
+> [`follow-mode-rskj-vs-rustock.md`](./follow-mode-rskj-vs-rustock.md) §5.
+
 ### 4.5 Drain
 
 ```
