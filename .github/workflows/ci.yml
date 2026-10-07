@@ -77,8 +77,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93.1
         with:
           components: rustfmt
+      # Reports, never fails. A red check that is expected to be red is worse
+      # than no check: this repository already has a permanently-failing
+      # cargo-deny job that everyone has learned to scroll past, and a second
+      # one would make a real failure easier to miss. Promote this to gating
+      # (drop the "|| true" and the continue-on-error above) once the
+      # formatting commit lands.
       - name: Report formatting drift
         run: |
-          files=$(cargo fmt --all --check 2>/dev/null | grep -c '^Diff in' || true)
-          echo "::notice::${files} files differ from rustfmt"
-          cargo fmt --all --check
+          files=$(cargo fmt --all --check 2>/dev/null | grep -c "^Diff in" || true)
+          echo "::notice::${files} file(s) differ from rustfmt"
+          echo "### Rustfmt: ${files} file(s) differ" >> "$GITHUB_STEP_SUMMARY"
