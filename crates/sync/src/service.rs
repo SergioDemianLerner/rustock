@@ -2134,10 +2134,29 @@ impl SyncService {
                     // Rolling back to a height whose state we still hold costs
                     // re-executing a few blocks. Not rolling back costs the node.
                     Violation::StateRootMissing { at, .. } => {
+                        // Say whether the collector took it. A node at or below
+                        // the collection floor is gone deliberately and will
+                        // not come back; one above it means the store is
+                        // damaged, which is a different problem with a
+                        // different fix. Reporting "no state" for both sends
+                        // whoever reads this down the wrong path.
+                        let why = match self.trie_store.as_ref().and_then(|t| t.collected_below()) {
+                            Some(w) if at <= w => format!(
+                                "the trie collector has swept blocks up to #{w}, so this \
+                                 state was collected and is not recoverable here"
+                            ),
+                            Some(w) => format!(
+                                "the trie collector has only swept up to #{w}, so this state \
+                                 should still be present: the store is damaged"
+                            ),
+                            None => "this store never collects, so the state should be \
+                                     present: the store is damaged"
+                                .to_string(),
+                        };
                         warn!(
                             target: "rustock::sync",
-                            "Executed head #{at} has no state in the trie store; resuming \
-                             from the highest ancestor that does"
+                            "Executed head #{at} has no state in the trie store ({why}); \
+                             resuming from the highest ancestor that does"
                         );
                         self.roll_execution_back(cursor.executed);
                     }

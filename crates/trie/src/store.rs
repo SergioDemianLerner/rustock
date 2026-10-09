@@ -52,6 +52,22 @@ pub trait TrieStore: Send + Sync {
     fn get_many_sorted(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
         keys.iter().map(|k| self.get(k)).collect()
     }
+
+    /// The highest block whose state this store may have collected, if it
+    /// collects at all.
+    ///
+    /// Answers the question a missing node raises and cannot answer alone: was
+    /// it taken deliberately, or is the store damaged? A node missing at or
+    /// below this height was collected and is not recoverable here; one above
+    /// it should still be present, so its absence is damage.
+    ///
+    /// `None` means this store never collects -- every store but the epoch one
+    /// -- so any missing node is damage. Defaulting to `None` is the safe
+    /// direction: it calls damage damage, rather than excusing it as
+    /// collection that never happened.
+    fn collected_below(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// In-memory store for testing.
