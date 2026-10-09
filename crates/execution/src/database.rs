@@ -27,6 +27,18 @@ pub enum RskDbError {
     RlpDecode(String),
     #[error("block store error: {0}")]
     BlockStore(String),
+    /// The trie referred to a node the store does not hold.
+    ///
+    /// Distinct from "the account does not exist", which is an ordinary answer.
+    /// Without this the two were the same `None`, and a hole in the trie read
+    /// back as an empty account -- mainnet 2026-09-23, where it surfaced as
+    /// `NonceTooHigh { state: 0 }` several layers away from the cause.
+    #[error(
+        "trie is incomplete: node {node} is referenced but not in the store \
+         (reading key {key}). The state for this block cannot be read; it was \
+         collected, pruned, or the store is damaged."
+    )]
+    MissingTrieNode { node: B256, key: String },
 }
 
 impl DBErrorMarker for RskDbError {}
@@ -50,9 +62,22 @@ impl RskDatabase {
         Self { root, store, block_store, code_cache: RefCell::new(HashMap::new()) }
     }
 
-    fn trie_get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    /// Reads one key, distinguishing "not in the trie" from "the trie is
+    /// incomplete here".
+    ///
+    /// `Ok(None)` is an answer: nothing is stored under that key. An error
+    /// means the walk hit a reference the store could not resolve, so the
+    /// value is unknown -- and must not be reported as absent, because an
+    /// absent account reads as balance 0 and nonce 0 and executes happily
+    /// against state the node does not have.
+    fn trie_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, RskDbError> {
         let expanded = TrieKeySlice::from_key(key);
-        self.root.get(&expanded, self.store.as_ref())
+        self.root.try_get(&expanded, self.store.as_ref()).map_err(|node| {
+            RskDbError::MissingTrieNode {
+                node,
+                key: alloy_primitives::hex::encode_prefixed(key),
+            }
+        })
     }
 }
 
@@ -61,7 +86,7 @@ impl DatabaseRef for RskDatabase {
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let key = account_key(&address);
-        let Some(data) = self.trie_get(&key) else {
+        let Some(data) = self.trie_get(&key)? else {
             return Ok(None);
         };
 
@@ -69,7 +94,7 @@ impl DatabaseRef for RskDatabase {
             .map_err(|e| RskDbError::RlpDecode(e.to_string()))?;
 
         let code_key = code_key(&address);
-        let code = self.trie_get(&code_key);
+        let code = self.trie_get(&code_key)?;
 
         let code_hash = match &code {
             Some(c) => B256::from_slice(&Keccak256::digest(c)),
@@ -122,13 +147,15 @@ impl DatabaseRef for RskDatabase {
                 address,
                 index,
                 self.trie_get(&key)
+                    .ok()
+                    .flatten()
                     .as_deref()
                     .map(alloy_primitives::hex::encode)
                     .unwrap_or_default()
             );
         }
 
-        match self.trie_get(&key) {
+        match self.trie_get(&key)? {
             Some(data) => {
                 if data.len() > 32 {
                     return Err(RskDbError::TrieError(
@@ -365,5 +392,79 @@ mod tests {
         assert_eq!(info1.balance, U256::from(100));
         assert_eq!(info2.balance, U256::from(200));
         assert_eq!(info3.balance, U256::from(300));
+    }
+
+    // ---- a hole in the trie is not an empty account (issue #275) ----------
+
+    /// The failure this exists to prevent: with a node missing from under it,
+    /// the adapter used to answer `Ok(None)` -- "no such account" -- which the
+    /// EVM reads as balance 0, nonce 0, no code, and executes against happily.
+    /// Mainnet 2026-09-23 surfaced that as `NonceTooHigh { state: 0 }`, several
+    /// layers from the cause.
+    #[test]
+    fn a_missing_trie_node_is_an_error_not_an_empty_account() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let mut root = TrieNode::empty();
+        // Enough accounts that the trie has interior nodes to remove.
+        let addrs: Vec<Address> = (1u8..=16).map(|i| Address::from([i; 20])).collect();
+        for (i, a) in addrs.iter().enumerate() {
+            root = put_account(&root, store.as_ref(), a, i as u64 + 1, U256::from(1000 + i));
+        }
+        root.save(store.as_ref(), true);
+
+        // Read back from the store, as a node executing a block does.
+        let root_hash = root.compute_hash(store.as_ref());
+        let data = store.get(root_hash.as_slice()).expect("root was saved");
+        let root = TrieNode::from_message(&data, store.as_ref());
+
+        // Remove one interior node on the path to a known account.
+        let target = &addrs[7];
+        let key = TrieKeySlice::from_key(&account_key(target));
+        let path = root.nodes_on_path(&key, store.as_ref()).expect("account is in the trie");
+        let victim = path
+            .iter()
+            .rev()
+            .skip(1)
+            .find(|n| !n.is_terminal())
+            .expect("no interior node on the path")
+            .compute_hash(store.as_ref());
+        assert!(store.remove(victim.as_slice()), "an interior node must be stored by hash");
+
+        let db = RskDatabase::new(
+            root,
+            store.clone() as Arc<dyn TrieStore>,
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap()),
+        );
+
+        match db.basic_ref(*target) {
+            Err(RskDbError::MissingTrieNode { node, .. }) => {
+                assert_eq!(node, victim, "the error must name the node that is gone");
+            }
+            Ok(None) => panic!(
+                "a hole in the trie reported as an absent account -- this is the bug: \
+                 the EVM would execute against balance 0 / nonce 0"
+            ),
+            other => panic!("expected MissingTrieNode, got {other:?}"),
+        }
+    }
+
+    /// Strictness must not turn ordinary absence into a failure, or every
+    /// account that genuinely does not exist becomes a failed block.
+    #[test]
+    fn an_account_that_does_not_exist_is_still_reported_absent() {
+        let (store, root) = make_store_and_root();
+        let mut root = put_account(&root, store.as_ref(), &Address::from([1u8; 20]), 1, U256::from(5));
+        root.save(store.as_ref(), true);
+
+        let db = RskDatabase::new(
+            root,
+            store.clone() as Arc<dyn TrieStore>,
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap()),
+        );
+
+        assert!(
+            matches!(db.basic_ref(Address::from([9u8; 20])), Ok(None)),
+            "an account absent from a complete trie is an answer, not an error"
+        );
     }
 }
