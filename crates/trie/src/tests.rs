@@ -1213,4 +1213,130 @@ mod orchid_converter_tests {
             parse_hash("b5e35460d1ee9e2d7586f4c06c70d9a918cb0d7a1728cd4c37088ea5352a6b0a")
         );
     }
+
+    // ---- a missing node is not an absent key (issue #275) ----------------
+
+    /// Builds a trie over `n` keys, saves it, and returns `(root, store)`.
+    ///
+    /// Values are 64 bytes on purpose. A terminal node whose message fits in
+    /// MAX_EMBEDDED_NODE_SIZE (44) is embedded in its parent and never gets a
+    /// store entry of its own, so a trie of short values has almost nothing to
+    /// remove and nothing to miss.
+    fn saved_trie(n: u8) -> (TrieNode, MemoryTrieStore) {
+        let store = MemoryTrieStore::new();
+        let mut root = TrieNode::empty();
+        for i in 0..n {
+            root = root.put(&TrieKeySlice::from_key(&[i, i, i, i]), &[i; 64], &store);
+        }
+        root.save(&store, true);
+
+        // Reload from the store. The tree `put` returns holds its children as
+        // in-memory `NodeRef::Node`, so it never consults the store and a hole
+        // in it changes nothing. A node reading its own state starts from a
+        // root hash, where every child is a `NodeRef::Hash` that must be
+        // fetched -- which is the situation this is about.
+        let root_hash = root.compute_hash(&store);
+        let data = store.get(root_hash.as_slice()).expect("root was saved");
+        (TrieNode::from_message(&data, &store), store)
+    }
+
+    /// The whole point. With a node removed from under it, the old read says
+    /// "no value" -- indistinguishable from a key that was never there -- and
+    /// the strict read names the node it could not follow.
+    #[test]
+    fn a_hole_in_the_store_reads_as_missing_not_as_absent() {
+        let (root, store) = saved_trie(16);
+        let key = TrieKeySlice::from_key(&[7u8, 7, 7, 7]);
+
+        // Take the victim from the path to `key`, not from `store.keys()`:
+        // `put` also saves the intermediate tries it built on the way, so most
+        // store entries are orphans that no lookup reaches.
+        // An *interior* node, not the leaf. `is_embeddable` requires
+        // `is_terminal`, so a branch node always has its own store entry, while
+        // a leaf with a long value is embedded in its parent (the value goes to
+        // the store instead) and removing its hash would change nothing.
+        let path = root.nodes_on_path(&key, &store).expect("key is in the trie");
+        let victim = path
+            .iter()
+            .rev()
+            .skip(1) // the root itself is the caller's handle, not a lookup
+            .find(|n| !n.is_terminal())
+            .expect("no interior node on the path")
+            .compute_hash(&store);
+        assert!(store.remove(victim.as_slice()), "an interior node must be stored by hash");
+
+        match root.try_get(&key, &store) {
+            Err(h) => assert_eq!(h, victim, "must name the node that is actually gone"),
+            Ok(v) => panic!("a hole in the store must not read as a value: {v:?}"),
+        }
+
+        // The behaviour being replaced: indistinguishable from a missing key.
+        assert_eq!(
+            root.get(&key, &store),
+            None,
+            "the lenient read reports a hole as absence, which is the bug"
+        );
+    }
+
+    /// The other half: strictness must not turn ordinary absence into an error,
+    /// or every account that genuinely does not exist becomes a failed block.
+    #[test]
+    fn a_key_that_was_never_there_is_still_absent() {
+        let (root, store) = saved_trie(8);
+        let absent = TrieKeySlice::from_key(b"no such key at all");
+        assert!(
+            matches!(root.try_get(&absent, &store), Ok(None)),
+            "a key not in a complete trie is an answer, not a failure"
+        );
+    }
+
+    #[test]
+    fn a_present_key_still_reads_its_value() {
+        let (root, store) = saved_trie(8);
+        for i in 0..8u8 {
+            let key = TrieKeySlice::from_key(&[i, i, i, i]);
+            assert_eq!(
+                root.try_get(&key, &store).expect("complete trie must not error"),
+                Some(vec![i; 64]),
+                "strict and lenient reads must agree on a complete trie"
+            );
+        }
+    }
+
+    /// Bytes that cannot be parsed are as missing as bytes that are not there:
+    /// the store holds something under that hash, but nothing that can be
+    /// walked, so the trie is incomplete either way.
+    #[test]
+    fn unreadable_bytes_count_as_missing_rather_than_as_the_end_of_the_trie() {
+        let (root, store) = saved_trie(16);
+        let key = TrieKeySlice::from_key(&[7u8, 7, 7, 7]);
+
+        let path = root.nodes_on_path(&key, &store).expect("key is in the trie");
+        let victim = path
+            .iter()
+            .rev()
+            .skip(1)
+            .find(|n| !n.is_terminal())
+            .expect("no interior node on the path")
+            .compute_hash(&store);
+        store.remove(victim.as_slice());
+        store.put(victim.as_slice(), b"not a trie node");
+
+        match root.try_get(&key, &store) {
+            Err(h) => assert_eq!(h, victim, "unreadable bytes are as missing as absent ones"),
+            Ok(v) => panic!("corrupt bytes must not read as a value: {v:?}"),
+        }
+    }
+
+    /// `Absent` and `Missing` are different answers to different questions, and
+    /// the empty reference is the one that is genuinely fine.
+    #[test]
+    fn an_empty_reference_resolves_to_absent_not_missing() {
+        let store = MemoryTrieStore::new();
+        assert!(
+            matches!(crate::node::NodeRef::Empty.try_resolve(&store), crate::node::Resolution::Absent),
+            "an empty child is the trie ending, not a hole in the store"
+        );
+    }
+
 }

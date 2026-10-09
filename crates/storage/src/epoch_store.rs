@@ -1032,6 +1032,11 @@ impl EpochTrieStore {
 }
 
 impl TrieStore for EpochTrieStore {
+    /// The watermark a completed sweep records; see `collected_below`.
+    fn collected_below(&self) -> Option<u64> {
+        EpochTrieStore::collected_below(self)
+    }
+
     /// Newest epoch first: recently written entries are the most read, and
     /// stopping at the first hit keeps the common case to one lookup.
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {

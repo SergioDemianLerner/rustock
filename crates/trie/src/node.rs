@@ -33,9 +33,57 @@ pub enum NodeRef {
     Node(Box<TrieNode>),
 }
 
+/// What [`NodeRef::try_resolve`] found.
+///
+/// The distinction `Option` cannot make: `Absent` is a well-formed trie that
+/// ends here, `Missing` is a trie that refers to a node the store does not
+/// hold.
+// No PartialEq: TrieNode does not implement it, and comparing two resolutions
+// structurally is not a thing a caller should want -- match on the variant.
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    /// The node is here.
+    Found(TrieNode),
+    /// The trie ends here. Nothing is wrong.
+    Absent,
+    /// The trie refers to this hash and the store cannot produce a node for
+    /// it. The store is incomplete -- collected, pruned, or damaged.
+    Missing(B256),
+}
+
 impl NodeRef {
     pub fn is_empty(&self) -> bool {
         matches!(self, NodeRef::Empty)
+    }
+
+    /// Resolves the node, distinguishing "the trie ends here" from "the trie
+    /// says there is a node here and the store does not have it".
+    ///
+    /// [`resolve`](Self::resolve) answers both with `None`, which is right when
+    /// reading a store filled from the network -- a peer may simply not have
+    /// sent it yet. It is wrong when a node reads its **own** store to execute
+    /// a block: there, a referenced node that is absent means the trie is
+    /// incomplete, and reporting it as an empty account is how mainnet
+    /// 2026-09-23 surfaced as `NonceTooHigh { state: 0 }` instead of as the
+    /// missing state it was.
+    ///
+    /// Costs nothing extra: `resolve` already performs the lookup that tells
+    /// the two apart and discards the answer with `?`.
+    pub fn try_resolve(&self, store: &dyn TrieStore) -> Resolution {
+        match self {
+            NodeRef::Empty => Resolution::Absent,
+            NodeRef::Node(n) => Resolution::Found(*n.clone()),
+            NodeRef::Hash(h) => match store.get(h.as_slice()) {
+                // Unreadable bytes are as missing as absent ones: the store
+                // holds something under that hash, but nothing that can be
+                // walked, so the trie is incomplete either way.
+                Some(data) => match TrieNode::try_from_message(&data, store) {
+                    Some(node) => Resolution::Found(node),
+                    None => Resolution::Missing(*h),
+                },
+                None => Resolution::Missing(*h),
+            },
+        }
     }
 
     /// Resolves the node, loading from store if only a hash is available.
@@ -561,6 +609,53 @@ impl TrieNode {
         let mut subnodes = child.nodes_on_path(&sub_key, store)?;
         subnodes.push(self.clone());
         Some(subnodes)
+    }
+
+    /// Like [`get`](Self::get), but says which node was missing instead of
+    /// answering "no value" when the trie is incomplete.
+    ///
+    /// `Ok(None)` means the key is genuinely not in the trie. `Err(hash)` means
+    /// the walk reached a reference the store could not resolve, and the answer
+    /// is unknown rather than absent.
+    pub fn try_get(
+        &self,
+        key: &TrieKeySlice,
+        store: &dyn TrieStore,
+    ) -> Result<Option<Vec<u8>>, B256> {
+        Ok(self.try_find(key, store)?.and_then(|n| n.value.clone()))
+    }
+
+    /// The strict counterpart of [`find`](Self::find); see
+    /// [`try_get`](Self::try_get).
+    pub fn try_find(
+        &self,
+        key: &TrieKeySlice,
+        store: &dyn TrieStore,
+    ) -> Result<Option<TrieNode>, B256> {
+        if self.shared_path.length() > key.length() {
+            return Ok(None);
+        }
+
+        let common = key.common_path(&self.shared_path);
+        if common.length() < self.shared_path.length() {
+            return Ok(None);
+        }
+
+        if common.length() == key.length() {
+            return Ok(Some(self.clone()));
+        }
+
+        let bit = key.get(common.length());
+        let child_ref = if bit == 0 { &self.left } else { &self.right };
+        let child = match child_ref.try_resolve(store) {
+            Resolution::Found(c) => c,
+            // The trie ends here: the key is not in it, which is an answer.
+            Resolution::Absent => return Ok(None),
+            // The trie does not end here; the store just cannot follow it.
+            Resolution::Missing(h) => return Err(h),
+        };
+        let sub_key = key.slice(common.length() + 1, key.length());
+        child.try_find(&sub_key, store)
     }
 
     fn find(&self, key: &TrieKeySlice, store: &dyn TrieStore) -> Option<TrieNode> {
