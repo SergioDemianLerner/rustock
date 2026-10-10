@@ -42,6 +42,9 @@ fn test_chain_config() -> Arc<ChainConfig> {
             papyrus200: u64::MAX,
             iris300: 0,
             fingerroot500: 0,
+            // Active from genesis: this fixture mines blocks back to back,
+            // so the ten-minute drop would only add noise.
+            rskip97: Some(0),
         },
     })
 }
