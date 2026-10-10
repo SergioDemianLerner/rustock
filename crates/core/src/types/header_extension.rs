@@ -146,6 +146,41 @@ fn decode_list_items(encoded: &[u8]) -> Result<Vec<Vec<u8>>, ExtensionError> {
     Ok(items)
 }
 
+/// What a V1/V2 header carries in its logs-bloom slot.
+///
+/// The header commits to its extension by version *and* hash. Both are
+/// checked: a body that hashes correctly but claims a different version is a
+/// body that would be parsed with the wrong field layout, which after
+/// RSKIP-535 means reading `base_event` as `edges`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionCommitment {
+    pub version: u8,
+    pub hash: B256,
+}
+
+impl ExtensionCommitment {
+    /// Parses `RLP([version, hash])` as found in the header's bloom slot.
+    pub fn from_extension_data(bytes: &[u8]) -> Result<Self, ExtensionError> {
+        let items = decode_list_items(bytes)?;
+        if items.len() != 2 {
+            return Err(ExtensionError::NotAPair);
+        }
+        let version = items[0].first().copied().unwrap_or(0);
+        if version != 0x1 && version != 0x2 {
+            return Err(ExtensionError::UnknownVersion(version));
+        }
+        if items[1].len() != 32 {
+            return Err(ExtensionError::Malformed);
+        }
+        Ok(ExtensionCommitment { version, hash: B256::from_slice(&items[1]) })
+    }
+
+    /// Whether `extension` is the body this commitment names.
+    pub fn matches(&self, extension: &BlockHeaderExtension) -> bool {
+        self.version == extension.version() && self.hash == extension.hash()
+    }
+}
+
 impl BlockHeaderExtension {
     pub fn version(&self) -> u8 {
         match self {
@@ -488,6 +523,60 @@ mod tests {
         for junk in [&b""[..], &b"\xff\xff\xff"[..], &b"not rlp at all"[..]] {
             assert!(BlockHeaderExtension::from_encoded(junk).is_err(), "junk: {junk:?}");
         }
+    }
+
+    // ---- the header's commitment -------------------------------------------
+
+    /// A header carries `RLP([version, hash])` where its bloom would be, and
+    /// that round-trips into the two things needed to validate a body.
+    #[test]
+    fn a_commitment_round_trips_from_the_header_slot() {
+        for e in [
+            v1(bloom(&[1, 2]), Some(vec![4, 8])),
+            v2(bloom(&[3]), None, Some(vec![0xEE; 5])),
+        ] {
+            let c = ExtensionCommitment::from_extension_data(&e.create_extension_data()).unwrap();
+            assert_eq!(c.version, e.version());
+            assert_eq!(c.hash, e.hash());
+            assert!(c.matches(&e));
+        }
+    }
+
+    /// The version is checked as well as the hash. After RSKIP-535 the two
+    /// versions have different field layouts, so a body parsed at the wrong
+    /// version reads `base_event` where `edges` should be.
+    #[test]
+    fn a_commitment_rejects_the_right_body_under_the_wrong_version() {
+        let body = v1(bloom(&[1]), None);
+        let mut c = ExtensionCommitment::from_extension_data(&body.create_extension_data()).unwrap();
+        c.version = 0x2;
+        assert!(!c.matches(&body), "version must be checked, not just the hash");
+    }
+
+    #[test]
+    fn a_commitment_rejects_a_tampered_body() {
+        let real = v1(bloom(&[1, 2, 3]), Some(vec![2]));
+        let c = ExtensionCommitment::from_extension_data(&real.create_extension_data()).unwrap();
+        let tampered = v1(bloom(&[1, 2, 3]), Some(vec![3]));
+        assert!(!c.matches(&tampered));
+    }
+
+    #[test]
+    fn a_commitment_refuses_a_version_it_does_not_know() {
+        let bad = encode_list(&[encode_byte(0x5), encode_element(&[0u8; 32])]);
+        assert_eq!(
+            ExtensionCommitment::from_extension_data(&bad),
+            Err(ExtensionError::UnknownVersion(0x5))
+        );
+    }
+
+    #[test]
+    fn a_commitment_refuses_a_hash_that_is_not_32_bytes() {
+        let bad = encode_list(&[encode_byte(0x1), encode_element(&[0u8; 31])]);
+        assert_eq!(
+            ExtensionCommitment::from_extension_data(&bad),
+            Err(ExtensionError::Malformed)
+        );
     }
 
     // ---- the encoding detail most likely to be got wrong -------------------

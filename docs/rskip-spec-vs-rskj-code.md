@@ -186,3 +186,41 @@ That is worth stating plainly: **porting rskj's tests is not sufficient to
 establish compatibility with rskj.** The tests pin internal consistency. Only
 reading the encoder, or checking against bytes produced by rskj itself, pins
 the wire format.
+
+---
+
+## Open: rustock cannot yet reproduce a testnet V1 header hash
+
+Not an RSKIP/rskj divergence — a rustock gap, recorded here because it was
+found by the same exercise and it blocks validating testnet.
+
+**What works.** Testnet block #6,000,000 (version 0) hashes correctly from
+reconstructed fields, so the base header layout, `umm_root` handling, merged
+mining fields and the RSKIP-92 hash rule are all right for testnet.
+
+**What does not.** Testnet block #8,126,464 (version 1, `rskPteEdges = [1, 2]`)
+does not. A matrix over the plausible unknowns — edges as `[1,2]`, `[]`,
+absent, reversed, scaled; version 1 vs 2; `umm_root` present-and-empty vs
+absent — produces fourteen different hashes and none is the one testnet agreed
+on. So at least one more thing about the V1 header layout is still unknown.
+
+**A real bug was found on the way, and is fixed.** `Header::encode_base_fields`
+wrote `logs_bloom` unconditionally, so `extension_data` never reached the
+encoder: every V1/V2 header re-encoded as a 256-byte zero bloom. This was
+invisible because the decoder caches the hash from the peer's original bytes,
+so nothing had ever asked rustock to *derive* a versioned header's hash. Before
+the fix, all fourteen candidates above produced the *same* hash — which is how
+it was noticed.
+
+**What would settle it.** The actual wire bytes. The public testnet RPC exposes
+no raw-header method (`rsk_getRawBlockHeaderByNumber`, `debug_getRawHeader`,
+`debug_getBlockRlp` and others are all absent), and the JSON view is lossy in
+exactly the way that matters: `rskPteEdges: []` cannot distinguish rskj's
+`null` from `short[0]`, which are different encodings and different hashes
+(see §2). Pointing a rustock instance at testnet P2P and capturing a real V1
+header would resolve it directly.
+
+**Why this matters beyond one test.** Until a V1 hash can be derived rather
+than cached, rustock cannot validate a testnet header it did not receive
+verbatim — which includes any header it builds, and any it would re-serve.
+The V0 path is unaffected.

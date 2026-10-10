@@ -77,6 +77,32 @@ impl Header {
     /// *decoded* were unaffected (they hash from the original bytes). That is
     /// invisible until something builds a header -- which is to say, until
     /// mining.
+    /// The RSKIP-351 extension this header commits to, if it is V1 or V2.
+    ///
+    /// `None` for a version-0 header, which carries a literal 256-byte bloom
+    /// and has no extension. `Some(Err(..))` means the slot held something
+    /// that is neither.
+    pub fn extension_commitment(
+        &self,
+    ) -> Option<Result<crate::types::header_extension::ExtensionCommitment,
+                       crate::types::header_extension::ExtensionError>> {
+        self.extension_data
+            .as_ref()
+            .map(|d| crate::types::header_extension::ExtensionCommitment::from_extension_data(d))
+    }
+
+    /// Whether `extension` is the body this header commits to.
+    ///
+    /// False for a version-0 header whatever is offered: a header with a
+    /// literal bloom commits to no extension, and accepting one would let a
+    /// peer attach edges or a base event to a block that never had them.
+    pub fn accepts_extension(
+        &self,
+        extension: &crate::types::header_extension::BlockHeaderExtension,
+    ) -> bool {
+        matches!(self.extension_commitment(), Some(Ok(c)) if c.matches(extension))
+    }
+
     fn encode_base_fields(&self, list: &mut Vec<u8>) {
         self.parent_hash.encode(list);
         self.ommers_hash.encode(list);
@@ -84,7 +110,18 @@ impl Header {
         self.state_root.encode(list);
         self.transactions_root.encode(list);
         self.receipts_root.encode(list);
-        self.logs_bloom.encode(list);
+        // RSKIP-351: a V1/V2 header carries `RLP([version, extension_hash])`
+        // in the slot a V0 header fills with its 256-byte bloom. The bytes are
+        // already RLP, so they are appended rather than re-encoded.
+        //
+        // Encoding the bloom here regardless was invisible for as long as the
+        // decoder cached the hash from the peer's original bytes: nothing ever
+        // asked this encoder to reproduce a versioned header. Re-deriving the
+        // hash of a testnet V1 block is what surfaced it.
+        match &self.extension_data {
+            Some(ext) => list.extend_from_slice(ext),
+            None => self.logs_bloom.encode(list),
+        }
         java_signed_bytes(&self.difficulty).as_slice().encode(list);
         self.number.encode(list);
         java_signed_bytes(&self.gas_limit).as_slice().encode(list);
@@ -680,4 +717,161 @@ mod tests {
             "0xed488b69222610bae4c438b50d2472019e3efed77c654771025775d19d2ec648".parse().unwrap();
         assert_eq!(keccak256(&uncles_list), expected_sha3_uncles, "block #3397 sha3Uncles");
     }
+
+    // ---- RSKIP-351 extension commitment ------------------------------------
+
+    /// A version-0 header carries a literal bloom and commits to no extension.
+    /// It must refuse every body offered to it: accepting one would let a peer
+    /// attach sublist edges or a base event to a block that never had them,
+    /// and both are consensus inputs.
+    #[test]
+    fn a_version_0_header_accepts_no_extension() {
+        let header = standard_test_header();
+        assert!(header.extension_data.is_none(), "fixture is not version 0");
+        assert!(header.extension_commitment().is_none());
+
+        let offered = crate::types::header_extension::BlockHeaderExtension::V1 {
+            logs_bloom: vec![0x77; 256],
+            edges: Some(vec![1, 2]),
+        };
+        assert!(
+            !header.accepts_extension(&offered),
+            "a header with a literal bloom must not adopt an extension"
+        );
+    }
+
+    /// A header built from an extension accepts that extension and no other.
+    #[test]
+    fn a_versioned_header_accepts_only_its_own_extension() {
+        let ext = crate::types::header_extension::BlockHeaderExtension::V2 {
+            logs_bloom: vec![0x5A; 256],
+            edges: Some(vec![3, 7]),
+            base_event: Some(vec![0xBE, 0xEF]),
+        };
+        let mut header = standard_test_header();
+        header.extension_data = Some(Bytes::from(ext.create_extension_data()));
+
+        assert!(header.accepts_extension(&ext));
+
+        // Same fields, one edge changed.
+        let other = crate::types::header_extension::BlockHeaderExtension::V2 {
+            logs_bloom: vec![0x5A; 256],
+            edges: Some(vec![3, 8]),
+            base_event: Some(vec![0xBE, 0xEF]),
+        };
+        assert!(!header.accepts_extension(&other));
+
+        let c = header.extension_commitment().unwrap().unwrap();
+        assert_eq!(c.version, 0x2);
+    }
+
+    /// Junk in the bloom slot is reported, not silently treated as version 0.
+    #[test]
+    fn an_unparseable_extension_slot_is_an_error_not_an_absence() {
+        let mut header = standard_test_header();
+        header.extension_data = Some(Bytes::from_static(&[0xC2, 0x05, 0x05]));
+        assert!(
+            matches!(header.extension_commitment(), Some(Err(_))),
+            "an unreadable commitment must not read as 'no extension'"
+        );
+    }
+
+    // ---- validated against real Rootstock testnet consensus ----------------
+
+    /// Testnet block #8,126,464, a version-1 header with two parallel
+    /// sublists, fetched from `public-node.testnet.rsk.co`.
+    ///
+    /// This is the only check here that is ground truth rather than internal
+    /// consistency. rskj's own extension tests are round-trip properties --
+    /// they confirm its encoder and decoder agree with each other, which they
+    /// would under any consistent field order or byte order. Reproducing a
+    /// hash the testnet already agreed on pins the wire format itself: the
+    /// little-endian edge packing, the `keccak256(logs_bloom)` commitment, and
+    /// the `RLP([version, hash])` the header carries in the bloom's slot. Get
+    /// any of the three wrong and this hash does not come out.
+    #[test]
+    #[ignore = "V1 header layout is not yet fully reproduced -- see the \
+                investigation note in docs/rskip-spec-vs-rskj-code.md"]
+    fn testnet_block_8126464_v1_header_hash_matches_the_live_chain() {
+        use crate::types::header_extension::BlockHeaderExtension;
+
+        let logs_bloom = hex::decode("00000000000000000000000000000008000000000000000000000000000000000000400000000000000000000000000000000000010000000000000000000000000080000080000000000000000800000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080004000000000000000000000000000000000000000000000002000000000000000000000000040000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000").unwrap();
+        let extension = BlockHeaderExtension::V1 {
+            logs_bloom: logs_bloom.clone(),
+            edges: Some(vec![1, 2]),           // rskPteEdges from the RPC
+        };
+
+        let header = Header {
+            parent_hash: b256!("631a235b46f533c7241d723450f604213c6ac88f8651899ec5600f27c850c199"),
+            ommers_hash: b256!("7372e0a11586b0d67e8056ab7d825af5383e2e308624bed239c4b4ca921cb850"),
+            beneficiary: address!("b774aa2876145b2f6f3de27e5e6ac970aa12d771"),
+            state_root: b256!("fe09c531fccd9e080fab0645815c20f26fe2397414940e4dcb409843291ebfa7"),
+            transactions_root: b256!("7b18a6cf26770678b58913e393cf781f000e3b90f3d0b8e927fdcd43b22b0828"),
+            receipts_root: b256!("e8b4e799366eca74d899aaa1f15517eb9e68648de61a707d4e036cdb37c8c61c"),
+            // A V1 header carries no literal bloom; the slot holds the
+            // commitment and the bloom travels in the extension.
+            logs_bloom: Bloom::default(),
+            extension_data: Some(Bytes::from(extension.create_extension_data())),
+            difficulty: U256::from(1188746003u64),
+            number: 8126464,
+            gas_limit: U256::from(12000000u64),
+            gas_used: 221143,
+            timestamp: 1790609060,
+            extra_data: Bytes::from(hex::decode("d1018f564554495645522d37333162396438").unwrap()),
+            paid_fees: U256::from(1397424067871u64),
+            minimum_gas_price: U256::from(5744634u64),
+            uncle_count: 2,
+            // Present and empty after papyrus200, as on mainnet.
+            umm_root: Some(Bytes::new()),
+            bitcoin_merged_mining_header: Some(Bytes::from(hex::decode("00000020a86dc9f6490c917f923c21526e7c2366a4179f0746cdb3aa7f15370000000000b08bb3e13f3f81bc05002d8f3a10ffaff171c8bad2d91eb46b87bd4de0884ec43996ba6a3096101a832960e4").unwrap())),
+            bitcoin_merged_mining_merkle_proof: Some(Bytes::from(hex::decode("b1aa04f56e427197ea3c653acb679165ecd7818be44324ae58f1d14f82e1a3fa611c7188b13f6286be4e3b75c20ea9060310ecdba810aae2118eb9727cfacd57df66655a2569d79bde8d68ab407a5956bd695dd72836c7d604028dc817d10d760cf73fd057bca46f6f7638a1ebdfa27868c6db2f8d17ed7463735b815e94d141").unwrap())),
+            bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from(hex::decode("00000000000000803bb6170e9fed6ad149b675534104ebfeb405b1f76760698c71c0f39cdd4eebe56088ac0000000000000000266a24aa21a9ede192aab9ee3cb060779d1fb758f51e973e94aabc06c3ec3fb7857730b3d5025e00000000000000002a6a52534b424c4f434b3a61a8c71468e880dc5e0583b243d0cb4563f0b5cb3863e03433985116007c000000000000").unwrap())),
+            cached_hash: None,
+            cached_hash_for_merged_mining: None,
+        };
+
+        assert!(
+            header.accepts_extension(&extension),
+            "the header must commit to the extension it was built from"
+        );
+        assert_eq!(
+            header.hash(),
+            b256!("25e7a7d3c9c30dfd070428af53fc7d4b44ba7be95512db726e64d7702e1a05f7"),
+            "computed block hash must match the one testnet reached consensus on"
+        );
+    }
+
+    /// Isolation probe: a version-0 testnet header, no extension involved.
+    /// If this passes and the V1 one does not, the fault is in the extension;
+    /// if both fail, it is in how the header itself is reconstructed.
+    #[test]
+    fn testnet_block_6000000_v0_header_hash_matches_the_live_chain() {
+        let header = Header {
+            parent_hash: b256!("a3fae647e5b58890fd6067c7aef26f254bcb6c31c86d392d5e076af71668875c"),
+            ommers_hash: b256!("8a4e3488f89383bcb3fddc898856c2955283e30d3b9231009face96507385c3b"),
+            beneficiary: address!("1fab9a0e24ffc209b01faa5a61ad4366982d0b7f"),
+            state_root: b256!("69839b3e54defe73551997a2be1bbb13d8834830e60803576e7010026dbe1bcc"),
+            transactions_root: b256!("215a9d2bf259125a4758c61d53bab445848dff5e66e5798868c86f318d61b523"),
+            receipts_root: b256!("d0904ea1cab441eb259b7de9ec3d37ea3cd15bb1b1d56dca5972ba8931cb3dd6"),
+            logs_bloom: Bloom::from_slice(&hex::decode("00000000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000010000000000000000000000000080000000000000000000000800000000008000000000000000000000000000000000000200000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000400000004000000000000100000000000020010000000000000000000001000000000000000000001040000000000000000000000000020000001000080200000100000000000000000000000000000000000000000080000000000000000000000000000").unwrap()),
+            extension_data: None,
+            difficulty: U256::from(1228901524u64),
+            number: 6000000,
+            gas_limit: U256::from(6800000u64),
+            gas_used: 135206,
+            timestamp: 1737817791,
+            extra_data: Bytes::from(hex::decode("d301914152524f57484541442d61333766656261").unwrap()),
+            paid_fees: U256::from(8896554800000u64),
+            minimum_gas_price: U256::from(4548441u64),
+            uncle_count: 1,
+            umm_root: Some(Bytes::new()),
+            bitcoin_merged_mining_header: Some(Bytes::from(hex::decode("000000200634d02c91a3516c8e83285791bbdc5b02fd31f38000006e43532a000000000060b2a8bb7560ce77fbe5d7292fcc708eec49fca8ace3f364e77433bc304d40bad50795679a0a0119c2eec753").unwrap())),
+            bitcoin_merged_mining_merkle_proof: Some(Bytes::from(hex::decode("fc29fbe26636c139458c602b0ff121d1017098500834d40e749f00448bfcaa181a42f80dfedf4a78a045936cbef21504b9dba52ec98f05b08840a469c1c2d8f9346ffde3a70182b3a6b8e737a2bf023458b890589f48f2e711ba631279bdd634bf9e4119806fcde6a0cdb03b3eca2ad4a48d963b8fed032fa6924746ed7f026da6c870ddcfd53f4a36636fcb61fd5eda5d3047f75c5cb13d6b8f755251331ef2").unwrap())),
+            bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from(hex::decode("000000000000008010685626cadc65f677c14b223755cfb6de56a4f933683312b254ee9307a397c46088ac0000000000000000266a24aa21a9ed401b9dfa5baf569d3af3b0e004a20541d5fb64a037d8670b764a7dbc40ad247500000000000000002a6a52534b424c4f434b3a92c99df0f40bcf1e4dc6c2d3ac5407b2caa26cfc09d51fa4e030f318005b8d8000000000").unwrap())),
+            cached_hash: None,
+            cached_hash_for_merged_mining: None,
+        };
+        assert_eq!(header.hash(), b256!("afe29f290437b18474a9d540ffe7379ee4f9d0149746644dc13de067d4cf13cd"));
+    }
+
 }
