@@ -811,7 +811,16 @@ mod tests {
             // A V1 header carries no literal bloom; the slot holds the
             // commitment and the bloom travels in the extension.
             logs_bloom: Bloom::default(),
-            extension_data: Some(Bytes::from(extension.create_extension_data())),
+            // rskj BlockHeader.getEncoded line 365:
+            //   RLP.encodeElement(compressed ? getExtensionData() : getLogsBloom())
+            // The commitment is carried as the *payload of an RLP string*, not
+            // spliced into the header as a nested list.
+            extension_data: Some(Bytes::from({
+                let inner = extension.create_extension_data();
+                let mut wrapped = Vec::new();
+                alloy_rlp::Encodable::encode(&inner.as_slice(), &mut wrapped);
+                wrapped
+            })),
             difficulty: U256::from(1188746003u64),
             number: 8126464,
             gas_limit: U256::from(12000000u64),
@@ -873,5 +882,6 @@ mod tests {
         };
         assert_eq!(header.hash(), b256!("afe29f290437b18474a9d540ffe7379ee4f9d0149746644dc13de067d4cf13cd"));
     }
+
 
 }

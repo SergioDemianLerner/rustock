@@ -212,13 +212,45 @@ so nothing had ever asked rustock to *derive* a versioned header's hash. Before
 the fix, all fourteen candidates above produced the *same* hash — which is how
 it was noticed.
 
+**Narrowed, with two more rskj findings along the way.**
+
+1. **The commitment is carried as the payload of an RLP *string*, not spliced
+   in as a nested list.** rskj `BlockHeader.getEncoded` line 365:
+
+   ```java
+   byte[] logsBloomField = RLP.encodeElement(compressed ? this.getExtensionData() : this.getLogsBloom());
+   ```
+
+   So field 6 of a V1 header is `0xA3 || RLP([version, hash])`, 36 bytes.
+   rustock now encodes and parses that form.
+
+2. **The block hash uses the *compressed* encoding**, and a V1 header adds
+   nothing extra to it — `getEncodedForHash() = getEncoded(true, !rskip92, true)`
+   and `BlockHeaderV1.addExtraFieldsToEncodedHeader` is a no-op when
+   `usingCompressedEncoding`. The *uncompressed* form is different: it appends
+   a version byte and then the edges, after `ummRoot` and before the merged
+   mining fields. V2 appends `baseEvent` after those. That asymmetry is not in
+   any of the three RSKIPs and matters for anyone decoding headers off the
+   wire.
+
+Structure verified: rustock computes `extension_data` as
+`e201a0<32-byte hash>`, which is the shape rskj produces. Twelve further
+combinations — edges `[1,2]`/`[]`/absent, wrapped vs spliced, with and without
+the trailing fields — were tried against the live hash and none matched, so
+the remaining disagreement is in the *inputs* to the extension hash (the bloom
+or the edge values), not in the encoding of it.
+
 **What would settle it.** The actual wire bytes. The public testnet RPC exposes
 no raw-header method (`rsk_getRawBlockHeaderByNumber`, `debug_getRawHeader`,
 `debug_getBlockRlp` and others are all absent), and the JSON view is lossy in
 exactly the way that matters: `rskPteEdges: []` cannot distinguish rskj's
 `null` from `short[0]`, which are different encodings and different hashes
 (see §2). Pointing a rustock instance at testnet P2P and capturing a real V1
-header would resolve it directly.
+header would resolve it directly, and is now the only route left: the explorer
+APIs return nothing, and **mainnet is still version 0**
+(`rskPteEdges: null` at #9,314,009), so rustock's own database contains no V1
+header to compare against. That also explains how the encoder bug survived --
+no rustock node has ever been asked to encode a versioned header.
 
 **Why this matters beyond one test.** Until a V1 hash can be derived rather
 than cached, rustock cannot validate a testnet header it did not receive

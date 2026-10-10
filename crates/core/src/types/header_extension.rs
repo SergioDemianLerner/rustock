@@ -161,7 +161,19 @@ pub struct ExtensionCommitment {
 impl ExtensionCommitment {
     /// Parses `RLP([version, hash])` as found in the header's bloom slot.
     pub fn from_extension_data(bytes: &[u8]) -> Result<Self, ExtensionError> {
-        let items = decode_list_items(bytes)?;
+        // The header carries the commitment as the payload of an RLP string
+        // (rskj `BlockHeader.getEncoded`: `RLP.encodeElement(getExtensionData())`),
+        // so the outer element is unwrapped before the pair is read. A bare
+        // pair is accepted too, so callers holding the inner form -- as
+        // `create_extension_data` returns -- are not forced to wrap it first.
+        let mut buf = bytes;
+        let outer = RlpHeader::decode(&mut buf).map_err(|_| ExtensionError::Malformed)?;
+        let inner: &[u8] = if outer.list {
+            bytes
+        } else {
+            buf.get(..outer.payload_length).ok_or(ExtensionError::Malformed)?
+        };
+        let items = decode_list_items(inner)?;
         if items.len() != 2 {
             return Err(ExtensionError::NotAPair);
         }
