@@ -551,6 +551,35 @@ impl RskHardforkConfig {
         block_number >= height
     }
 
+    /// RSKIP144: parallel transaction execution, and the
+    /// `txExecutionSublistsEdges` header field that carries the sublist
+    /// boundaries.
+    ///
+    /// Testnet-only as rskj is configured today: `reed810` is `-1` in
+    /// `main.conf` and `7_139_600` in `testnet.conf`.
+    pub fn has_rskip144(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Reed810
+    }
+
+    /// RSKIP351: the compressed ("mini") block header, where the logs-bloom
+    /// slot carries `RLP([version, extension_hash])` instead of the bloom.
+    ///
+    /// Same gate as RSKIP144. rskj's `ValidTxExecutionSublistsEdgesRule`
+    /// requires *both* before it validates anything, so they are kept as two
+    /// predicates rather than one even though they currently coincide.
+    pub fn has_rskip351(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Reed810
+    }
+
+    /// RSKIP535: the `baseEvent` header-extension field, which makes the
+    /// header version 2.
+    ///
+    /// `testnet.conf` sets `rskip535 = 7604200`, the vetiver900 height, with
+    /// the comment "To be activated in testnet only". Mainnet does not set it.
+    pub fn has_rskip535(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Vetiver900
+    }
+
     /// RSKIP536: additional BlockHeader precompile methods. Maps to reed810 in
     /// reference.conf; mainnet overrides it to the vetiver900 height (8_804_200)
     /// via main.conf consensusRules. `>= Reed810` is exact on both networks

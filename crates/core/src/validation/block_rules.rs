@@ -359,3 +359,185 @@ mod tests {
         ));
     }
 }
+
+/// rskj `ValidTxExecutionSublistsEdgesRule` (RSKIP144 + RSKIP351).
+///
+/// The header's `txExecutionSublistsEdges` say where each parallel sublist
+/// ends. A miner chooses them, so consensus has to bound them: an edge past
+/// the end of the transaction list, or out of order, would partition a block
+/// in a way no node could reproduce.
+///
+/// rskj applies this only when **both** RSKIP144 and RSKIP351 are active, and
+/// returns true otherwise — which is why the caller passes `active` rather
+/// than the rule deciding for itself.
+///
+/// Note the bound: rskj's `Constants.TX_EXECUTION_THREADS` is **2**, while
+/// RSKIP-144 specifies `maxTransactionExecutionThreads = 4`. The code is the
+/// stricter of the two, and the code is what the network agreed on — a node
+/// following the document would accept three-edge blocks that rskj rejects.
+/// See `docs/rskip-spec-vs-rskj-code.md`.
+pub const TX_EXECUTION_THREADS: usize = 2;
+
+/// Validates the sublist edges against the block's transaction count.
+///
+/// `edges` is `None` for a version-0 header, and `Some(&[])` means "all
+/// transactions in the sequential sublist" — both are valid and both return
+/// `Ok`. The distinction is preserved because the two encode differently and
+/// therefore hash differently.
+pub fn validate_tx_execution_sublists_edges(
+    edges: Option<&[i16]>,
+    transaction_count: usize,
+    active: bool,
+) -> Result<(), ValidationError> {
+    if !active {
+        return Ok(());
+    }
+    let Some(edges) = edges else { return Ok(()) };
+    if edges.is_empty() {
+        return Ok(());
+    }
+
+    if edges.len() > TX_EXECUTION_THREADS {
+        return Err(ValidationError::InvalidSublistEdges { reason: format!(
+            "number of execution list edges is greater than the number of execution \
+             threads ({} vs {TX_EXECUTION_THREADS})",
+            edges.len()
+        ) });
+    }
+
+    if edges[0] <= 0 {
+        return Err(ValidationError::InvalidSublistEdges { reason: format!(
+            "execution list edge is out of bounds: first edge {} must be positive",
+            edges[0]
+        ) });
+    }
+
+    for pair in edges.windows(2) {
+        if pair[0] >= pair[1] {
+            return Err(ValidationError::InvalidSublistEdges { reason: format!(
+                "execution list edges are not in ascending order: {} >= {}",
+                pair[0], pair[1]
+            ) });
+        }
+    }
+
+    // rskj compares against `size() - 1` on a signed int. An empty
+    // transaction list makes that -1, so any edge at all is out of bounds --
+    // which is the intended answer, and is reproduced here rather than
+    // underflowing.
+    let last = *edges.last().expect("non-empty");
+    let max_index = transaction_count as i64 - 1;
+    if i64::from(last) > max_index {
+        return Err(ValidationError::InvalidSublistEdges { reason: format!(
+            "execution list edge is out of bounds: {last} > {max_index}"
+        ) });
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod sublist_edges_tests {
+    use super::*;
+
+    /// Ported from rskj `ValidTxExecutionSublistsEdgesTest`, which fixes the
+    /// transaction list at 10. Each test keeps the Java name so a disagreement
+    /// can be taken back to the case it came from.
+    const TXS: usize = 10;
+
+    fn check(edges: Option<&[i16]>) -> Result<(), ValidationError> {
+        validate_tx_execution_sublists_edges(edges, TXS, true)
+    }
+
+    /// rskj `blockWithRSKIP144Deactivated`: before activation the rule passes
+    /// whatever the header says, including nothing at all.
+    #[test]
+    fn before_activation_anything_is_accepted() {
+        assert!(validate_tx_execution_sublists_edges(None, TXS, false).is_ok());
+        // Even edges that would be rejected once the rule is live.
+        assert!(validate_tx_execution_sublists_edges(Some(&[99, 1]), TXS, false).is_ok());
+    }
+
+    /// rskj `blockWithValidEdges`
+    #[test]
+    fn two_ascending_in_bounds_edges_are_valid() {
+        assert!(check(Some(&[2, 5])).is_ok());
+    }
+
+    /// rskj `blockWithEmptyEdges`: an empty list means every transaction goes
+    /// in the sequential sublist, which is valid.
+    #[test]
+    fn empty_edges_are_valid() {
+        assert!(check(Some(&[])).is_ok());
+    }
+
+    /// A version-0 header has no edges at all. Distinct from empty, and also
+    /// valid -- the two encode and hash differently, so the distinction is
+    /// carried rather than flattened.
+    #[test]
+    fn absent_edges_are_valid_and_distinct_from_empty() {
+        assert!(check(None).is_ok());
+    }
+
+    /// rskj `blockWithTooManyEdges`. The bound is rskj's
+    /// `TX_EXECUTION_THREADS = 2`, **not** RSKIP-144's stated
+    /// `maxTransactionExecutionThreads = 4`; a node following the document
+    /// would accept three edges here and diverge.
+    #[test]
+    fn more_edges_than_execution_threads_is_rejected() {
+        assert!(check(Some(&[1, 2, 3, 4, 5])).is_err());
+        assert!(check(Some(&[1, 2, 3])).is_err(), "three edges exceed the bound of two");
+        assert!(check(Some(&[1, 2])).is_ok(), "two is the limit, not one short of it");
+    }
+
+    /// rskj `blockWithOutOfBoundsEdgesBecauseOfRemascTx`: with 10
+    /// transactions the last index is 9, so 10 is out of bounds. The REMASC
+    /// transaction occupies the final slot and cannot start a sublist.
+    #[test]
+    fn an_edge_at_the_transaction_count_is_out_of_bounds() {
+        assert!(check(Some(&[10])).is_err());
+        assert!(check(Some(&[9])).is_ok(), "the last valid index is size - 1");
+    }
+
+    /// rskj `blockWithOutOfBoundsEdges`
+    #[test]
+    fn an_edge_past_the_transaction_list_is_rejected() {
+        assert!(check(Some(&[12])).is_err());
+    }
+
+    /// rskj `blockWithNegativeEdge`. Java's `short` is signed, so a negative
+    /// value is representable on the wire and has to be rejected explicitly
+    /// rather than being impossible by type.
+    #[test]
+    fn a_negative_edge_is_rejected() {
+        assert!(check(Some(&[-2])).is_err());
+    }
+
+    /// rskj `blockWithEdgeZero`: the first edge must be strictly positive --
+    /// a sublist ending at 0 would be empty.
+    #[test]
+    fn a_first_edge_of_zero_is_rejected() {
+        assert!(check(Some(&[0, 2])).is_err());
+    }
+
+    /// rskj `blockWithRepeatedEdge`: ascending means *strictly* ascending.
+    #[test]
+    fn a_repeated_edge_is_rejected() {
+        assert!(check(Some(&[2, 2])).is_err());
+    }
+
+    /// rskj `blockWithEdgesNotInOrder`
+    #[test]
+    fn edges_out_of_order_are_rejected() {
+        assert!(check(Some(&[2, 4, 3])).is_err());
+    }
+
+    /// Not in rskj's suite. An empty transaction list makes `size() - 1`
+    /// equal -1 in Java, so every edge is out of bounds; reproduced here
+    /// without underflowing an unsigned subtraction.
+    #[test]
+    fn any_edge_is_out_of_bounds_for_an_empty_block() {
+        assert!(validate_tx_execution_sublists_edges(Some(&[1]), 0, true).is_err());
+        assert!(validate_tx_execution_sublists_edges(Some(&[]), 0, true).is_ok());
+    }
+}

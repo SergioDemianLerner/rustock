@@ -387,3 +387,58 @@ wire bytes show version 2 with an empty baseEvent — it **is** active.
 Same class of loss as §2: `rskPteEdges: []` cannot distinguish `null` from
 `short[0]`, which are different encodings and different hashes. **The JSON view
 is not a sound basis for reconstructing a header.** Only the wire bytes are.
+
+## 8. RSKIP-144 allows four parallel sublists; rskj allows two
+
+**Severity: consensus-fatal in the accepts-too-much direction.** A node
+following the document accepts blocks rskj rejects, and would follow a chain
+rskj refuses.
+
+**The spec says** (RSKIP144.md):
+
+> A new constant `maxTransactionExecutionThreads` is specified. […] Initially,
+> `maxTransactionExecutionThreads = 4`
+>
+> The maximum number of parallel sublists that the miner can specify is equal
+> to `maxTransactionExecutionThreads`.
+
+**The code says** `Constants.java`:
+
+```java
+public static final int TX_EXECUTION_THREADS = 2;
+```
+
+and `ValidTxExecutionSublistsEdgesRule` rejects any header with more edges than
+that. So a block with three sublist edges is valid per RSKIP-144 and invalid
+per rskj.
+
+**rustock implements 2**, with the constant named `TX_EXECUTION_THREADS` to
+match rskj rather than the RSKIP, and a test
+(`more_edges_than_execution_threads_is_rejected`) asserting that three edges
+are refused — the case that separates the two readings.
+
+## 9. Testnet header versions, and what #48 assumed
+
+Recorded because rustock's issue #48 states the version "is not checked to
+equal 1", which is no longer the whole rule.
+
+From `testnet.conf`:
+
+```
+reed810  = 7139600     # RSKIP144 + RSKIP351  -> header version 1
+vetiver900 = 7604200
+rskip535 = 7604200     # "To be activated in testnet only"  -> header version 2
+```
+
+| testnet range | header version |
+|---|---|
+| below #7,139,600 | 0 |
+| #7,139,600 – #7,604,199 | 1 |
+| from #7,604,200 | **2** |
+
+So a validator that insists on version 1 rejects every testnet block after
+#7,604,200. `ActivationConfig.getHeaderVersion` returns `0x2` when RSKIP-535 is
+active and `0x1` otherwise; the check has to follow activation, not a constant.
+
+Mainnet does not set `rskip535` and is still version 0 throughout
+(`rskPteEdges: null` at #9,314,009), so none of this is reachable there yet.
