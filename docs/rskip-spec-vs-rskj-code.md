@@ -58,9 +58,17 @@ byte[] baseEvent = rlpExtension.get(1).getRLPRawData();   // index 1, not 2
 | RSKIP-535 | `logsBloom` | `txExecutionSublistsEdges` | `baseEvent` |
 | **rskj** | `logsBloom` | **`baseEvent`** | **`edges`** |
 
+**Confirmed against the live chain, not just read from the source.** Testnet
+block #8,160,760 is a version-2 header. Rebuilding its commitment with the
+rskj order -- `[bloom, base_event, edges]` -- reproduces the block hash the
+network agreed on, `0xa3403ff9…`. The RSKIP's order does not. A node built
+from the document cannot follow testnet.
+
 **rustock implements the rskj order.** `BlockHeaderExtension::trailing_elements`
 pushes `base_event` before `edges`, with the override order named in a comment
-so it is not "tidied" later.
+so it is not "tidied" later, and the test
+`testnet_block_8160760_v2_wire_header_hashes_correctly` pins it to real wire
+bytes.
 
 ---
 
@@ -328,3 +336,54 @@ no rustock node has ever been asked to encode a versioned header.
 than cached, rustock cannot validate a testnet header it did not receive
 verbatim — which includes any header it builds, and any it would re-serve.
 The V0 path is unaffected.
+
+
+---
+
+## 6. The wire layout of a versioned header is in no RSKIP
+
+Captured from a testnet peer, block #8,160,760, item by item:
+
+```text
+ 0..5   parentHash … receiptTrieRoot
+ 6      logsBloom          256 bytes -- the REAL bloom, not the commitment
+ 7..15  difficulty … uncleCount
+ 16     ummRoot            empty
+ 17     version            0x02
+ 18     edges              0x0100   little-endian, = [1]
+ 19     baseEvent          empty
+ 20..22 btcHeader, merkleProof, coinbaseTx
+```
+
+So a versioned header has **two serialisations**, and only one is documented:
+
+| | field 6 | after `ummRoot` |
+|---|---|---|
+| **wire / storage** (uncompressed) | the real 256-byte bloom | `version`, `edges?`, `baseEvent` |
+| **block hash** (compressed) | `encodeElement(RLP([version, hash]))` | nothing |
+
+`getEncodedForHash() = getEncoded(true, !rskip92, true)` — the compressed form
+exists only to be hashed and is never transmitted. RSKIP-351 describes only the
+compressed shape and calls it "the extended header"; nothing says the wire form
+keeps the bloom and appends the fields separately.
+
+An implementer reading the RSKIPs would decode every testnet header wrongly:
+the version byte lands where the merged-mining header is expected and every
+later field shifts.
+
+## 7. The RPC reports an empty `baseEvent` as `null`
+
+`BlockResultDTO`:
+
+```java
+this.baseEvent = baseEvent != null && baseEvent.length > 0 ? HexUtils.toUnformattedJsonHex(baseEvent) : null;
+```
+
+So `"baseEvent": null` means *either* "no such field" *or* "present and empty",
+and the JSON cannot distinguish them. This cost real time here: testnet reports
+`null` on every block, which reads as "RSKIP-535 is not active yet", while the
+wire bytes show version 2 with an empty baseEvent — it **is** active.
+
+Same class of loss as §2: `rskPteEdges: []` cannot distinguish `null` from
+`short[0]`, which are different encodings and different hashes. **The JSON view
+is not a sound basis for reconstructing a header.** Only the wire bytes are.

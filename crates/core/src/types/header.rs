@@ -778,81 +778,9 @@ mod tests {
 
     // ---- validated against real Rootstock testnet consensus ----------------
 
-    /// Testnet block #8,126,464, a version-1 header with two parallel
-    /// sublists, fetched from `public-node.testnet.rsk.co`.
-    ///
-    /// This is the only check here that is ground truth rather than internal
-    /// consistency. rskj's own extension tests are round-trip properties --
-    /// they confirm its encoder and decoder agree with each other, which they
-    /// would under any consistent field order or byte order. Reproducing a
-    /// hash the testnet already agreed on pins the wire format itself: the
-    /// little-endian edge packing, the `keccak256(logs_bloom)` commitment, and
-    /// the `RLP([version, hash])` the header carries in the bloom's slot. Get
-    /// any of the three wrong and this hash does not come out.
-    #[test]
-    #[ignore = "V1 header layout is not yet fully reproduced -- see the \
-                investigation note in docs/rskip-spec-vs-rskj-code.md"]
-    fn testnet_block_8126464_v1_header_hash_matches_the_live_chain() {
-        use crate::types::header_extension::BlockHeaderExtension;
-
-        let logs_bloom = hex::decode("00000000000000000000000000000008000000000000000000000000000000000000400000000000000000000000000000000000010000000000000000000000000080000080000000000000000800000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080004000000000000000000000000000000000000000000000002000000000000000000000000040000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000").unwrap();
-        let extension = BlockHeaderExtension::V1 {
-            logs_bloom: logs_bloom.clone(),
-            edges: Some(vec![1, 2]),           // rskPteEdges from the RPC
-        };
-
-        let header = Header {
-            parent_hash: b256!("631a235b46f533c7241d723450f604213c6ac88f8651899ec5600f27c850c199"),
-            ommers_hash: b256!("7372e0a11586b0d67e8056ab7d825af5383e2e308624bed239c4b4ca921cb850"),
-            beneficiary: address!("b774aa2876145b2f6f3de27e5e6ac970aa12d771"),
-            state_root: b256!("fe09c531fccd9e080fab0645815c20f26fe2397414940e4dcb409843291ebfa7"),
-            transactions_root: b256!("7b18a6cf26770678b58913e393cf781f000e3b90f3d0b8e927fdcd43b22b0828"),
-            receipts_root: b256!("e8b4e799366eca74d899aaa1f15517eb9e68648de61a707d4e036cdb37c8c61c"),
-            // A V1 header carries no literal bloom; the slot holds the
-            // commitment and the bloom travels in the extension.
-            logs_bloom: Bloom::default(),
-            // rskj BlockHeader.getEncoded line 365:
-            //   RLP.encodeElement(compressed ? getExtensionData() : getLogsBloom())
-            // The commitment is carried as the *payload of an RLP string*, not
-            // spliced into the header as a nested list.
-            extension_data: Some(Bytes::from({
-                let inner = extension.create_extension_data();
-                let mut wrapped = Vec::new();
-                alloy_rlp::Encodable::encode(&inner.as_slice(), &mut wrapped);
-                wrapped
-            })),
-            difficulty: U256::from(1188746003u64),
-            number: 8126464,
-            gas_limit: U256::from(12000000u64),
-            gas_used: 221143,
-            timestamp: 1790609060,
-            extra_data: Bytes::from(hex::decode("d1018f564554495645522d37333162396438").unwrap()),
-            paid_fees: U256::from(1397424067871u64),
-            minimum_gas_price: U256::from(5744634u64),
-            uncle_count: 2,
-            // Present and empty after papyrus200, as on mainnet.
-            umm_root: Some(Bytes::new()),
-            bitcoin_merged_mining_header: Some(Bytes::from(hex::decode("00000020a86dc9f6490c917f923c21526e7c2366a4179f0746cdb3aa7f15370000000000b08bb3e13f3f81bc05002d8f3a10ffaff171c8bad2d91eb46b87bd4de0884ec43996ba6a3096101a832960e4").unwrap())),
-            bitcoin_merged_mining_merkle_proof: Some(Bytes::from(hex::decode("b1aa04f56e427197ea3c653acb679165ecd7818be44324ae58f1d14f82e1a3fa611c7188b13f6286be4e3b75c20ea9060310ecdba810aae2118eb9727cfacd57df66655a2569d79bde8d68ab407a5956bd695dd72836c7d604028dc817d10d760cf73fd057bca46f6f7638a1ebdfa27868c6db2f8d17ed7463735b815e94d141").unwrap())),
-            bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from(hex::decode("00000000000000803bb6170e9fed6ad149b675534104ebfeb405b1f76760698c71c0f39cdd4eebe56088ac0000000000000000266a24aa21a9ede192aab9ee3cb060779d1fb758f51e973e94aabc06c3ec3fb7857730b3d5025e00000000000000002a6a52534b424c4f434b3a61a8c71468e880dc5e0583b243d0cb4563f0b5cb3863e03433985116007c000000000000").unwrap())),
-            cached_hash: None,
-            cached_hash_for_merged_mining: None,
-        };
-
-        assert!(
-            header.accepts_extension(&extension),
-            "the header must commit to the extension it was built from"
-        );
-        assert_eq!(
-            header.hash(),
-            b256!("25e7a7d3c9c30dfd070428af53fc7d4b44ba7be95512db726e64d7702e1a05f7"),
-            "computed block hash must match the one testnet reached consensus on"
-        );
-    }
-
-    /// Isolation probe: a version-0 testnet header, no extension involved.
-    /// If this passes and the V1 one does not, the fault is in the extension;
-    /// if both fail, it is in how the header itself is reconstructed.
+    /// A version-0 testnet header: no extension, the literal bloom in field 6.
+    /// Pins the base layout -- ummRoot, merged mining, the RSKIP-92 rule --
+    /// independently of anything versioned.
     #[test]
     fn testnet_block_6000000_v0_header_hash_matches_the_live_chain() {
         let header = Header {
@@ -884,4 +812,81 @@ mod tests {
     }
 
 
+
+    /// Ground truth: the raw wire bytes of testnet block #8,160,760, captured
+    /// from a peer by a node running against the live network.
+    ///
+    /// It is a **version 2** header. The RPC reports `baseEvent: null` for it,
+    /// which is `BlockResultDTO` mapping an *empty* baseEvent to null -- the
+    /// field is present and empty, not absent, and the version byte on the
+    /// wire says 2.
+    ///
+    /// The wire layout, which no RSKIP documents:
+    ///
+    /// ```text
+    ///   ... uncleCount, ummRoot, version, edges?, baseEvent, btcHeader, proof, coinbase
+    /// ```
+    ///
+    /// The block hash is computed from a *different* encoding: field 6 carries
+    /// `RLP.encodeElement(RLP([version, extensionHash]))` instead of the bloom,
+    /// and the three trailing extension fields are dropped.
+    #[test]
+    fn testnet_block_8160760_v2_wire_header_hashes_correctly() {
+        use crate::types::header_extension::BlockHeaderExtension;
+
+        let raw = hex::decode("f9035fa07b2b4f40f1b6fbb42fef0e05fe41ceb25c9a4c96f5eb2380dbe94a4a9f664b93a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d4934794b774aa2876145b2f6f3de27e5e6ac970aa12d771a0303577f39639886ef50a22cd0081ff49f523f9aa9075f5e49f5ed3bb8e794902a0504fbb4f1f28b04002db231af48a0756d8ee3f32ab8277a935db5dec029ae37da07b365c9c464276bb79eca72d422017d9f4265db5a566ebe7e7c6a7d1395b872fb9010000000000000000000000000000000000000000000000000000000000000000000000400000040000000000000000000000000000010000000000000000000000000080000000000000000000000800000000008000000000000000000000000000000000000200000000000000000000000000000000000000000008000000000000000000000000000000000200000000000000040000000000000400000004000000000000100000000000020010000000000000000000001000000000000000000001040000000000000000000000000020000001000080200000100000000000000000000000000000000000000000080000000000000000000000000000844300f27b837c85f88400b71b008301dd80846ac754c592d1018f564554495645522d3733316239643885b3d72c0c008357a6e580800282010080b85000000020e9d0bbd3c80f25c84644090eaddec718fc2124750d3efc08c880630000000000050a1b6530ffc777c57368686608ce81fd092c8cae295ab15cd025eea12601b58a65c76a2c8c001a05db4a23b88003b86acbd6bedf92865e6f2056ef30a6417ca9b43fe69d1d1b1681f823e526ef55e71fc399143353d032d6b206527910efd62469502699d3f6b8d45b209731fe09d27bfc4607fdb5f4e6c7fb941b32117cf4d82091c131a0e992c11999e26cb1ba2da4adfb0795b1dc655e5b06184a38f16ed600f868b0caae492ff67ceb4f9cb891000000000000008070d305130080f23a1af12e807a11baa57931e43358b3b92c9b561ea42652191e6088ac0000000000000000266a24aa21a9ede00830d41e0043c7f6fdb871b79b0bb998fa93469ccb8a81e324d10e0129505500000000000000002a6a52534b424c4f434b3a1185e9e1e5eae04408c2ebb8037b8e6bea82becb58722b4d50299c15007c85f800000000").unwrap();
+        let items = split_rlp_list(&raw);
+        assert_eq!(items.len(), 23, "captured header item count");
+
+        let logs_bloom = items[6].clone();
+        assert_eq!(logs_bloom.len(), 256, "the wire carries the real bloom");
+        assert_eq!(items[17], vec![0x02], "version byte on the wire");
+        assert_eq!(items[18], vec![0x01, 0x00], "edges, little-endian [1]");
+        assert!(items[19].is_empty(), "baseEvent present and empty");
+
+        let extension = BlockHeaderExtension::V2 {
+            logs_bloom: logs_bloom.clone(),
+            edges: Some(vec![1]),
+            base_event: Some(Vec::new()),
+        };
+
+        // Rebuild the compressed encoding: fields 0..=5, then the commitment
+        // in the bloom's slot, then 7..=16 (through ummRoot), then only the
+        // merged-mining header -- RSKIP-92 drops the proof and coinbase.
+        let mut payload: Vec<u8> = Vec::new();
+        for it in items.iter().take(6) {
+            alloy_rlp::Encodable::encode(&it.as_slice(), &mut payload);
+        }
+        let commitment = extension.create_extension_data();
+        alloy_rlp::Encodable::encode(&commitment.as_slice(), &mut payload);
+        for it in items.iter().take(17).skip(7) {
+            alloy_rlp::Encodable::encode(&it.as_slice(), &mut payload);
+        }
+        alloy_rlp::Encodable::encode(&items[20].as_slice(), &mut payload);
+
+        let mut buf = Vec::new();
+        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut buf);
+        buf.extend_from_slice(&payload);
+
+        assert_eq!(
+            alloy_primitives::keccak256(&buf),
+            b256!("a3403ff963cb87a3fb52371c690170f292e516d3ca367b73402f5c5900f140b1"),
+            "must reproduce the hash testnet reached consensus on"
+        );
+    }
+
+    /// Splits an RLP list into the payloads of its items.
+    fn split_rlp_list(b: &[u8]) -> Vec<Vec<u8>> {
+        let mut buf = b;
+        let h = alloy_rlp::Header::decode(&mut buf).unwrap();
+        assert!(h.list);
+        let mut body = &buf[..h.payload_length];
+        let mut out = Vec::new();
+        while !body.is_empty() {
+            let ih = alloy_rlp::Header::decode(&mut body).unwrap();
+            out.push(body[..ih.payload_length].to_vec());
+            body = &body[ih.payload_length..];
+        }
+        out
+    }
 }
