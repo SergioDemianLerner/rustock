@@ -252,7 +252,12 @@ struct Args {
     #[arg(long, default_value_t = 32 * 1024 * 1024, value_name = "BYTES")]
     snap_total_rate: u64,
 
-    /// Network ID (30 for mainnet, 33 for regtest)
+    /// Which chain to run: 30 mainnet, 31 testnet, anything else regtest.
+    ///
+    /// Named `--network-id` for historical reasons; it selects the chain, not
+    /// the wire network id (testnet's is 8100, which is *not* what to pass
+    /// here). Passing a value no chain claims gives a regtest node, which
+    /// starts cleanly on the wrong genesis and never finds a peer.
     #[arg(long, default_value = "30")]
     network_id: u64,
 
