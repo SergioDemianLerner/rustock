@@ -557,3 +557,4 @@ mod tests {
             "testnet genesis hash must match rskj GenesisHashesTest");
     }
 }
+
