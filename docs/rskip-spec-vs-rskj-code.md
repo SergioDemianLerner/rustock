@@ -189,7 +189,79 @@ the wire format.
 
 ---
 
-## Open: rustock cannot yet reproduce a testnet V1 header hash
+## Solved: rustock misparses every V1 header on the wire
+
+**Root cause, confirmed against live testnet.** A V1 header has *two*
+serialisations, and rustock only knows one of them.
+
+rskj `BlockHeaderV1.makeExtension`:
+
+```java
+return compressed
+    ? new BlockHeaderExtensionV1(null, null)      // body fetched separately
+    : new BlockHeaderExtensionV1(extensionData, txExecutionSublistsEdges);
+                              // ^ field 6 IS the 256-byte bloom here
+```
+
+and `BlockHeaderV1.addExtraFieldsToEncodedHeader`:
+
+```java
+if (!usingCompressedEncoding) {
+    fieldsToEncode.add(RLP.encodeByte(this.getVersion()));
+    this.addTxExecutionSublistsEdgesIfAny(fieldsToEncode);
+}
+```
+
+| | field 6 | after `ummRoot` |
+|---|---|---|
+| **uncompressed** (wire, storage) | the real 256-byte `logsBloom` | `version`, then `edges` if any |
+| **compressed** (block hash only) | `RLP.encodeElement(extensionData)` | nothing |
+
+`getEncodedForHash() = getEncoded(true, !rskip92, true)` — the hash uses the
+compressed form; the network never sends it.
+
+**What rustock does.** `Header::decode` dispatches on how many RLP items remain
+after the base fields: 3 means the three merged-mining fields, 4 means
+`ummRoot` plus those three. A testnet V1 header has **5 or 6** — `ummRoot`,
+the version byte, optionally the edges, then the three mining fields. Every one
+is therefore misparsed: the version byte is read as the merged-mining header,
+and the real fields shift by one or two positions.
+
+**How it was found.** Running a node against testnet (`--network-id 31`, 17
+peers) produced, five times in a row:
+
+```
+WARN snapshot sync failed: the offered blocks do not form a chain
+```
+
+Not a peer problem. rustock cannot link the headers it is offered because it
+cannot parse them, so no parent hash matches.
+
+**Why the earlier reconstruction attempts failed.** They were assembling the
+*compressed* form from RPC fields and comparing against the live hash. That is
+the right shape for hashing, but the inputs were being taken from a JSON view
+that cannot distinguish `null` edges from `short[0]` (§2), and the decoder gap
+above meant no real V1 header was ever available to check against.
+
+**What the fix requires.** Three things, none of them large but all
+consensus-critical:
+
+1. Decode the trailing `version` and optional `edges` when 5 or 6 items remain,
+   and build the extension from them together with the wire bloom.
+2. Hash using the compressed form — `encodeElement(extensionData)` in field 6
+   and no trailing fields — while re-encoding for transmission with the bloom
+   and the trailing fields.
+3. Keep both forms on the decoded header, since it needs the bloom to serve
+   logs and the commitment to hash.
+
+**Why it matters.** This is the whole of "rustock cannot validate testnet". The
+V0 path is correct and testnet #6,000,000 hashes exactly; everything above the
+RSKIP-351 activation is unreadable. Mainnet is unaffected and still version 0
+(`rskPteEdges: null` at #9,314,009), which is why nothing has surfaced it.
+
+---
+
+## Superseded: earlier notes on the V1 hash investigation
 
 Not an RSKIP/rskj divergence — a rustock gap, recorded here because it was
 found by the same exercise and it blocks validating testnet.
