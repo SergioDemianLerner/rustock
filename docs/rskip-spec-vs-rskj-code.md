@@ -442,3 +442,51 @@ active and `0x1` otherwise; the check has to follow activation, not a constant.
 
 Mainnet does not set `rskip535` and is still version 0 throughout
 (`rskPteEdges: null` at #9,314,009), so none of this is reachable there yet.
+
+## 10. The lock whitelist is rewritten whenever it is read
+
+Found by replaying testnet #6,602 and comparing against a reference node;
+fixed in `whitelist_allows_and_consume`. Issue #290.
+
+RSKIP-87 describes the whitelist as a set that governance methods modify.
+Nothing in it says a *read* changes state. The code says otherwise.
+
+`BridgeStorageProvider` caches the whitelist in a field and writes it back in
+`save()`, which runs once at the end of every Bridge transaction:
+
+```java
+private void saveLockWhitelist() {
+    if (lockWhitelist == null) { return; }   // null = never loaded
+    List<OneOffWhiteListEntry> oneOffEntries = lockWhitelist.getAll(OneOffWhiteListEntry.class);
+    safeSaveToRepository(LOCK_ONE_OFF,
+        Pair.of(oneOffEntries, lockWhitelist.getDisableBlockHeight()),
+        BridgeSerializationUtils::serializeOneOffLockWhitelist);
+    if (activations.isActive(ConsensusRule.RSKIP87)) {
+        List<UnlimitedWhiteListEntry> unlimitedEntries = lockWhitelist.getAll(UnlimitedWhiteListEntry.class);
+        safeSaveToRepository(LOCK_UNLIMITED, unlimitedEntries,
+            BridgeSerializationUtils::serializeUnlimitedLockWhitelist);
+    }
+}
+```
+
+The guard is `lockWhitelist == null`, i.e. "was it ever loaded", not "was it
+ever changed". So any call that reaches `getLockWhitelist()` — including
+`verifyLockSenderIsWhitelisted` on a peg-in that is then **rejected** —
+materialises both cells.
+
+Where the whitelist has never been written, that creates state out of
+nothing: an empty one-off list with the default `Integer.MAX_VALUE` disable
+height serialises to `0xc5847fffffff`, and an empty unlimited list to `0xc0`.
+
+Testnet #6,602 is the block where this first happens. Its only peg-in is
+rejected and refunded, yet the reference node's storage goes from no cells at
+#6,601 to exactly those two values at #6,602. A node that writes the
+whitelist only on modification computes a different state root for #6,602 and
+every block after it.
+
+Note the activation boundary: `unlimitedLockWhitelist` is written only under
+RSKIP-87, which is **orchid** (mainnet #729,000, testnet #0) — not wasabi100,
+where the unlimited *entry type* is often assumed to begin.
+
+Mainnet never reaches the interesting case: both cells were written before
+#1,000, so every later read rewrites identical bytes and changes no root.

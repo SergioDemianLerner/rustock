@@ -374,6 +374,36 @@ pub fn store_one_off_whitelist<CTX: crate::RskContextTr>(
     bridge_store_bytes_named(ctx, LOCK_WHITELIST_KEY, &data);
 }
 
+/// rskj `BridgeStorageProvider.saveLockWhitelist`: write both whitelist cells
+/// back, changed or not.
+///
+/// rskj caches the whitelist in `BridgeStorageProvider.lockWhitelist` and
+/// `save()` -- which runs once at the end of every Bridge transaction --
+/// writes it whenever that field is non-null, i.e. whenever anything in the
+/// call reached `getLockWhitelist()`. Merely *reading* the whitelist
+/// therefore materialises both cells.
+///
+/// That is consensus-visible rather than cosmetic. On a chain whose whitelist
+/// was never written, the first peg-in to consult it creates
+/// `lockWhitelist = [i32::MAX]` and `unlimitedLockWhitelist = []` out of
+/// nothing, and a node that writes only on modification computes a different
+/// state root from that block on. Testnet #6,602 is exactly that block.
+///
+/// `unlimitedLockWhitelist` is written only under RSKIP87, matching the
+/// `activations.isActive(RSKIP87)` guard inside `saveLockWhitelist`.
+pub fn save_lock_whitelist<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    one_off: &[([u8; 20], u64)],
+    disable_height: i32,
+    unlimited: &[[u8; 20]],
+    rskip87: bool,
+) {
+    store_one_off_whitelist(ctx, one_off, disable_height);
+    if rskip87 {
+        store_unlimited_whitelist(ctx, unlimited);
+    }
+}
+
 /// Load the unlimited lock whitelist from Bridge storage.
 pub fn load_unlimited_whitelist<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<[u8; 20]> {
     let data = bridge_load_bytes_named(ctx, UNLIMITED_LOCK_WHITELIST_KEY);

@@ -701,7 +701,13 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // so a whitelist rejection never lazily initializes the cap). A cap
     // rejection produces the same refund release as a whitelist one.
     let allowed = lockable
-        && whitelist_allows_and_consume(ctx, &sender_hash160, total_value, btc_block_height)
+        && whitelist_allows_and_consume(
+            ctx,
+            &sender_hash160,
+            total_value,
+            btc_block_height,
+            hardfork_cfg.has_rskip87(rsk_height),
+        )
         && cap_ok(ctx);
     tracing::debug!(
         "pegin lock check: sender {} amount {} btc_height {} -> {}",
@@ -1045,22 +1051,33 @@ fn whitelist_allows_and_consume<CTX: crate::RskContextTr>(
     sender_hash160: &[u8; 20],
     amount: u64,
     height: u64,
+    rskip87: bool,
 ) -> bool {
+    // rskj `getLockWhitelist()` deserializes BOTH cells together, so reaching
+    // this function reads both even where the decision needs only one.
     let (mut one_off, disable_h) = load_one_off_whitelist(ctx);
+    let unlimited = load_unlimited_whitelist(ctx);
     let disabled = (height as i64) > (disable_h as i64);
 
-    if let Some(pos) = one_off.iter().position(|(h, _)| h == sender_hash160) {
+    let allowed = if let Some(pos) = one_off.iter().position(|(h, _)| h == sender_hash160) {
         let allowed = disabled || amount <= one_off[pos].1;
         if allowed {
+            // rskj consumes the matching one-off entry only on success.
             one_off.remove(pos);
-            store_one_off_whitelist(ctx, &one_off, disable_h);
         }
-        return allowed;
-    }
-    if disabled {
-        return true;
-    }
-    load_unlimited_whitelist(ctx).contains(sender_hash160)
+        allowed
+    } else if disabled {
+        true
+    } else {
+        unlimited.contains(sender_hash160)
+    };
+
+    // Unconditional, including on rejection: rskj's save() writes the
+    // whitelist back because the call loaded it, not because it changed it.
+    // See `save_lock_whitelist` -- this write is why testnet #6,602 has a
+    // `lockWhitelist` cell at all.
+    super::storage::save_lock_whitelist(ctx, &one_off, disable_h, &unlimited, rskip87);
+    allowed
 }
 
 /// rskj `BridgeSupport.registerNewUtxos`: register every output paying the
@@ -5365,6 +5382,125 @@ mod tests {
         // Before RSKIP146 the with-txhash queue is not in scope at all.
         let pre = load_release_request_queue(&mut ctx, false);
         assert_eq!(pre.len(), 2);
+    }
+
+    /// Ground truth: rootstock testnet #6,602, whose only state-changing
+    /// peg-in was *rejected*. The reference node's storage at that block
+    /// holds `lockWhitelist = 0xc5847fffffff` and
+    /// `unlimitedLockWhitelist = 0xc0` where #6,601 held neither, so rskj
+    /// created both cells on a rejection that changed nothing.
+    ///
+    /// Writing only on modification makes rustock's state root diverge from
+    /// #6,602 onward, which is what issue #290 was.
+    #[test]
+    fn a_rejected_pegin_still_materialises_both_whitelist_cells() {
+        let mut ctx = queue_ctx();
+        let sender = [0x42u8; 20];
+
+        assert!(
+            bridge_load_bytes_named(&mut ctx, LOCK_WHITELIST_KEY).is_empty(),
+            "precondition: the whitelist has never been written"
+        );
+
+        let allowed = whitelist_allows_and_consume(&mut ctx, &sender, 1_000, 100, true);
+        assert!(!allowed, "an address on neither list is not whitelisted");
+
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(&mut ctx, LOCK_WHITELIST_KEY)),
+            "c5847fffffff",
+            "empty one-off list plus the i32::MAX disable height, as rskj writes it"
+        );
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(&mut ctx, UNLIMITED_LOCK_WHITELIST_KEY)),
+            "c0",
+            "empty unlimited list"
+        );
+    }
+
+    /// Before RSKIP87 rskj's `saveLockWhitelist` skips the unlimited cell, so
+    /// writing it early would diverge in the other direction.
+    #[test]
+    fn the_unlimited_cell_is_not_written_before_rskip87() {
+        let mut ctx = queue_ctx();
+        whitelist_allows_and_consume(&mut ctx, &[0x42; 20], 1_000, 100, false);
+
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(&mut ctx, LOCK_WHITELIST_KEY)),
+            "c5847fffffff",
+            "the one-off cell is written at every activation"
+        );
+        assert!(
+            bridge_load_bytes_named(&mut ctx, UNLIMITED_LOCK_WHITELIST_KEY).is_empty(),
+            "the unlimited cell does not exist before RSKIP87"
+        );
+    }
+
+    /// The save-back must not disturb the entry it did not touch, and a
+    /// successful one-off lock must still consume its entry.
+    #[test]
+    fn a_consumed_one_off_entry_is_removed_and_the_rest_survive() {
+        let mut ctx = queue_ctx();
+        let user = [0x11u8; 20];
+        let other = [0x22u8; 20];
+        store_one_off_whitelist(&mut ctx, &[(user, 5_000), (other, 7_000)], i32::MAX);
+
+        assert!(whitelist_allows_and_consume(&mut ctx, &user, 5_000, 100, true));
+
+        let (entries, disable_h) = load_one_off_whitelist(&mut ctx);
+        assert_eq!(entries, vec![(other, 7_000)], "only the used entry is consumed");
+        assert_eq!(disable_h, i32::MAX);
+    }
+
+    /// A one-off entry too small for the amount rejects *and keeps* the
+    /// entry: rskj consumes only after `isWhitelistedFor` passes.
+    #[test]
+    fn an_over_cap_lock_is_rejected_without_consuming_the_entry() {
+        let mut ctx = queue_ctx();
+        let user = [0x11u8; 20];
+        store_one_off_whitelist(&mut ctx, &[(user, 5_000)], i32::MAX);
+
+        assert!(!whitelist_allows_and_consume(&mut ctx, &user, 9_000, 100, true));
+
+        assert_eq!(
+            load_one_off_whitelist(&mut ctx).0,
+            vec![(user, 5_000)],
+            "a rejected lock leaves the entry in place"
+        );
+    }
+
+    /// An unlimited entry is never consumed, and the save-back must preserve
+    /// it rather than write the empty list the one-off branch computed.
+    #[test]
+    fn an_unlimited_entry_survives_the_lock_it_authorises() {
+        let mut ctx = queue_ctx();
+        let user = [0x33u8; 20];
+        store_unlimited_whitelist(&mut ctx, &[user]);
+
+        assert!(whitelist_allows_and_consume(&mut ctx, &user, 1_000_000, 100, true));
+        assert_eq!(load_unlimited_whitelist(&mut ctx), vec![user]);
+
+        // And again: unlimited entries authorise repeatedly.
+        assert!(whitelist_allows_and_consume(&mut ctx, &user, 1_000_000, 100, true));
+        assert_eq!(load_unlimited_whitelist(&mut ctx), vec![user]);
+    }
+
+    /// Past the disable height the whitelist stops gating, but it is still
+    /// loaded -- and so still saved.
+    #[test]
+    fn a_disabled_whitelist_allows_anyone_and_is_still_written_back() {
+        let mut ctx = queue_ctx();
+        store_one_off_whitelist(&mut ctx, &[], 50);
+
+        assert!(whitelist_allows_and_consume(&mut ctx, &[0x99; 20], 1_000, 51, true));
+        assert_eq!(
+            load_one_off_whitelist(&mut ctx),
+            (Vec::new(), 50),
+            "the disable height survives the save-back"
+        );
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(&mut ctx, UNLIMITED_LOCK_WHITELIST_KEY)),
+            "c0"
+        );
     }
 
     #[test]

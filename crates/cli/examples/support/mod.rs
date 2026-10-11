@@ -317,10 +317,22 @@ pub fn describe_value(key: &[u8], value: Option<&Vec<u8>>) -> String {
             Ok(a) => format!("nonce={} balance={}", a.nonce, a.balance),
             Err(e) => format!("0x{} (undecodable account: {e})", hex(v)),
         },
-        TrieKeyKind::Code { .. } => format!("{} bytes of code, keccak-prefix 0x{}", v.len(), hex(&v[..v.len().min(8)])),
+        TrieKeyKind::Code { .. } => format!("{} bytes of code, 0x{}", v.len(), hex(elide(v))),
         _ if v.len() <= 32 => {
             format!("0x{} ({})", hex(v), alloy_primitives::U256::from_be_slice(v))
         }
-        _ => format!("{} bytes, 0x{}…", v.len(), hex(&v[..16])),
+        // Printed in full, not elided. A Bridge field is an RLP structure of a
+        // few hundred bytes, and the only way to tell which of two of them is
+        // right is to decode both -- a truncated prefix just says they are
+        // long. `BLOCK_WRITES_ELIDE=<n>` caps it where the output is unwieldy.
+        _ => format!("{} bytes, 0x{}", v.len(), hex(elide(v))),
+    }
+}
+
+/// How much of an over-long value to print. Unbounded by default.
+fn elide(v: &[u8]) -> &[u8] {
+    match std::env::var("BLOCK_WRITES_ELIDE").ok().and_then(|n| n.parse::<usize>().ok()) {
+        Some(n) if n < v.len() => &v[..n],
+        _ => v,
     }
 }
