@@ -1277,10 +1277,18 @@ mod tests {
         assert!(BlockProcessor::is_remasc_tx(&remasc), "the fixture must look like REMASC");
 
         let block = Block {
-            // Below REMASC's 4,000-block maturity, so the distribution has no
-            // processing block to look up and returns early. The point here
-            // is that the *trace* exists, not what REMASC paid.
-            header: dummy_header(100),
+            // Below REMASC's maturity, so the distribution has no processing
+            // block to look up and returns early. The point here is that the
+            // *trace* exists, not what REMASC paid.
+            //
+            // The maturity that matters is **regtest's 10**, not mainnet's
+            // 4,000: this fixture is `all_active(33)`. The comment used to say
+            // 4,000 and the height used to be 100, which only passed because
+            // the executor hardcoded mainnet's REMASC config regardless of
+            // chain. Once it selected by chain, block 100 was past maturity
+            // and REMASC went looking for block 90, which this fixture does
+            // not have.
+            header: dummy_header(5),
             transactions: vec![transfer, remasc],
             ommers: vec![],
         };

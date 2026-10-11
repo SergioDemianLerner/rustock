@@ -82,7 +82,20 @@ impl RskExecutor {
     }
 
     pub fn new(hardfork_cfg: RskHardforkConfig, block_store: Arc<BlockStore>) -> Self {
-        let remasc_config = crate::remasc::RemascConfig::mainnet();
+        // Selected by chain, like the bridge constants below. rskj's
+        // remasc.json differs per network in ways that change state: testnet's
+        // maturity is 50 against mainnet's 4000, and its rskLabsAddress is
+        // `dabadaba...0003` rather than `14d3065c...`.
+        //
+        // Hardcoding mainnet here meant testnet diverged at block #60 -- an
+        // empty block whose only transaction is REMASC, and the first one past
+        // testnet's maturity window, so the first where a payout happens at
+        // all.
+        let remasc_config = match hardfork_cfg.chain_id {
+            crate::hardfork::RSK_TESTNET_CHAIN_ID => crate::remasc::RemascConfig::testnet(),
+            crate::hardfork::RSK_MAINNET_CHAIN_ID => crate::remasc::RemascConfig::mainnet(),
+            _ => crate::remasc::RemascConfig::regtest(),
+        };
         let bridge_constants = match hardfork_cfg.chain_id {
             crate::hardfork::RSK_TESTNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::testnet(),
             crate::hardfork::RSK_MAINNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::mainnet(),
@@ -102,6 +115,11 @@ impl RskExecutor {
             free_bridge_senders,
             btc_block_cache: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remasc_config_for_test(&self) -> &crate::remasc::RemascConfig {
+        &self.remasc_config
     }
 
     pub fn with_remasc_config(mut self, config: crate::remasc::RemascConfig) -> Self {
