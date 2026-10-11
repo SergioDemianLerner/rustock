@@ -414,6 +414,26 @@ at the production store while it is running or wedged. `resume_point` answers
 `height_peek` lists every block stored at a height, canonical or not;
 `diff_roots` and `diff_state` locate where two state roots disagree.
 
+`diff_state` needs rskj's own database to compare against, which testnet work
+does not have. `block_writes` closes that gap from the other side: it replays
+one block and reports every leaf the block wrote, decoded — the account or
+contract by address, the storage slot by name where rskj stored it by name,
+as the Bridge does for `releaseTransactionSet` and `blockStoreChainHead`. Each
+line is then checkable against any public node over `eth_getStorageAt`. Run
+against testnet #6,602 it put the whole divergence inside Bridge storage in
+one pass, which balance and receipt comparisons had not managed.
+
+`replay_block`, `diff_state` and `block_writes` share one module: the stores
+are opened the same way, the rules are selected by network id the same way,
+and the hash-pruned dual walk is written once. The sharing is not tidiness —
+replaying a testnet block under mainnet rules reports a divergence that is the
+tool's own, and that has already cost one investigation.
+
+Replaying a block computes a trie, and computing a trie writes nodes, so a
+read-only database is not by itself enough. `OverlayTrieStore` takes the
+writes into memory and lets reads fall through, which is what lets these run
+against a live node's store without touching it.
+
 Some exist to keep a design claim honest rather than to debug anything.
 `pin_cost` walks the collector's mark from two roots and reports what the
 second one added, which is how "pinning costs only the delta" became 0.58%
