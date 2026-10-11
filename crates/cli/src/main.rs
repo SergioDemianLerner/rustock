@@ -3059,6 +3059,54 @@ fn build_genesis_state(config: &ChainConfig, trie_store: &dyn TrieStore) -> Resu
         root = root.put(&key, &acct.encode(), trie_store);
     }
 
+    // rskj `GenesisLoaderImpl.setupPrecompiledContractsStorage`: when RSKIP126
+    // activates *at* genesis, the genesis precompiles are created if absent and
+    // given the contract storage-prefix marker.
+    //
+    // rustock does this in the block executor at the activation block, which is
+    // right for mainnet (#1,591,000, an ordinary executed block) and wrong for
+    // testnet, where wasabi100 is height 0 -- genesis is constructed, never
+    // executed, so the markers were never written and the genesis state root
+    // came out as mainnet's.
+    if config.activation_heights.wasabi100 == 0 {
+        for addr in rustock_execution::precompiles::GENESIS_PRECOMPILES {
+            let acct_key = TrieKeySlice::from_key(&account_key(&addr));
+            if root.get(&acct_key, trie_store).is_none() {
+                // rskj only creates the account when it does not already
+                // exist, so the Bridge keeps the balance the alloc gave it.
+                let acct = AccountState::new(U256::ZERO, U256::ZERO);
+                root = root.put(&acct_key, &acct.encode(), trie_store);
+            }
+            let marker = TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(&addr));
+            root = root.put(&marker, &[1], trie_store);
+        }
+
+        // The second loop of `maintainPrecompiledContractStorageRoots`: any
+        // consensus-enabled precompile whose rule also activates at genesis.
+        // rskj calls `createAccount` unconditionally for these -- a fresh
+        // account, nonce and balance reset -- and then marks it, unlike the
+        // genesis set above which is only created when absent.
+        for (addr, upgrade) in rustock_execution::precompiles::CONSENSUS_ENABLED_PRECOMPILES {
+            use rustock_execution::hardfork::RskNetworkUpgrade as U;
+            let height = match upgrade {
+                U::Wasabi100 => Some(config.activation_heights.wasabi100),
+                U::Papyrus200 => Some(config.activation_heights.papyrus200),
+                U::Iris300 => Some(config.activation_heights.iris300),
+                // Later upgrades are not modelled in ActivationHeights, and
+                // none of them can be zero on any chain rustock supports.
+                _ => None,
+            };
+            if height != Some(0) {
+                continue;
+            }
+            let acct_key = TrieKeySlice::from_key(&account_key(&addr));
+            let acct = AccountState::new(U256::ZERO, U256::ZERO);
+            root = root.put(&acct_key, &acct.encode(), trie_store);
+            let marker = TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(&addr));
+            root = root.put(&marker, &[1], trie_store);
+        }
+    }
+
     let computed = root.compute_hash(trie_store);
     info!("Genesis Unitrie hash: {computed:?}");
 
@@ -4226,5 +4274,75 @@ mod snap_checkpoint_tests {
             None,
             "the checkpoint contradicts the chain it was read from"
         );
+    }
+}
+
+#[cfg(test)]
+mod genesis_tests {
+    use super::*;
+    use rustock_trie::MemoryTrieStore;
+
+    /// Testnet's genesis state root, published in rskj's
+    /// `genesis/orchid-testnet.json` and in every testnet block #0.
+    ///
+    /// Reproducing it requires `setupPrecompiledContractsStorage`, which rskj
+    /// runs in its *genesis loader* — not in the block executor — precisely
+    /// because genesis is constructed rather than executed. rustock ran the
+    /// equivalent only at the activation block, which is right for mainnet
+    /// (#1,591,000, an ordinary block) and silently wrong for testnet, where
+    /// wasabi100 is height 0. Without it the testnet genesis state was just
+    /// the allocation, which is *mainnet's* genesis state.
+    #[test]
+    fn testnet_genesis_state_root_matches_the_chain() {
+        let config = ChainConfig::testnet();
+        let store = MemoryTrieStore::new();
+        let root = build_genesis_state(&config, &store).unwrap();
+        assert_eq!(
+            root.compute_hash(&store),
+            "0x45bce5168430c42b3d568331753f900a32457b4f3748697cbd8375ff4da72641"
+                .parse::<alloy_primitives::B256>()
+                .unwrap(),
+            "testnet genesis state must match the published root"
+        );
+    }
+
+    /// Mainnet must be untouched by that: RSKIP126 does not activate at its
+    /// genesis (wasabi100 is #1,591,000), so no precompile is seeded and the
+    /// state is the allocation alone. Its header carries the *orchid* root of
+    /// that same allocation, which `test_mainnet_genesis_orchid_state_root_matches_header`
+    /// asserts separately.
+    #[test]
+    fn mainnet_genesis_seeds_no_precompiles() {
+        let config = ChainConfig::mainnet();
+        let store = MemoryTrieStore::new();
+        let root = build_genesis_state(&config, &store).unwrap();
+
+        // The alloc-only unitrie root, unchanged by the testnet fix.
+        assert_eq!(
+            root.compute_hash(&store),
+            "0x21de9a922f22eb925cefc6d4c994cb28e9ec36e7a45862105f79e4d97c0babfc"
+                .parse::<alloy_primitives::B256>()
+                .unwrap()
+        );
+
+        // And specifically: no storage-prefix marker for a genesis precompile.
+        let marker = TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(
+            &rustock_execution::precompiles::GENESIS_PRECOMPILES[0],
+        ));
+        assert!(
+            root.get(&marker, &store).is_none(),
+            "mainnet genesis must not seed precompile markers"
+        );
+    }
+
+    /// The two chains must not agree: before the fix they did, which was the
+    /// bug. Pinned so a future change cannot quietly collapse them again.
+    #[test]
+    fn the_two_chains_have_different_genesis_state() {
+        let store_m = MemoryTrieStore::new();
+        let store_t = MemoryTrieStore::new();
+        let m = build_genesis_state(&ChainConfig::mainnet(), &store_m).unwrap();
+        let t = build_genesis_state(&ChainConfig::testnet(), &store_t).unwrap();
+        assert_ne!(m.compute_hash(&store_m), t.compute_hash(&store_t));
     }
 }
