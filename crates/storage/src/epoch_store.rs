@@ -777,6 +777,45 @@ impl EpochTrieStore {
     ///
     /// Returns the live set, the pins that could not be marked in full, and how
     /// many entries the pins added that the collection root had not already.
+    /// Marks one node's own entries: its long value, its children by hash,
+    /// and -- recursively -- anything an embedded child points at.
+    ///
+    /// The embedded case is the subtle one. A node is embedded in its parent
+    /// when it is terminal and its message is small, and a node holding a
+    /// value over 32 bytes *is* small, because the value is not in it: the
+    /// node keeps the value's hash and length and the bytes become their own
+    /// store entry. So an embedded node can own an entry even though it has
+    /// none itself, and skipping embedded children -- which have nothing to
+    /// mark on their own account -- used to skip those values too.
+    ///
+    /// They were then swept while live, and nothing noticed: a state root
+    /// commits to the value's hash, which lives inside the node, so every root
+    /// still matched while the bytes were gone. It surfaced only when
+    /// something read the value back -- a contract whose code had vanished.
+    fn mark_node(node: &TrieNode, live: &mut HashSet<B256>, next: &mut Vec<B256>) {
+        // A value over 32 bytes is its own entry, keyed by the hash of the
+        // value, and is just as collectable as a node.
+        if node.has_long_value() {
+            if let Some(vh) = node.value_hash {
+                // Not traversed: a value has no references.
+                live.insert(vh);
+            }
+        }
+        for child in [&node.left, &node.right] {
+            match child {
+                NodeRef::Hash(h) => {
+                    if live.insert(*h) {
+                        next.push(*h);
+                    }
+                }
+                // No entry of its own, but it may still point at a value that
+                // has one.
+                NodeRef::Node(embedded) => Self::mark_node(embedded, live, next),
+                NodeRef::Empty => {}
+            }
+        }
+    }
+
     fn mark(
         &self,
         root_hash: B256,
@@ -868,28 +907,7 @@ impl EpochTrieStore {
                     continue;
                 };
                 let node = TrieNode::from_message(&bytes, self);
-
-                // A value over 32 bytes is its own entry, keyed by the hash of
-                // the value, and is just as collectable as a node.
-                if node.has_long_value() {
-                    if let Some(vh) = node.value_hash {
-                        if live.insert(vh) {
-                            // Not traversed: a value has no references.
-                        }
-                    }
-                }
-                for child in [&node.left, &node.right] {
-                    match child {
-                        NodeRef::Hash(h) => {
-                            if live.insert(*h) {
-                                next.push(*h);
-                            }
-                        }
-                        // Embedded children live inside this node's bytes and
-                        // have no entry of their own to mark.
-                        NodeRef::Node(_) | NodeRef::Empty => {}
-                    }
-                }
+                Self::mark_node(&node, live, &mut next);
             }
             frontier = next;
         }
@@ -1839,6 +1857,59 @@ mod tests {
             Some(1234),
             "the snapshot's own figure wins over the resume point"
         );
+    }
+
+    /// A long value hanging off an *embedded* node must survive collection.
+    ///
+    /// A value over 32 bytes is not stored in its node; the node keeps the
+    /// value's hash and length and the bytes become their own store entry. A
+    /// node holding one is therefore small, and a small terminal node is
+    /// embedded into its parent rather than given an entry of its own.
+    ///
+    /// The mark walk skips embedded children -- correctly, they have no entry
+    /// to mark -- and so never looks at their long values either. Those values
+    /// do have entries, are reachable from the live root, and were being swept.
+    /// Nothing detects it: the state root commits to the value's *hash*, which
+    /// is inside the node, so every root still matches while the bytes are
+    /// gone. It surfaces later as a contract whose code has vanished.
+    #[test]
+    fn a_long_value_under_an_embedded_node_survives_collection() {
+        let d = tempfile::tempdir().unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
+
+        // Values well over the 32-byte threshold, so each is its own entry.
+        let long = |i: u64| {
+            let mut v = vec![0xAB; 64];
+            v[..8].copy_from_slice(&i.to_be_bytes());
+            v
+        };
+
+        let mut root = TrieNode::empty();
+        for i in 0..64u64 {
+            root = root.put(&TrieKeySlice::from_key(&key(i)), &long(i), &s);
+        }
+        root.save(&s, true);
+        let root_hash = root.compute_hash(&s);
+
+        // Rotate past the configured width so the first epoch becomes a sweep
+        // candidate, then collect against the live root.
+        for i in 1..=3u64 {
+            s.rotate_only(i * 1_000).unwrap();
+        }
+        s.collect(root_hash, 4_000, 8_000).unwrap();
+
+        // Every value must still read back. Reading through the trie is the
+        // point: the nodes are fine, it is the values they point at that were
+        // being lost.
+        let reloaded = TrieNode::from_message(&s.get(root_hash.as_slice()).expect("root"), &s);
+        for i in 0..64u64 {
+            let got = reloaded.get(&TrieKeySlice::from_key(&key(i)), &s);
+            assert_eq!(
+                got.as_deref(),
+                Some(long(i).as_slice()),
+                "value {i} was collected while still live"
+            );
+        }
     }
 
     /// The ledger is diagnosis, not consensus data. A torn trailing write -- a
