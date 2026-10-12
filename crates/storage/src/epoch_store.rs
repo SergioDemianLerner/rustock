@@ -417,7 +417,17 @@ impl EpochTrieStore {
         })
     }
 
-    pub fn open(dir: impl AsRef<Path>, config: EpochConfig) -> Result<Self> {
+    /// Opens the store for writing.
+    ///
+    /// `resume_at` is the height execution will resume from -- the node's
+    /// executed head, or `None` where there is no chain yet or the caller
+    /// genuinely does not know. It is used only to close an epoch this open
+    /// inherits mid-flight; see the rotation below for why that matters.
+    pub fn open(
+        dir: impl AsRef<Path>,
+        config: EpochConfig,
+        resume_at: Option<u64>,
+    ) -> Result<Self> {
         config.validate()?;
         let root = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)
@@ -448,29 +458,63 @@ impl EpochTrieStore {
         let mut next = seqs.last().copied().unwrap_or(0) + 1;
 
         // A store with a single, non-empty epoch has just been seeded from a
-        // snapshot. Rotate before anything can write into it, so the seed stays
-        // exactly what the snapshot contained and its highest block is known.
-        // Letting the node write into the seed makes the seed both the newest
-        // epoch and the first candidate for sweeping -- the two roles the design
-        // requires to stay separate.
+        // snapshot, or is an ordinary node restarted before its first
+        // rotation. Either way, rotate before anything can write into it, so
+        // what is already there stays exactly as it was. Letting the node
+        // write into it makes it both the newest epoch and the first
+        // candidate for sweeping -- the two roles the design requires to stay
+        // separate.
         if epochs.len() == 1 && !Self::epoch_is_empty(&epochs[0]) {
-            let seeded_at = epochs[0].last_block;
             info!(
                 target: "rustock::gc",
-                "Epoch store seeded from a snapshot (highest block {:?}); rotating so it \
-                 stays read-only", seeded_at
+                "Epoch store opened with a single written epoch (highest block {:?}); \
+                 rotating so it stays read-only", epochs[0].last_block
             );
-            if epochs[0].last_block.is_none() {
-                warn!(
-                    target: "rustock::gc",
-                    "Seeded epoch has no snapshot metadata, so its highest block is \
-                     unknown; it can never be swept until that is recorded"
-                );
-            }
             let seq = next;
             next += 1;
             let d = epoch_dir(&root, seq);
             epochs.push(Epoch { seq, db: open_epoch(&d, &cache)?, dir: d, last_block: None });
+        }
+
+        // Close any epoch that stopped receiving writes without being
+        // recorded. Only the newest epoch is legitimately open-ended;
+        // everything behind it needs a highest block or it can never be shown
+        // safe to delete.
+        //
+        // An epoch gets that record when it is rotated away from, and the
+        // rotation just above is the one path that does not rotate -- it
+        // inherits. So the first epoch of any node restarted before its first
+        // rotation arrives here with nothing, which is every node syncing
+        // from genesis for its first gigabyte. Left alone it becomes the
+        // oldest epoch, and the oldest epoch is the only sweep candidate:
+        // collection then refuses for the life of the store, silently, while
+        // the trie grows without bound.
+        //
+        // `resume_at` closes it. Execution resumes from there, so nothing
+        // anywhere in this store was written for a later block -- which is
+        // exactly the upper bound a sweep needs. Recording a value too high
+        // only delays collection; too low would delete state a later block
+        // still needs, so an unknown resume point stays `None` and keeps the
+        // old, safe refusal.
+        if let Some(newest) = epochs.len().checked_sub(1) {
+            for e in epochs[..newest].iter_mut().filter(|e| e.last_block.is_none()) {
+                match resume_at {
+                    Some(n) => {
+                        info!(
+                            target: "rustock::gc",
+                            "Epoch {} has no record of its highest block; closing it at the \
+                             resume point #{n} so it can be collected", e.seq
+                        );
+                        write_last_block(&e.dir, n);
+                        e.last_block = Some(n);
+                    }
+                    None => warn!(
+                        target: "rustock::gc",
+                        "Epoch {} has no record of its highest block and no resume point \
+                         was given, so it can never be swept", e.seq
+                    ),
+                }
+            }
         }
 
         info!(
@@ -1135,6 +1179,7 @@ pub fn open_backend(
     backend: &TrieBackend,
     single_db: Arc<DB>,
     epoch_root: &Path,
+    resume_at: Option<u64>,
 ) -> Result<Arc<dyn TrieStore>> {
     match backend {
         TrieBackend::Single => Ok(Arc::new(crate::RocksDbTrieStore::from_db(single_db))),
@@ -1142,7 +1187,7 @@ pub fn open_backend(
             Ok(Arc::new(crate::RocksDbTrieStore::open(epoch_root)?))
         }
         TrieBackend::Epochs(cfg) => {
-            Ok(Arc::new(EpochTrieStore::open(epoch_root, cfg.clone())?))
+            Ok(Arc::new(EpochTrieStore::open(epoch_root, cfg.clone(), resume_at)?))
         }
     }
 }
@@ -1182,7 +1227,7 @@ mod tests {
     fn a_read_only_store_reads_everything_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let (root_hash, nodes_written) = {
-            let store = EpochTrieStore::open(dir.path(), cfg(3)).unwrap();
+            let store = EpochTrieStore::open(dir.path(), cfg(3), None).unwrap();
             let h = build(&store, 64, 0);
             let n = walk(&store, h).unwrap();
             store.flush().unwrap();
@@ -1204,7 +1249,7 @@ mod tests {
     fn writing_to_a_read_only_store_panics_rather_than_silently_losing_data() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let store = EpochTrieStore::open(dir.path(), cfg(3)).unwrap();
+            let store = EpochTrieStore::open(dir.path(), cfg(3), None).unwrap();
             build(&store, 4, 0);
             store.flush().unwrap();
         }
@@ -1244,13 +1289,13 @@ mod tests {
     #[test]
     fn rejects_fewer_than_three_epochs() {
         let d = tempfile::tempdir().unwrap();
-        assert!(EpochTrieStore::open(d.path(), cfg(2)).is_err());
+        assert!(EpochTrieStore::open(d.path(), cfg(2), None).is_err());
     }
 
     #[test]
     fn reads_find_entries_in_older_epochs() {
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
         s.put(b"aaaaaaaa", b"first");
         s.rotate_only(0).unwrap();
         s.put(b"bbbbbbbb", b"second");
@@ -1262,7 +1307,7 @@ mod tests {
     #[test]
     fn collection_keeps_the_state_it_collected_against() {
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
 
         let root = build(&s, 200, 0);
         let before = walk(&s, root).unwrap();
@@ -1279,7 +1324,7 @@ mod tests {
     #[test]
     fn collection_drops_state_older_than_the_collection_root() {
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
 
         let old_root = build(&s, 200, 0);
         let old_nodes = walk(&s, old_root).unwrap();
@@ -1309,7 +1354,7 @@ mod tests {
         // burial depth, so the collection root does not reach it. Without a
         // pin it goes the way of any superseded state.
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
 
         let pinned = build(&s, 200, 0);
         let pinned_nodes = walk(&s, pinned).unwrap();
@@ -1333,7 +1378,7 @@ mod tests {
         // everything, the test above would pass for the wrong reason and the
         // collector would have stopped reclaiming.
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
 
         let pinned = build(&s, 200, 0);
         let unpinned = build(&s, 200, 500_000);
@@ -1356,7 +1401,7 @@ mod tests {
         // The cost argument for pins: the two states share nearly everything,
         // so marking both must cost the delta, not two full walks.
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
 
         let pinned = build(&s, 400, 0);
         // One entry different, so the delta is a single root-to-leaf path.
@@ -1386,7 +1431,7 @@ mod tests {
         // partly collected would stop the collector for good -- one broken
         // thing turned into two.
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
 
         let newer = build(&s, 200, 1_000_000);
         let absent = B256::repeat_byte(0xAB);
@@ -1410,7 +1455,7 @@ mod tests {
         // half-collected checkpoint looks like, and it must be reported --
         // not raised as the hard error the collection root would raise.
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
 
         let pinned = build(&s, 200, 0);
         let newer = build(&s, 200, 1_000_000);
@@ -1447,7 +1492,7 @@ mod tests {
         // Snapshot serving off means no checkpoint to protect, and collection
         // must be what it always was.
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
 
         let old = build(&s, 200, 0);
         let newer = build(&s, 200, 1_000_000);
@@ -1466,7 +1511,7 @@ mod tests {
         // to one that now lives only in the oldest epoch. With a conditional
         // write the new state would point into a database about to be deleted.
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
 
         let original = build(&s, 120, 7);
         // Move on to a different state, rotating as we go.
@@ -1491,7 +1536,7 @@ mod tests {
         // nothing, drain almost nothing, and then delete an epoch whose
         // contents were still reachable.
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
         let root = build(&s, 150, 3);
         for _ in 0..3 {
             s.collect(root, 1_000_000, 1_000_000).unwrap();
@@ -1519,7 +1564,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         // N=4 so the three calls below only grow the store; the fourth would be
         // the first real cycle, and that is the one that must be refused.
-        let s = EpochTrieStore::open(d.path(), cfg(4)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(4), None).unwrap();
 
         // State as of "block 100", then more state written for "block 500"
         // while the same epoch is still the newest -- exactly the shape the
@@ -1553,7 +1598,7 @@ mod tests {
         // first sweep candidate.
         let d = tempfile::tempdir().unwrap();
         {
-            let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+            let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
             build(&s, 80, 1);
             s.flush().unwrap();
         }
@@ -1561,7 +1606,7 @@ mod tests {
         let seed = d.path().join(format!("epoch-{:012}", 0));
         std::fs::write(seed.join(EPOCH_META), "100").unwrap();
 
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
         assert_eq!(s.epoch_count(), 2, "the seed must be rotated away from on open");
 
         // Writes now land in the new epoch, leaving the seed byte-identical.
@@ -1579,7 +1624,7 @@ mod tests {
     /// `epochs`, returning it. Each cycle writes a fresh generation, so the
     /// oldest epoch is genuinely dead by the time it is swept.
     fn sweep_n(dir: &Path, epochs: usize, n: u64) -> EpochTrieStore {
-        let s = EpochTrieStore::open(dir, cfg(epochs)).unwrap();
+        let s = EpochTrieStore::open(dir, cfg(epochs), None).unwrap();
         for i in 0..n {
             let root = build(&s, 64, i * 10_000);
             // root_block climbs so each cycle's collection root stays above the
@@ -1614,7 +1659,7 @@ mod tests {
     #[test]
     fn a_store_that_never_swept_has_no_watermark() {
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(8)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(8), None).unwrap();
         let root = build(&s, 32, 0);
         s.collect(root, 1_000, 1_000).unwrap();
 
@@ -1653,9 +1698,147 @@ mod tests {
         };
         assert!(watermark.is_some(), "the fixture swept nothing");
 
-        let reopened = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let reopened = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
         assert_eq!(reopened.collected_below(), watermark);
         assert_eq!(reopened.sweep_log(), log, "the ledger must reopen in the same order");
+    }
+
+    /// A node restarted before its first rotation must still end up with a
+    /// collectable store.
+    ///
+    /// This is the ordinary case, not an exotic one: every node syncing from
+    /// genesis writes into one epoch for its first gigabyte, and any restart
+    /// in that window lands here. The reopen rotates the written epoch away to
+    /// keep it read-only, and if it does so without recording a highest block
+    /// for it, that epoch -- now the oldest, and so the only sweep candidate
+    /// -- can never be shown safe to delete. Nothing revisits it, so
+    /// collection stays off for the life of the store and the trie grows
+    /// without bound. The testnet sync hit exactly this.
+    #[test]
+    fn a_store_reopened_before_its_first_rotation_can_still_be_collected() {
+        let d = tempfile::tempdir().unwrap();
+
+        // Write, but never rotate: nothing records a highest block.
+        {
+            let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
+            build(&s, 64, 0);
+            assert_eq!(
+                s.epochs.read().unwrap().len(),
+                1,
+                "fixture must not have rotated, or it proves nothing"
+            );
+        }
+
+        let resumed_at = 5_000;
+        let s = EpochTrieStore::open(d.path(), cfg(3), Some(resumed_at)).unwrap();
+
+        let epochs = s.epochs.read().unwrap();
+        assert_eq!(epochs.len(), 2, "the inherited epoch is rotated away from");
+        assert_eq!(
+            epochs[0].last_block,
+            Some(resumed_at),
+            "the inherited epoch is closed at the resume point, so it can be swept"
+        );
+        drop(epochs);
+
+        // And it survives another restart: the record is on disk, not just in
+        // memory, so a second reopen does not have to rediscover it.
+        drop(s);
+        let again = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
+        assert_eq!(again.epochs.read().unwrap()[0].last_block, Some(resumed_at));
+    }
+
+    /// The repair has to reach an epoch that is no longer the first one.
+    ///
+    /// A store that hit the bug and then kept running rotates past it: the
+    /// stuck epoch ends up behind two or three properly closed ones, where a
+    /// fix that only looked at `epochs.len() == 1` would never see it again.
+    /// This is the shape the testnet store was actually found in -- epoch 0
+    /// with no record, 1 and 2 closed at #97,920 and #208,896, 3 newest.
+    #[test]
+    fn a_stuck_epoch_behind_later_ones_is_still_repaired() {
+        let d = tempfile::tempdir().unwrap();
+
+        // Exactly the sequence that produced the testnet store: write into
+        // the first epoch, restart with no resume point -- which inherits it
+        // without recording anything -- then keep running and rotating, which
+        // buries it behind epochs that did get closed.
+        {
+            let s = EpochTrieStore::open(d.path(), cfg(8), None).unwrap();
+            build(&s, 64, 0);
+        }
+        {
+            let s = EpochTrieStore::open(d.path(), cfg(8), None).unwrap();
+            for i in 1..=2u64 {
+                build(&s, 64, i * 10_000);
+                s.rotate_only(i * 1_000).unwrap();
+            }
+        }
+
+        let dirs: Vec<_> = (0..4).map(|n| epoch_dir(d.path(), n)).collect();
+        assert!(
+            read_last_block(&dirs[0]).is_none(),
+            "fixture must reproduce the stuck epoch, or it proves nothing"
+        );
+        assert!(read_last_block(&dirs[1]).is_some(), "later epochs closed normally");
+
+        let s = EpochTrieStore::open(d.path(), cfg(8), Some(641_664)).unwrap();
+        let epochs = s.epochs.read().unwrap();
+
+        assert_eq!(epochs[0].last_block, Some(641_664), "the stuck epoch is closed");
+        assert_eq!(
+            epochs[1].last_block,
+            Some(1_000),
+            "an epoch that already had a record keeps its own, more accurate figure"
+        );
+        assert_eq!(
+            epochs.last().unwrap().last_block,
+            None,
+            "the newest epoch is still receiving writes and stays open-ended"
+        );
+    }
+
+    /// Without a resume point the old refusal stands. Guessing low here would
+    /// delete state a later block still needs, which is worse than never
+    /// collecting -- so an unknown resume point must stay unknown.
+    #[test]
+    fn an_unknown_resume_point_leaves_the_epoch_unsweepable() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
+            build(&s, 64, 0);
+        }
+
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
+        assert_eq!(
+            s.epochs.read().unwrap()[0].last_block,
+            None,
+            "no resume point means no claim about what the epoch holds"
+        );
+    }
+
+    /// A store seeded from a trie snapshot already knows its highest block
+    /// from the snapshot's own metadata. The resume point must not overwrite
+    /// it -- the snapshot's figure is the accurate one.
+    #[test]
+    fn a_snapshot_seed_keeps_the_block_its_metadata_names() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
+            build(&s, 64, 0);
+        }
+        std::fs::write(
+            epoch_dir(d.path(), 0).join("trie_snapshot.json"),
+            r#"{"block":1234,"other":"ignored"}"#,
+        )
+        .unwrap();
+
+        let s = EpochTrieStore::open(d.path(), cfg(3), Some(9_999)).unwrap();
+        assert_eq!(
+            s.epochs.read().unwrap()[0].last_block,
+            Some(1234),
+            "the snapshot's own figure wins over the resume point"
+        );
     }
 
     /// The ledger is diagnosis, not consensus data. A torn trailing write -- a
@@ -1706,7 +1889,7 @@ mod tests {
     #[test]
     fn sweep_reclaims_disk() {
         let d = tempfile::tempdir().unwrap();
-        let s = EpochTrieStore::open(d.path(), cfg(3)).unwrap();
+        let s = EpochTrieStore::open(d.path(), cfg(3), None).unwrap();
         let mut root = B256::ZERO;
         for i in 0..6 {
             root = build(&s, 400, i * 100_000);

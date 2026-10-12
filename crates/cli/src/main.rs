@@ -1908,7 +1908,20 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     cfg.clone(),
                 )?
             } else {
-                rustock_storage::epoch_store::EpochTrieStore::open(&trie_dir, cfg.clone())?
+                // Where execution will resume from. An epoch this open
+                // inherits mid-flight holds nothing written above it, so
+                // this is the upper bound that lets the collector sweep it
+                // later; without it that epoch is never collectable and the
+                // store grows without bound.
+                let resume_at = match store.exec_head()? {
+                    Some((hash, _)) => store.header(hash)?.map(|h| h.number),
+                    None => None,
+                };
+                rustock_storage::epoch_store::EpochTrieStore::open(
+                    &trie_dir,
+                    cfg.clone(),
+                    resume_at,
+                )?
             }))
         }
         _ => None,

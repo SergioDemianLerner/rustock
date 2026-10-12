@@ -104,6 +104,8 @@ fn main() -> Result<()> {
         Box::new(EpochTrieStore::open(
             &dir,
             EpochConfig { epochs: 4, burial_depth: 0, rotate_bytes: u64::MAX },
+            // A read benchmark never collects, so there is nothing to close.
+            None,
         )?)
     } else {
         Box::new(rustock_storage::RocksDbTrieStore::open(std::path::Path::new(&dir))?)
@@ -123,6 +125,8 @@ fn main() -> Result<()> {
         Box::new(EpochTrieStore::open(
             &dir,
             EpochConfig { epochs: 4, burial_depth: 0, rotate_bytes: u64::MAX },
+            // A read benchmark never collects, so there is nothing to close.
+            None,
         )?)
     } else {
         Box::new(rustock_storage::RocksDbTrieStore::open(std::path::Path::new(&dir))?)
