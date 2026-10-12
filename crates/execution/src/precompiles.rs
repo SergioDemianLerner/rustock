@@ -1144,6 +1144,30 @@ impl RskPrecompileProvider {
             // `requiredGas` and the CALL fails (pushes zero). Record that cost
             // and revert so the caller refunds the forwarded leftover.
             if let Some(spent) = crate::bridge::internal_throw_gas(e) {
+                if !self.rskip197_active(context) {
+                    // Before RSKIP197 (iris300) there is no error handling at
+                    // all. `Program.executePrecompiled` wraps the method's
+                    // `VMException` in a `RuntimeException`, which escapes the
+                    // VM: no `stackPushZero`, no rollback-and-continue. The
+                    // transaction dies and is charged its whole gas limit.
+                    //
+                    // Modelled as a non-revert precompile error, which spends
+                    // the entire forwarded gas. A caller that forwarded
+                    // everything -- what a bare Solidity `.call()` does -- is
+                    // then left with the 63/64 remainder and runs out, so the
+                    // transaction ends where rskj ends it, with the same gas.
+                    // A caller holding back enough to continue would carry on
+                    // here and not there; that case is #295.
+                    //
+                    // Testnet #808,484 is the live instance: a constructor
+                    // calls the Bridge with a selector that is not a Bridge
+                    // method, which post-RSKIP88 throws.
+                    let _ = spent;
+                    let underflow = result.gas.record_cost(inputs.gas_limit);
+                    assert!(underflow, "spending exactly the forwarded gas");
+                    result.result = InstructionResult::PrecompileError;
+                    return Ok(Some(result));
+                }
                 let underflow = result.gas.record_cost(spent);
                 assert!(underflow, "gas pre-checked against requiredGas");
                 result.result = InstructionResult::Revert;

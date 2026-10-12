@@ -1391,6 +1391,196 @@ mod tests {
         root.put(&TrieKeySlice::from_key(&code_key_bytes), code, store)
     }
 
+    /// Before RSKIP197 a throwing precompile burns every bit of gas forwarded
+    /// to it; from RSKIP197 it costs the flat parse-failure fee.
+    ///
+    /// rskj `Program.callToPrecompiledAddress` picks between two methods:
+    ///
+    /// ```java
+    /// if (getActivations().isActive(ConsensusRule.RSKIP197)) {
+    ///     executePrecompiledAndHandleError(contract, msg, requiredGas, track, data);
+    /// } else {
+    ///     executePrecompiled(contract, msg, requiredGas, track, data);
+    /// }
+    /// ```
+    ///
+    /// The older one has no error handling at all -- it wraps the method's
+    /// `VMException` in a `RuntimeException` that escapes the VM. The newer
+    /// one pushes zero, refunds `gas - requiredGas`, and lets the caller
+    /// continue.
+    ///
+    /// Ground truth: testnet #808,484, whose first transaction deploys a
+    /// contract whose constructor calls the Bridge with `0xad69a4f7` -- not a
+    /// Bridge method, so post-RSKIP88 it throws. The reference node reports
+    /// `status 0x0, gasUsed 1000000`, the whole limit; rustock reported
+    /// success at 120,388 until this gate existed.
+    #[test]
+    fn a_bridge_throw_before_rskip197_burns_all_the_gas_forwarded_to_it() {
+        let (pre, post) = bridge_throw_gas_either_side_of_iris300();
+        assert!(
+            pre > post * 10,
+            "pre-RSKIP197 must burn the forwarded gas, not the flat fee \
+             (pre {pre}, post {post})"
+        );
+    }
+
+    #[test]
+    fn a_bridge_throw_from_rskip197_costs_only_the_flat_parse_failure_fee() {
+        let (pre_dbg, post) = bridge_throw_gas_either_side_of_iris300();
+        // 23_000 (BridgeMethods.RELEASE_BTC) plus the caller's own overhead.
+        assert_eq!(pre_dbg, 1_000_000, "pre-RSKIP197 consumes the whole limit");
+        assert!(
+            post < 100_000,
+            "post-RSKIP197 pays requiredGas plus call overhead, not the limit (got {post})"
+        );
+    }
+
+    /// KNOWN DIVERGENCE (#295): a caller that caps the gas it forwards
+    /// survives here, where rskj kills the transaction.
+    ///
+    /// rskj's escaping `RuntimeException` ends the transaction regardless of
+    /// how much gas the caller still held. Modelling the throw as a
+    /// spent-everything precompile error reproduces that only when the caller
+    /// forwarded everything, because then the caller runs out too. A caller
+    /// using `call{gas: n}` keeps the rest and carries on.
+    ///
+    /// Pinned rather than left unsaid, so the gap is visible and so that
+    /// closing it fails this test instead of passing silently.
+    #[test]
+    fn a_capped_forward_still_survives_the_pre_rskip197_throw() {
+        let used = bridge_throw_gas_with_capped_forward(2_060_499);
+        assert_eq!(
+            used, 96_733,
+            "only the forwarded 50,000 is burned; rskj would charge the whole \
+             1,000,000 limit -- see #295"
+        );
+
+        // From iris300 both agree: the caller continues on what it kept.
+        let after = bridge_throw_gas_with_capped_forward(2_060_500);
+        assert!(after < 150_000, "post-RSKIP197 the caller continues (got {after})");
+    }
+
+    /// Runs the same contract on both sides of testnet iris300 (#2,060,500)
+    /// and returns the gas each transaction used.
+    fn bridge_throw_gas_either_side_of_iris300() -> (u64, u64) {
+        let run = |height: u64| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let contract = Address::repeat_byte(0xBB);
+
+            // CALL the Bridge forwarding all remaining gas, with a 4-byte
+            // selector that is not a Bridge method, then STOP.
+            //
+            //   PUSH4 ad69a4f7 ; PUSH1 00 ; MSTORE   (left-aligned at 0x1c)
+            //   PUSH1 00 x2    ; PUSH1 04 ; PUSH1 1c ; PUSH1 00
+            //   PUSH20 <bridge>; GAS ; CALL ; STOP
+            let mut code: Vec<u8> = vec![
+                0x63, 0xad, 0x69, 0xa4, 0xf7, // PUSH4 selector
+                0x60, 0x00, // PUSH1 0 (mstore offset, left-aligned word)
+                0x52, // MSTORE
+                0x60, 0x00, // retSize
+                0x60, 0x00, // retOffset
+                0x60, 0x04, // argsSize
+                0x60, 0x00, // argsOffset (selector is the word's high bytes)
+                0x60, 0x00, // value
+                0x73, // PUSH20
+            ];
+            code.extend_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice());
+            code.extend_from_slice(&[0x5a, 0xf1, 0x00]); // GAS, CALL, STOP
+
+            let root = put_account(
+                &TrieNode::empty(),
+                store.as_ref(),
+                &sender,
+                0,
+                U256::from(10u64).pow(U256::from(18)),
+            );
+            let root = put_account_with_code(
+                &root,
+                store.as_ref(),
+                &contract,
+                1,
+                U256::ZERO,
+                &code,
+            );
+
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(contract.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let result = executor
+                .execute_block(&dummy_header(height), &[(tx, sender)], &root, store)
+                .expect("block executes");
+            result.tx_results[0].gas_used
+        };
+
+        // testnet iris300 = #2,060,500.
+        (run(2_060_499), run(2_060_500))
+    }
+
+    /// Same call, but forwarding a fixed 50,000 gas instead of everything.
+    fn bridge_throw_gas_with_capped_forward(height: u64) -> u64 {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xBB);
+
+        let mut code: Vec<u8> = vec![
+            0x63, 0xad, 0x69, 0xa4, 0xf7, // PUSH4 selector
+            0x60, 0x00, 0x52, // PUSH1 0, MSTORE
+            0x60, 0x00, // retSize
+            0x60, 0x00, // retOffset
+            0x60, 0x04, // argsSize
+            0x60, 0x00, // argsOffset
+            0x60, 0x00, // value
+            0x73, // PUSH20
+        ];
+        code.extend_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice());
+        // PUSH3 0x00c350 = 50,000 forwarded, rather than GAS.
+        code.extend_from_slice(&[0x62, 0x00, 0xc3, 0x50, 0xf1, 0x00]);
+
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        let root =
+            put_account_with_code(&root, store.as_ref(), &contract, 1, U256::ZERO, &code);
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        executor
+            .execute_block(&dummy_header(height), &[(tx, sender)], &root, store)
+            .expect("block executes")
+            .tx_results[0]
+            .gas_used
+    }
+
     /// rskj `Bridge.validateLocalCall` (Bridge.java:431) lets a LOCAL-ONLY
     /// getter run for `eth_call`/`estimateGas` and throws for anything on-chain.
     /// rustock had the throw but no way to say "this is a local call", so the
