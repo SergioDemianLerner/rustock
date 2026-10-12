@@ -456,6 +456,23 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP174: a top-level contract creation carries over the balance an
+    /// address already held, instead of destroying it (Iris300).
+    ///
+    /// rskj `TransactionExecutor.create`:
+    ///
+    /// ```java
+    /// cacheTrack.createAccount(newContractAddress,
+    ///     activations.isActive(RSKIP174) && cacheTrack.isExist(newContractAddress));
+    /// ```
+    ///
+    /// `createAccount(addr, false)` writes a fresh `AccountState` over
+    /// whatever was there, so before this activation a deployment onto a
+    /// pre-funded address silently burns the funds.
+    pub fn has_rskip174(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
     /// RSKIP326: add_signature is only logged when a signature is actually
     /// applied (Fingerroot500).
     pub fn has_rskip326(&self, block_number: u64) -> bool {

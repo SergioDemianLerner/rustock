@@ -934,6 +934,54 @@ impl RskExecutor {
                 called.clear();
             }
 
+            // rskj `TransactionExecutor.create`:
+            //
+            //     cacheTrack.createAccount(newContractAddress,
+            //         activations.isActive(RSKIP174) && cacheTrack.isExist(newContractAddress));
+            //
+            // `createAccount(addr, false)` writes a *fresh* AccountState over
+            // whatever was there, so before RSKIP174 (iris300) deploying onto
+            // an address that already holds a balance destroys it. Someone
+            // funding a deploy address before the deployment lands loses the
+            // money, and the chain's supply drops with it.
+            //
+            // revm does the sane thing and keeps the balance, which is the
+            // post-iris300 rule, so only the earlier window needs this. The
+            // VM's own CREATE/CREATE2 is untouched: `Program.createContract`
+            // passes `existingAccount` with no activation check, and so always
+            // carries over.
+            //
+            // Testnet #647,051 is a live instance -- 0.05 RBTC sitting at the
+            // deploy address, gone in the reference node's post-state.
+            if tx.to.is_empty() && !self.hardfork_cfg.has_rskip174(header.number) {
+                use revm::context_interface::journaled_state::account::JournaledAccountTr;
+                use revm::context_interface::{ContextTr, JournalTr};
+                let created = sender.create(tx.nonce);
+                // Read before taking a mutable handle, so an address with
+                // nothing in it is not materialised into an empty account that
+                // the state root would then have to carry.
+                let occupied = evm
+                    .ctx
+                    .journal_mut()
+                    .load_account(created)
+                    .map(|a| !a.data.info.balance.is_zero() || a.data.info.nonce != 0)
+                    .unwrap_or(false);
+                if occupied {
+                    let mut acc = evm
+                        .ctx
+                        .journal_mut()
+                        .load_account_mut(created)
+                        .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?;
+                    // `new AccountState()` -- nonce and balance both zero.
+                    // Code lives under its own trie key and createAccount does
+                    // not touch it, so an address holding code still collides
+                    // in revm where rskj would overwrite. Reaching that needs a
+                    // hash collision, so it is left alone rather than modelled.
+                    acc.data.set_balance(U256::ZERO);
+                    acc.data.set_nonce(0);
+                }
+            }
+
             let result = {
                 use revm::context::ContextSetters;
                 use revm::handler::Handler;
@@ -8045,6 +8093,117 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             .map(|a| a.info.balance)
             .unwrap_or_default();
         assert_eq!(bridge_balance, one_rbtc - burned, "burn debits the Bridge");
+    }
+
+    /// Deploying onto an address that already holds a balance destroys that
+    /// balance, until RSKIP174.
+    ///
+    /// rskj `TransactionExecutor.create` calls
+    /// `createAccount(newContractAddress, RSKIP174 && isExist(addr))`, and
+    /// `createAccount(addr, false)` writes a fresh `AccountState` over
+    /// whatever was there. So someone who funds a deploy address before the
+    /// deployment lands loses the money. revm keeps the balance, which is the
+    /// post-iris300 rule -- so without the activation gate rustock diverges
+    /// for every such deployment before it.
+    ///
+    /// Ground truth: testnet #647,051, where 0.05 RBTC sat at the deploy
+    /// address at #647,050 and is zero in the reference node's post-state.
+    #[test]
+    fn a_pre_rskip174_deployment_burns_the_balance_already_at_the_address() {
+        let (before, after) = deploy_onto_funded_address(2_060_499);
+        assert_eq!(before, U256::from(50_000_000_000_000_000u64), "fixture pre-funds it");
+        assert_eq!(after, U256::ZERO, "the pre-existing balance is destroyed");
+    }
+
+    /// From iris300 the balance is carried over, which is what revm does on
+    /// its own -- so the gate must stop applying, or every later deployment
+    /// onto a funded address burns funds rskj keeps.
+    #[test]
+    fn from_rskip174_a_deployment_keeps_the_balance_already_at_the_address() {
+        let (before, after) = deploy_onto_funded_address(2_060_500);
+        assert_eq!(after, before, "iris300 carries the balance over");
+    }
+
+    /// The wipe must not reach an address with nothing at it: materialising an
+    /// empty account there would put a leaf in the trie that rskj's state root
+    /// does not have.
+    #[test]
+    fn deploying_onto_an_untouched_address_creates_no_spurious_account() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        let created = sender.create(0);
+
+        let result = run_deploy(&root, store.clone(), sender, 2_060_499);
+        let acct = result.state_changes.get(&created);
+        assert!(
+            acct.is_none_or(|a| a.info.balance.is_zero()),
+            "nothing was at the address, so nothing is burned and no balance appears"
+        );
+    }
+
+    /// Runs a bare contract-creation transaction at `height`, with the create
+    /// address pre-funded, and reports its balance before and after.
+    fn deploy_onto_funded_address(height: u64) -> (U256, U256) {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let funded = U256::from(50_000_000_000_000_000u64);
+
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        // The address CREATE will land on, funded in advance.
+        let created = sender.create(0);
+        let root = put_account(&root, store.as_ref(), &created, 0, funded);
+
+        let result = run_deploy(&root, store.clone(), sender, height);
+        let after = result
+            .state_changes
+            .get(&created)
+            .map(|a| a.info.balance)
+            .unwrap_or(funded);
+        (funded, after)
+    }
+
+    fn run_deploy(
+        root: &TrieNode,
+        store: Arc<MemoryTrieStore>,
+        sender: Address,
+        height: u64,
+    ) -> crate::executor::BlockExecutionResult {
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            // Empty `to` is what makes it a creation.
+            to: Bytes::new(),
+            value: U256::ZERO,
+            // Returns empty code: enough to deploy, short enough to stay
+            // about the account rather than about the EVM.
+            input: Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xf3]),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        executor
+            .execute_block(&dummy_header(height), &[(tx, sender)], root, store)
+            .expect("block executes")
     }
 
     /// rskj `Bridge.activeAndRetiringFederationOnly`: a non-federation sender's
