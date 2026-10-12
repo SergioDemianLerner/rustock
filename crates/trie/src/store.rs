@@ -132,34 +132,86 @@ impl TrieStore for MemoryTrieStore {
 /// the replay reads back as the recomputed one.
 pub struct OverlayTrieStore {
     base: std::sync::Arc<dyn TrieStore>,
+    /// In-memory writes, used when no store was supplied to hold them.
     overlay: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+    /// Somewhere other than memory to put them, for runs long enough that
+    /// memory is the wrong place.
+    spill: Option<std::sync::Arc<dyn TrieStore>>,
+    written: std::sync::atomic::AtomicUsize,
 }
 
 impl OverlayTrieStore {
+    /// Keeps writes in memory. Right for a block or two; a long replay should
+    /// use [`Self::with_spill`] instead.
     pub fn new(base: std::sync::Arc<dyn TrieStore>) -> Self {
-        Self { base, overlay: Mutex::new(HashMap::new()) }
+        Self {
+            base,
+            overlay: Mutex::new(HashMap::new()),
+            spill: None,
+            written: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Sends writes to `spill` rather than memory.
+    ///
+    /// Replaying fifty thousand blocks writes far more trie than a diagnostic
+    /// should hold in RAM, and the writes are worthless once the run ends --
+    /// they exist only so the replay can read back what it just computed. A
+    /// scratch store on disk gives that for a fixed memory cost, and is
+    /// deleted afterwards.
+    pub fn with_spill(
+        base: std::sync::Arc<dyn TrieStore>,
+        spill: std::sync::Arc<dyn TrieStore>,
+    ) -> Self {
+        Self {
+            base,
+            overlay: Mutex::new(HashMap::new()),
+            spill: Some(spill),
+            written: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     /// Number of nodes written since the overlay was created.
     pub fn written(&self) -> usize {
-        self.overlay.lock().unwrap().len()
+        match self.spill {
+            Some(_) => self.written.load(std::sync::atomic::Ordering::Relaxed),
+            None => self.overlay.lock().unwrap().len(),
+        }
     }
 }
 
 impl TrieStore for OverlayTrieStore {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if let Some(v) = self.overlay.lock().unwrap().get(key) {
-            return Some(v.clone());
+        match &self.spill {
+            Some(s) => s.get(key).or_else(|| self.base.get(key)),
+            None => {
+                if let Some(v) = self.overlay.lock().unwrap().get(key) {
+                    return Some(v.clone());
+                }
+                self.base.get(key)
+            }
         }
-        self.base.get(key)
     }
 
     fn put(&self, key: &[u8], value: &[u8]) {
-        self.overlay.lock().unwrap().insert(key.to_vec(), value.to_vec());
+        match &self.spill {
+            Some(s) => {
+                s.put(key, value);
+                self.written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            None => {
+                self.overlay.lock().unwrap().insert(key.to_vec(), value.to_vec());
+            }
+        }
     }
 
-    /// Deliberately a no-op: the whole point is that nothing reaches the base.
-    fn flush(&self) {}
+    /// Nothing reaches the base either way. A spill store is a real database
+    /// and is flushed, so a long run's writes are readable after a restart.
+    fn flush(&self) {
+        if let Some(s) = &self.spill {
+            s.flush();
+        }
+    }
 
     /// Inherited from the base, so a missing node is still judged against the
     /// height the real store collected below rather than excused.
@@ -245,5 +297,64 @@ mod overlay_tests {
             vec![Some(b"base-a".to_vec()), Some(b"over-b".to_vec()), None]
         );
         assert_eq!(overlay.get_many_sorted(&keys), overlay.get_many(&keys));
+    }
+}
+
+#[cfg(test)]
+mod overlay_spill_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    struct ReadOnlyBase(MemoryTrieStore);
+
+    impl TrieStore for ReadOnlyBase {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key)
+        }
+        fn put(&self, _key: &[u8], _value: &[u8]) {
+            panic!("write reached the read-only base store");
+        }
+    }
+
+    #[test]
+    fn a_spilled_write_goes_to_the_spill_store_and_not_the_base() {
+        let base = MemoryTrieStore::new();
+        base.put(b"old", b"from-base");
+        let spill = Arc::new(MemoryTrieStore::new());
+        let overlay =
+            OverlayTrieStore::with_spill(Arc::new(ReadOnlyBase(base)), spill.clone());
+
+        overlay.put(b"new", b"written");
+        assert_eq!(spill.get(b"new"), Some(b"written".to_vec()));
+        assert_eq!(overlay.get(b"new"), Some(b"written".to_vec()));
+        // Reads still fall through for anything the run did not write.
+        assert_eq!(overlay.get(b"old"), Some(b"from-base".to_vec()));
+        assert_eq!(overlay.written(), 1);
+    }
+
+    #[test]
+    fn a_spilled_write_shadows_the_base() {
+        let base = MemoryTrieStore::new();
+        base.put(b"k", b"disk");
+        let overlay = OverlayTrieStore::with_spill(
+            Arc::new(ReadOnlyBase(base)),
+            Arc::new(MemoryTrieStore::new()),
+        );
+        overlay.put(b"k", b"recomputed");
+        assert_eq!(overlay.get(b"k"), Some(b"recomputed".to_vec()));
+    }
+
+    /// The point of spilling is that memory does not grow with the run.
+    #[test]
+    fn spilling_leaves_the_in_memory_map_empty() {
+        let overlay = OverlayTrieStore::with_spill(
+            Arc::new(ReadOnlyBase(MemoryTrieStore::new())),
+            Arc::new(MemoryTrieStore::new()),
+        );
+        for i in 0..1000u32 {
+            overlay.put(&i.to_be_bytes(), b"value");
+        }
+        assert!(overlay.overlay.lock().unwrap().is_empty(), "nothing held in memory");
+        assert_eq!(overlay.written(), 1000);
     }
 }

@@ -658,6 +658,17 @@ struct Args {
     #[arg(long)]
     import_metadata_only: bool,
 
+    /// Import the blocks and chain metadata but not the state trie.
+    ///
+    /// For a database that is going to be *read against* rather than executed
+    /// from: a verification run reads state straight out of rskj's own
+    /// unitrie, so copying it here would duplicate ~130 GB to no purpose. What
+    /// it cannot read out of rskj is a block by height, because rskj keys
+    /// blocks by hash and keeps the height index somewhere this cannot read --
+    /// which is exactly what the block and metadata phases build.
+    #[arg(long)]
+    import_skip_unitrie: bool,
+
     /// Rebuild chain metadata for this block range only, then exit.
     ///
     /// For benchmarking the metadata phase without paying for a full pass --
@@ -1635,6 +1646,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             !args.import_enable_wal,
             !args.import_auto_compaction,
             args.import_metadata_only,
+            args.import_skip_unitrie,
             if args.import_unitrie_threads == 0 {
                 std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
             } else {
@@ -3155,6 +3167,7 @@ fn run_rskj_import(
     disable_wal: bool,
     compact_first: bool,
     metadata_only: bool,
+    skip_unitrie: bool,
     unitrie_threads: usize,
 ) -> Result<()> {
     use rustock_storage::rskj_import::{self, WalMode, WriteMode};
@@ -3200,7 +3213,10 @@ fn run_rskj_import(
 
     // State first: if this is interrupted the blocks are still absent, so the
     // node will not come up believing it has a chain it cannot execute.
-    let unitrie_phase = if metadata_only {
+    let unitrie_phase = if metadata_only || skip_unitrie {
+        if skip_unitrie {
+            info!("Skipping the trie phase: state will be read from the source instead");
+        }
         Default::default()
     } else if unitrie_threads == 1 {
         rskj_import::import_unitrie(
