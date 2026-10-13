@@ -174,10 +174,13 @@ impl Header {
         let bloom = self.logs_bloom.as_slice().to_vec();
         let extension = match v.version {
             1 => BlockHeaderExtension::V1 { logs_bloom: bloom, edges: v.edges.clone() },
+            // A V2 extension always has a base event; a header that omitted
+            // the field still commits to an empty one, which is what rskj
+            // substitutes when it accepts the short form.
             2 => BlockHeaderExtension::V2 {
                 logs_bloom: bloom,
                 edges: v.edges.clone(),
-                base_event: v.base_event.as_ref().map(|b| b.to_vec()),
+                base_event: Some(v.base_event.as_ref().map(|b| b.to_vec()).unwrap_or_default()),
             },
             _ => return None,
         };
@@ -386,21 +389,22 @@ impl alloy_rlp::Decodable for Header {
             let mining_items = after_version.min(3);
             let extras = after_version - mining_items;
 
+            // Edges come first and are emitted whenever RSKIP144 is active --
+            // as an empty string when the block has no sublists -- so they are
+            // present on every versioned header seen here. The base event
+            // follows, and on testnet between vetiver900 and #7,800,000 it can
+            // be missing altogether: rskj accepts a header one element short
+            // there and supplies an empty base event for it
+            // (`BlockFactory.isInBaseEventRecoveryWindow`). Reading the
+            // trailing element as the base event in that case takes the edges
+            // for it and hashes the header wrong.
             let mut edges = None;
             let mut base_event = None;
-            if version == 1 {
-                if extras >= 1 {
-                    edges = Some(rlp_to_shorts(&Bytes::decode(&mut body)?));
-                }
-            } else {
-                // V2 always carries a base event, empty when the block has
-                // none, so a second extra item means edges precede it.
-                if extras >= 2 {
-                    edges = Some(rlp_to_shorts(&Bytes::decode(&mut body)?));
-                }
-                if extras >= 1 {
-                    base_event = Some(Bytes::decode(&mut body)?);
-                }
+            if extras >= 1 {
+                edges = Some(rlp_to_shorts(&Bytes::decode(&mut body)?));
+            }
+            if version >= 2 && extras >= 2 {
+                base_event = Some(Bytes::decode(&mut body)?);
             }
             header.version_fields = Some(HeaderVersionFields { version, edges, base_event });
         }
@@ -1169,6 +1173,67 @@ mod versioned_wire_header_tests {
                 original.bitcoin_merged_mining_header
             );
         }
+    }
+
+
+    /// A testnet V2 header from the base-event recovery window, where rskj
+    /// accepts a header one element short and supplies an empty base event
+    /// (`BlockFactory.isInBaseEventRecoveryWindow`, testnet only, below
+    /// #7,800,000).
+    ///
+    /// Testnet #7,610,038 is one: version 2, an empty edges field, and no
+    /// base event element at all. Reading that single trailing element as the
+    /// base event takes the edges for it, and the header hashes wrong -- which
+    /// put this block off the canonical chain as far as REMASC was concerned,
+    /// and surfaced at #7,610,088 as a `brokenSelectionRule` computed from the
+    /// wrong processing block.
+    const V2_SHORT_WIRE: &str = concat!(
+        "f9039ba0cc346a97c07829a8141fb4e05e3d23f34f22b516e7633443c29b63071f559549a01dcc4de8dec75d7aab85b5",
+        "67b6ccd41ad312451b948a7413f0a142fd40d4934794b774aa2876145b2f6f3de27e5e6ac970aa12d771a062b3e056cc",
+        "c2a82da98835b4f97332be60dd932f32f39210244feb3cc6c7cd4fa0fda7a5d4416d23e24de57f56a2a2e1c0b2f66529",
+        "2bf869abca1545c702b4f134a0ee88aad6351b56e1ba187f3622b45708f038cbffde58ecf9226b8cef4ae2f6f6b90100",
+        "000000000000000000000000000000000000000000000000000000000000000000004000000400000000000000000000",
+        "000000000100000000000000000000000000800000000000000000000008000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000",
+        "000000000400000000000004000000040000000000001000000000000000100000000000000000000010000000000000",
+        "000000010400000000000000000000000000200000000000802000001000000000000000000000000000000000000000",
+        "000000000000000000000000000000008444fe47ef83741eb68367c28083016a3c8469f56ec692d1018f564554495645",
+        "522d626534343931348590809c57a0835cd6e880800280b8500000002068365e8e5ccff1319164e71ccd01087044ff1a",
+        "39706ce65c677c14f6000000001a9208cbd76abc95b0dc4a68b18a32fa64b11af432121393f513269bf6c0b4821e70f5",
+        "69f0bd061b46301295b8c0fa8111aca10ab53448dbdf1c4573a2caa47cad2d71f67bc463e5f9e209c253cb8ede63c8ab",
+        "d0cb2b7db5c12a2ca8f1408c81afca9e1476249a06cfc5911266f19fb5c9e5502a49bf1875b0e5680627fedc99d8a8dc",
+        "be38738a31e59e410b9b29668de54fa4e877fe1296506a9439b9cd1b01a0c0ce48df8af374ced199c2578d4e20fb262f",
+        "9320a0b682ad7838b84e13e07e067188399fa314d822b0e62feacf9a77787d3382698ac1780705a2a31cb4bd433845c7",
+        "cbb4ae56a0df5e54152e04b89100000000000000806186026de2b34cd6af8d9a404c455ad350422e347ec41790944c51",
+        "497baa779b6088ac0000000000000000266a24aa21a9ed0e17800cbbd43be92cf60aab5b68a25d2e5ef1da482dda1bbd",
+        "2057fd1bd4a59300000000000000002a6a52534b424c4f434b3a992f0beca2dc21b0d1d9348b8a459bfebab19e1a0697",
+        "d50308ca8a1200741eb600000000",
+    );
+
+    #[test]
+    fn a_v2_header_without_a_base_event_element_still_hashes_right() {
+        let h = decode(V2_SHORT_WIRE);
+        assert_eq!(h.number, 7_610_038);
+        let v = h.version_fields.as_ref().unwrap();
+        assert_eq!(v.version, 2);
+        assert_eq!(v.edges.as_deref(), Some(&[][..]), "the edges field is present and empty");
+        assert_eq!(v.base_event, None, "no base event element on the wire");
+        assert_eq!(
+            h.hash(),
+            "0x119296ea9d8d7efa82550bfb447ae9441ea75f9537f47917f1ca38e0b8982c05"
+                .parse::<B256>()
+                .unwrap()
+        );
+    }
+
+    /// And the short form must round-trip as the short form: re-emitting an
+    /// empty base event would add an element rskj never wrote.
+    #[test]
+    fn the_short_v2_form_is_re_encoded_as_the_short_form() {
+        let original = decode(V2_SHORT_WIRE);
+        let mut buf = Vec::new();
+        original.encode(&mut buf);
+        assert_eq!(alloy_primitives::hex::encode(&buf), V2_SHORT_WIRE);
     }
 
     /// A version-0 header must stay untouched by any of this: mainnet is
