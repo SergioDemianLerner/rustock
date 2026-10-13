@@ -480,8 +480,8 @@ pub(crate) fn commit_proposed_federation<CTX: crate::RskContextTr>(
     let old_format = federation_format_version(hardfork_cfg, old_block);
 
     // moveUTXOsFromNewToOldFederation.
-    let active_utxos = load_federation_utxos(ctx);
-    store_federation_utxos(ctx, &[]);
+    let active_utxos = load_federation_utxos(ctx, hardfork_cfg, block_number);
+    store_federation_utxos(ctx, hardfork_cfg, block_number, &[]);
     super::storage::store_old_federation_utxos(ctx, &active_utxos);
 
     // setOldAndNewFederations (always multikey post-RSKIP419).
@@ -634,8 +634,8 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
         store_pending_federation(ctx, None, multikey);
     } else {
         // Legacy handover. Move active-federation UTXOs to the old set.
-        let active_utxos = load_federation_utxos(ctx);
-        store_federation_utxos(ctx, &[]);
+        let active_utxos = load_federation_utxos(ctx, hardfork_cfg, block_number);
+        store_federation_utxos(ctx, hardfork_cfg, block_number, &[]);
         super::storage::store_old_federation_utxos(ctx, &active_utxos);
 
         // rskj saveOldFederation/saveNewFederation: post-RSKIP123 store the

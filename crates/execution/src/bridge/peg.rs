@@ -3551,7 +3551,7 @@ pub(crate) fn active_federation_utxo_key<CTX: crate::RskContextTr>(
             return super::storage::OLD_FEDERATION_BTC_UTXOS_KEY;
         }
     }
-    super::storage::NEW_FEDERATION_BTC_UTXOS_KEY
+    super::storage::new_federation_utxos_key(hardfork_cfg, block_number)
 }
 
 fn load_utxos_at<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str) -> Vec<BridgeUtxo> {
@@ -3970,7 +3970,7 @@ pub fn add_signature<CTX: crate::RskContextTr>(
                 deserialize_pegouts_waiting_for_confirmations(&bridge_load_bytes(ctx, key), false)
                     .len()
             };
-            let utxo_count = load_federation_utxos(ctx).len();
+            let utxo_count = load_federation_utxos(ctx, hardfork_cfg, block_number).len();
             let wfc_raw_len = {
                 let key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
                 bridge_load_bytes(ctx, key).len()
