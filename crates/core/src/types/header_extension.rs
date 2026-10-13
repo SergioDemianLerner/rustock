@@ -67,7 +67,7 @@ pub enum ExtensionError {
 /// The endianness is not a detail. RLP is big-endian everywhere else, so a
 /// reader who assumes the usual convention produces a different commitment and
 /// a different block hash.
-fn shorts_to_rlp(shorts: &[i16]) -> Vec<u8> {
+pub fn shorts_to_rlp(shorts: &[i16]) -> Vec<u8> {
     let mut packed = Vec::with_capacity(shorts.len() * 2);
     for s in shorts {
         packed.extend_from_slice(&s.to_le_bytes());

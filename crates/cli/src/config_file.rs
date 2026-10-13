@@ -324,6 +324,7 @@ pub const ONE_SHOT: &[&str] = &[
     "probe_unitrie",
     "probe_source",
     "import_metadata_only",
+    "import_skip_unitrie",
     "metadata_range",
     "import_index_dump",
     "metadata_by_walk",

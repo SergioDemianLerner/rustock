@@ -29,6 +29,15 @@ pub struct Header {
     
     // Optional / Advanced RSK fields (Merged Mining)
     pub umm_root: Option<Bytes>,
+    /// RSKIP-351 trailing fields, present only on a versioned (V1/V2) header
+    /// and only in its *wire* form.
+    ///
+    /// Kept verbatim because the wire form has to round-trip: the store
+    /// re-encodes every header it writes, so anything dropped here is lost
+    /// from the database rather than merely from one message. The hashed form
+    /// does not carry these -- it commits to them through
+    /// `extension_data` instead.
+    pub version_fields: Option<HeaderVersionFields>,
     pub bitcoin_merged_mining_header: Option<Bytes>,
     pub bitcoin_merged_mining_merkle_proof: Option<Bytes>,
     pub bitcoin_merged_mining_coinbase_transaction: Option<Bytes>,
@@ -45,6 +54,48 @@ pub struct Header {
     /// same Java RLP compatibility reasons as `cached_hash`.
     #[serde(skip)]
     pub cached_hash_for_merged_mining: Option<B256>,
+}
+
+/// What a versioned (RSKIP-351) header carries beyond a version-0 one.
+///
+/// rskj appends these after `ummRoot` in the uncompressed encoding only
+/// (`BlockHeaderV1/V2.addExtraFieldsToEncodedHeader`, guarded by
+/// `!usingCompressedEncoding`). The compressed encoding -- the one that is
+/// hashed -- replaces the bloom field with a commitment to them instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderVersionFields {
+    /// 1 or 2. A version-0 header has no record of a version at all, which is
+    /// why this lives behind an `Option` rather than defaulting to 0.
+    pub version: u8,
+    /// RSKIP-144 transaction execution sublist edges, when the block has any.
+    /// rskj omits the field entirely when they are absent.
+    pub edges: Option<Vec<i16>>,
+    /// RSKIP-535 base event. V2 only, and empty rather than absent when the
+    /// block carries none.
+    pub base_event: Option<Bytes>,
+}
+
+/// Number of complete RLP items in `buf`, stopping at the first that does not
+/// fit. Used to tell a header's trailing fields apart by position.
+fn count_rlp_items(buf: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut rest = buf;
+    while !rest.is_empty() {
+        let mut temp = rest;
+        match alloy_rlp::Header::decode(&mut temp) {
+            Ok(h) if h.payload_length <= temp.len() => {
+                rest = &temp[h.payload_length..];
+                count += 1;
+            }
+            _ => break,
+        }
+    }
+    count
+}
+
+/// rskj `ByteUtil.rlpToShorts`: little-endian pairs.
+fn rlp_to_shorts(bytes: &[u8]) -> Vec<i16> {
+    bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
 }
 
 /// `BigInteger.toByteArray()` for a non-negative value: zero is the single
@@ -86,9 +137,17 @@ impl Header {
         &self,
     ) -> Option<Result<crate::types::header_extension::ExtensionCommitment,
                        crate::types::header_extension::ExtensionError>> {
-        self.extension_data
-            .as_ref()
-            .map(|d| crate::types::header_extension::ExtensionCommitment::from_extension_data(d))
+        // A wire header has no stored commitment; derive it from the fields
+        // it does carry, so both forms answer this the same way.
+        let owned;
+        let data: &[u8] = match &self.extension_data {
+            Some(d) => d,
+            None => {
+                owned = self.compressed_extension_field()?;
+                &owned
+            }
+        };
+        Some(crate::types::header_extension::ExtensionCommitment::from_extension_data(data))
     }
 
     /// Whether `extension` is the body this header commits to.
@@ -103,7 +162,31 @@ impl Header {
         matches!(self.extension_commitment(), Some(Ok(c)) if c.matches(extension))
     }
 
-    fn encode_base_fields(&self, list: &mut Vec<u8>) {
+    /// The bloom slot as the *hashed* form carries it: an RLP string wrapping
+    /// `RLP([version, keccak(extension)])`.
+    ///
+    /// Built from the wire fields rather than stored, because the commitment
+    /// is derived from the bloom, edges and base event the header already
+    /// holds -- keeping a second copy would let the two disagree.
+    fn compressed_extension_field(&self) -> Option<Vec<u8>> {
+        use crate::types::header_extension::BlockHeaderExtension;
+        let v = self.version_fields.as_ref()?;
+        let bloom = self.logs_bloom.as_slice().to_vec();
+        let extension = match v.version {
+            1 => BlockHeaderExtension::V1 { logs_bloom: bloom, edges: v.edges.clone() },
+            2 => BlockHeaderExtension::V2 {
+                logs_bloom: bloom,
+                edges: v.edges.clone(),
+                base_event: v.base_event.as_ref().map(|b| b.to_vec()),
+            },
+            _ => return None,
+        };
+        let mut out = Vec::new();
+        extension.create_extension_data().as_slice().encode(&mut out);
+        Some(out)
+    }
+
+    fn encode_base_fields(&self, list: &mut Vec<u8>, compressed: bool) {
         self.parent_hash.encode(list);
         self.ommers_hash.encode(list);
         self.beneficiary.encode(list);
@@ -118,9 +201,21 @@ impl Header {
         // decoder cached the hash from the peer's original bytes: nothing ever
         // asked this encoder to reproduce a versioned header. Re-deriving the
         // hash of a testnet V1 block is what surfaced it.
-        match &self.extension_data {
-            Some(ext) => list.extend_from_slice(ext),
-            None => self.logs_bloom.encode(list),
+        // rskj: `compressed ? getExtensionData() : getLogsBloom()`. Only the
+        // compressed form is hashed; the wire form keeps the literal bloom and
+        // carries the version, edges and base event after `ummRoot` instead.
+        match (compressed, &self.extension_data, &self.version_fields) {
+            // Already-compressed input: the literal bloom was never received,
+            // so this is all there is to emit either way.
+            (_, Some(ext), _) => list.extend_from_slice(ext),
+            (true, None, Some(_)) => match self.compressed_extension_field() {
+                Some(field) => list.extend_from_slice(&field),
+                // An extension that will not build cannot be hashed into a
+                // commitment; emitting the bloom keeps this total, and the
+                // hash it yields simply will not match, which is visible.
+                None => self.logs_bloom.encode(list),
+            },
+            _ => self.logs_bloom.encode(list),
         }
         java_signed_bytes(&self.difficulty).as_slice().encode(list);
         self.number.encode(list);
@@ -136,12 +231,30 @@ impl Header {
     /// rskj BlockHeader.getEncoded(true, with_merkle_proof_and_coinbase):
     /// list payload of all header fields; the merkle proof and coinbase tx
     /// are excluded from RSKIP92 block hashes but kept on the wire.
-    fn encode_payload(&self, with_merkle_proof_and_coinbase: bool) -> Vec<u8> {
+    fn encode_payload(&self, with_merkle_proof_and_coinbase: bool, compressed: bool) -> Vec<u8> {
         let mut list = Vec::new();
-        self.encode_base_fields(&mut list);
+        self.encode_base_fields(&mut list, compressed);
 
         if let Some(umm) = &self.umm_root {
             umm.encode(&mut list);
+        }
+        // rskj `BlockHeaderV1/V2.addExtraFieldsToEncodedHeader`: the version,
+        // the edges when the block has any, and (V2) the base event, in that
+        // order and only when not compressed.
+        if !compressed {
+            if let Some(v) = &self.version_fields {
+                list.push(v.version);
+                if let Some(edges) = &v.edges {
+                    // Already an RLP string; appending rather than encoding,
+                    // or `Vec<u8>` would go out as a list of single bytes.
+                    list.extend_from_slice(
+                        &crate::types::header_extension::shorts_to_rlp(edges),
+                    );
+                }
+                if let Some(be) = &v.base_event {
+                    be.encode(&mut list);
+                }
+            }
         }
         // rskj emits the merkle proof and coinbase tx whenever the mining
         // header is present — as empty elements if need be — rather than
@@ -165,7 +278,7 @@ impl Header {
 
 impl Encodable for Header {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        let list = self.encode_payload(true);
+        let list = self.encode_payload(true, false);
         alloy_rlp::Header { list: true, payload_length: list.len() }.encode(out);
         out.put_slice(&list);
     }
@@ -229,6 +342,7 @@ impl alloy_rlp::Decodable for Header {
             minimum_gas_price: decode_u256_lenient(&mut body)?,
             uncle_count: decode_u64_lenient(&mut body)?,
             umm_root: None,
+            version_fields: None,
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
@@ -240,25 +354,57 @@ impl alloy_rlp::Decodable for Header {
         //   3 items → V0: btc_header, btc_merkle_proof, btc_coinbase_tx
         //   4 items → V1 (RSKIP-153/Hop): umm_root, btc_header, btc_merkle_proof, btc_coinbase_tx
         //   0-2     → partial (pre-orchid blocks without full mining data)
-        let remaining_items = {
-            let mut count = 0usize;
-            let mut rest = body;
-            while !rest.is_empty() {
-                let mut temp = rest;
-                if let Ok(h) = alloy_rlp::Header::decode(&mut temp) {
-                    if h.payload_length > temp.len() { break; }
-                    rest = &temp[h.payload_length..];
-                    count += 1;
-                } else {
-                    break;
-                }
-            }
-            count
-        };
+        let remaining_items = count_rlp_items(body);
 
         if remaining_items >= 4 {
             header.umm_root = Some(Bytes::decode(&mut body)?);
         }
+
+        // RSKIP-351: a versioned header puts its version, its RSKIP-144 edges
+        // and (V2) its base event here, between `ummRoot` and the merged
+        // mining fields. rskj picks them out by activation height; nothing
+        // here knows the network, so the version byte is used as its own
+        // marker instead. It is `RLP.encodeByte(1|2)`, a bare 0x01 or 0x02 --
+        // a value no other field in this position can take. `ummRoot` is
+        // empty or 32 bytes, edges are an even-length string, the base event
+        // is empty or long, and a merged-mining header is 80 bytes.
+        //
+        // Dropping these was invisible for as long as nothing re-derived a
+        // hash: the decoder cached the one the peer sent. It cost every
+        // header from testnet reed810 on its correct hash, which first
+        // surfaced as REMASC's selection rule comparing the wrong ones.
+        if matches!(body.first(), Some(1 | 2)) {
+            let version = body[0];
+            body = &body[1..];
+
+            // Whatever is left belongs to the merged mining fields, except
+            // what the version says comes first. rskj emits the edges only
+            // when the block has any, so their presence is positional: with a
+            // base event to follow (V2) there is one more item here than
+            // mining alone accounts for.
+            let after_version = count_rlp_items(body);
+            let mining_items = after_version.min(3);
+            let extras = after_version - mining_items;
+
+            let mut edges = None;
+            let mut base_event = None;
+            if version == 1 {
+                if extras >= 1 {
+                    edges = Some(rlp_to_shorts(&Bytes::decode(&mut body)?));
+                }
+            } else {
+                // V2 always carries a base event, empty when the block has
+                // none, so a second extra item means edges precede it.
+                if extras >= 2 {
+                    edges = Some(rlp_to_shorts(&Bytes::decode(&mut body)?));
+                }
+                if extras >= 1 {
+                    base_event = Some(Bytes::decode(&mut body)?);
+                }
+            }
+            header.version_fields = Some(HeaderVersionFields { version, edges, base_event });
+        }
+
         if !body.is_empty() {
             header.bitcoin_merged_mining_header = Some(Bytes::decode(&mut body)?);
         }
@@ -285,7 +431,7 @@ impl Header {
         if let Some(h) = self.cached_hash {
             return h;
         }
-        let payload = self.encode_payload(!self.rskip92_active());
+        let payload = self.encode_payload(!self.rskip92_active(), true);
         let mut buffer = Vec::with_capacity(payload.len() + 4);
         alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut buffer);
         buffer.extend_from_slice(&payload);
@@ -425,7 +571,7 @@ impl Header {
         // agrees with -- and since only a header this node built ever reaches
         // this path, nothing that merely replays the chain would notice.
         let mut payload = Vec::new();
-        self.encode_base_fields(&mut payload);
+        self.encode_base_fields(&mut payload, true);
         if let Some(umm) = &self.umm_root {
             umm.encode(&mut payload);
         }
@@ -474,6 +620,7 @@ mod tests {
             minimum_gas_price: U256::from(1),
             uncle_count: 0,
             umm_root: Some(Bytes::from("umm")),
+            version_fields: None,
             bitcoin_merged_mining_header: Some(Bytes::from("btc_header")),
             bitcoin_merged_mining_merkle_proof: Some(Bytes::from("proof")),
             bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from("coinbase")),
@@ -540,6 +687,7 @@ mod tests {
             minimum_gas_price: U256::from(0x387ee40),
             uncle_count: 0,
             umm_root: None,
+            version_fields: None,
             bitcoin_merged_mining_header: Some(Bytes::from(hex::decode("00000020acdd4738e831d35ebe6645a87753b8b3f039e5f9c65c0400000000000000000085751e2e92e415c18a729c97da426024245e96dd2d79854549874cada2d2b50cc32e935ba11928170c066040").unwrap())),
             bitcoin_merged_mining_merkle_proof: Some(Bytes::from(hex::decode("933662067ae81cd741330a5c016522ba48fb86623f060554ceaf7e22373cc12496524f3581c075e4b7515ef02c5618df17bf23b714f4f009de2ea39609e3b8f16ae54151c8e73358be6b287d1129df13fd32b128d3fc9b9f872d5a44f8a5ef2bb1254f0ff89566420ab6357c7e11c8607d6f4383b338b9c84191c50fc5e81475a643ee5a693f0116de61f1ff8823c25844416b1f1080d6017ac2a91b66b87bf3b777aa583044084d50a3b5b0902fba0e80b413a039037f353fe301c7c9862056fe78a6f14d21c663b2e556a8eb9c7b3e4b01eaa94e51fe55846d6e7151a72606ba69fa024ae827376734e89eb4e0f7a3f6e08f7cfef5ac21b9ae5fea70fe021d").unwrap())),
             bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from(hex::decode("00000000000000c08c2bae9460a30c6a03f7a557813a68cebdc1d38c70ffd6363ac537fb20c15d4cbd3de0fd7404d31200000000000000002952534b424c4f434b3aa40e3d3aad7ee477a2f38bd83c6e22413b231f48e0b831214589ecde9fb7e24e00000000").unwrap())),
@@ -600,6 +748,7 @@ mod tests {
             uncle_count: 2,
             // Present and empty: papyrus200 activated at #2,392,700.
             umm_root: Some(Bytes::new()),
+            version_fields: None,
             bitcoin_merged_mining_header: Some(Bytes::from(hex::decode("00e0f327307a19d17c1e20f51c1190b40d9fc53e7f056272a91d02000000000000000000cd81b87bdc182ac40f11daa46886c0b93b7e6497ca0e541ab5775f9c8fdd3d98936cb06ac51e02172a5c3c6e").unwrap())),
             bitcoin_merged_mining_merkle_proof: Some(Bytes::from(hex::decode("c91bd5fe20d82da439eba4770fb50b6792cc06f083eb88b6795f0c89fc8ca427df7cc40dc64602e3fb3cf5c267664be19d148552f01cc28b6d3907d472008d15ba45ca54695cb6cbceac33003f9582450081de9ac6de608f0d49a78f2cae66c5c65cc0e8ac0674edfad8b00027c9d26b64ebe2476b5e91a95800b6786d91df004aa35390a8e996bf2cf9cc57555a12fcb76abcc376b20ebb5a441b1f94839653472ac163740f33c5e88a33003c73726de57da577d9e57d305937269421c1b0be94af8aa6a13a431fb5425ad871e9675edff825e8b49dc016ab6903bf63d376386dbb6c55d84d449f6147763855259dc20a09f72adfb25195c692bd8da719d1d8e9b227b874cbec4f58fb88dc6b21d810e995b4531346f37b0a3a7e54b3327d79450fa01b5a3420bd772f4f0605c829facdb88bc9f2945aa897aef9e6585c80fa62d683e84d1b8bd228f8c985a8269e312e7d0b135cf5aeb50132e1f2592a112db15c3e521d92fb7184af28a0adc8008fa3eb839d1b6d9e5d5c802160ffa7522649c18aa20502e09c50804448465889141227a0a82c85a0ce6876163ae60cc3ac").unwrap())),
             bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from(hex::decode("000000000000014013a11ba36836286d0115b1c5c58a42ad692d3aeeaedae25686175928146d440f8931d770ea29b3d5f1dd2eabaf3724518831d656f447230000000000000000002b6a2952534b424c4f434b3afe829f5c494b038c03268d18d0e338bb162f06b69ebc2a5e8f871a1d008d425000000000").unwrap())),
@@ -694,6 +843,7 @@ mod tests {
             minimum_gas_price: U256::ZERO,
             uncle_count: 0,
             umm_root: None,
+            version_fields: None,
             bitcoin_merged_mining_header: Some(Bytes::from(
                 alloy_primitives::hex::decode("f8441ba100c98acd36a060dd25c8c8d46f42ededd98f7c2c7e5d460c3557a6ba0e693d4d50a053c04cb6bedfa59173811b3b1c2783f4328a7745f136abe58fcd1bac16de76e6").unwrap()
             )),
@@ -802,6 +952,7 @@ mod tests {
             minimum_gas_price: U256::from(4548441u64),
             uncle_count: 1,
             umm_root: Some(Bytes::new()),
+            version_fields: None,
             bitcoin_merged_mining_header: Some(Bytes::from(hex::decode("000000200634d02c91a3516c8e83285791bbdc5b02fd31f38000006e43532a000000000060b2a8bb7560ce77fbe5d7292fcc708eec49fca8ace3f364e77433bc304d40bad50795679a0a0119c2eec753").unwrap())),
             bitcoin_merged_mining_merkle_proof: Some(Bytes::from(hex::decode("fc29fbe26636c139458c602b0ff121d1017098500834d40e749f00448bfcaa181a42f80dfedf4a78a045936cbef21504b9dba52ec98f05b08840a469c1c2d8f9346ffde3a70182b3a6b8e737a2bf023458b890589f48f2e711ba631279bdd634bf9e4119806fcde6a0cdb03b3eca2ad4a48d963b8fed032fa6924746ed7f026da6c870ddcfd53f4a36636fcb61fd5eda5d3047f75c5cb13d6b8f755251331ef2").unwrap())),
             bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from(hex::decode("000000000000008010685626cadc65f677c14b223755cfb6de56a4f933683312b254ee9307a397c46088ac0000000000000000266a24aa21a9ed401b9dfa5baf569d3af3b0e004a20541d5fb64a037d8670b764a7dbc40ad247500000000000000002a6a52534b424c4f434b3a92c99df0f40bcf1e4dc6c2d3ac5407b2caa26cfc09d51fa4e030f318005b8d8000000000").unwrap())),
@@ -888,5 +1039,150 @@ mod tests {
             body = &body[ih.payload_length..];
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod versioned_wire_header_tests {
+    use super::*;
+    use alloy_rlp::Decodable;
+
+    /// A testnet reed810 header, exactly as rskj stores it: the literal
+    /// 256-byte bloom in the bloom slot and the version after `ummRoot`.
+    const V1_WIRE: &str = concat!(
+        "f90321a00252ae025d3339a92786e05618464665754ff688d5b1704282d0974712d0f77ca01dcc4de8dec75d7aab85b5",
+        "67b6ccd41ad312451b948a7413f0a142fd40d4934794905a918ba4e1c0eaa5e8186bdac1bd786f9f0c8aa0777ebf9d10",
+        "066edefed3f70b492c226c84e6fe651c9e0ee24f7b470f4bf08b20a0b6edce5ae9e2df89eb8e8bb144e0d03ed885ea46",
+        "c0ca72ea1a52a7b5384da7b5a08a048af6bf5bf016f24ee7452e68ce354f9b746dd036960cba1acbc65198fd63b90100",
+        "000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000080000000000000000002000000",
+        "000000000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000c000000000000000000001000000000000000100000000000010000000010010000000000",
+        "000000810000000000020000000000000000200000000000842000001000000000000000000000000000000000000000",
+        "000808000000000000000000000000008501ab902851836cf1108367c280830ebfc08469419ce688c70185524545442d",
+        "8616ea1f215000840169928080800180b85000004020117749aef3c948db2669e7e4fe3acdc5e15497e0a4000a4f5fc5",
+        "bd5700000000bb048d4ce30362e01fc594e252e99c2eda73d5d981dbca724f8bd987b9e3282e49a141699f1f031956e0",
+        "a070b8605379889958ec3a9581629acf62b5d7f47488254e27aa666a138c8328ddcf8eb1a7660e42e11af681848e3d9d",
+        "97207c30ca8a9d0b01b56c2ed630f2e59acd901ac92176a710bf86f05a48c92ff39d4c938ffbc6aa356baeeaf77e9d75",
+        "565c9c2ab87e0000000000000100186b33f9239bea2ed26e2e899574775f136a2f1b43be664298a42b604b837ec501ad",
+        "67ad0f32129ab431e6d18fda214e5b9f350ffc7b6cf3058b9026e76500000000000000002b6a2952534b424c4f434b3a",
+        "0a82fd55469601ed22c406fb16f8cfc1834bbb83052c82075b86e91b006cf11000000000",
+    );
+
+    /// A testnet vetiver900 header -- version 2, so it carries a base event
+    /// as well, empty because the block has none.
+    const V2_WIRE: &str = concat!(
+        "f9035ca0e6c6a8357e0755f07bd7e7ac44cab3404c182be237139be42f8e2e59ae551541a01dcc4de8dec75d7aab85b5",
+        "67b6ccd41ad312451b948a7413f0a142fd40d4934794ad418c1d48780005f6d847ef0a5e3bd93ea09090a0f0d72601cf",
+        "2532977bf04dd50678b91ea880a81d0fcd60325007e5d9f0f801e1a0cea1f8d7a1652b6a738070c365405f04c3308c91",
+        "154fe68aac124a12e8f4016fa0cdd9c5f3b359844415e82d68e3a8ec70cc277751fcf7cb8378851dae288538f5b90100",
+        "000000000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000",
+        "000000000100000000000000000000000000800000000000000000000008000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000000",
+        "000000000400000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000008447a40f2d837407e88367c28083016a4d8469f339f092d1018f564554495645",
+        "522d6265343439313485948089f976835f64478080028080b85000000020ef145fde73d31abc4ba0e5b82e8afce729dc",
+        "51c9562f50b392217822000000001def8ef1b0fdf43d53e4ef0bd826e52e19a7c9d505c34fb459370bb70fa2d13bfe3c",
+        "f369c0f71a1bc1d1146eb880398f49964f5a77479f4244cbb2e9300ab003a8f510583e44be5e9fff9db9b02622033ae1",
+        "224764d26e17972865081b7c56492881e25ff769137411ce440a0db80f4b690f53ce057116986345b8fff7a9cd43af03",
+        "7e7f1be96e8c88c042824c118c77a5631f02db9d554555bceaeef77ec990d2beeca422cb3801a1008b259cb2b8910000",
+        "0000000000806aac5c0a780d7c155e405262e52f39ca51b3f988f9f18be7dffe065e19007fbb6088ac00000000000000",
+        "00266a24aa21a9edf883a036547b5e0374127de8a7dbcfdd3624e87f59af6b6cc0da5e3ac8bbecb60000000000000000",
+        "2a6a52534b424c4f434b3aa299d0e6dcc89894d1897433dcfc94cb400657c925509283bf09a213007407e800000000",
+    );
+
+    fn decode(hex: &str) -> Header {
+        let bytes = alloy_primitives::hex::decode(hex).unwrap();
+        let mut slice = bytes.as_slice();
+        let mut h = Header::decode(&mut slice).unwrap();
+        // The decoder caches the hash of the bytes it was handed; clearing it
+        // forces `hash()` to re-derive, which is the thing under test.
+        h.cached_hash = None;
+        h
+    }
+
+    /// Testnet #7,139,600 -- the reed810 activation block, the first header
+    /// whose bloom moved into an extension.
+    ///
+    /// The hash has to come from the *compressed* encoding: the bloom slot
+    /// holds `RLP([version, keccak(extension)])` and the trailing fields are
+    /// dropped. Hashing the wire form instead gave every header from this
+    /// block on a hash no other node agrees with, which surfaced as REMASC's
+    /// selection rule comparing the wrong ones.
+    #[test]
+    fn a_v1_wire_header_hashes_to_what_the_chain_says() {
+        let h = decode(V1_WIRE);
+        assert_eq!(h.number, 7_139_600);
+        assert_eq!(h.version_fields.as_ref().map(|v| v.version), Some(1));
+        assert_eq!(
+            h.hash(),
+            "0xa44a88ce39fb3851d7f9b5ca9879b2c93b2544b12ac8239c034c6e589219c411"
+                .parse::<B256>()
+                .unwrap()
+        );
+    }
+
+    /// Testnet #7,604,200 -- the vetiver900 activation block, version 2.
+    #[test]
+    fn a_v2_wire_header_hashes_to_what_the_chain_says() {
+        let h = decode(V2_WIRE);
+        assert_eq!(h.number, 7_604_200);
+        assert_eq!(h.version_fields.as_ref().map(|v| v.version), Some(2));
+        assert!(
+            h.version_fields.as_ref().unwrap().base_event.is_some(),
+            "a V2 header carries a base event even when the block has none"
+        );
+        assert_eq!(
+            h.hash(),
+            "0x27138ca46912bd08e1a9a942a5e81d0ec96fc91820f539f7e872239b3a1626bd"
+                .parse::<B256>()
+                .unwrap()
+        );
+    }
+
+    /// The store re-encodes every header it writes, so anything the wire form
+    /// cannot round-trip is lost from the database rather than from a single
+    /// message. The first attempt at this encoded the edges with `Vec<u8>`,
+    /// which alloy emits as a list of single bytes, and the result would not
+    /// decode at all.
+    #[test]
+    fn a_versioned_header_survives_being_re_encoded() {
+        for wire in [V1_WIRE, V2_WIRE] {
+            let original = decode(wire);
+            let mut buf = Vec::new();
+            original.encode(&mut buf);
+            assert_eq!(
+                alloy_primitives::hex::encode(&buf),
+                wire,
+                "re-encoding must reproduce rskj's own bytes"
+            );
+
+            let mut slice = buf.as_slice();
+            let mut again = Header::decode(&mut slice).unwrap();
+            again.cached_hash = None;
+            assert_eq!(again.hash(), original.hash());
+            assert_eq!(again.version_fields, original.version_fields);
+            assert_eq!(again.logs_bloom, original.logs_bloom);
+            assert_eq!(
+                again.bitcoin_merged_mining_header,
+                original.bitcoin_merged_mining_header
+            );
+        }
+    }
+
+    /// A version-0 header must stay untouched by any of this: mainnet is
+    /// entirely V0, so a decoder that invented version fields for it would
+    /// change hashes on a chain that has none.
+    #[test]
+    fn a_v0_header_gains_no_version_fields() {
+        let mut h = decode(V1_WIRE);
+        h.version_fields = None;
+        h.cached_hash = None;
+        let mut buf = Vec::new();
+        h.encode(&mut buf);
+        let mut slice = buf.as_slice();
+        let again = Header::decode(&mut slice).unwrap();
+        assert_eq!(again.version_fields, None);
     }
 }

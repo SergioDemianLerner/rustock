@@ -2427,7 +2427,7 @@ mod tests {
             difficulty: U256::ZERO, number: 0, gas_limit: U256::ZERO,
             gas_used: 0, timestamp: 0, extra_data: ABytes::new(),
             paid_fees: U256::ZERO, minimum_gas_price: U256::ZERO,
-            uncle_count: 0, umm_root: None,
+            uncle_count: 0, umm_root: None, version_fields: None,
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
