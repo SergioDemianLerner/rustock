@@ -490,3 +490,125 @@ where the unlimited *entry type* is often assumed to begin.
 
 Mainnet never reaches the interesting case: both cells were written before
 #1,000, so every later read rewrites identical bytes and changes no root.
+
+## 11. Testnet accepts a V2 header with no `baseEvent` element at all
+
+Found by replaying testnet #7,610,088; fixed in the header decoder.
+
+RSKIP-535 gives the V2 extension a base event. Nothing in it says the field
+may be missing from the header. On testnet it can be, and rskj has a dated
+accommodation for it:
+
+```java
+private static final long BASE_EVENT_RECOVERY_UPPER_BOUND = 7_800_000L;
+
+private boolean isInBaseEventRecoveryWindow(long blockNumber, boolean compressed) {
+    return !compressed
+            && chainId == Constants.TESTNET_CHAIN_ID
+            && isBaseEventEnabled(blockNumber)
+            && blockNumber < BASE_EVENT_RECOVERY_UPPER_BOUND;
+}
+```
+
+`canBeDecoded` then accepts a header **one RLP element short** of the expected
+layout inside that window, and the decoder substitutes an empty base event:
+
+```java
+boolean isBaseEventAbsent = remaining == 0 || remaining == miningFieldCount;
+if (isBaseEventAbsent) {
+    baseEvent = ByteUtil.EMPTY_BYTE_ARRAY;
+}
+```
+
+So between vetiver900 (#7,604,200) and #7,800,000 a testnet header may carry
+`version` and `edges` and then go straight to the merged-mining fields.
+Testnet #7,610,038 is one.
+
+Two consequences an implementer has to get right:
+
+- **The commitment still includes a base event.** The header omitted the
+  field; the extension it commits to has an empty one. Treating "absent" as
+  "no base event in the extension" gives a different hash.
+- **The short form must be re-emitted short.** Writing back an empty element
+  adds one rskj never wrote, so the header no longer round-trips — which
+  matters for any node that stores headers by re-encoding them.
+
+Beyond #7,800,000 the field is mandatory again. The bound is a constant with
+no RSKIP behind it: it marks where a testnet mishap stopped, not a rule.
+
+## 12. Which trailing fields are present is decided by height, not by the bytes
+
+RSKIP-351 and RSKIP-144 describe the fields; neither says how a decoder knows
+which are there. rskj does not work it out from the data — `BlockFactory`
+asks the activation config at the block's own height:
+
+```java
+if (activationConfig.isActive(ConsensusRule.RSKIPUMM, blockNumber)) {
+    ummRoot = rlpHeader.get(r++).getRLPRawData();
+}
+if (isBlockHeaderCompressionEnabled(blockNumber)) {
+    version = compressed ? ... : rlpHeader.get(r++).getRLPData()[0];
+}
+if (... && activationConfig.areActive(blockNumber, RSKIP351, RSKIP144)) {
+    txExecutionSublistsEdges = ByteUtil.rlpToShorts(rlpHeader.get(r++).getRLPRawData());
+}
+```
+
+Two asymmetries follow, and they are what make the layout decidable at all:
+
+- **Edges are always emitted once RSKIP-144 is active**, including when the
+  block has no sublists, because `addTxExecutionSublistsEdgesIfAny` skips only
+  a `null`, and a block built under the rule has an empty array rather than
+  null. Every versioned testnet header observed carries the field; it is
+  simply empty. "Edges present" therefore says nothing about whether a block
+  used parallel execution — only a non-empty value does.
+- **The base event is the one that can be absent** (§11).
+
+A decoder without an activation config can still be exact, because the
+version byte is self-describing where nothing else is: `RLP.encodeByte(1|2)`
+is a bare `0x01` or `0x02`, and no other field in that position can take those
+values — `ummRoot` is empty or 32 bytes, edges are an even-length string, a
+merged-mining header is 80 bytes. Read the version that way, then take edges
+before base event, and the layout follows.
+
+**V0 is not exempt.** `BlockHeaderV0.addExtraFieldsToEncodedHeader` appends
+edges and base event too, with the reason in a comment:
+
+```java
+// 1. keep RSKIP 351 and RSKIP 144 independent
+//    either can be activated at any height independently
+// 2. keep compressed encoding the same as uncompressed
+//    since this difference should not exist on v0
+```
+
+So a version-0 header on a chain with RSKIP-144 active carries edges without
+carrying a version byte. No RSKIP mentions this.
+
+## 13. Testnet's federation UTXOs live under a different storage cell
+
+Found by replaying testnet #7,139,903, a pegout batch; fixed in the Bridge.
+
+`FederationStorageProviderImpl.getStorageKeyForNewFederationBtcUtxos` picks
+the cell by network and activation:
+
+```java
+if (networkIsTestnet(networkParameters)) {
+    return getNewFederationBtcUtxosKeyForTestnet(activations);
+}
+return NEW_FEDERATION_BTC_UTXOS_KEY.getKey();
+```
+
+and for testnet: the general `newFederationBtcUTXOs` before RSKIP284,
+`newFederationBtcUTXOsForTestnet` between RSKIP284 and RSKIP293, and
+`newFedBtcUTXOsForTestnetPostHop` after. Both activate at hop400, so testnet
+moves straight to the third at #3,103,000. Mainnet never moves.
+
+This is chain repair, not consensus design: the names say so, and no RSKIP
+describes a per-network storage key. But it *is* consensus — reading the wrong
+cell selects different inputs, which builds a different pegout transaction,
+with a different hash and different outpoint values. At #7,139,903 that one
+cell accounted for seven differing leaves.
+
+Worth noting for anyone porting the Bridge: the three key names can all be
+present in an implementation and only the first one used, which looks
+finished and is not.
