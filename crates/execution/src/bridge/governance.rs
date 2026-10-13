@@ -1331,7 +1331,7 @@ fn decode_bytes_arg_at(args: &[u8], index: usize) -> Result<Vec<u8>, PrecompileE
     Ok(args[start..start + len].to_vec())
 }
 
-fn encode_int_result(gas_cost: u64, value: i64) -> PrecompileOutput {
+pub(crate) fn encode_int_result(gas_cost: u64, value: i64) -> PrecompileOutput {
     let mut output = [0u8; 32];
     if value >= 0 {
         output[24..32].copy_from_slice(&(value as u64).to_be_bytes());

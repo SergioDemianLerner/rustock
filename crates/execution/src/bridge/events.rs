@@ -547,6 +547,80 @@ fn release_request_received_data(dynamic: &[u8], amount: alloy_primitives::U256)
     data
 }
 
+// ---------------------------------------------------------------------------
+// RSKIP-502 union bridge events
+// ---------------------------------------------------------------------------
+
+/// `union_bridge_locking_cap_increased(address indexed caller, uint256 previousLockingCap, uint256 newLockingCap)`
+pub fn log_union_locking_cap_increased<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    caller: alloy_primitives::Address,
+    previous: alloy_primitives::U256,
+    new: alloy_primitives::U256,
+) {
+    let topics = vec![
+        event_topic("union_bridge_locking_cap_increased(address,uint256,uint256)"),
+        address_topic(caller),
+    ];
+    let mut data = Vec::with_capacity(64);
+    data.extend_from_slice(&previous.to_be_bytes::<32>());
+    data.extend_from_slice(&new.to_be_bytes::<32>());
+    emit_topics(ctx, topics, data);
+}
+
+/// `union_rbtc_requested(address indexed requester, uint256 amount)`
+pub fn log_union_rbtc_requested<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    requester: alloy_primitives::Address,
+    amount: alloy_primitives::U256,
+) {
+    let topics = vec![
+        event_topic("union_rbtc_requested(address,uint256)"),
+        address_topic(requester),
+    ];
+    emit_topics(ctx, topics, amount.to_be_bytes::<32>().to_vec());
+}
+
+/// `union_rbtc_released(address indexed receiver, uint256 amount)`
+pub fn log_union_rbtc_released<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    receiver: alloy_primitives::Address,
+    amount: alloy_primitives::U256,
+) {
+    let topics = vec![
+        event_topic("union_rbtc_released(address,uint256)"),
+        address_topic(receiver),
+    ];
+    emit_topics(ctx, topics, amount.to_be_bytes::<32>().to_vec());
+}
+
+/// `union_bridge_transfer_permissions_updated(address indexed caller, bool enablePowPegToUnionBridge, bool enableUnionBridgeToPowPeg)`
+pub fn log_union_transfer_permissions_updated<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    caller: alloy_primitives::Address,
+    request_enabled: bool,
+    release_enabled: bool,
+) {
+    let topics = vec![
+        event_topic("union_bridge_transfer_permissions_updated(address,bool,bool)"),
+        address_topic(caller),
+    ];
+    let mut data = vec![0u8; 64];
+    data[31] = request_enabled as u8;
+    data[63] = release_enabled as u8;
+    emit_topics(ctx, topics, data);
+}
+
+fn event_topic(signature: &str) -> alloy_primitives::B256 {
+    alloy_primitives::keccak256(signature.as_bytes())
+}
+
+fn address_topic(a: alloy_primitives::Address) -> alloy_primitives::B256 {
+    let mut t = [0u8; 32];
+    t[12..].copy_from_slice(a.as_slice());
+    alloy_primitives::B256::from(t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

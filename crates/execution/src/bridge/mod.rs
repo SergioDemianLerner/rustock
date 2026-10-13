@@ -29,6 +29,7 @@ pub mod rskj_sender_compat;
 pub mod serialization;
 pub mod storage;
 pub mod tx;
+pub mod union;
 pub mod vote;
 
 use alloy_primitives::{Bytes, U256};
@@ -267,6 +268,14 @@ fn method_enabled(name: &str) -> BridgeMethodEnabled {
     use crate::hardfork::RskNetworkUpgrade::*;
     use BridgeMethodEnabled::*;
     match name {
+        // RSKIP502 (reed810): the union bridge.
+        "setUnionBridgeContractAddressForTestnet"
+        | "getUnionBridgeContractAddress"
+        | "getUnionBridgeLockingCap"
+        | "increaseUnionBridgeLockingCap"
+        | "requestUnionBridgeRbtc"
+        | "releaseUnionBridgeRbtc"
+        | "setUnionBridgeTransferPermissions" => Since(Reed810),
         // !RSKIP87 / !RSKIP89
         "addLockWhitelistAddress" | "getBtcBlockchainBlockLocator" => Until(Orchid),
         // RSKIP87 / RSKIP89
@@ -457,6 +466,14 @@ fn build_method_table() -> Vec<BridgeMethodInfo> {
         ("getQueuedPegoutsCount",       "getQueuedPegoutsCount()",                                   Fixed(3000),  TransactionCallable),
         ("getEstimatedFeesForNextPegOutEvent","getEstimatedFeesForNextPegOutEvent()",                 Fixed(10000), TransactionCallable),
         ("getEstimatedFeesForPegOutAmount","getEstimatedFeesForPegOutAmount(uint256)",                Fixed(10000), TransactionCallable),
+        // -- RSKIP502 union bridge (reed810) --
+        ("setUnionBridgeContractAddressForTestnet","setUnionBridgeContractAddressForTestnet(address)", Fixed(8000), TransactionCallable),
+        ("getUnionBridgeContractAddress","getUnionBridgeContractAddress()",                           Fixed(3000),  TransactionCallable),
+        ("getUnionBridgeLockingCap",    "getUnionBridgeLockingCap()",                                 Fixed(3000),  TransactionCallable),
+        ("increaseUnionBridgeLockingCap","increaseUnionBridgeLockingCap(uint256)",                    Fixed(8000),  TransactionCallable),
+        ("requestUnionBridgeRbtc",      "requestUnionBridgeRbtc(uint256)",                            Fixed(8000),  TransactionCallable),
+        ("releaseUnionBridgeRbtc",      "releaseUnionBridgeRbtc()",                                   Fixed(8000),  TransactionCallable),
+        ("setUnionBridgeTransferPermissions","setUnionBridgeTransferPermissions(bool,bool)",          Fixed(8000),  TransactionCallable),
         // -- Dynamic permission --
         ("getBtcBlockchainBestChainHeight","getBtcBlockchainBestChainHeight()",                       Fixed(19000), DynamicRskip220),
         // -- Local-only getters (needed for completeness; not consensus-critical) --
@@ -931,6 +948,35 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getBtcBlockchainBlockHeaderByHeight" => btc_chain::get_block_header_by_height(ctx, args, gas_cost),
         "getBtcBlockchainParentBlockHeaderByHash" => btc_chain::get_parent_block_header_by_hash(ctx, args, gas_cost),
 
+        // RSKIP502: the union bridge, authorized against the *immediate*
+        // caller.
+        //
+        // rskj reads `tx.getSender()`, and for a Bridge reached by an internal
+        // call that is not the originating EOA: `Program` builds an
+        // `InternalTransaction` whose sender is the calling contract
+        // (Program.java, "Special initialization for Bridge, Remasc and
+        // NativeContract contracts"). For a direct transaction the caller is
+        // the EOA anyway, so the immediate caller is right in both cases --
+        // and it has to be, or the union bridge contract could never authorize
+        // itself, since a contract never originates a transaction.
+        "setUnionBridgeContractAddressForTestnet" => {
+            union::set_contract_address_for_testnet(ctx, args, gas_cost, hardfork_cfg, caller)
+        }
+        "getUnionBridgeContractAddress" => union::get_contract_address(ctx, gas_cost, hardfork_cfg),
+        "getUnionBridgeLockingCap" => union::get_locking_cap(ctx, gas_cost, hardfork_cfg),
+        "increaseUnionBridgeLockingCap" => {
+            union::increase_locking_cap(ctx, args, gas_cost, hardfork_cfg, caller)
+        }
+        "requestUnionBridgeRbtc" => {
+            union::request_rbtc(ctx, args, gas_cost, hardfork_cfg, caller)
+        }
+        "releaseUnionBridgeRbtc" => {
+            union::release_rbtc(ctx, gas_cost, hardfork_cfg, caller, call_value)
+        }
+        "setUnionBridgeTransferPermissions" => {
+            union::set_transfer_permissions(ctx, args, gas_cost, hardfork_cfg, caller)
+        }
+
         // Phase 3: BTC transaction verification
         "registerBtcCoinbaseTransaction" => tx::register_btc_coinbase_transaction(ctx, args, gas_cost),
         "hasBtcBlockCoinbaseTransactionInformation" => tx::has_btc_block_coinbase_info(ctx, args, gas_cost),
@@ -1099,14 +1145,15 @@ mod tests {
     }
 
     #[test]
-    fn method_table_has_70_entries() {
-        // 69 pre-vetiver methods + getEstimatedFeesForPegOutAmount (RSKIP540).
-        assert_eq!(BRIDGE_METHODS.len(), 70);
+    fn method_table_has_77_entries() {
+        // 69 pre-vetiver methods + getEstimatedFeesForPegOutAmount (RSKIP540)
+        // + the seven union bridge methods (RSKIP502, reed810).
+        assert_eq!(BRIDGE_METHODS.len(), 77);
     }
 
     #[test]
-    fn selector_map_has_70_entries() {
-        assert_eq!(BRIDGE_SELECTOR_MAP.len(), 70);
+    fn selector_map_has_77_entries() {
+        assert_eq!(BRIDGE_SELECTOR_MAP.len(), 77);
     }
 
     #[test]
@@ -1262,7 +1309,11 @@ mod tests {
             .iter()
             .filter(|m| m.permission == BridgePermission::TransactionCallable)
             .count();
-        assert_eq!(count, 32, "31 pre-vetiver methods with fixedPermission(false) + getEstimatedFeesForPegOutAmount");
+        assert_eq!(
+            count, 39,
+            "31 pre-vetiver methods with fixedPermission(false), \
+             getEstimatedFeesForPegOutAmount, and the seven union bridge methods"
+        );
     }
 
     #[test]
