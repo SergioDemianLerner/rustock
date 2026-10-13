@@ -612,3 +612,51 @@ cell accounted for seven differing leaves.
 Worth noting for anyone porting the Bridge: the three key names can all be
 present in an implementation and only the first one used, which looks
 finished and is not.
+
+## 14. RSKIP-144 does not say that receipt gas is per sublist
+
+Found by replaying testnet #7,690,876, the first block whose transactions are
+actually split; fixed in the receipt builder.
+
+RSKIP-144 specifies sublists and their gas *limits* at length:
+
+> Each sublist has its own gas limit value. The block `gasLimit` constant is
+> replaced for two new constants ... The sum of the gas used of all the
+> transactions in a sublist cannot exceed the sublist's gas limit.
+
+It never mentions receipts. The words `cumulative` and `receipt` do not occur
+in the document. No other RSKIP covers it either: 543, 546 and 692 use
+`cumulativeGasUsed` only in its ordinary block-wide sense.
+
+The code does something the spec does not describe. `BlockExecutor` fills the
+receipt from the sublist's accumulator, not a block-wide one:
+
+```java
+long cumulativeGas = sublistGasAccumulated
+        .orElseGet(() -> parallelizeTransactionHandler.getGasUsedIn(...));
+TransactionReceipt receipt = buildTransactionReceipt(tx, txExecutor, gasUsed, cumulativeGas, logIndexOffset);
+```
+
+so the counter restarts at every sublist boundary. REMASC lands in the
+sequential sublist, which is the last one (`addRemascTransaction` ->
+`getSequentialSublist`), and so continues that sublist's total.
+
+Testnet #7,690,876, edges `[1]`:
+
+| tx | gas | cumulative |
+|---|---|---|
+| 0 | 59,981 | 59,981 |
+| 1 | 92,737 | **92,737** — restarts |
+| 2 (REMASC) | 0 | 92,737 |
+
+A block-wide counter gives 152,718 for the last two.
+
+An implementer reading the spec takes the per-sublist *gas limit* and keeps a
+block-wide *cumulative counter*; they are different quantities and only the
+first is written down.
+
+It is also invisible until a block splits. The block's own `gasUsed` is a
+plain total and still matches, the state root is untouched, and only the
+receipts root moves -- so this cost us nothing for 100,002 verified blocks
+across reed810 and vetiver900, where RSKIP-144 was active and every header
+carried an empty edges field.
