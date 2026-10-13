@@ -74,6 +74,22 @@ pub struct ProcessedBlock {
     pub logs_bloom: Bloom,
 }
 
+/// The running gas total for the receipt at `index`.
+///
+/// RSKIP-144 accumulates per sublist rather than per block: `sublist_starts`
+/// holds the index each sublist after the first begins at, and the total
+/// restarts there. With no edges this is a plain running sum, which is every
+/// block before testnet #7,690,876.
+fn next_cumulative_gas(
+    running: u64,
+    index: usize,
+    gas_used: u64,
+    sublist_starts: &[i16],
+) -> u64 {
+    let base = if sublist_starts.contains(&(index as i16)) { 0 } else { running };
+    base + gas_used
+}
+
 /// Processes blocks by executing transactions and validating results against headers.
 pub struct BlockProcessor {
     executor: RskExecutor,
@@ -198,8 +214,24 @@ impl BlockProcessor {
         let mut cumulative_gas = 0u64;
         let mut block_bloom = Bloom::ZERO;
 
-        for tx_result in &exec_result.tx_results {
-            cumulative_gas += tx_result.gas_used;
+        // RSKIP-144: a block whose transactions are split across sublists
+        // accumulates gas *per sublist*, not across the block. `edges` holds
+        // the index each sublist after the first begins at, so the running
+        // total restarts there.
+        //
+        // Only the receipts carry this -- the state and the block's own
+        // gasUsed are unaffected -- so a block that splits diverges on the
+        // receipts root alone, which is how testnet #7,690,876 showed up.
+        // Every earlier block verified because none of them actually split:
+        // the edges field is present and empty from reed810 until here.
+        let sublist_starts: &[i16] = header
+            .version_fields
+            .as_ref()
+            .and_then(|v| v.edges.as_deref())
+            .unwrap_or(&[]);
+
+        for (i, tx_result) in exec_result.tx_results.iter().enumerate() {
+            cumulative_gas = next_cumulative_gas(cumulative_gas, i, tx_result.gas_used, sublist_starts);
 
             let logs: Vec<Log> = tx_result.logs.iter().map(|log| {
                 Log {
@@ -2151,5 +2183,53 @@ mod tests {
         // Full validation should pass
         let validated = processor.process_block(&block, &root, store).unwrap();
         assert_eq!(validated.gas_used, 0);
+    }
+}
+
+#[cfg(test)]
+mod sublist_gas_tests {
+    use super::next_cumulative_gas;
+
+    /// Ground truth: testnet #7,690,876, the first block whose transactions
+    /// are split. Its edges are `[1]`, and the reference node reports
+    /// cumulative 59,981 then 92,737 -- the second restarting at its own gas
+    /// -- where a block-wide sum would give 152,718.
+    #[test]
+    fn gas_restarts_at_each_sublist_boundary() {
+        let edges = [1i16];
+        let gas = [59_981u64, 92_737, 0];
+        let mut running = 0u64;
+        let mut cumulative = Vec::new();
+        for (i, g) in gas.iter().enumerate() {
+            running = next_cumulative_gas(running, i, *g, &edges);
+            cumulative.push(running);
+        }
+        assert_eq!(cumulative, vec![59_981, 92_737, 92_737]);
+    }
+
+    /// Without edges it is a plain running sum, which is every block before
+    /// the first split.
+    #[test]
+    fn no_edges_means_a_block_wide_sum() {
+        let mut running = 0u64;
+        let mut out = Vec::new();
+        for (i, g) in [10u64, 20, 30].iter().enumerate() {
+            running = next_cumulative_gas(running, i, *g, &[]);
+            out.push(running);
+        }
+        assert_eq!(out, vec![10, 30, 60]);
+    }
+
+    /// Three sublists, so two restarts.
+    #[test]
+    fn several_sublists_each_restart() {
+        let edges = [1i16, 3];
+        let mut running = 0u64;
+        let mut out = Vec::new();
+        for (i, g) in [5u64, 7, 11, 13].iter().enumerate() {
+            running = next_cumulative_gas(running, i, *g, &edges);
+            out.push(running);
+        }
+        assert_eq!(out, vec![5, 7, 18, 13]);
     }
 }
