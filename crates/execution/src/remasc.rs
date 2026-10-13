@@ -545,6 +545,25 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
     let broken_key = remasc_storage_key(BROKEN_SELECTION_RULE_KEY);
     let previous_broken = remasc_load_bool(ctx, broken_key);
     let broken = is_broken_selection_rule(&processing_header, &siblings);
+    tracing::debug!(
+        "REMASC selection rule at #{current_number}: processing #{candidate_block_number} \
+         hash={:?} paid_fees={} uncle_count={} siblings={} -> broken={broken}",
+        processing_header.hash(),
+        processing_header.paid_fees,
+        processing_header.uncle_count,
+        siblings.len()
+    );
+    tracing::debug!(
+        "  previous_broken={previous_broken} broken_now={} (siblings_empty={})",
+        !siblings.is_empty() && broken,
+        siblings.is_empty()
+    );
+    for s in &siblings {
+        tracing::debug!(
+            "  sibling hash={:?} paid_fees={} uncle_count={} included_at=#{}",
+            s.hash, s.paid_fees, s.uncle_count, s.included_height
+        );
+    }
     // rskj `RemascStorageProvider.saveBrokenSelectionRule` writes a literal
     // 1-byte value (0/1) via `addStorageBytes` once the field is set, so the
     // cell is present in the unitrie even when false. A plain SSTORE of 0

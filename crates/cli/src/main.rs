@@ -669,6 +669,16 @@ struct Args {
     #[arg(long)]
     import_skip_unitrie: bool,
 
+    /// Import the blocks but leave the derived chain metadata alone.
+    ///
+    /// The canonical index and total difficulty are keyed by block hash, and
+    /// the block phase writes under rskj's own hashes, so re-importing blocks
+    /// into a datadir that already has its metadata leaves that metadata
+    /// correct. Rebuilding it anyway is the expensive half of an import --
+    /// over six hours on RSK testnet -- for no change.
+    #[arg(long)]
+    import_skip_metadata: bool,
+
     /// Rebuild chain metadata for this block range only, then exit.
     ///
     /// For benchmarking the metadata phase without paying for a full pass --
@@ -1647,6 +1657,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             !args.import_auto_compaction,
             args.import_metadata_only,
             args.import_skip_unitrie,
+            args.import_skip_metadata,
             if args.import_unitrie_threads == 0 {
                 std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
             } else {
@@ -3168,6 +3179,7 @@ fn run_rskj_import(
     compact_first: bool,
     metadata_only: bool,
     skip_unitrie: bool,
+    skip_metadata: bool,
     unitrie_threads: usize,
 ) -> Result<()> {
     use rustock_storage::rskj_import::{self, WalMode, WriteMode};
@@ -3248,6 +3260,16 @@ fn run_rskj_import(
         csv.as_mut().map(|f| f as &mut dyn std::io::Write),
     )?
     };
+
+    if skip_metadata {
+        info!(
+            "Skipping the metadata rebuild: the canonical index is keyed by block hash \
+             and the block phase wrote under the source's own hashes, so what is already \
+             there still holds"
+        );
+        info!("Import complete in {:.0}s", started.elapsed().as_secs_f64());
+        return Ok(());
+    }
 
     // Compact BEFORE the metadata rebuild, not after.
     //

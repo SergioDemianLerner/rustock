@@ -139,7 +139,11 @@ impl Verdict {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("warn").with_target(false).init();
+    // Honour RUST_LOG so a divergence can be chased with the execution
+    // crate's own debug output, which is usually the fastest next step.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
 
     let (positional, options) = split_options(std::env::args().skip(1).collect())?;
     anyhow::ensure!(positional.len() == 4, "{USAGE}");
@@ -326,10 +330,22 @@ fn main() -> Result<()> {
                             .into_iter()
                             .filter(|k| a.get(*k).map(|e| e.0) != b.get(*k).map(|e| e.0))
                             .collect();
+                        // The pre-state too: it separates "wrote the wrong
+                        // value" from "wrote nothing and kept the old one",
+                        // which are different bugs and look identical without
+                        // it.
+                        let (pre_leaves, _) =
+                            support::diff_roots(&pre, &processed.new_state_root, trie.as_ref());
+                        let p = support::index(pre_leaves);
+
                         println!("\n    {} leaf/leaves differ from rskj:", differing.len());
                         for k in differing {
                             println!("      {}", support::describe_key(k));
                             println!("        key     0x{}", alloy_primitives::hex::encode(k));
+                            println!(
+                                "        before  {}",
+                                support::describe_value(k, p.get(k).and_then(|e| e.1.as_ref()))
+                            );
                             println!(
                                 "        ours    {}",
                                 support::describe_value(k, a.get(k).and_then(|e| e.1.as_ref()))
