@@ -669,6 +669,18 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
             .filter(|m| abi_args_decode_ok(&input[4..], m.signature))
     };
     let Some(method) = parsed else {
+        // Which selector, and from where. A Bridge method that exists in rskj
+        // and not here fails exactly like a malformed call, and the two are
+        // indistinguishable in a receipt -- this is what tells them apart.
+        if input.len() >= 4 {
+            use revm::context_interface::JournalTr;
+            tracing::debug!(
+                "Bridge: no method for selector 0x{} at #{block_number} (depth {}, {} byte(s) of input)",
+                alloy_primitives::hex::encode(&input[..4]),
+                ctx.journal().depth(),
+                input.len()
+            );
+        }
         let gas_cost = 23_000u64; // BridgeMethods.RELEASE_BTC cost, no data cost
         if gas_limit < gas_cost {
             return Err(insufficient_gas_marker(ctx, gas_limit));

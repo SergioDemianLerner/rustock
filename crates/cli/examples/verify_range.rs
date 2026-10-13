@@ -305,6 +305,46 @@ fn main() -> Result<()> {
                 );
             }
 
+            // A receipts-root divergence has no leaves to walk: the state
+            // can be identical and a single receipt still differ. Printing
+            // ours per transaction is what makes it comparable against the
+            // same block from any node over `eth_getTransactionReceipt`.
+            if explain && verdict.receipts {
+                println!("\n    our receipts, by transaction:");
+                let mut cumulative = 0u64;
+                for (i, r) in processed.receipts.iter().enumerate() {
+                    cumulative += r.gas_used;
+                    println!(
+                        "      tx[{i}] status={:?} gas_used={} cumulative={} logs={}",
+                        r.status,
+                        r.gas_used,
+                        cumulative,
+                        r.logs.len()
+                    );
+                    for (j, log) in r.logs.iter().enumerate() {
+                        println!("        log[{j}] address={:?} topics={}", log.address, log.topics.len());
+                        for t in &log.topics {
+                            println!("          {t:?}");
+                        }
+                        println!(
+                            "          data 0x{}",
+                            alloy_primitives::hex::encode(&log.data)
+                        );
+                    }
+                }
+                if !verdict.state {
+                    // Said explicitly: with the state root matching, every
+                    // write this block made is right and only the receipt is
+                    // wrong -- a much narrower place to look.
+                    println!(
+                        "\n    (the state root MATCHES: the writes are right, the receipt is not)"
+                    );
+                    stopped_at = Some(n);
+                    println!("\n    (--explain stops at the first explained block)");
+                    break;
+                }
+            }
+
             // Both post-states are reachable through the same store -- ours
             // from the scratch spill, rskj's from its unitrie -- so the two
             // can be walked against each other directly. That names the
