@@ -15,11 +15,19 @@
 //! the replay computes goes to a scratch store that can be deleted afterwards.
 //!
 //! ```text
-//! verify_range <data-dir> <rskj-unitrie-dir> <from> <to> [network-id] [scratch-dir]
+//! verify_range <data-dir> <rskj-unitrie-dir> <from> <to> [options]
 //!
-//!   network-id   30 mainnet, 31 testnet (default), anything else regtest
-//!   scratch-dir  where the replay's own trie writes go; a temp dir if omitted
+//!   --network-id N     30 mainnet, 31 testnet (default), else regtest
+//!   --scratch DIR      where the replay's own trie writes go (default: a temp dir)
+//!   --max-failures N   stop after this many (default 10; 0 means never)
+//!   --cache-mb N       block cache for the rskj unitrie (default 256)
 //! ```
+//!
+//! The stop exists because one defect usually breaks every block it touches.
+//! Ten instances of a rule that is wrong at every block say exactly what one
+//! says, so running the remaining fifty thousand buys nothing and costs an
+//! hour. The same goes for a range the snapshot cannot serve: if the first
+//! blocks have no pre-state, none of them will.
 
 #[path = "support/mod.rs"]
 mod support;
@@ -32,8 +40,55 @@ use rustock_storage::BlockStore;
 use rustock_trie::{OverlayTrieStore, TrieNode, TrieStore};
 use std::sync::Arc;
 
-const USAGE: &str =
-    "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <to> [network-id] [scratch-dir]";
+const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <to> \
+[--network-id N] [--scratch DIR] [--max-failures N] [--cache-mb N]";
+
+/// Splits `--key value` and `--key=value` options out of the command line,
+/// leaving the positional arguments.
+///
+/// Hand-rolled because these diagnostics take no dependency on an argument
+/// parser, and an unknown option must be an error rather than be silently
+/// read as a positional -- a mistyped `--max-failures` that became a block
+/// number would be worse than no option at all.
+fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)>)> {
+    const WITH_VALUE: [&str; 4] = ["--network-id", "--scratch", "--max-failures", "--cache-mb"];
+    let mut positional = Vec::new();
+    let mut options = Vec::new();
+    let mut it = argv.into_iter();
+    while let Some(a) = it.next() {
+        if !a.starts_with("--") {
+            positional.push(a);
+            continue;
+        }
+        let (key, inline) = match a.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (a.clone(), None),
+        };
+        anyhow::ensure!(WITH_VALUE.contains(&key.as_str()), "unknown option {key}\n{USAGE}");
+        let value = match inline {
+            Some(v) => v,
+            None => it.next().with_context(|| format!("{key} needs a value"))?,
+        };
+        options.push((key, value));
+    }
+    Ok((positional, options))
+}
+
+fn option<T: std::str::FromStr>(
+    options: &[(String, String)],
+    key: &str,
+    default: T,
+) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    match options.iter().rev().find(|(k, _)| k == key) {
+        Some((_, v)) => v
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{key}: {e}")),
+        None => Ok(default),
+    }
+}
 
 /// rskj's unitrie, read-only. Content-addressed exactly as rustock's is.
 struct RskjUnitrie {
@@ -79,13 +134,20 @@ impl Verdict {
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").with_target(false).init();
 
-    let mut args = std::env::args().skip(1);
-    let data_dir = args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
-    let unitrie_dir = args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
-    let from: u64 = args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?.parse()?;
-    let to: u64 = args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?.parse()?;
-    let network_id: u64 = args.next().map(|a| a.parse()).transpose()?.unwrap_or(support::TESTNET);
-    let scratch = args.next();
+    let (positional, options) = split_options(std::env::args().skip(1).collect())?;
+    anyhow::ensure!(positional.len() == 4, "{USAGE}");
+    let data_dir = positional[0].clone();
+    let unitrie_dir = positional[1].clone();
+    let from: u64 = positional[2].parse().context("<from>")?;
+    let to: u64 = positional[3].parse().context("<to>")?;
+    let network_id: u64 = option(&options, "--network-id", support::TESTNET)?;
+    let scratch: Option<String> =
+        options.iter().rev().find(|(k, _)| k == "--scratch").map(|(_, v)| v.clone());
+    // 0 disables the stop, for a run that is deliberately exhaustive.
+    let max_failures: u64 = option(&options, "--max-failures", 10)?;
+    // Small by default: this runs beside whatever else is on the machine, and
+    // a cache sized for the database rather than the box gets it killed.
+    let cache_mb: usize = option(&options, "--cache-mb", 256)?;
     anyhow::ensure!(from <= to, "empty range: {from} > {to}");
 
     let store = Arc::new(
@@ -95,7 +157,7 @@ fn main() -> Result<()> {
 
     let mut opts = Options::default();
     let mut bbt = rocksdb::BlockBasedOptions::default();
-    bbt.set_block_cache(&rocksdb::Cache::new_lru_cache(2 * 1024 * 1024 * 1024));
+    bbt.set_block_cache(&rocksdb::Cache::new_lru_cache(cache_mb * 1024 * 1024));
     bbt.set_cache_index_and_filter_blocks(true);
     opts.set_block_based_table_factory(&bbt);
     let rskj: Arc<dyn TrieStore> = Arc::new(RskjUnitrie {
@@ -131,13 +193,30 @@ fn main() -> Result<()> {
     eprintln!("  scratch {}", scratch_path.display());
     let processor = BlockProcessor::new(hardfork_cfg, store.clone());
 
+    if max_failures > 0 {
+        eprintln!("  stopping after {max_failures} divergent or unverifiable block(s)");
+    }
+
     let started = std::time::Instant::now();
     let mut checked = 0u64;
     let mut diverged = 0u64;
     let mut unverifiable = 0u64;
     let mut first_bad: Option<u64> = None;
+    let mut stopped_at: Option<u64> = None;
 
     for n in from..=to {
+        // Checked at the top of each block so every exit from the body below
+        // -- divergence or unverifiable -- is counted before it is consulted.
+        if max_failures > 0 && diverged + unverifiable >= max_failures {
+            stopped_at = Some(n - 1);
+            eprintln!(
+                "\nstopping at #{}: {max_failures} failures reached. \
+                 Re-run with --max-failures 0 to see the rest.",
+                n - 1
+            );
+            break;
+        }
+
         let Some(hash) = store.canonical_hash(n)? else {
             eprintln!("#{n}: no canonical hash — the metadata rebuild did not reach here");
             unverifiable += 1;
@@ -162,9 +241,13 @@ fn main() -> Result<()> {
             continue;
         };
         let Some(root_data) = trie.get(parent.state_root.as_slice()) else {
+            // States the fact, not a cause: an absent root means the source
+            // was pruned below here, or that these blocks and this unitrie
+            // are from different chains. Naming only one of those sends the
+            // reader after the wrong thing.
             eprintln!(
-                "#{n}: parent state root {:?} is not in the rskj unitrie — \
-                 that database is pruned below this height",
+                "#{n}: parent state root {:?} is not in the source unitrie \
+                 (pruned below this height, or not the same chain as these blocks)",
                 parent.state_root
             );
             unverifiable += 1;
@@ -221,7 +304,13 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("\n=== #{from}..=#{to} ===");
+    let reached = stopped_at.unwrap_or(to);
+    println!("\n=== #{from}..=#{reached} ===");
+    if let Some(at) = stopped_at {
+        // Said plainly, so the counts are never mistaken for a full pass over
+        // the range that was asked for.
+        println!("  STOPPED EARLY at #{at}; #{}..=#{to} was not examined", at + 1);
+    }
     println!("  verified      {checked}");
     println!("  diverged      {diverged}");
     println!("  unverifiable  {unverifiable}");
@@ -232,7 +321,9 @@ fn main() -> Result<()> {
     println!("  took {:.0}s", started.elapsed().as_secs_f64());
 
     // A non-zero exit makes this usable from a script without parsing output.
-    if diverged > 0 {
+    // An early stop counts as failure even if every examined block passed,
+    // because the range was not actually cleared.
+    if diverged > 0 || stopped_at.is_some() {
         std::process::exit(1);
     }
     Ok(())
