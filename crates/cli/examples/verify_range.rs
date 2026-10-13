@@ -21,6 +21,8 @@
 //!   --scratch DIR      where the replay's own trie writes go (default: a temp dir)
 //!   --max-failures N   stop after this many (default 10; 0 means never)
 //!   --cache-mb N       block cache for the rskj unitrie (default 256)
+//!   --explain          on a state-root divergence, print the leaves that
+//!                      differ from rskj's own post-state, then stop
 //! ```
 //!
 //! The stop exists because one defect usually breaks every block it touches.
@@ -52,6 +54,7 @@ const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <t
 /// number would be worse than no option at all.
 fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)>)> {
     const WITH_VALUE: [&str; 4] = ["--network-id", "--scratch", "--max-failures", "--cache-mb"];
+    const FLAGS: [&str; 1] = ["--explain"];
     let mut positional = Vec::new();
     let mut options = Vec::new();
     let mut it = argv.into_iter();
@@ -64,6 +67,10 @@ fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)
             Some((k, v)) => (k.to_string(), Some(v.to_string())),
             None => (a.clone(), None),
         };
+        if FLAGS.contains(&key.as_str()) {
+            options.push((key, "true".to_string()));
+            continue;
+        }
         anyhow::ensure!(WITH_VALUE.contains(&key.as_str()), "unknown option {key}\n{USAGE}");
         let value = match inline {
             Some(v) => v,
@@ -148,6 +155,7 @@ fn main() -> Result<()> {
     // Small by default: this runs beside whatever else is on the machine, and
     // a cache sized for the database rather than the box gets it killed.
     let cache_mb: usize = option(&options, "--cache-mb", 256)?;
+    let explain = options.iter().any(|(k, _)| k == "--explain");
     anyhow::ensure!(from <= to, "empty range: {from} > {to}");
 
     let store = Arc::new(
@@ -292,6 +300,51 @@ fn main() -> Result<()> {
                     block.transactions.len()
                 );
             }
+
+            // Both post-states are reachable through the same store -- ours
+            // from the scratch spill, rskj's from its unitrie -- so the two
+            // can be walked against each other directly. That names the
+            // leaves that differ instead of leaving a pair of root hashes.
+            if explain && verdict.state {
+                match trie.get(block.header.state_root.as_slice()) {
+                    None => println!(
+                        "    (rskj's own post-state for this block is not in its unitrie)"
+                    ),
+                    Some(bytes) => {
+                        let theirs_root = TrieNode::from_message(&bytes, trie.as_ref());
+                        let (mine, theirs) = support::diff_roots(
+                            &processed.new_state_root,
+                            &theirs_root,
+                            trie.as_ref(),
+                        );
+                        let a = support::index(mine);
+                        let b = support::index(theirs);
+                        let mut keys: Vec<&Vec<u8>> = a.keys().chain(b.keys()).collect();
+                        keys.sort();
+                        keys.dedup();
+                        let differing: Vec<&Vec<u8>> = keys
+                            .into_iter()
+                            .filter(|k| a.get(*k).map(|e| e.0) != b.get(*k).map(|e| e.0))
+                            .collect();
+                        println!("\n    {} leaf/leaves differ from rskj:", differing.len());
+                        for k in differing {
+                            println!("      {}", support::describe_key(k));
+                            println!("        key     0x{}", alloy_primitives::hex::encode(k));
+                            println!(
+                                "        ours    {}",
+                                support::describe_value(k, a.get(k).and_then(|e| e.1.as_ref()))
+                            );
+                            println!(
+                                "        rskj    {}",
+                                support::describe_value(k, b.get(k).and_then(|e| e.1.as_ref()))
+                            );
+                        }
+                        stopped_at = Some(n);
+                        println!("\n    (--explain stops at the first explained block)");
+                        break;
+                    }
+                }
+            }
         }
 
         if n % 1000 == 0 || n == to {
@@ -316,7 +369,7 @@ fn main() -> Result<()> {
     println!("  unverifiable  {unverifiable}");
     if let Some(n) = first_bad {
         println!("  first failure #{n}");
-        println!("\n  next: `block_writes {data_dir} {n} {network_id}` for what that block wrote");
+        println!("\n  next: re-run with --explain to see which leaves differ from rskj");
     }
     println!("  took {:.0}s", started.elapsed().as_secs_f64());
 
