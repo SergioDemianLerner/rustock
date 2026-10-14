@@ -13,6 +13,10 @@
 //! ```text
 //! scan_pegin_calls <data-dir> <from> <to> [--fed-p2sh ADDR,ADDR] [--json]
 //! scan_pegin_calls <data-dir> --blocks FILE   [--fed-p2sh ADDR,ADDR] [--json]
+//!
+//!   --list-blocks   print only the block numbers that contain a call, one
+//!                   per line, for feeding straight back into
+//!                   `verify_range --blocks`
 //! ```
 //!
 //! Reading blocks is far cheaper *per block* than replaying them, but a range
@@ -117,6 +121,7 @@ fn main() -> Result<()> {
     let data_dir = argv.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
     let mut fed: Vec<[u8; 20]> = Vec::new();
     let mut json = false;
+    let mut list_blocks = false;
     let mut rest: Vec<String> = argv.collect();
     // The positional range is absent when a block list is given.
     let blocks_file = rest
@@ -157,6 +162,7 @@ fn main() -> Result<()> {
     while i < rest.len() {
         match rest[i].as_str() {
             "--json" => json = true,
+            "--list-blocks" => list_blocks = true,
             "--fed-p2sh" => {
                 i += 1;
                 let list = rest.get(i).context("--fed-p2sh needs a value")?;
@@ -225,6 +231,9 @@ fn main() -> Result<()> {
                 }
             }
 
+            if list_blocks {
+                println!("{n}");
+            }
             let e = seen.entry(key).or_insert(Seen {
                 calls: 0,
                 first_block: n,
@@ -250,7 +259,10 @@ fn main() -> Result<()> {
     }
 
     let sat = |v: u64| format!("{}.{:08}", v / 100_000_000, v % 100_000_000);
-    if json {
+    if list_blocks {
+        // Block numbers already printed as they were found; a summary on
+        // stdout would corrupt the list.
+    } else if json {
         for (k, s) in &seen {
             println!(
                 "{{\"btcTxHash\":\"{k}\",\"calls\":{},\"firstBlock\":{},\"lastBlock\":{},\"shape\":\"{}\",\"fedSat\":{},\"totalOutSat\":{}}}",
