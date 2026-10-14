@@ -14,6 +14,7 @@ pub mod window_store;
 pub mod position;
 pub mod pruner;
 pub mod freezer;
+pub mod silent_store;
 pub use cached_trie_store::CachedTrieStore;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};

@@ -892,6 +892,10 @@ pub struct BridgeTxContext {
     /// can never change consensus; it only decides whether a read-only query
     /// over RPC is answered or rejected.
     pub local_call: bool,
+    /// Position of this transaction in its block. Not consensus -- it exists
+    /// so a recorded Bridge decision can be located afterwards, and is zero
+    /// outside block execution.
+    pub tx_index: u32,
 }
 
 /// RSKIP197 (iris300): the `requiredGas` (rskj `getGasForData`) charged to a

@@ -23,7 +23,22 @@
 //!   --cache-mb N       block cache for the rskj unitrie (default 256)
 //!   --explain          on a state-root divergence, print the leaves that
 //!                      differ from rskj's own post-state, then stop
+//!   --record-silent DIR
+//!                      also record the Bridge decisions that emit no event
+//!                      into a silent-decision store at DIR (created if
+//!                      absent, appended to otherwise)
 //! ```
+//!
+//! `--record-silent` makes the pass pay for itself twice. Verifying a range
+//! already executes every block against rskj's own state; recording while it
+//! does means a question like "was a peg-in ever refunded here" is answered
+//! from an index afterwards instead of by replaying the range again.
+//!
+//! Only blocks that verified contribute records. A block whose state root
+//! disagrees with the chain was executed by this implementation but not by
+//! the network, so its decisions are this implementation's, and storing them
+//! beside real ones would make the store untrustworthy exactly where it
+//! matters. Such blocks become recorded gaps instead.
 //!
 //! The stop exists because one defect usually breaks every block it touches.
 //! Ten instances of a rule that is wrong at every block say exactly what one
@@ -53,7 +68,8 @@ const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <t
 /// read as a positional -- a mistyped `--max-failures` that became a block
 /// number would be worse than no option at all.
 fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)>)> {
-    const WITH_VALUE: [&str; 4] = ["--network-id", "--scratch", "--max-failures", "--cache-mb"];
+    const WITH_VALUE: [&str; 5] =
+        ["--network-id", "--scratch", "--max-failures", "--cache-mb", "--record-silent"];
     const FLAGS: [&str; 1] = ["--explain"];
     let mut positional = Vec::new();
     let mut options = Vec::new();
@@ -138,6 +154,47 @@ impl Verdict {
     }
 }
 
+/// Records `start..=end` as replayed and verified by `build`.
+fn write_coverage(
+    silent: &Option<rustock_storage::silent_store::SilentStore>,
+    start: u64,
+    end: u64,
+    build: &str,
+) -> Result<()> {
+    let Some(store) = silent else { return Ok(()) };
+    if end < start {
+        return Ok(());
+    }
+    store.add_coverage(&rustock_storage::silent_store::Coverage {
+        from: start,
+        to: end,
+        build: build.to_string(),
+        recorded_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        verified: end - start + 1,
+        diverged: 0,
+    })
+}
+
+/// Ends the contiguous verified run at the block before `failed`, and notes
+/// why it ended. Coverage must stop short of a block whose decisions were not
+/// confirmed against the chain.
+fn close_run(
+    silent: &Option<rustock_storage::silent_store::SilentStore>,
+    run_start: &mut Option<u64>,
+    failed: u64,
+    build: &str,
+    why: &str,
+) -> Result<()> {
+    let Some(store) = silent else { return Ok(()) };
+    if let Some(start) = run_start.take() {
+        write_coverage(silent, start, failed - 1, build)?;
+    }
+    store.add_gap(failed, why)
+}
+
 fn main() -> Result<()> {
     // Honour RUST_LOG so a divergence can be chased with the execution
     // crate's own debug output, which is usually the fastest next step.
@@ -160,6 +217,8 @@ fn main() -> Result<()> {
     // a cache sized for the database rather than the box gets it killed.
     let cache_mb: usize = option(&options, "--cache-mb", 256)?;
     let explain = options.iter().any(|(k, _)| k == "--explain");
+    let record_silent: Option<String> =
+        options.iter().rev().find(|(k, _)| k == "--record-silent").map(|(_, v)| v.clone());
     anyhow::ensure!(from <= to, "empty range: {from} > {to}");
 
     let store = Arc::new(
@@ -205,6 +264,34 @@ fn main() -> Result<()> {
     eprintln!("  scratch {}", scratch_path.display());
     let processor = BlockProcessor::new(hardfork_cfg, store.clone());
 
+    let silent = match &record_silent {
+        Some(dir) => {
+            let s = rustock_storage::silent_store::SilentStore::open(dir)
+                .with_context(|| format!("opening the silent-decision store at {dir}"))?;
+            eprintln!("  silent  {dir} (recording Bridge decisions that emit no event)");
+            rustock_execution::silent::start();
+            Some(s)
+        }
+        None => None,
+    };
+    // The build that produced the records. A replay is only as good as the
+    // code that ran it, and this is the only way to tell later which rows
+    // came from which rules.
+    let build = option_env!("RUSTOCK_BUILD").map(str::to_string).unwrap_or_else(|| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    });
+    // The first block of the contiguous run being recorded; a divergence or
+    // an unverifiable block closes the run and starts a new one, so coverage
+    // describes only blocks that actually verified.
+    let mut run_start: Option<u64> = None;
+    let mut silent_rows = 0u64;
+
     if max_failures > 0 {
         eprintln!("  stopping after {max_failures} divergent or unverifiable block(s)");
     }
@@ -231,16 +318,19 @@ fn main() -> Result<()> {
 
         let Some(hash) = store.canonical_hash(n)? else {
             eprintln!("#{n}: no canonical hash — the metadata rebuild did not reach here");
+            close_run(&silent, &mut run_start, n, &build, "no canonical hash")?;
             unverifiable += 1;
             continue;
         };
         let Some(header) = store.header(hash)? else {
             eprintln!("#{n}: header missing");
+            close_run(&silent, &mut run_start, n, &build, "header missing")?;
             unverifiable += 1;
             continue;
         };
         let Some((transactions, ommers)) = store.body(hash)? else {
             eprintln!("#{n}: body missing");
+            close_run(&silent, &mut run_start, n, &build, "body missing")?;
             unverifiable += 1;
             continue;
         };
@@ -249,6 +339,7 @@ fn main() -> Result<()> {
         // independent check instead of a continuation of the last one.
         let Some(parent) = store.header(header.parent_hash)? else {
             eprintln!("#{n}: parent header missing");
+            close_run(&silent, &mut run_start, n, &build, "parent header missing")?;
             unverifiable += 1;
             continue;
         };
@@ -262,6 +353,13 @@ fn main() -> Result<()> {
                  (pruned below this height, or not the same chain as these blocks)",
                 parent.state_root
             );
+            close_run(
+                &silent,
+                &mut run_start,
+                n,
+                &build,
+                "parent state root not in the source unitrie",
+            )?;
             unverifiable += 1;
             continue;
         };
@@ -272,6 +370,10 @@ fn main() -> Result<()> {
             Ok(p) => p,
             Err(e) => {
                 println!("#{n}  EXECUTION ERROR  {e}");
+                // Whatever the failed block recorded before it failed is
+                // dropped, not kept and not left to be blamed on the next one.
+                rustock_execution::silent::drain();
+                close_run(&silent, &mut run_start, n, &build, "execution error")?;
                 diverged += 1;
                 first_bad.get_or_insert(n);
                 continue;
@@ -284,6 +386,30 @@ fn main() -> Result<()> {
             gas: processed.gas_used != block.header.gas_used,
         };
         checked += 1;
+        // Taken whether or not it is kept: leaving a diverged block's records
+        // in the sink would attribute them to the next block.
+        let decisions =
+            if silent.is_some() { rustock_execution::silent::drain() } else { Vec::new() };
+        if let Some(store) = &silent {
+            if verdict.ok() {
+                if !decisions.is_empty() {
+                    let rows: Vec<rustock_storage::silent_store::SilentRow> = decisions
+                        .iter()
+                        .map(|d| rustock_storage::silent_store::SilentRow {
+                            kind: d.kind.name().to_string(),
+                            block: d.block,
+                            tx_index: d.tx_index,
+                            json: d.to_json(),
+                        })
+                        .collect();
+                    silent_rows += rows.len() as u64;
+                    store.put_records(&rows)?;
+                }
+                run_start.get_or_insert(n);
+            } else {
+                close_run(&silent, &mut run_start, n, &build, &verdict.label())?;
+            }
+        }
         if !verdict.ok() {
             diverged += 1;
             first_bad.get_or_insert(n);
@@ -411,6 +537,20 @@ fn main() -> Result<()> {
                 (n - from + 1) as f64 / secs.max(0.001)
             );
         }
+    }
+
+    // The last run has no failing block to close it, so close it at the end.
+    if let Some(start) = run_start.take() {
+        let last = stopped_at.unwrap_or(to);
+        write_coverage(&silent, start, last, &build)?;
+    }
+    if let Some(store) = &silent {
+        rustock_execution::silent::finish();
+        eprintln!(
+            "\n  silent: {silent_rows} decision(s) recorded; coverage now {} span(s), {} gap(s)",
+            store.coverage()?.len(),
+            store.gaps()?.len()
+        );
     }
 
     let reached = stopped_at.unwrap_or(to);

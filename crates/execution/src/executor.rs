@@ -771,6 +771,7 @@ impl RskExecutor {
                         rsk_sender: *sender,
                         // A transaction in a block is never a local call.
                         local_call: false,
+                        tx_index: i as u32,
                     };
                 }
             }
