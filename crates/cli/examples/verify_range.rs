@@ -23,6 +23,10 @@
 //!   --cache-mb N       block cache for the rskj unitrie (default 256)
 //!   --explain          on a state-root divergence, print the leaves that
 //!                      differ from rskj's own post-state, then stop
+//!   --state-format F   how to read <rskj-unitrie-dir>: "rskj" (default, a
+//!                      flat RocksDB keyed by node hash) or "rustock" (one of
+//!                      our own trie stores, e.g. a segbuild chunk's `sealed`
+//!                      directory, which keys nodes in a `trie_nodes` CF)
 //!   --blocks FILE      verify only the block numbers in FILE (one per line)
 //!                      instead of a contiguous range; <from> and <to> are
 //!                      then omitted
@@ -72,13 +76,14 @@ const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <t
 /// read as a positional -- a mistyped `--max-failures` that became a block
 /// number would be worse than no option at all.
 fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)>)> {
-    const WITH_VALUE: [&str; 6] = [
+    const WITH_VALUE: [&str; 7] = [
         "--network-id",
         "--scratch",
         "--max-failures",
         "--cache-mb",
         "--record-silent",
         "--blocks",
+        "--state-format",
     ];
     const FLAGS: [&str; 1] = ["--explain"];
     let mut positional = Vec::new();
@@ -256,6 +261,12 @@ fn main() -> Result<()> {
     // a cache sized for the database rather than the box gets it killed.
     let cache_mb: usize = option(&options, "--cache-mb", 256)?;
     let explain = options.iter().any(|(k, _)| k == "--explain");
+    let state_format: String = options
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "--state-format")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| "rskj".to_string());
     // Coverage over a block list cannot be recorded as a span: the blocks
     // between two listed ones were never replayed, and claiming them would
     // make the store assert exactly the thing it exists to disprove.
@@ -272,10 +283,25 @@ fn main() -> Result<()> {
     bbt.set_block_cache(&rocksdb::Cache::new_lru_cache(cache_mb * 1024 * 1024));
     bbt.set_cache_index_and_filter_blocks(true);
     opts.set_block_based_table_factory(&bbt);
-    let rskj: Arc<dyn TrieStore> = Arc::new(RskjUnitrie {
-        db: DB::open_for_read_only(&opts, &unitrie_dir, false)
-            .with_context(|| format!("opening rskj unitrie at {unitrie_dir} read-only"))?,
-    });
+    // A segbuild chunk holds only the nodes its producer touched while
+    // executing its range, so a read we issue that the producer did not can
+    // return a false absence rather than an error. That is safe here only
+    // because every block is checked against its header's state root: a block
+    // computed from an incomplete source cannot match, so it is reported as
+    // diverged and recorded as a gap, never as a verified decision. Treat a
+    // divergence from such a source as "this chunk could not serve the block",
+    // not as a consensus finding.
+    let source: Arc<dyn TrieStore> = match state_format.as_str() {
+        "rskj" => Arc::new(RskjUnitrie {
+            db: DB::open_for_read_only(&opts, &unitrie_dir, false)
+                .with_context(|| format!("opening rskj unitrie at {unitrie_dir} read-only"))?,
+        }),
+        "rustock" => Arc::new(
+            rustock_storage::RocksDbTrieStore::open_read_only(&unitrie_dir)
+                .with_context(|| format!("opening rustock trie store at {unitrie_dir}"))?,
+        ),
+        other => anyhow::bail!("--state-format must be rskj or rustock, not {other:?}"),
+    };
 
     // Somewhere for the replay's own writes that is neither database. Kept on
     // disk rather than in memory because a 50,000-block range writes far more
@@ -298,7 +324,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("opening scratch trie at {}", scratch_path.display()))?,
     );
     let spill: Arc<dyn TrieStore> = scratch_store.clone();
-    let trie: Arc<dyn TrieStore> = Arc::new(OverlayTrieStore::with_spill(rskj, spill));
+    let trie: Arc<dyn TrieStore> = Arc::new(OverlayTrieStore::with_spill(source, spill));
 
     let hardfork_cfg = support::hardfork_for(network_id);
     eprintln!(
@@ -310,7 +336,7 @@ fn main() -> Result<()> {
         eprintln!("  blocks listed in {path}");
     }
     eprintln!("  blocks  {data_dir} (read-only)");
-    eprintln!("  state   {unitrie_dir} (read-only)");
+    eprintln!("  state   {unitrie_dir} (read-only, {state_format} format)");
     eprintln!("  scratch {}", scratch_path.display());
     let processor = BlockProcessor::new(hardfork_cfg, store.clone());
 
