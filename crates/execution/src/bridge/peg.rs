@@ -914,12 +914,21 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             }
         } else if !lockable {
             silent_reason = "LEGACY_PEGIN_MULTISIG_SENDER";
-        } else if crate::silent::is_recording() && !locking_cap_would_allow(ctx, config, total_value)
+        } else if crate::silent::is_recording()
+            && hardfork_cfg.has_rskip134(rsk_height)
+            && !locking_cap_would_allow(ctx, config, total_value)
         {
             // Pre-RSKIP181 rskj does not re-evaluate the cap here, so the
             // reason is established by a read-only equivalent rather than by
             // the real check, which writes. Guarded on recording only to skip
             // the reads when nobody wants the answer -- it changes nothing.
+            //
+            // Gated on RSKIP134 as `cap_ok` is: before papyrus200 no locking
+            // cap exists, so the cell is unset and the read-only equivalent
+            // would fall back to `initial_locking_cap` and could blame a cap
+            // that was not yet a rule. In that era the only way to reach this
+            // branch is a lock-whitelist rejection, which is the one thing a
+            // pre-papyrus200 replay exists to find.
             silent_reason = "PEGIN_CAP_SURPASSED";
         } else {
             silent_reason = "LOCK_WHITELIST_REJECTED";
@@ -1568,6 +1577,12 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
 ) -> Result<PrecompileOutput, PrecompileError> {
     let ok = |code: Bytes| Ok(PrecompileOutput::new(gas_cost, code));
 
+    // Attribute anything this call records. Flyover is a second peg-in path
+    // with its own refund rules, and it reaches the Bridge only through a
+    // contract (`call_depth > 1`), so nothing registered here is visible to a
+    // scan of top-level transactions.
+    crate::silent::set_position(rsk_height_of(ctx), tx_ctx.tx_index);
+
     // rskj wraps the whole body in try/catch → GENERIC_ERROR. Any malformed
     // ABI / arg shape returns GENERIC_ERROR (NOT a failed tx).
     let parse = (|| -> Option<(usize, u64, usize, [u8; 32], Vec<u8>, RskAddress, Vec<u8>, bool)> {
@@ -1776,6 +1791,23 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     if hardfork_cfg.has_rskip293(block_number) {
         let min_pegin = config.minimum_pegin_tx_value; // RSKIP219 active alongside RSKIP293.
         if flyover_output_values.iter().any(|v| *v < min_pegin) {
+            // Refused with the bitcoin kept: no refund is generated on this
+            // path, and the flyover derivation hash is not marked used, so the
+            // same transaction can be presented again. The flyover analogue of
+            // INVALID_AMOUNT, and logged by nothing.
+            record_pegin(
+                SilentKind::PeginRejectedNoRefund,
+                &btc_tx,
+                tx_ctx,
+                total_satoshis,
+                "FLYOVER_UTXO_BELOW_MINIMUM",
+                vec![
+                    ("peginPath", FieldValue::Text("flyover".into())),
+                    ("minimumSat", FieldValue::U64(min_pegin)),
+                    ("fedOutputs", FieldValue::U64(flyover_output_values.len() as u64)),
+                    ("logged", FieldValue::Flag(false)),
+                ],
+            );
             return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_UTXO_BELOW_MINIMUM));
         }
     }
@@ -1816,6 +1848,20 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         if let Some(r) = &retiring_flyover {
             flyover_redeems.push(r.flyover_redeem.clone());
         }
+        let mut extra = refund_fields(&refund_hash160, refund_is_p2sh, config);
+        extra.push(("peginPath", FieldValue::Text("flyover".into())));
+        // Which of the two addresses the flyover protocol chose. The event
+        // log carries neither.
+        extra.push(("refundedTo", FieldValue::Text(if is_lp { "liquidity_provider".into() } else { "user".into() })));
+        extra.push(("logged", FieldValue::Flag(false)));
+        record_pegin(
+            SilentKind::PeginRefunded,
+            &btc_tx,
+            tx_ctx,
+            total_satoshis,
+            "FLYOVER_PEGIN_CAP_SURPASSED",
+            extra,
+        );
         emit_flyover_rejection_release(
             ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_satoshis,
             &flyover_redeems, rsk_height, config, hardfork_cfg, tx_ctx,
@@ -1826,6 +1872,19 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
             flyover_codes::REFUNDED_USER
         }));
     }
+
+    record_pegin(
+        SilentKind::PeginAccepted,
+        &btc_tx,
+        tx_ctx,
+        total_satoshis,
+        "ACCEPTED",
+        vec![
+            ("peginPath", FieldValue::Text("flyover".into())),
+            ("destination", FieldValue::Addr(lbc_address)),
+            ("logged", FieldValue::Flag(false)),
+        ],
+    );
 
     // transferTo(lbcAddress, amount): credit the LBC contract.
     let rbtc_amount = btc_satoshi_to_rbtc_wei(total_satoshis);
