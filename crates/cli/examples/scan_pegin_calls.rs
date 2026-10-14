@@ -258,7 +258,7 @@ fn main() -> Result<()> {
             );
         }
     } else {
-        println!("\n{:>8}  {:>16}  {:<22} {:>10} {}", "calls", "fed value", "first input", "first blk", "btcTxHash");
+        println!("\n{:>8}  {:>16}  {:<22} {:>10} btcTxHash", "calls", "fed value", "first input", "first blk");
         let mut rows: Vec<(&String, &Seen)> = seen.iter().collect();
         rows.sort_by(|a, b| b.1.calls.cmp(&a.1.calls));
         for (k, s) in rows {
