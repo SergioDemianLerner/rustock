@@ -23,6 +23,9 @@
 //!   --cache-mb N       block cache for the rskj unitrie (default 256)
 //!   --explain          on a state-root divergence, print the leaves that
 //!                      differ from rskj's own post-state, then stop
+//!   --blocks FILE      verify only the block numbers in FILE (one per line)
+//!                      instead of a contiguous range; <from> and <to> are
+//!                      then omitted
 //!   --record-silent DIR
 //!                      also record the Bridge decisions that emit no event
 //!                      into a silent-decision store at DIR (created if
@@ -58,7 +61,8 @@ use rustock_trie::{OverlayTrieStore, TrieNode, TrieStore};
 use std::sync::Arc;
 
 const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <to> \
-[--network-id N] [--scratch DIR] [--max-failures N] [--cache-mb N]";
+[--network-id N] [--scratch DIR] [--max-failures N] [--cache-mb N] \
+[--blocks FILE] [--record-silent DIR]";
 
 /// Splits `--key value` and `--key=value` options out of the command line,
 /// leaving the positional arguments.
@@ -68,8 +72,14 @@ const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <t
 /// read as a positional -- a mistyped `--max-failures` that became a block
 /// number would be worse than no option at all.
 fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)>)> {
-    const WITH_VALUE: [&str; 5] =
-        ["--network-id", "--scratch", "--max-failures", "--cache-mb", "--record-silent"];
+    const WITH_VALUE: [&str; 6] = [
+        "--network-id",
+        "--scratch",
+        "--max-failures",
+        "--cache-mb",
+        "--record-silent",
+        "--blocks",
+    ];
     const FLAGS: [&str; 1] = ["--explain"];
     let mut positional = Vec::new();
     let mut options = Vec::new();
@@ -203,11 +213,40 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
 
     let (positional, options) = split_options(std::env::args().skip(1).collect())?;
-    anyhow::ensure!(positional.len() == 4, "{USAGE}");
+    let blocks_file: Option<String> =
+        options.iter().rev().find(|(k, _)| k == "--blocks").map(|(_, v)| v.clone());
+
+    // A block list replaces the range, so <from> and <to> go away with it.
+    let targets: Vec<u64> = match &blocks_file {
+        Some(path) => {
+            anyhow::ensure!(positional.len() == 2, "{USAGE}");
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading the block list at {path}"))?;
+            let mut v: Vec<u64> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.parse::<u64>().with_context(|| format!("block number {l:?}")))
+                .collect::<Result<_>>()?;
+            // Sorted so the replay walks the state source forward, and deduped
+            // so a block listed twice is not verified twice.
+            v.sort_unstable();
+            v.dedup();
+            anyhow::ensure!(!v.is_empty(), "the block list at {path} is empty");
+            v
+        }
+        None => {
+            anyhow::ensure!(positional.len() == 4, "{USAGE}");
+            let from: u64 = positional[2].parse().context("<from>")?;
+            let to: u64 = positional[3].parse().context("<to>")?;
+            anyhow::ensure!(from <= to, "empty range: {from} > {to}");
+            (from..=to).collect()
+        }
+    };
     let data_dir = positional[0].clone();
     let unitrie_dir = positional[1].clone();
-    let from: u64 = positional[2].parse().context("<from>")?;
-    let to: u64 = positional[3].parse().context("<to>")?;
+    let from = *targets.first().expect("non-empty");
+    let to = *targets.last().expect("non-empty");
     let network_id: u64 = option(&options, "--network-id", support::TESTNET)?;
     let scratch: Option<String> =
         options.iter().rev().find(|(k, _)| k == "--scratch").map(|(_, v)| v.clone());
@@ -217,10 +256,12 @@ fn main() -> Result<()> {
     // a cache sized for the database rather than the box gets it killed.
     let cache_mb: usize = option(&options, "--cache-mb", 256)?;
     let explain = options.iter().any(|(k, _)| k == "--explain");
+    // Coverage over a block list cannot be recorded as a span: the blocks
+    // between two listed ones were never replayed, and claiming them would
+    // make the store assert exactly the thing it exists to disprove.
+    let contiguous = blocks_file.is_none();
     let record_silent: Option<String> =
         options.iter().rev().find(|(k, _)| k == "--record-silent").map(|(_, v)| v.clone());
-    anyhow::ensure!(from <= to, "empty range: {from} > {to}");
-
     let store = Arc::new(
         BlockStore::open_read_only(&data_dir)
             .with_context(|| format!("opening block store at {data_dir} read-only"))?,
@@ -247,18 +288,27 @@ fn main() -> Result<()> {
             tmp.path().to_path_buf()
         }
     };
-    let spill: Arc<dyn TrieStore> = Arc::new(
+    // Kept as the concrete type as well as behind the trait: the replay has
+    // to be able to ask whether its own writes succeeded. They go to a
+    // scratch directory on whatever filesystem had room, and a full disk
+    // makes a trie store answer "absent" for nodes it was asked to keep --
+    // which yields wrong roots, not errors.
+    let scratch_store = Arc::new(
         rustock_storage::RocksDbTrieStore::open(&scratch_path)
             .with_context(|| format!("opening scratch trie at {}", scratch_path.display()))?,
     );
+    let spill: Arc<dyn TrieStore> = scratch_store.clone();
     let trie: Arc<dyn TrieStore> = Arc::new(OverlayTrieStore::with_spill(rskj, spill));
 
     let hardfork_cfg = support::hardfork_for(network_id);
     eprintln!(
-        "verifying #{from}..=#{to} ({} blocks) on network-id {network_id} (chain_id {})",
-        to - from + 1,
+        "verifying {} block(s) in #{from}..=#{to} on network-id {network_id} (chain_id {})",
+        targets.len(),
         hardfork_cfg.chain_id
     );
+    if let Some(path) = &blocks_file {
+        eprintln!("  blocks listed in {path}");
+    }
     eprintln!("  blocks  {data_dir} (read-only)");
     eprintln!("  state   {unitrie_dir} (read-only)");
     eprintln!("  scratch {}", scratch_path.display());
@@ -303,7 +353,7 @@ fn main() -> Result<()> {
     let mut first_bad: Option<u64> = None;
     let mut stopped_at: Option<u64> = None;
 
-    for n in from..=to {
+    for (done, n) in targets.iter().copied().enumerate() {
         // Checked at the top of each block so every exit from the body below
         // -- divergence or unverifiable -- is counted before it is consulted.
         if max_failures > 0 && diverged + unverifiable >= max_failures {
@@ -380,6 +430,25 @@ fn main() -> Result<()> {
             }
         };
 
+        // Before the verdict is believed: if the scratch could not keep what
+        // this block computed, the comparison below is meaningless, and so is
+        // every block after it. Stop rather than record a plausible lie.
+        if scratch_store.write_failed() {
+            if let Some(store) = &silent {
+                rustock_execution::silent::drain();
+                if let Some(start) = run_start.take() {
+                    write_coverage(&silent, start, n - 1, &build)?;
+                }
+                store.add_gap(n, "scratch trie write failed (disk full?)")?;
+            }
+            anyhow::bail!(
+                "#{n}: a write to the scratch trie at {} failed, so the replay can no \
+                 longer read back what it computed. Nothing after this point is sound. \
+                 Free space and re-run; completed chunks are recorded as coverage.",
+                scratch_path.display()
+            );
+        }
+
         let verdict = Verdict {
             state: processed.state_root_hash != block.header.state_root,
             receipts: processed.receipts_root != block.header.receipts_root,
@@ -405,7 +474,12 @@ fn main() -> Result<()> {
                     silent_rows += rows.len() as u64;
                     store.put_records(&rows)?;
                 }
-                run_start.get_or_insert(n);
+                if contiguous {
+                    run_start.get_or_insert(n);
+                } else {
+                    // One span per block: truthful about a scattered replay.
+                    write_coverage(&silent, n, n, &build)?;
+                }
             } else {
                 close_run(&silent, &mut run_start, n, &build, &verdict.label())?;
             }
@@ -529,12 +603,15 @@ fn main() -> Result<()> {
             }
         }
 
-        if n % 1000 == 0 || n == to {
+        let step = if contiguous { 1000 } else { 500 };
+        if (done + 1) % step == 0 || n == to {
             let secs = started.elapsed().as_secs_f64();
             eprintln!(
                 "  #{n}  {checked} verified, {diverged} diverged, {unverifiable} unverifiable \
-                 | {:.0} blk/s",
-                (n - from + 1) as f64 / secs.max(0.001)
+                 | {:.1} blk/s | {}/{} done",
+                (done + 1) as f64 / secs.max(0.001),
+                done + 1,
+                targets.len()
             );
         }
     }

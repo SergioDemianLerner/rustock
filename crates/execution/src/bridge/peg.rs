@@ -795,6 +795,23 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             "LEGACY_PEGIN_UNDETERMINED_SENDER",
             vec![
                 ("senderType", FieldValue::Text("UNDETERMINED".into())),
+                ("inputShape", FieldValue::Text(undetermined_input_shape(&btc_tx).into())),
+                (
+                    "scriptSigLen",
+                    FieldValue::U64(
+                        btc_tx
+                            .input
+                            .first()
+                            .map(|i| i.script_sig.as_bytes().len() as u64)
+                            .unwrap_or(0),
+                    ),
+                ),
+                (
+                    "witnessItems",
+                    FieldValue::U64(
+                        btc_tx.input.first().map(|i| i.witness.len() as u64).unwrap_or(0),
+                    ),
+                ),
                 ("peginVersion", FieldValue::U64(0)),
                 ("logged", FieldValue::Flag(hardfork_cfg.has_rskip379(rsk_height))),
             ],
@@ -1018,6 +1035,37 @@ fn record_pegin(
     ];
     fields.extend(extra);
     crate::silent::record_here(kind, fields);
+}
+
+/// Why `classify_pegin_sender` returned nothing, read off the first input.
+///
+/// Every shape it recognises requires a NON-EMPTY scriptSig: P2PKH wants
+/// `[sig, pubkey]`, and the three P2SH forms want one chunk or three. A
+/// native segwit (bech32) input carries an empty scriptSig and puts
+/// everything in the witness, so it matches none of them and the peg-in is
+/// refused with the bitcoin kept. Recording which shape it was turns "the
+/// sender was undetermined" into something that can be counted.
+fn undetermined_input_shape(tx: &BtcTransaction) -> &'static str {
+    use super::release_tx::parse_chunks;
+    let Some(first) = tx.input.first() else { return "NO_INPUTS" };
+    let script_sig = first.script_sig.as_bytes();
+    let witness: Vec<&[u8]> = first.witness.iter().collect();
+    if script_sig.is_empty() {
+        return match witness.len() {
+            0 => "EMPTY_SCRIPTSIG_NO_WITNESS",
+            // P2WPKH spends are [signature, 33-byte compressed pubkey].
+            2 if witness[1].len() == 33 => "NATIVE_P2WPKH",
+            _ => "NATIVE_SEGWIT_OTHER",
+        };
+    }
+    match parse_chunks(script_sig) {
+        None => "UNPARSEABLE_SCRIPTSIG",
+        Some(chunks) => match chunks.len() {
+            1 => "ONE_CHUNK_UNRECOGNISED",
+            2 => "TWO_CHUNKS_BAD_PUBKEY",
+            _ => "OTHER_SCRIPTSIG",
+        },
+    }
 }
 
 /// The sender shape rskj's `BtcLockSenderProvider` settled on, named for a

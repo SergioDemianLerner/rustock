@@ -156,7 +156,16 @@ fn accounting(store: &SilentStore, from: u64, to: u64) -> Result<()> {
     }
 
     let mut by_reason: std::collections::BTreeMap<String, (u64, u128)> = Default::default();
+    // How many times each bitcoin transaction was registered and rejected.
+    // Counted, not just suppressed: a transaction resubmitted hundreds of
+    // times is worth seeing, and the count is only visible here because
+    // nothing on chain records a rejection that changed no state.
+    let mut attempts: std::collections::HashMap<String, (u64, u64, String)> = Default::default();
     let mut seen: std::collections::HashSet<String> = Default::default();
+    // For undetermined senders, what the first input actually looked like.
+    // Every shape rskj recognises needs a non-empty scriptSig, so a native
+    // segwit spend lands here and its bitcoin is kept.
+    let mut shapes: std::collections::BTreeMap<String, (u64, u128)> = Default::default();
     let mut records = 0u64;
     let mut repeats = 0u64;
 
@@ -171,17 +180,24 @@ fn accounting(store: &SilentStore, from: u64, to: u64) -> Result<()> {
                 }
             };
             let hash = field(&v, "btcTxHash").and_then(|h| h.as_str()).unwrap_or("").to_string();
+            let amount = field(&v, "amountSat").and_then(|a| a.as_u64()).unwrap_or(0);
+            let reason =
+                field(&v, "reason").and_then(|r| r.as_str()).unwrap_or("(none)").to_string();
+            let e = attempts.entry(hash.clone()).or_insert((0, amount, reason.clone()));
+            e.0 += 1;
             // The same bitcoin transaction rejected twice moved its coins once.
             if !seen.insert(hash) {
                 repeats += 1;
                 continue;
             }
-            let amount = field(&v, "amountSat").and_then(|a| a.as_u64()).unwrap_or(0);
-            let reason =
-                field(&v, "reason").and_then(|r| r.as_str()).unwrap_or("(none)").to_string();
             let e = by_reason.entry(reason).or_insert((0, 0));
             e.0 += 1;
             e.1 += amount as u128;
+            if let Some(shape) = field(&v, "inputShape").and_then(|s| s.as_str()) {
+                let e = shapes.entry(shape.to_string()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += amount as u128;
+            }
         }
     }
 
@@ -198,6 +214,41 @@ fn accounting(store: &SilentStore, from: u64, to: u64) -> Result<()> {
     println!("  {:<40} {:>8}  {:>22}", "TOTAL", total_txs, satoshis(total_sat));
     println!("\n  from {records} record(s); {repeats} were repeat registrations of a");
     println!("  bitcoin transaction already counted, and are excluded.");
+
+    // The transactions somebody kept resubmitting. Each attempt cost its
+    // sender an RSK transaction fee and changed nothing.
+    let mut repeated: Vec<(&String, &(u64, u64, String))> =
+        attempts.iter().filter(|(_, (n, _, _))| *n > 1).collect();
+    repeated.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(b.1.1.cmp(&a.1.1)));
+    println!(
+        "\n  {} bitcoin transaction(s) were registered more than once.",
+        repeated.len()
+    );
+    if !repeated.is_empty() {
+        println!("  the ten most repeated:\n");
+        println!("  {:<8} {:>20}  {:<32} btcTxHash", "attempts", "value", "reason");
+        for (hash, (n, amount, reason)) in repeated.iter().take(10) {
+            println!(
+                "  {:<8} {:>20}  {:<32} {}",
+                n,
+                satoshis(*amount as u128),
+                reason,
+                hash
+            );
+        }
+    }
+
+    if !shapes.is_empty() {
+        println!("\n  undetermined senders, by what the first input actually was:\n");
+        println!("  {:<32} {:>8}  {:>22}", "input shape", "txs", "value");
+        for (shape, (n, v)) in &shapes {
+            println!("  {:<32} {:>8}  {:>22}", shape, n, satoshis(*v));
+        }
+        println!(
+            "\n  every shape rskj recognises requires a non-empty scriptSig, so a native"
+        );
+        println!("  segwit (bech32) spend cannot be classified and its bitcoin is kept.");
+    }
 
     // Stated rather than left to be assumed: excess bitcoin, but not peg funds.
     for line in [
