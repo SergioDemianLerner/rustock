@@ -3542,12 +3542,31 @@ impl SyncService {
                 // The highest block number in the response should match a skeleton entry.
                 let chunk_idx = identify_chunk_by_content(&headers, &skeleton);
 
+                // A chunk is only taken from a peer that was actually asked
+                // for one. Content matching alone identifies *which* chunk a
+                // response belongs to, not *who* was entitled to answer: any
+                // connected peer can compute where the skeleton boundaries
+                // fall and send headers ending on one.
+                let solicited = tracker.has_outstanding(&peer);
                 // Consume the FIFO entry for this peer regardless (keeps queue aligned)
                 let _ = tracker.identify_response(&peer);
 
                 match chunk_idx {
-                    Some(idx) if idx < tracker.total_chunks => {
-                        tracker.buffer_response(peer, idx, headers);
+                    Some(idx) if idx < tracker.total_chunks && solicited => {
+                        if !tracker.buffer_response(peer, idx, headers) {
+                            debug!(
+                                target: "rustock::sync",
+                                "Chunk {} already answered; ignoring the copy from {:?}",
+                                idx, &peer.0[..4]
+                            );
+                        }
+                    }
+                    Some(_) if !solicited => {
+                        debug!(
+                            target: "rustock::sync",
+                            "Headers from {:?}, which has no chunk request outstanding; ignoring",
+                            &peer.0[..4]
+                        );
                     }
                     _ => {
                         // Response doesn't match any skeleton entry. This happens when
