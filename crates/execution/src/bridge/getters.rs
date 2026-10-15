@@ -910,7 +910,7 @@ pub fn get_state_for_debugging<CTX: crate::RskContextTr>(
     let papyrus = hardfork_cfg.has_rskip146(block_number);
 
     let height = super::btc_store::load_chain_head(ctx).map_or(0u32, |h| h.height);
-    let utxos = load_federation_utxos(ctx);
+    let utxos = load_federation_utxos(ctx, hardfork_cfg, block_number);
     let waiting_for_signatures = super::peg::serialize_rsk_txs_waiting_for_signatures(
         &super::peg::deserialize_rsk_txs_waiting_for_signatures(&bridge_load_bytes_named(
             ctx,

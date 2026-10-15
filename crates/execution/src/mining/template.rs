@@ -209,6 +209,7 @@ impl BlockTemplateBuilder {
             receipts_root: B256::ZERO,
             logs_bloom: Bloom::ZERO,
             extension_data: None,
+            version_fields: None,
             difficulty,
             number,
             gas_limit,

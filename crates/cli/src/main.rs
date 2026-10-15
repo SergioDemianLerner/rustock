@@ -252,7 +252,12 @@ struct Args {
     #[arg(long, default_value_t = 32 * 1024 * 1024, value_name = "BYTES")]
     snap_total_rate: u64,
 
-    /// Network ID (30 for mainnet, 33 for regtest)
+    /// Which chain to run: 30 mainnet, 31 testnet, anything else regtest.
+    ///
+    /// Named `--network-id` for historical reasons; it selects the chain, not
+    /// the wire network id (testnet's is 8100, which is *not* what to pass
+    /// here). Passing a value no chain claims gives a regtest node, which
+    /// starts cleanly on the wrong genesis and never finds a peer.
     #[arg(long, default_value = "30")]
     network_id: u64,
 
@@ -652,6 +657,27 @@ struct Args {
     /// import to redo them would rewrite ~180 GB for nothing.
     #[arg(long)]
     import_metadata_only: bool,
+
+    /// Import the blocks and chain metadata but not the state trie.
+    ///
+    /// For a database that is going to be *read against* rather than executed
+    /// from: a verification run reads state straight out of rskj's own
+    /// unitrie, so copying it here would duplicate ~130 GB to no purpose. What
+    /// it cannot read out of rskj is a block by height, because rskj keys
+    /// blocks by hash and keeps the height index somewhere this cannot read --
+    /// which is exactly what the block and metadata phases build.
+    #[arg(long)]
+    import_skip_unitrie: bool,
+
+    /// Import the blocks but leave the derived chain metadata alone.
+    ///
+    /// The canonical index and total difficulty are keyed by block hash, and
+    /// the block phase writes under rskj's own hashes, so re-importing blocks
+    /// into a datadir that already has its metadata leaves that metadata
+    /// correct. Rebuilding it anyway is the expensive half of an import --
+    /// over six hours on RSK testnet -- for no change.
+    #[arg(long)]
+    import_skip_metadata: bool,
 
     /// Rebuild chain metadata for this block range only, then exit.
     ///
@@ -1630,6 +1656,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             !args.import_enable_wal,
             !args.import_auto_compaction,
             args.import_metadata_only,
+            args.import_skip_unitrie,
+            args.import_skip_metadata,
             if args.import_unitrie_threads == 0 {
                 std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
             } else {
@@ -1903,7 +1931,20 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     cfg.clone(),
                 )?
             } else {
-                rustock_storage::epoch_store::EpochTrieStore::open(&trie_dir, cfg.clone())?
+                // Where execution will resume from. An epoch this open
+                // inherits mid-flight holds nothing written above it, so
+                // this is the upper bound that lets the collector sweep it
+                // later; without it that epoch is never collectable and the
+                // store grows without bound.
+                let resume_at = match store.exec_head()? {
+                    Some((hash, _)) => store.header(hash)?.map(|h| h.number),
+                    None => None,
+                };
+                rustock_storage::epoch_store::EpochTrieStore::open(
+                    &trie_dir,
+                    cfg.clone(),
+                    resume_at,
+                )?
             }))
         }
         _ => None,
@@ -3054,6 +3095,54 @@ fn build_genesis_state(config: &ChainConfig, trie_store: &dyn TrieStore) -> Resu
         root = root.put(&key, &acct.encode(), trie_store);
     }
 
+    // rskj `GenesisLoaderImpl.setupPrecompiledContractsStorage`: when RSKIP126
+    // activates *at* genesis, the genesis precompiles are created if absent and
+    // given the contract storage-prefix marker.
+    //
+    // rustock does this in the block executor at the activation block, which is
+    // right for mainnet (#1,591,000, an ordinary executed block) and wrong for
+    // testnet, where wasabi100 is height 0 -- genesis is constructed, never
+    // executed, so the markers were never written and the genesis state root
+    // came out as mainnet's.
+    if config.activation_heights.wasabi100 == 0 {
+        for addr in rustock_execution::precompiles::GENESIS_PRECOMPILES {
+            let acct_key = TrieKeySlice::from_key(&account_key(&addr));
+            if root.get(&acct_key, trie_store).is_none() {
+                // rskj only creates the account when it does not already
+                // exist, so the Bridge keeps the balance the alloc gave it.
+                let acct = AccountState::new(U256::ZERO, U256::ZERO);
+                root = root.put(&acct_key, &acct.encode(), trie_store);
+            }
+            let marker = TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(&addr));
+            root = root.put(&marker, &[1], trie_store);
+        }
+
+        // The second loop of `maintainPrecompiledContractStorageRoots`: any
+        // consensus-enabled precompile whose rule also activates at genesis.
+        // rskj calls `createAccount` unconditionally for these -- a fresh
+        // account, nonce and balance reset -- and then marks it, unlike the
+        // genesis set above which is only created when absent.
+        for (addr, upgrade) in rustock_execution::precompiles::CONSENSUS_ENABLED_PRECOMPILES {
+            use rustock_execution::hardfork::RskNetworkUpgrade as U;
+            let height = match upgrade {
+                U::Wasabi100 => Some(config.activation_heights.wasabi100),
+                U::Papyrus200 => Some(config.activation_heights.papyrus200),
+                U::Iris300 => Some(config.activation_heights.iris300),
+                // Later upgrades are not modelled in ActivationHeights, and
+                // none of them can be zero on any chain rustock supports.
+                _ => None,
+            };
+            if height != Some(0) {
+                continue;
+            }
+            let acct_key = TrieKeySlice::from_key(&account_key(&addr));
+            let acct = AccountState::new(U256::ZERO, U256::ZERO);
+            root = root.put(&acct_key, &acct.encode(), trie_store);
+            let marker = TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(&addr));
+            root = root.put(&marker, &[1], trie_store);
+        }
+    }
+
     let computed = root.compute_hash(trie_store);
     info!("Genesis Unitrie hash: {computed:?}");
 
@@ -3089,6 +3178,8 @@ fn run_rskj_import(
     disable_wal: bool,
     compact_first: bool,
     metadata_only: bool,
+    skip_unitrie: bool,
+    skip_metadata: bool,
     unitrie_threads: usize,
 ) -> Result<()> {
     use rustock_storage::rskj_import::{self, WalMode, WriteMode};
@@ -3134,7 +3225,10 @@ fn run_rskj_import(
 
     // State first: if this is interrupted the blocks are still absent, so the
     // node will not come up believing it has a chain it cannot execute.
-    let unitrie_phase = if metadata_only {
+    let unitrie_phase = if metadata_only || skip_unitrie {
+        if skip_unitrie {
+            info!("Skipping the trie phase: state will be read from the source instead");
+        }
         Default::default()
     } else if unitrie_threads == 1 {
         rskj_import::import_unitrie(
@@ -3166,6 +3260,16 @@ fn run_rskj_import(
         csv.as_mut().map(|f| f as &mut dyn std::io::Write),
     )?
     };
+
+    if skip_metadata {
+        info!(
+            "Skipping the metadata rebuild: the canonical index is keyed by block hash \
+             and the block phase wrote under the source's own hashes, so what is already \
+             there still holds"
+        );
+        info!("Import complete in {:.0}s", started.elapsed().as_secs_f64());
+        return Ok(());
+    }
 
     // Compact BEFORE the metadata rebuild, not after.
     //
@@ -4221,5 +4325,75 @@ mod snap_checkpoint_tests {
             None,
             "the checkpoint contradicts the chain it was read from"
         );
+    }
+}
+
+#[cfg(test)]
+mod genesis_tests {
+    use super::*;
+    use rustock_trie::MemoryTrieStore;
+
+    /// Testnet's genesis state root, published in rskj's
+    /// `genesis/orchid-testnet.json` and in every testnet block #0.
+    ///
+    /// Reproducing it requires `setupPrecompiledContractsStorage`, which rskj
+    /// runs in its *genesis loader* — not in the block executor — precisely
+    /// because genesis is constructed rather than executed. rustock ran the
+    /// equivalent only at the activation block, which is right for mainnet
+    /// (#1,591,000, an ordinary block) and silently wrong for testnet, where
+    /// wasabi100 is height 0. Without it the testnet genesis state was just
+    /// the allocation, which is *mainnet's* genesis state.
+    #[test]
+    fn testnet_genesis_state_root_matches_the_chain() {
+        let config = ChainConfig::testnet();
+        let store = MemoryTrieStore::new();
+        let root = build_genesis_state(&config, &store).unwrap();
+        assert_eq!(
+            root.compute_hash(&store),
+            "0x45bce5168430c42b3d568331753f900a32457b4f3748697cbd8375ff4da72641"
+                .parse::<alloy_primitives::B256>()
+                .unwrap(),
+            "testnet genesis state must match the published root"
+        );
+    }
+
+    /// Mainnet must be untouched by that: RSKIP126 does not activate at its
+    /// genesis (wasabi100 is #1,591,000), so no precompile is seeded and the
+    /// state is the allocation alone. Its header carries the *orchid* root of
+    /// that same allocation, which `test_mainnet_genesis_orchid_state_root_matches_header`
+    /// asserts separately.
+    #[test]
+    fn mainnet_genesis_seeds_no_precompiles() {
+        let config = ChainConfig::mainnet();
+        let store = MemoryTrieStore::new();
+        let root = build_genesis_state(&config, &store).unwrap();
+
+        // The alloc-only unitrie root, unchanged by the testnet fix.
+        assert_eq!(
+            root.compute_hash(&store),
+            "0x21de9a922f22eb925cefc6d4c994cb28e9ec36e7a45862105f79e4d97c0babfc"
+                .parse::<alloy_primitives::B256>()
+                .unwrap()
+        );
+
+        // And specifically: no storage-prefix marker for a genesis precompile.
+        let marker = TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(
+            &rustock_execution::precompiles::GENESIS_PRECOMPILES[0],
+        ));
+        assert!(
+            root.get(&marker, &store).is_none(),
+            "mainnet genesis must not seed precompile markers"
+        );
+    }
+
+    /// The two chains must not agree: before the fix they did, which was the
+    /// bug. Pinned so a future change cannot quietly collapse them again.
+    #[test]
+    fn the_two_chains_have_different_genesis_state() {
+        let store_m = MemoryTrieStore::new();
+        let store_t = MemoryTrieStore::new();
+        let m = build_genesis_state(&ChainConfig::mainnet(), &store_m).unwrap();
+        let t = build_genesis_state(&ChainConfig::testnet(), &store_t).unwrap();
+        assert_ne!(m.compute_hash(&store_m), t.compute_hash(&store_t));
     }
 }

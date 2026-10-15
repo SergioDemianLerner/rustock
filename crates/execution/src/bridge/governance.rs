@@ -480,8 +480,8 @@ pub(crate) fn commit_proposed_federation<CTX: crate::RskContextTr>(
     let old_format = federation_format_version(hardfork_cfg, old_block);
 
     // moveUTXOsFromNewToOldFederation.
-    let active_utxos = load_federation_utxos(ctx);
-    store_federation_utxos(ctx, &[]);
+    let active_utxos = load_federation_utxos(ctx, hardfork_cfg, block_number);
+    store_federation_utxos(ctx, hardfork_cfg, block_number, &[]);
     super::storage::store_old_federation_utxos(ctx, &active_utxos);
 
     // setOldAndNewFederations (always multikey post-RSKIP419).
@@ -634,8 +634,8 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
         store_pending_federation(ctx, None, multikey);
     } else {
         // Legacy handover. Move active-federation UTXOs to the old set.
-        let active_utxos = load_federation_utxos(ctx);
-        store_federation_utxos(ctx, &[]);
+        let active_utxos = load_federation_utxos(ctx, hardfork_cfg, block_number);
+        store_federation_utxos(ctx, hardfork_cfg, block_number, &[]);
         super::storage::store_old_federation_utxos(ctx, &active_utxos);
 
         // rskj saveOldFederation/saveNewFederation: post-RSKIP123 store the
@@ -1331,7 +1331,7 @@ fn decode_bytes_arg_at(args: &[u8], index: usize) -> Result<Vec<u8>, PrecompileE
     Ok(args[start..start + len].to_vec())
 }
 
-fn encode_int_result(gas_cost: u64, value: i64) -> PrecompileOutput {
+pub(crate) fn encode_int_result(gas_cost: u64, value: i64) -> PrecompileOutput {
     let mut output = [0u8; 32];
     if value >= 0 {
         output[24..32].copy_from_slice(&(value as u64).to_be_bytes());

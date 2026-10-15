@@ -45,6 +45,7 @@ use super::storage::*;
 use super::tx::*;
 use crate::hardfork::RskHardforkConfig;
 use crate::precompiles::{BRIDGE_ADDR, BridgeTxContext};
+use crate::silent::{FieldValue, SilentKind};
 
 /// rskj `BridgeSupport.BURN_ADDRESS`: receiver of the sBTC burned when a
 /// pegout's dusty change output is raised to the non-dust minimum.
@@ -309,6 +310,9 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // rskj marks processed txs with the RSK execution block number
     // (BridgeSupport.markTxAsProcessed), not the BTC block height.
     let rsk_height = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    // Attribute anything this call records, including from helpers several
+    // frames down that have no block of their own.
+    crate::silent::set_position(rsk_height, tx_ctx.tx_index);
 
     // RSKIP419: an SVP fund/spend transaction is recognized by its
     // signature-stripped txid matching the stored unsigned hash. rskj's
@@ -367,6 +371,14 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                     );
                     super::governance::commit_proposed_federation(ctx, config, hardfork_cfg);
                 }
+                record_pegin(
+                    SilentKind::BtcTxMarkedProcessed,
+                    &btc_tx,
+                    tx_ctx,
+                    0,
+                    if is_fund { "SVP_FUND_TX" } else { "SVP_SPEND_TX" },
+                    vec![],
+                );
                 set_btc_tx_processed(
                     ctx,
                     &legacy_txid,
@@ -476,6 +488,20 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     let is_migration = spends_retired_or_retiring && move_to_active;
 
     if tx_from_old_fed || is_migration || spends_live_fed {
+        record_pegin(
+            SilentKind::BtcTxMarkedProcessed,
+            &btc_tx,
+            tx_ctx,
+            active_output_values.iter().sum(),
+            if tx_from_old_fed {
+                "FROM_OLD_FEDERATION"
+            } else if is_migration {
+                "MIGRATION"
+            } else {
+                "PEGOUT"
+            },
+            vec![],
+        );
         let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
         register_federation_outputs(ctx, &btc_tx, &fed_script, active_utxo_key);
         if let Some((_, retiring_script)) = &retiring {
@@ -531,6 +557,20 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         // then unrefundable_pegin(NonRefundablePeginReason.INVALID_AMOUNT=3); it
         // marks the tx processed only when shouldMarkRejectedPeginAsProcessed
         // (RSKIP459 && !RSKIP551 — not yet active at Arrowhead600).
+        record_pegin(
+            SilentKind::PeginRejectedNoRefund,
+            &btc_tx,
+            tx_ctx,
+            total_value,
+            "INVALID_AMOUNT",
+            vec![
+                ("minimumSat", FieldValue::U64(min_pegin)),
+                ("fedOutputs", FieldValue::U64(live_output_values.len() as u64)),
+                // Whether the chain also logged this. Before RSKIP379 it did
+                // not, which is the gap these records exist to fill.
+                ("logged", FieldValue::Flag(rskip379)),
+            ],
+        );
         if rskip379 {
             let hash = btc_txid_event_bytes(&btc_tx);
             super::events::log_rejected_pegin(ctx, &hash, 5);
@@ -590,6 +630,40 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                 if hardfork_cfg.has_rskip181(rsk_height) {
                     super::events::log_rejected_pegin(ctx, &btc_txid_event_bytes(&btc_tx), 4);
                 }
+                match &sender {
+                    Some(s) => {
+                        let (h, p2sh) = sender_refund_target(s);
+                        let mut extra = refund_fields(&h, p2sh, config);
+                        extra.push((
+                            "senderType",
+                            FieldValue::Text(sender_type_name(Some(s)).into()),
+                        ));
+                        extra.push(("peginVersion", FieldValue::U64(1)));
+                        extra.push((
+                            "logged",
+                            FieldValue::Flag(hardfork_cfg.has_rskip181(rsk_height)),
+                        ));
+                        record_pegin(
+                            SilentKind::PeginRefunded,
+                            &btc_tx,
+                            tx_ctx,
+                            total_value,
+                            "PEGIN_V1_INVALID_PAYLOAD",
+                            extra,
+                        );
+                    }
+                    None => record_pegin(
+                        SilentKind::PeginRejectedNoRefund,
+                        &btc_tx,
+                        tx_ctx,
+                        total_value,
+                        "PEGIN_V1_INVALID_PAYLOAD",
+                        vec![
+                            ("senderType", FieldValue::Text("UNDETERMINED".into())),
+                            ("peginVersion", FieldValue::U64(1)),
+                        ],
+                    ),
+                }
                 if let Some(sender) = &sender {
                     let (refund_hash160, refund_is_p2sh) = sender_refund_target(sender);
                     emit_pegin_rejection_release(
@@ -621,6 +695,42 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             // refundTxSender: refund to the v1 refund address if present, else
             // the BtcLockSender address; if neither, no refund (a non-refundable
             // peg-in — unrefundable_pegin event not modeled, see TODO).
+            match v1_refund_target(&instr, sender.as_ref()) {
+                Some((h, p2sh)) => {
+                    let mut extra = refund_fields(&h, p2sh, config);
+                    extra.push((
+                        "senderType",
+                        FieldValue::Text(sender_type_name(sender.as_ref()).into()),
+                    ));
+                    extra.push(("peginVersion", FieldValue::U64(1)));
+                    // Whether the refund address came from the OP_RETURN or
+                    // fell back to the sender -- the RSKIP distinguishes them.
+                    extra.push((
+                        "refundFromPayload",
+                        FieldValue::Flag(instr.btc_refund_address.is_some()),
+                    ));
+                    extra.push(("logged", FieldValue::Flag(hardfork_cfg.has_rskip181(rsk_height))));
+                    record_pegin(
+                        SilentKind::PeginRefunded,
+                        &btc_tx,
+                        tx_ctx,
+                        total_value,
+                        "PEGIN_CAP_SURPASSED",
+                        extra,
+                    );
+                }
+                None => record_pegin(
+                    SilentKind::PeginRejectedNoRefund,
+                    &btc_tx,
+                    tx_ctx,
+                    total_value,
+                    "PEGIN_CAP_SURPASSED",
+                    vec![
+                        ("senderType", FieldValue::Text("UNDETERMINED".into())),
+                        ("peginVersion", FieldValue::U64(1)),
+                    ],
+                ),
+            }
             if let Some((refund_hash160, refund_is_p2sh)) = v1_refund_target(&instr, sender.as_ref()) {
                 emit_pegin_rejection_release(
                     ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
@@ -643,6 +753,19 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         }
         // RSKIP170 is required for v1, so pegin_btc (protocolVersion = 1).
         super::events::log_pegin_btc(ctx, dest, &btc_txid_event_bytes(&btc_tx), total_value, 1);
+        record_pegin(
+            SilentKind::PeginAccepted,
+            &btc_tx,
+            tx_ctx,
+            total_value,
+            "ACCEPTED",
+            vec![
+                ("destination", FieldValue::Addr(dest)),
+                ("senderType", FieldValue::Text(sender_type_name(sender.as_ref()).into())),
+                ("peginVersion", FieldValue::U64(1)),
+                ("logged", FieldValue::Flag(true)),
+            ],
+        );
 
         let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
         register_federation_outputs(ctx, &btc_tx, &fed_script, active_utxo_key);
@@ -664,6 +787,35 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         // then unrefundable_pegin(NonRefundablePeginReason.LEGACY_PEGIN_UNDETERMINED_SENDER=1),
         // and marks the tx processed only when RSKIP459 && !RSKIP551. Pre-379 the
         // legacy path aborts silently (sender could not be determined).
+        record_pegin(
+            SilentKind::PeginRejectedNoRefund,
+            &btc_tx,
+            tx_ctx,
+            total_value,
+            "LEGACY_PEGIN_UNDETERMINED_SENDER",
+            vec![
+                ("senderType", FieldValue::Text("UNDETERMINED".into())),
+                ("inputShape", FieldValue::Text(undetermined_input_shape(&btc_tx).into())),
+                (
+                    "scriptSigLen",
+                    FieldValue::U64(
+                        btc_tx
+                            .input
+                            .first()
+                            .map(|i| i.script_sig.as_bytes().len() as u64)
+                            .unwrap_or(0),
+                    ),
+                ),
+                (
+                    "witnessItems",
+                    FieldValue::U64(
+                        btc_tx.input.first().map(|i| i.witness.len() as u64).unwrap_or(0),
+                    ),
+                ),
+                ("peginVersion", FieldValue::U64(0)),
+                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip379(rsk_height))),
+            ],
+        );
         if hardfork_cfg.has_rskip379(rsk_height) {
             let hash = btc_txid_event_bytes(&btc_tx);
             super::events::log_rejected_pegin(ctx, &hash, 3);
@@ -676,6 +828,21 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     };
     let rskip143 = hardfork_cfg.has_rskip143(rsk_height);
     if !matches!(sender, PeginSender::P2pkh { .. }) && !rskip143 {
+        // Dropped without a refund, without being marked processed and
+        // without a log line of any kind: the quietest outcome the Bridge has.
+        record_pegin(
+            SilentKind::PeginRejectedNoRefund,
+            &btc_tx,
+            tx_ctx,
+            total_value,
+            "SENDER_NOT_PROCESSABLE_PRE_RSKIP143",
+            vec![
+                ("senderType", FieldValue::Text(sender_type_name(Some(&sender)).into())),
+                ("peginVersion", FieldValue::U64(0)),
+                ("logged", FieldValue::Flag(false)),
+                ("markedProcessed", FieldValue::Flag(false)),
+            ],
+        );
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
     // rskj txIsLockable: only P2PKH and (post-RSKIP143) P2SH-P2WPKH senders
@@ -701,7 +868,13 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // so a whitelist rejection never lazily initializes the cap). A cap
     // rejection produces the same refund release as a whitelist one.
     let allowed = lockable
-        && whitelist_allows_and_consume(ctx, &sender_hash160, total_value, btc_block_height)
+        && whitelist_allows_and_consume(
+            ctx,
+            &sender_hash160,
+            total_value,
+            btc_block_height,
+            hardfork_cfg.has_rskip87(rsk_height),
+        )
         && cap_ok(ctx);
     tracing::debug!(
         "pegin lock check: sender {} amount {} btc_height {} -> {}",
@@ -718,18 +891,59 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         // A whitelist-only rejection (lockable, cap ok) logs nothing. The cap
         // re-evaluation here also lazily initializes the locking-cap cell, like
         // rskj's second verifyLockDoesNotSurpassLockingCap call.
+        //
+        // The silent reason is read off this same evaluation rather than
+        // recomputed: `cap_ok` WRITES (it lazily initializes the locking-cap
+        // cell), so calling it a second time -- or calling it pre-RSKIP181,
+        // where rskj does not -- would change the state root. A diagnostic
+        // that alters what it observes is worse than no diagnostic.
+        let silent_reason;
         if hardfork_cfg.has_rskip181(rsk_height) {
             let reason = if !lockable {
+                silent_reason = "LEGACY_PEGIN_MULTISIG_SENDER";
                 Some(2u64) // LEGACY_PEGIN_MULTISIG_SENDER
             } else if !cap_ok(ctx) {
+                silent_reason = "PEGIN_CAP_SURPASSED";
                 Some(1u64) // PEGIN_CAP_SURPASSED
             } else {
+                silent_reason = "LOCK_WHITELIST_REJECTED";
                 None // whitelist rejection: no event
             };
             if let Some(reason) = reason {
                 super::events::log_rejected_pegin(ctx, &btc_txid_event_bytes(&btc_tx), reason);
             }
+        } else if !lockable {
+            silent_reason = "LEGACY_PEGIN_MULTISIG_SENDER";
+        } else if crate::silent::is_recording()
+            && hardfork_cfg.has_rskip134(rsk_height)
+            && !locking_cap_would_allow(ctx, config, total_value)
+        {
+            // Pre-RSKIP181 rskj does not re-evaluate the cap here, so the
+            // reason is established by a read-only equivalent rather than by
+            // the real check, which writes. Guarded on recording only to skip
+            // the reads when nobody wants the answer -- it changes nothing.
+            //
+            // Gated on RSKIP134 as `cap_ok` is: before papyrus200 no locking
+            // cap exists, so the cell is unset and the read-only equivalent
+            // would fall back to `initial_locking_cap` and could blame a cap
+            // that was not yet a rule. In that era the only way to reach this
+            // branch is a lock-whitelist rejection, which is the one thing a
+            // pre-papyrus200 replay exists to find.
+            silent_reason = "PEGIN_CAP_SURPASSED";
+        } else {
+            silent_reason = "LOCK_WHITELIST_REJECTED";
         }
+        let mut extra = refund_fields(&sender_hash160, sender_is_p2sh, config);
+        extra.push(("senderType", FieldValue::Text(sender_type_name(Some(&sender)).into())));
+        extra.push(("peginVersion", FieldValue::U64(0)));
+        extra.push((
+            "logged",
+            FieldValue::Flag(
+                hardfork_cfg.has_rskip181(rsk_height)
+                    && silent_reason != "LOCK_WHITELIST_REJECTED",
+            ),
+        ));
+        record_pegin(SilentKind::PeginRefunded, &btc_tx, tx_ctx, total_value, silent_reason, extra);
         emit_pegin_rejection_release(
             ctx, &btc_tx, &sender_hash160, sender_is_p2sh, total_value, &fed_redeem,
             &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
@@ -759,6 +973,25 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         // Peg-in events: lock_btc from RSKIP146, pegin_btc from RSKIP170
         // (a legacy peg-in past RSKIP170 logs pegin_btc with protocolVersion 0).
         let txid_bytes = btc_txid_event_bytes(&btc_tx);
+        record_pegin(
+            SilentKind::PeginAccepted,
+            &btc_tx,
+            tx_ctx,
+            total_value,
+            "ACCEPTED",
+            vec![
+                ("destination", FieldValue::Addr(dest)),
+                ("senderType", FieldValue::Text(sender_type_name(Some(&sender)).into())),
+                (
+                    "senderAddress",
+                    FieldValue::Text(sender_base58_address(&sender_hash160, sender_is_p2sh, config)),
+                ),
+                ("peginVersion", FieldValue::U64(0)),
+                // lock_btc arrives with RSKIP146 and pegin_btc with RSKIP170;
+                // before either, a credited peg-in left no trace but the balance.
+                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip146(rsk_height))),
+            ],
+        );
         if hardfork_cfg.has_rskip170(rsk_height) {
             super::events::log_pegin_btc(ctx, dest, &txid_bytes, total_value, 0);
         } else if hardfork_cfg.has_rskip146(rsk_height) {
@@ -785,6 +1018,93 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// Describes a peg-in decision for the silent-decision store.
+///
+/// A no-op unless a replay tool turned recording on, so the cost on an
+/// ordinary block is one thread-local read per decision. Nothing here is read
+/// back during execution -- see [`crate::silent`].
+fn record_pegin(
+    kind: SilentKind,
+    btc_tx: &BtcTransaction,
+    tx_ctx: &BridgeTxContext,
+    amount_sat: u64,
+    reason: &'static str,
+    extra: Vec<(&'static str, FieldValue)>,
+) {
+    if !crate::silent::is_recording() {
+        return;
+    }
+    let mut fields = vec![
+        ("btcTxHash", FieldValue::Bytes(btc_txid_event_bytes(btc_tx).to_vec())),
+        ("rskTxHash", FieldValue::Bytes(tx_ctx.rsk_tx_hash.to_vec())),
+        ("amountSat", FieldValue::U64(amount_sat)),
+        ("reason", FieldValue::Text(reason.to_string())),
+    ];
+    fields.extend(extra);
+    crate::silent::record_here(kind, fields);
+}
+
+/// Why `classify_pegin_sender` returned nothing, read off the first input.
+///
+/// Every shape it recognises requires a NON-EMPTY scriptSig: P2PKH wants
+/// `[sig, pubkey]`, and the three P2SH forms want one chunk or three. A
+/// native segwit (bech32) input carries an empty scriptSig and puts
+/// everything in the witness, so it matches none of them and the peg-in is
+/// refused with the bitcoin kept. Recording which shape it was turns "the
+/// sender was undetermined" into something that can be counted.
+fn undetermined_input_shape(tx: &BtcTransaction) -> &'static str {
+    use super::release_tx::parse_chunks;
+    let Some(first) = tx.input.first() else { return "NO_INPUTS" };
+    let script_sig = first.script_sig.as_bytes();
+    let witness: Vec<&[u8]> = first.witness.iter().collect();
+    if script_sig.is_empty() {
+        return match witness.len() {
+            0 => "EMPTY_SCRIPTSIG_NO_WITNESS",
+            // P2WPKH spends are [signature, 33-byte compressed pubkey].
+            2 if witness[1].len() == 33 => "NATIVE_P2WPKH",
+            _ => "NATIVE_SEGWIT_OTHER",
+        };
+    }
+    match parse_chunks(script_sig) {
+        None => "UNPARSEABLE_SCRIPTSIG",
+        Some(chunks) => match chunks.len() {
+            1 => "ONE_CHUNK_UNRECOGNISED",
+            2 => "TWO_CHUNKS_BAD_PUBKEY",
+            _ => "OTHER_SCRIPTSIG",
+        },
+    }
+}
+
+/// The sender shape rskj's `BtcLockSenderProvider` settled on, named for a
+/// reader. `None` is the undetermined case, which is itself a decision.
+fn sender_type_name(sender: Option<&PeginSender>) -> &'static str {
+    match sender {
+        Some(PeginSender::P2pkh { .. }) => "P2PKH",
+        Some(PeginSender::P2shP2wpkh { .. }) => "P2SH-P2WPKH",
+        Some(PeginSender::P2shMultisig { .. }) => "P2SH-MULTISIG",
+        Some(PeginSender::P2shP2wsh { .. }) => "P2SH-P2WSH",
+        None => "UNDETERMINED",
+    }
+}
+
+/// The refund destination as it would be paid: the base58 address and whether
+/// it is a P2SH. This is the field the event log never carried, and the one a
+/// question about past refunds actually turns on.
+fn refund_fields(
+    hash160: &[u8; 20],
+    is_p2sh: bool,
+    config: &BridgeConstants,
+) -> Vec<(&'static str, FieldValue)> {
+    vec![
+        ("refundAddress", FieldValue::Text(sender_base58_address(hash160, is_p2sh, config))),
+        (
+            "refundAddressType",
+            FieldValue::Text(if is_p2sh { "P2SH".into() } else { "P2PKH".into() }),
+        ),
+        ("refundHash160", FieldValue::Bytes(hash160.to_vec())),
+    ]
 }
 
 /// rskj `BtcLockSender.getBTCAddress` target for a legacy refund: the sender's
@@ -895,6 +1215,25 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
             );
         }
         store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
+    } else {
+        // The refund was due and could not be built -- in practice the inputs
+        // do not cover the fee. rskj logs a warn line and moves on, so the
+        // peg-in is refused and the bitcoin stays with the federation, with
+        // no event to say so. Recorded separately because a `pegin_refunded`
+        // row on its own would claim a refund that never went out.
+        crate::silent::record_here(
+            SilentKind::RefundBuildFailed,
+            vec![
+                ("btcTxHash", FieldValue::Bytes(btc_txid_event_bytes(btc_tx).to_vec())),
+                ("amountSat", FieldValue::U64(total_value)),
+                ("utxos", FieldValue::U64(pegin_utxos.len() as u64)),
+                ("feePerKb", FieldValue::U64(fee_per_kb)),
+                (
+                    "refundAddress",
+                    FieldValue::Text(sender_base58_address(refund_hash160, refund_is_p2sh, config)),
+                ),
+            ],
+        );
     }
 }
 
@@ -1015,6 +1354,38 @@ pub(super) fn get_or_init_locking_cap<CTX: crate::RskContextTr>(
     bridge_load_u256(ctx, LOCKING_CAP_KEY).to::<u64>()
 }
 
+/// The locking-cap verdict WITHOUT the lazy initialization.
+///
+/// `verify_lock_does_not_surpass_locking_cap` writes the cap cell when it is
+/// unset, which is consensus behaviour and must happen exactly where rskj
+/// does it. Before RSKIP181 rskj does not re-evaluate the cap in the
+/// rejection branch at all, so a recorder that called the real check to name
+/// the reason would write a cell the chain never wrote. This reads the same
+/// inputs and decides the same way, without the write.
+fn locking_cap_would_allow<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    total_amount_satoshis: u64,
+) -> bool {
+    let raw = bridge_load_bytes_named(ctx, LOCKING_CAP_KEY);
+    let cap = if raw.is_empty() {
+        // Unset means the initial cap applies: the same value the real check
+        // would have stored and then used.
+        config.initial_locking_cap
+    } else {
+        bridge_load_u256(ctx, LOCKING_CAP_KEY).to::<u64>()
+    };
+    let bridge_balance_wei = ctx
+        .journal_mut()
+        .load_account(crate::precompiles::BRIDGE_ADDR)
+        .map(|a| a.info.balance)
+        .unwrap_or_default();
+    let balance_satoshis = (bridge_balance_wei / U256::from(10_000_000_000u64)).to::<u64>();
+    const MAX_RBTC_SATOSHIS: u64 = 2_100_000_000_000_000;
+    let fed_current_funds = MAX_RBTC_SATOSHIS.saturating_sub(balance_satoshis);
+    fed_current_funds + total_amount_satoshis <= cap
+}
+
 /// rskj `BridgeSupport.verifyLockDoesNotSurpassLockingCap`: the federation's
 /// current funds are maxRbtc (21M BTC) minus the Bridge contract balance;
 /// the peg-in is rejected when funds + amount exceed the cap.
@@ -1045,22 +1416,44 @@ fn whitelist_allows_and_consume<CTX: crate::RskContextTr>(
     sender_hash160: &[u8; 20],
     amount: u64,
     height: u64,
+    rskip87: bool,
 ) -> bool {
+    // rskj `getLockWhitelist()` deserializes BOTH cells together, so reaching
+    // this function reads both even where the decision needs only one.
     let (mut one_off, disable_h) = load_one_off_whitelist(ctx);
+    let unlimited = load_unlimited_whitelist(ctx);
     let disabled = (height as i64) > (disable_h as i64);
 
-    if let Some(pos) = one_off.iter().position(|(h, _)| h == sender_hash160) {
+    let allowed = if let Some(pos) = one_off.iter().position(|(h, _)| h == sender_hash160) {
         let allowed = disabled || amount <= one_off[pos].1;
         if allowed {
+            // A one-off entry is spent here and gone from the next block's
+            // state, with nothing logged to say it was ever used.
+            crate::silent::record_here(
+                SilentKind::WhitelistEntryConsumed,
+                vec![
+                    ("senderHash160", FieldValue::Bytes(sender_hash160.to_vec())),
+                    ("amountSat", FieldValue::U64(amount)),
+                    ("entryMaxSat", FieldValue::U64(one_off[pos].1)),
+                    ("whitelistDisabled", FieldValue::Flag(disabled)),
+                ],
+            );
+            // rskj consumes the matching one-off entry only on success.
             one_off.remove(pos);
-            store_one_off_whitelist(ctx, &one_off, disable_h);
         }
-        return allowed;
-    }
-    if disabled {
-        return true;
-    }
-    load_unlimited_whitelist(ctx).contains(sender_hash160)
+        allowed
+    } else if disabled {
+        true
+    } else {
+        unlimited.contains(sender_hash160)
+    };
+
+    // Unconditional, including on rejection: rskj's save() writes the
+    // whitelist back because the call loaded it, not because it changed it.
+    // See `save_lock_whitelist` -- this write is why testnet #6,602 has a
+    // `lockWhitelist` cell at all.
+    super::storage::save_lock_whitelist(ctx, &one_off, disable_h, &unlimited, rskip87);
+    allowed
 }
 
 /// rskj `BridgeSupport.registerNewUtxos`: register every output paying the
@@ -1183,6 +1576,12 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     call_depth: usize,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let ok = |code: Bytes| Ok(PrecompileOutput::new(gas_cost, code));
+
+    // Attribute anything this call records. Flyover is a second peg-in path
+    // with its own refund rules, and it reaches the Bridge only through a
+    // contract (`call_depth > 1`), so nothing registered here is visible to a
+    // scan of top-level transactions.
+    crate::silent::set_position(rsk_height_of(ctx), tx_ctx.tx_index);
 
     // rskj wraps the whole body in try/catch → GENERIC_ERROR. Any malformed
     // ABI / arg shape returns GENERIC_ERROR (NOT a failed tx).
@@ -1392,6 +1791,23 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     if hardfork_cfg.has_rskip293(block_number) {
         let min_pegin = config.minimum_pegin_tx_value; // RSKIP219 active alongside RSKIP293.
         if flyover_output_values.iter().any(|v| *v < min_pegin) {
+            // Refused with the bitcoin kept: no refund is generated on this
+            // path, and the flyover derivation hash is not marked used, so the
+            // same transaction can be presented again. The flyover analogue of
+            // INVALID_AMOUNT, and logged by nothing.
+            record_pegin(
+                SilentKind::PeginRejectedNoRefund,
+                &btc_tx,
+                tx_ctx,
+                total_satoshis,
+                "FLYOVER_UTXO_BELOW_MINIMUM",
+                vec![
+                    ("peginPath", FieldValue::Text("flyover".into())),
+                    ("minimumSat", FieldValue::U64(min_pegin)),
+                    ("fedOutputs", FieldValue::U64(flyover_output_values.len() as u64)),
+                    ("logged", FieldValue::Flag(false)),
+                ],
+            );
             return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_UTXO_BELOW_MINIMUM));
         }
     }
@@ -1432,6 +1848,20 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         if let Some(r) = &retiring_flyover {
             flyover_redeems.push(r.flyover_redeem.clone());
         }
+        let mut extra = refund_fields(&refund_hash160, refund_is_p2sh, config);
+        extra.push(("peginPath", FieldValue::Text("flyover".into())));
+        // Which of the two addresses the flyover protocol chose. The event
+        // log carries neither.
+        extra.push(("refundedTo", FieldValue::Text(if is_lp { "liquidity_provider".into() } else { "user".into() })));
+        extra.push(("logged", FieldValue::Flag(false)));
+        record_pegin(
+            SilentKind::PeginRefunded,
+            &btc_tx,
+            tx_ctx,
+            total_satoshis,
+            "FLYOVER_PEGIN_CAP_SURPASSED",
+            extra,
+        );
         emit_flyover_rejection_release(
             ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_satoshis,
             &flyover_redeems, rsk_height, config, hardfork_cfg, tx_ctx,
@@ -1442,6 +1872,19 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
             flyover_codes::REFUNDED_USER
         }));
     }
+
+    record_pegin(
+        SilentKind::PeginAccepted,
+        &btc_tx,
+        tx_ctx,
+        total_satoshis,
+        "ACCEPTED",
+        vec![
+            ("peginPath", FieldValue::Text("flyover".into())),
+            ("destination", FieldValue::Addr(lbc_address)),
+            ("logged", FieldValue::Flag(false)),
+        ],
+    );
 
     // transferTo(lbcAddress, amount): credit the LBC contract.
     let rbtc_amount = btc_satoshi_to_rbtc_wei(total_satoshis);
@@ -3534,7 +3977,7 @@ pub(crate) fn active_federation_utxo_key<CTX: crate::RskContextTr>(
             return super::storage::OLD_FEDERATION_BTC_UTXOS_KEY;
         }
     }
-    super::storage::NEW_FEDERATION_BTC_UTXOS_KEY
+    super::storage::new_federation_utxos_key(hardfork_cfg, block_number)
 }
 
 fn load_utxos_at<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str) -> Vec<BridgeUtxo> {
@@ -3953,7 +4396,7 @@ pub fn add_signature<CTX: crate::RskContextTr>(
                 deserialize_pegouts_waiting_for_confirmations(&bridge_load_bytes(ctx, key), false)
                     .len()
             };
-            let utxo_count = load_federation_utxos(ctx).len();
+            let utxo_count = load_federation_utxos(ctx, hardfork_cfg, block_number).len();
             let wfc_raw_len = {
                 let key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
                 bridge_load_bytes(ctx, key).len()
@@ -5321,6 +5764,47 @@ mod tests {
         revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default())
     }
 
+    /// Recording must be observation only. The whitelist consumer is the
+    /// hook that sits inside a state-mutating function, so it is the one
+    /// where a careless record could write; and the rejection branch nearby
+    /// re-evaluates a locking-cap check that lazily initializes its cell.
+    /// If turning recording on changed the writes, every replayed root would
+    /// differ from the chain and the records would describe a fiction.
+    #[test]
+    fn recording_does_not_change_what_is_written() {
+        use revm::MainContext;
+
+        fn run(record: bool) -> Vec<crate::raw_storage::RawWrite> {
+            let mut ctx =
+                revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+            let sender = [0x7au8; 20];
+            super::super::storage::save_lock_whitelist(
+                &mut ctx,
+                &[(sender, 1_000_000u64)],
+                0,
+                &[],
+                true,
+            );
+            ctx.chain.raw_storage.commit_call();
+
+            if record {
+                crate::silent::start();
+                crate::silent::set_position(2_745_770, 1);
+            }
+            let allowed = whitelist_allows_and_consume(&mut ctx, &sender, 500_000, 10, true);
+            assert!(allowed, "the entry covers the amount");
+            if record {
+                let recorded = crate::silent::finish();
+                assert_eq!(recorded.len(), 1, "the consumed entry was recorded");
+                assert_eq!(recorded[0].kind, SilentKind::WhitelistEntryConsumed);
+            }
+            ctx.chain.raw_storage.commit_call();
+            ctx.chain.raw_storage.drain()
+        }
+
+        assert_eq!(run(false), run(true), "recording changed the written state");
+    }
+
     fn legacy_entry(tag: u8, amount: u64) -> ReleaseRequest {
         ReleaseRequest { btc_dest_hash160: [tag; 20], amount_satoshis: amount, rsk_tx_hash: None }
     }
@@ -5365,6 +5849,125 @@ mod tests {
         // Before RSKIP146 the with-txhash queue is not in scope at all.
         let pre = load_release_request_queue(&mut ctx, false);
         assert_eq!(pre.len(), 2);
+    }
+
+    /// Ground truth: rootstock testnet #6,602, whose only state-changing
+    /// peg-in was *rejected*. The reference node's storage at that block
+    /// holds `lockWhitelist = 0xc5847fffffff` and
+    /// `unlimitedLockWhitelist = 0xc0` where #6,601 held neither, so rskj
+    /// created both cells on a rejection that changed nothing.
+    ///
+    /// Writing only on modification makes rustock's state root diverge from
+    /// #6,602 onward, which is what issue #290 was.
+    #[test]
+    fn a_rejected_pegin_still_materialises_both_whitelist_cells() {
+        let mut ctx = queue_ctx();
+        let sender = [0x42u8; 20];
+
+        assert!(
+            bridge_load_bytes_named(&mut ctx, LOCK_WHITELIST_KEY).is_empty(),
+            "precondition: the whitelist has never been written"
+        );
+
+        let allowed = whitelist_allows_and_consume(&mut ctx, &sender, 1_000, 100, true);
+        assert!(!allowed, "an address on neither list is not whitelisted");
+
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(&mut ctx, LOCK_WHITELIST_KEY)),
+            "c5847fffffff",
+            "empty one-off list plus the i32::MAX disable height, as rskj writes it"
+        );
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(&mut ctx, UNLIMITED_LOCK_WHITELIST_KEY)),
+            "c0",
+            "empty unlimited list"
+        );
+    }
+
+    /// Before RSKIP87 rskj's `saveLockWhitelist` skips the unlimited cell, so
+    /// writing it early would diverge in the other direction.
+    #[test]
+    fn the_unlimited_cell_is_not_written_before_rskip87() {
+        let mut ctx = queue_ctx();
+        whitelist_allows_and_consume(&mut ctx, &[0x42; 20], 1_000, 100, false);
+
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(&mut ctx, LOCK_WHITELIST_KEY)),
+            "c5847fffffff",
+            "the one-off cell is written at every activation"
+        );
+        assert!(
+            bridge_load_bytes_named(&mut ctx, UNLIMITED_LOCK_WHITELIST_KEY).is_empty(),
+            "the unlimited cell does not exist before RSKIP87"
+        );
+    }
+
+    /// The save-back must not disturb the entry it did not touch, and a
+    /// successful one-off lock must still consume its entry.
+    #[test]
+    fn a_consumed_one_off_entry_is_removed_and_the_rest_survive() {
+        let mut ctx = queue_ctx();
+        let user = [0x11u8; 20];
+        let other = [0x22u8; 20];
+        store_one_off_whitelist(&mut ctx, &[(user, 5_000), (other, 7_000)], i32::MAX);
+
+        assert!(whitelist_allows_and_consume(&mut ctx, &user, 5_000, 100, true));
+
+        let (entries, disable_h) = load_one_off_whitelist(&mut ctx);
+        assert_eq!(entries, vec![(other, 7_000)], "only the used entry is consumed");
+        assert_eq!(disable_h, i32::MAX);
+    }
+
+    /// A one-off entry too small for the amount rejects *and keeps* the
+    /// entry: rskj consumes only after `isWhitelistedFor` passes.
+    #[test]
+    fn an_over_cap_lock_is_rejected_without_consuming_the_entry() {
+        let mut ctx = queue_ctx();
+        let user = [0x11u8; 20];
+        store_one_off_whitelist(&mut ctx, &[(user, 5_000)], i32::MAX);
+
+        assert!(!whitelist_allows_and_consume(&mut ctx, &user, 9_000, 100, true));
+
+        assert_eq!(
+            load_one_off_whitelist(&mut ctx).0,
+            vec![(user, 5_000)],
+            "a rejected lock leaves the entry in place"
+        );
+    }
+
+    /// An unlimited entry is never consumed, and the save-back must preserve
+    /// it rather than write the empty list the one-off branch computed.
+    #[test]
+    fn an_unlimited_entry_survives_the_lock_it_authorises() {
+        let mut ctx = queue_ctx();
+        let user = [0x33u8; 20];
+        store_unlimited_whitelist(&mut ctx, &[user]);
+
+        assert!(whitelist_allows_and_consume(&mut ctx, &user, 1_000_000, 100, true));
+        assert_eq!(load_unlimited_whitelist(&mut ctx), vec![user]);
+
+        // And again: unlimited entries authorise repeatedly.
+        assert!(whitelist_allows_and_consume(&mut ctx, &user, 1_000_000, 100, true));
+        assert_eq!(load_unlimited_whitelist(&mut ctx), vec![user]);
+    }
+
+    /// Past the disable height the whitelist stops gating, but it is still
+    /// loaded -- and so still saved.
+    #[test]
+    fn a_disabled_whitelist_allows_anyone_and_is_still_written_back() {
+        let mut ctx = queue_ctx();
+        store_one_off_whitelist(&mut ctx, &[], 50);
+
+        assert!(whitelist_allows_and_consume(&mut ctx, &[0x99; 20], 1_000, 51, true));
+        assert_eq!(
+            load_one_off_whitelist(&mut ctx),
+            (Vec::new(), 50),
+            "the disable height survives the save-back"
+        );
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(&mut ctx, UNLIMITED_LOCK_WHITELIST_KEY)),
+            "c0"
+        );
     }
 
     #[test]

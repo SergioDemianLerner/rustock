@@ -80,7 +80,7 @@ fn main() -> anyhow::Result<()> {
     let from: u64 = args.next().map(|s| s.parse()).transpose()?.unwrap_or(0);
     let to: u64 = args.next().map(|s| s.parse()).transpose()?.unwrap_or(u64::MAX);
 
-    let store = BlockStore::open(&data_dir)?;
+    let store = BlockStore::open_read_only(&data_dir)?;
 
     if what == "--all" {
         // Enumerate what the index actually holds. The index stores every

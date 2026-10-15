@@ -23,6 +23,15 @@ const CF_TRIE: &str = "trie_nodes";
 // `crate::set_read_threads`.
 pub struct RocksDbTrieStore {
     db: Arc<DB>,
+    /// Set if any write failed.
+    ///
+    /// `TrieStore::put` returns nothing, so a failed write cannot be
+    /// propagated to the caller -- and a replay that cannot store the nodes
+    /// it computes goes on to read them back as absent, producing wrong
+    /// roots rather than an error. A full disk is the usual way in. Callers
+    /// that draw conclusions from a replay must be able to ask whether this
+    /// happened; see [`RocksDbTrieStore::write_failed`].
+    write_failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RocksDbTrieStore {
@@ -38,7 +47,7 @@ impl RocksDbTrieStore {
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)
             .map_err(|e| anyhow::anyhow!("Failed to open trie RocksDB: {e}"))?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db: Arc::new(db), write_failed: Arc::new(Default::default()) })
     }
 
     /// Open a trie store read-only, without taking the directory lock.
@@ -72,12 +81,19 @@ impl RocksDbTrieStore {
         // `false`: tolerate a live writer's WAL files being present.
         let db = DB::open_cf_for_read_only(&opts, path, vec![CF_TRIE], false)
             .map_err(|e| anyhow::anyhow!("Failed to open trie RocksDB read-only: {e}"))?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db: Arc::new(db), write_failed: Arc::new(Default::default()) })
+    }
+
+    /// Whether any write to this store has failed. A replay that returns
+    /// `true` here has been reading back nodes it believes it wrote, and
+    /// nothing it computed afterwards can be trusted.
+    pub fn write_failed(&self) -> bool {
+        self.write_failed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Open using an existing RocksDB instance that has a `trie_nodes` CF.
     pub fn from_db(db: Arc<DB>) -> Self {
-        Self { db }
+        Self { db, write_failed: Arc::new(Default::default()) }
     }
 }
 
@@ -98,11 +114,21 @@ impl TrieStore for RocksDbTrieStore {
             Some(cf) => cf,
             None => {
                 warn!(target: "rustock::trie_store", "trie_nodes CF not found");
+                self.write_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         };
         if let Err(e) = self.db.put_cf(cf, key, value) {
-            warn!(target: "rustock::trie_store", "RocksDB put error: {e}");
+            // Logged once. The condition is usually a full disk, which fails
+            // every subsequent write too, and tens of thousands of identical
+            // lines bury the one thing the reader needs to see.
+            if !self.write_failed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!(
+                    target: "rustock::trie_store",
+                    "RocksDB put failed, so this store is now incomplete \
+                     and anything computed from it is unsound: {e}"
+                );
+            }
         }
     }
 

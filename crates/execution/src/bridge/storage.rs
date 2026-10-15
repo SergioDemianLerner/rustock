@@ -374,6 +374,36 @@ pub fn store_one_off_whitelist<CTX: crate::RskContextTr>(
     bridge_store_bytes_named(ctx, LOCK_WHITELIST_KEY, &data);
 }
 
+/// rskj `BridgeStorageProvider.saveLockWhitelist`: write both whitelist cells
+/// back, changed or not.
+///
+/// rskj caches the whitelist in `BridgeStorageProvider.lockWhitelist` and
+/// `save()` -- which runs once at the end of every Bridge transaction --
+/// writes it whenever that field is non-null, i.e. whenever anything in the
+/// call reached `getLockWhitelist()`. Merely *reading* the whitelist
+/// therefore materialises both cells.
+///
+/// That is consensus-visible rather than cosmetic. On a chain whose whitelist
+/// was never written, the first peg-in to consult it creates
+/// `lockWhitelist = [i32::MAX]` and `unlimitedLockWhitelist = []` out of
+/// nothing, and a node that writes only on modification computes a different
+/// state root from that block on. Testnet #6,602 is exactly that block.
+///
+/// `unlimitedLockWhitelist` is written only under RSKIP87, matching the
+/// `activations.isActive(RSKIP87)` guard inside `saveLockWhitelist`.
+pub fn save_lock_whitelist<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    one_off: &[([u8; 20], u64)],
+    disable_height: i32,
+    unlimited: &[[u8; 20]],
+    rskip87: bool,
+) {
+    store_one_off_whitelist(ctx, one_off, disable_height);
+    if rskip87 {
+        store_unlimited_whitelist(ctx, unlimited);
+    }
+}
+
 /// Load the unlimited lock whitelist from Bridge storage.
 pub fn load_unlimited_whitelist<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<[u8; 20]> {
     let data = bridge_load_bytes_named(ctx, UNLIMITED_LOCK_WHITELIST_KEY);
@@ -507,9 +537,52 @@ pub fn deserialize_utxo_list(data: &[u8]) -> Vec<BridgeUtxo> {
     items.into_iter().filter_map(|b| deserialize_utxo(&b)).collect()
 }
 
+/// Which cell holds the active federation's UTXOs.
+///
+/// rskj `FederationStorageProviderImpl.getStorageKeyForNewFederationBtcUtxos`:
+///
+/// ```java
+/// if (networkIsTestnet(networkParameters)) {
+///     return getNewFederationBtcUtxosKeyForTestnet(activations);
+/// }
+/// return NEW_FEDERATION_BTC_UTXOS_KEY.getKey();
+/// ```
+///
+/// and for testnet, the general key before RSKIP284, the pre-hop key between
+/// RSKIP284 and RSKIP293, the post-hop key after. Both activate at hop400
+/// (testnet #3,103,000), so the middle case is unreachable there -- it is
+/// modelled anyway because the rule is rskj's, not the schedule's.
+///
+/// Mainnet never moved: its UTXOs stayed under the general key throughout.
+///
+/// Spending from the wrong cell is not a storage detail. It selects different
+/// inputs, which builds a different pegout transaction, with a different hash
+/// and different outpoint values -- the whole of testnet #7,139,903's
+/// divergence.
+pub fn new_federation_utxos_key(
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    block_number: u64,
+) -> &'static str {
+    if hardfork_cfg.chain_id != crate::hardfork::RSK_TESTNET_CHAIN_ID {
+        return NEW_FEDERATION_BTC_UTXOS_KEY;
+    }
+    if !hardfork_cfg.has_rskip284(block_number) {
+        return NEW_FEDERATION_BTC_UTXOS_KEY;
+    }
+    if !hardfork_cfg.has_rskip293(block_number) {
+        return NEW_FEDERATION_BTC_UTXOS_TESTNET_PRE_HOP_KEY;
+    }
+    NEW_FEDERATION_BTC_UTXOS_TESTNET_POST_HOP_KEY
+}
+
 /// Load the active federation's BTC UTXOs from Bridge storage.
-pub fn load_federation_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<BridgeUtxo> {
-    let data = bridge_load_bytes_named(ctx, NEW_FEDERATION_BTC_UTXOS_KEY);
+pub fn load_federation_utxos<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    block_number: u64,
+) -> Vec<BridgeUtxo> {
+    let key = new_federation_utxos_key(hardfork_cfg, block_number);
+    let data = bridge_load_bytes_named(ctx, key);
     deserialize_utxo_list(&data)
 }
 
@@ -526,14 +599,73 @@ pub fn load_old_federation_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec
 }
 
 /// Store the active federation's BTC UTXOs into Bridge storage.
-pub fn store_federation_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX, utxos: &[BridgeUtxo]) {
+pub fn store_federation_utxos<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    block_number: u64,
+    utxos: &[BridgeUtxo],
+) {
+    let key = new_federation_utxos_key(hardfork_cfg, block_number);
     let data = serialize_utxo_list(utxos);
-    bridge_store_bytes_named(ctx, NEW_FEDERATION_BTC_UTXOS_KEY, &data);
+    bridge_store_bytes_named(ctx, key, &data);
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod utxo_key_tests {
+    use super::*;
+    use crate::hardfork::RskHardforkConfig;
+
+    /// Testnet moved the active federation's UTXOs twice; mainnet never did.
+    ///
+    /// Ground truth: testnet #7,139,903 is a pegout batch where rskj spends
+    /// from `newFedBtcUTXOsForTestnetPostHop` and leaves
+    /// `newFederationBtcUTXOs` untouched. Reading the general cell there
+    /// selects different inputs, so the pegout transaction, its hash and its
+    /// outpoint values all come out different.
+    #[test]
+    fn testnet_moves_to_the_post_hop_cell_at_hop400() {
+        let cfg = RskHardforkConfig::testnet();
+        // hop400 on testnet is #3,103,000; RSKIP284 and RSKIP293 both land there.
+        assert_eq!(
+            new_federation_utxos_key(&cfg, 3_102_999),
+            NEW_FEDERATION_BTC_UTXOS_KEY,
+            "before hop400 testnet used the general cell"
+        );
+        assert_eq!(
+            new_federation_utxos_key(&cfg, 3_103_000),
+            NEW_FEDERATION_BTC_UTXOS_TESTNET_POST_HOP_KEY
+        );
+        assert_eq!(
+            new_federation_utxos_key(&cfg, 7_139_903),
+            NEW_FEDERATION_BTC_UTXOS_TESTNET_POST_HOP_KEY
+        );
+    }
+
+    /// Mainnet keeps the general cell at every height, so the testnet detour
+    /// must not reach it.
+    #[test]
+    fn mainnet_never_leaves_the_general_cell() {
+        let cfg = RskHardforkConfig::mainnet();
+        for h in [0, 1_591_000, 3_614_800, 9_000_000] {
+            assert_eq!(
+                new_federation_utxos_key(&cfg, h),
+                NEW_FEDERATION_BTC_UTXOS_KEY,
+                "mainnet at #{h}"
+            );
+        }
+    }
+
+    /// regtest is not testnet, whatever its activation schedule says.
+    #[test]
+    fn regtest_uses_the_general_cell() {
+        let cfg = RskHardforkConfig::regtest();
+        assert_eq!(new_federation_utxos_key(&cfg, 10_000_000), NEW_FEDERATION_BTC_UTXOS_KEY);
+    }
+}
 
 #[cfg(test)]
 mod tests {

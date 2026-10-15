@@ -13,8 +13,11 @@ mod tests;
 pub mod varint;
 
 pub use account::AccountState;
-pub use key_mapper::{account_key, account_key_from_bytes, code_key, storage_key, storage_prefix_key};
-pub use node::{empty_trie_hash, NodeRef, TrieNode};
+pub use key_mapper::{
+    TrieKeyKind, account_key, account_key_from_bytes, classify_key, code_key, code_key_from_bytes,
+    storage_key, storage_key_from_bytes, storage_prefix_key,
+};
+pub use node::{empty_trie_hash, NodeRef, Resolution, TrieNode};
 pub use orchid_converter::orchid_state_root;
 pub use path::TrieKeySlice;
-pub use store::{MemoryTrieStore, TrieStore};
+pub use store::{MemoryTrieStore, OverlayTrieStore, TrieStore};

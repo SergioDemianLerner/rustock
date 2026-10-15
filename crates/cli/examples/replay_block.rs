@@ -3,52 +3,65 @@
 //! results, logs, and computed state/receipts roots vs the header.
 //! Deterministic, offline diagnostic for gas/state/receipts divergences.
 //!
-//! Usage: cargo run -p rustock-cli --release --example replay_block -- <data-dir> <number>
+//! ```text
+//! cargo run -p rustock-cli --release --example replay_block -- \
+//!     <data-dir> <number> [network-id] [trie-dir]
+//!
+//!   network-id  30 mainnet (default), 31 testnet, anything else regtest
+//!   trie-dir    required for a node run with `--trie-backend epoch`
+//!
+//! env:
+//!   RUSTOCK_TRACE_TARGET_OPS=1  trace every opcode of the target block
+//! ```
+//!
+//! Opens read-only, so it runs beside a live node.
+//!
+//! When the roots diverge, `block_writes` on the same block lists the leaves
+//! that changed, which is usually the next question.
 
-use rustock_core::Block;
-use rustock_execution::{BlockProcessor, RskHardforkConfig};
-use rustock_storage::{BlockStore, CachedTrieStore};
-use rustock_trie::{TrieNode, TrieStore};
-use std::sync::Arc;
+#[path = "support/mod.rs"]
+mod support;
 
-fn main() -> anyhow::Result<()> {
+use anyhow::Result;
+use rustock_execution::BlockProcessor;
+use support::Replay;
+
+const USAGE: &str = "usage: replay_block <data-dir> <number> [network-id] [trie-dir]";
+
+fn main() -> Result<()> {
     // Frame tracing is read once by a LazyLock; set before any execution.
-    std::env::set_var("RUSTOCK_TRACE_FRAMES", "1");
+    unsafe { std::env::set_var("RUSTOCK_TRACE_FRAMES", "1") };
     tracing_subscriber::fmt()
         .with_env_filter("rustock_execution=debug")
         .with_target(false)
         .init();
 
     let mut args = std::env::args().skip(1);
-    let data_dir = args.next().expect("usage: replay_block <data-dir> <number>");
-    let number: u64 = args.next().expect("usage: replay_block <data-dir> <number>").parse()?;
+    let data_dir = args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
+    let number: u64 = args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?.parse()?;
+    // Default mainnet so existing invocations are unchanged.
+    let network_id: u64 = args.next().map(|a| a.parse()).transpose()?.unwrap_or(support::MAINNET);
+    let trie_dir = args.next();
 
-    let store = Arc::new(BlockStore::open(&data_dir)?);
-    let (exec_hash, state_root) = store.exec_head()?.expect("no exec_head");
-    let exec_number = store.header(exec_hash)?.expect("exec head header").number;
-    assert!(number > exec_number, "target #{number} not past exec head #{exec_number}");
+    let replay = Replay::open(&data_dir, trie_dir.as_deref())?;
+    replay.ensure_replayable(number)?;
 
-    let trie_store: Arc<dyn TrieStore> =
-        Arc::new(CachedTrieStore::with_defaults(store.db().clone()));
-    let root_data = trie_store.get(state_root.as_slice()).expect("root node");
-    let mut root = TrieNode::from_message(&root_data, trie_store.as_ref());
+    let hardfork_cfg = support::hardfork_for(network_id);
+    eprintln!("replaying on network-id {network_id} (chain_id {})", hardfork_cfg.chain_id);
+    let processor = BlockProcessor::new(hardfork_cfg, replay.store.clone());
 
-    let processor = BlockProcessor::new(RskHardforkConfig::mainnet(), store.clone());
-
-    for n in exec_number + 1..=number {
-        // The all-ops tracer flag is read per execute_block; enable it only
-        // for the target block so range replays stay tractable.
+    let mut root = replay.root.clone();
+    for n in replay.exec_number + 1..=number {
+        // The all-ops tracer is read per execute_block; enable it only for the
+        // target block so range replays stay tractable.
         if n == number && std::env::var_os("RUSTOCK_TRACE_TARGET_OPS").is_some() {
-            std::env::set_var("RUSTOCK_TRACE_ALL_OPS", "1");
+            unsafe { std::env::set_var("RUSTOCK_TRACE_ALL_OPS", "1") };
         }
-        let hash = store.canonical_hash(n)?.expect("canonical hash");
-        let header = store.header(hash)?.expect("header");
-        let (transactions, ommers) = store.body(hash)?.expect("body");
-        let block = Block { header, transactions, ommers };
-        let processed = processor.execute_block(&block, &root, trie_store.clone())?;
+        let block = replay.block(n)?;
+        let processed = processor.execute_block(&block, &root, replay.trie_store.clone())?;
 
         if n < number {
-            if processed.state_root_hash.as_slice() != block.header.state_root.as_slice() {
+            if processed.state_root_hash != block.header.state_root {
                 eprintln!(
                     "intermediate block #{n} state diverges: computed={:?} header={:?}",
                     processed.state_root_hash, block.header.state_root
@@ -80,7 +93,7 @@ fn main() -> anyhow::Result<()> {
             "state root:    computed={:?} header={:?} match={}",
             processed.state_root_hash,
             block.header.state_root,
-            processed.state_root_hash.as_slice() == block.header.state_root.as_slice()
+            processed.state_root_hash == block.header.state_root
         );
         eprintln!(
             "receipts root: computed={:?} header={:?} match={}",
@@ -88,6 +101,15 @@ fn main() -> anyhow::Result<()> {
             block.header.receipts_root,
             processed.receipts_root == block.header.receipts_root
         );
+        if processed.state_root_hash != block.header.state_root {
+            // Repeat the trie dir so the suggestion is copy-pasteable; an
+            // epoch-backed node fails without it.
+            let trie_arg = trie_dir.as_deref().map(|d| format!(" {d}")).unwrap_or_default();
+            eprintln!(
+                "\nnext: `block_writes {data_dir} {n} {network_id}{trie_arg}` lists the \
+                 leaves this block wrote."
+            );
+        }
     }
     Ok(())
 }

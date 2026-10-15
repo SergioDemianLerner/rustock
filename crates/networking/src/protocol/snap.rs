@@ -635,6 +635,7 @@ mod tests {
             logs_bloom: Default::default(),
             extension_data: None,
             umm_root: None,
+            version_fields: None,
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,

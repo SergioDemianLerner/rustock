@@ -545,6 +545,25 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
     let broken_key = remasc_storage_key(BROKEN_SELECTION_RULE_KEY);
     let previous_broken = remasc_load_bool(ctx, broken_key);
     let broken = is_broken_selection_rule(&processing_header, &siblings);
+    tracing::debug!(
+        "REMASC selection rule at #{current_number}: processing #{candidate_block_number} \
+         hash={:?} paid_fees={} uncle_count={} siblings={} -> broken={broken}",
+        processing_header.hash(),
+        processing_header.paid_fees,
+        processing_header.uncle_count,
+        siblings.len()
+    );
+    tracing::debug!(
+        "  previous_broken={previous_broken} broken_now={} (siblings_empty={})",
+        !siblings.is_empty() && broken,
+        siblings.is_empty()
+    );
+    for s in &siblings {
+        tracing::debug!(
+            "  sibling hash={:?} paid_fees={} uncle_count={} included_at=#{}",
+            s.hash, s.paid_fees, s.uncle_count, s.included_height
+        );
+    }
     // rskj `RemascStorageProvider.saveBrokenSelectionRule` writes a literal
     // 1-byte value (0/1) via `addStorageBytes` once the field is set, so the
     // cell is present in the unitrie even when false. A plain SSTORE of 0
@@ -808,6 +827,7 @@ mod tests {
             minimum_gas_price: U256::ZERO,
             uncle_count,
             umm_root: None,
+            version_fields: None,
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
@@ -964,5 +984,61 @@ mod tests {
         assert_eq!(addrs[0], "0x1888fa870b97a4845a6a1f7eee4ebb507dbe0967".parse::<Address>().unwrap());
         assert_eq!(addrs[1], "0x530aad5be57e9be2084881b1d84f2a30e896ae36".parse::<Address>().unwrap());
         assert_eq!(addrs[14], "0xf74b7e0d5bdd14eaedf725bb1549ce14abeb71dd".parse::<Address>().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod chain_selection_tests {
+    use super::*;
+    use crate::hardfork::RskHardforkConfig;
+    use crate::RskExecutor;
+    use std::sync::Arc;
+    use rustock_storage::BlockStore;
+
+    fn executor_for(cfg: RskHardforkConfig) -> RskExecutor {
+        let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        RskExecutor::new(cfg, store)
+    }
+
+    /// rskj's `remasc.json` is per-network and two of its fields change state:
+    /// `maturity` (4000 mainnet, 50 testnet) decides *when* a payout happens,
+    /// and `rskLabsAddress` decides *who* it goes to.
+    ///
+    /// rustock defined all three configs but `RskExecutor::new` always took
+    /// mainnet's, right beside the bridge constants which were already chosen
+    /// by chain. Testnet then diverged at block #60 -- an empty block whose
+    /// only transaction is REMASC, the first past testnet's maturity window.
+    #[test]
+    fn the_executor_takes_its_remasc_config_from_the_chain() {
+        let main = executor_for(RskHardforkConfig::mainnet());
+        let test = executor_for(RskHardforkConfig::testnet());
+
+        assert_eq!(main.remasc_config_for_test().maturity, 4000);
+        assert_eq!(test.remasc_config_for_test().maturity, 50);
+        assert_ne!(
+            main.remasc_config_for_test().rsk_labs_address,
+            test.remasc_config_for_test().rsk_labs_address,
+            "the two chains pay different addresses; sharing one is a state divergence"
+        );
+    }
+
+    /// The constants themselves, against rskj's remasc.json, so a future edit
+    /// cannot quietly move them.
+    #[test]
+    fn testnet_remasc_constants_match_rskj() {
+        let c = RemascConfig::testnet();
+        assert_eq!(c.maturity, 50, "remasc.json testnet.maturity");
+        assert_eq!(c.synthetic_span, 10);
+        assert_eq!(c.rsk_labs_divisor, 5);
+        assert_eq!(
+            format!("{:x}", c.rsk_labs_address),
+            "dabadabadabadabadabadabadabadabadaba0003",
+            "remasc.json testnet.rskLabsAddress"
+        );
+        assert_eq!(
+            format!("{:x}", c.rsk_labs_address_rskip218),
+            "dabadabadabadabadabadabadabadabadaba0003",
+            "testnet uses the same address before and after RSKIP218, unlike mainnet"
+        );
     }
 }

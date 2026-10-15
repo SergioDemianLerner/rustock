@@ -347,6 +347,7 @@ mod tests {
             minimum_gas_price: U256::ZERO,
             uncle_count: 0,
             umm_root: None,
+            version_fields: None,
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,

@@ -892,6 +892,10 @@ pub struct BridgeTxContext {
     /// can never change consensus; it only decides whether a read-only query
     /// over RPC is answered or rejected.
     pub local_call: bool,
+    /// Position of this transaction in its block. Not consensus -- it exists
+    /// so a recorded Bridge decision can be located afterwards, and is zero
+    /// outside block execution.
+    pub tx_index: u32,
 }
 
 /// RSKIP197 (iris300): the `requiredGas` (rskj `getGasForData`) charged to a
@@ -1144,6 +1148,30 @@ impl RskPrecompileProvider {
             // `requiredGas` and the CALL fails (pushes zero). Record that cost
             // and revert so the caller refunds the forwarded leftover.
             if let Some(spent) = crate::bridge::internal_throw_gas(e) {
+                if !self.rskip197_active(context) {
+                    // Before RSKIP197 (iris300) there is no error handling at
+                    // all. `Program.executePrecompiled` wraps the method's
+                    // `VMException` in a `RuntimeException`, which escapes the
+                    // VM: no `stackPushZero`, no rollback-and-continue. The
+                    // transaction dies and is charged its whole gas limit.
+                    //
+                    // Modelled as a non-revert precompile error, which spends
+                    // the entire forwarded gas. A caller that forwarded
+                    // everything -- what a bare Solidity `.call()` does -- is
+                    // then left with the 63/64 remainder and runs out, so the
+                    // transaction ends where rskj ends it, with the same gas.
+                    // A caller holding back enough to continue would carry on
+                    // here and not there; that case is #295.
+                    //
+                    // Testnet #808,484 is the live instance: a constructor
+                    // calls the Bridge with a selector that is not a Bridge
+                    // method, which post-RSKIP88 throws.
+                    let _ = spent;
+                    let underflow = result.gas.record_cost(inputs.gas_limit);
+                    assert!(underflow, "spending exactly the forwarded gas");
+                    result.result = InstructionResult::PrecompileError;
+                    return Ok(Some(result));
+                }
                 let underflow = result.gas.record_cost(spent);
                 assert!(underflow, "gas pre-checked against requiredGas");
                 result.result = InstructionResult::Revert;
@@ -2403,7 +2431,7 @@ mod tests {
             difficulty: U256::ZERO, number: 0, gas_limit: U256::ZERO,
             gas_used: 0, timestamp: 0, extra_data: ABytes::new(),
             paid_fees: U256::ZERO, minimum_gas_price: U256::ZERO,
-            uncle_count: 0, umm_root: None,
+            uncle_count: 0, umm_root: None, version_fields: None,
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,

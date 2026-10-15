@@ -33,6 +33,19 @@ pub struct ActivationHeights {
     pub iris300: u64,
     /// Fingerroot500 hardfork – enables RSKIP252 (transaction gas price cap).
     pub fingerroot500: u64,
+    /// Height at which RSKIP97 -- "no 10-minute difficulty drop" -- activates,
+    /// or `None` where it never does.
+    ///
+    /// Modelled separately from `orchid` because it is *not* the same switch.
+    /// `reference.conf` defaults it to `orchid`, which is what mainnet uses,
+    /// but `testnet.conf` and `regtest.conf` both override it to `-1`. On
+    /// those chains the drop is permanent: a block more than ten minutes
+    /// after its parent falls to the minimum difficulty, forever.
+    ///
+    /// Tying it to `orchid` made rustock reject testnet block #1, whose
+    /// difficulty is the 131,072 floor because its parent is genesis at
+    /// timestamp 0.
+    pub rskip97: Option<u64>,
 }
 
 /// Process-wide activation heights, consulted by block-hash computation
@@ -59,6 +72,8 @@ impl ActivationHeights {
             papyrus200: 2_392_700,
             iris300: 3_614_800,
             fingerroot500: 5_468_000,
+            // reference.conf: `rskip97 = orchid`, not overridden by main.conf.
+            rskip97: Some(729_000),
         }
     }
 
@@ -71,6 +86,8 @@ impl ActivationHeights {
             papyrus200: 863_000,
             iris300: 2_060_500,
             fingerroot500: 4_015_800,
+            // testnet.conf: `rskip97 = -1  # disable orchid difficulty drop`.
+            rskip97: None,
         }
     }
 
@@ -81,6 +98,8 @@ impl ActivationHeights {
             papyrus200: u64::MAX,
             iris300: 0,
             fingerroot500: 0,
+            // regtest.conf: `rskip97 = -1`, same as testnet.
+            rskip97: None,
         }
     }
 }
@@ -182,6 +201,7 @@ impl ChainConfig {
                 minimum_gas_price: U256::from(0x0AE85BC0),
                 uncle_count: 0,
                 umm_root: None,
+                version_fields: None,
                 bitcoin_merged_mining_header: Some(Bytes::from_static(&[0x00])),
                 bitcoin_merged_mining_merkle_proof: Some(Bytes::from_static(&[0x00])),
                 bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from_static(&[0x00])),
@@ -207,6 +227,7 @@ impl ChainConfig {
                 minimum_gas_price: U256::ZERO,
                 uncle_count: 0,
                 umm_root: None,
+                version_fields: None,
                 bitcoin_merged_mining_header: None,
                 bitcoin_merged_mining_merkle_proof: None,
                 bitcoin_merged_mining_coinbase_transaction: None,
@@ -232,6 +253,7 @@ impl ChainConfig {
                 minimum_gas_price: U256::ZERO,
                 uncle_count: 0,
                 umm_root: None,
+                version_fields: None,
                 bitcoin_merged_mining_header: None,
                 bitcoin_merged_mining_merkle_proof: None,
                 bitcoin_merged_mining_coinbase_transaction: None,
@@ -538,3 +560,4 @@ mod tests {
             "testnet genesis hash must match rskj GenesisHashesTest");
     }
 }
+

@@ -99,6 +99,9 @@ pub enum ValidationError {
 
     #[error("Fork detection data could not be read from the coinbase")]
     ForkDetectionDataUnreadable,
+
+    #[error("Invalid transaction execution sublist edges: {reason}")]
+    InvalidSublistEdges { reason: String },
 }
 
 pub trait HeaderValidator: Send + Sync {

@@ -10,6 +10,7 @@ pub mod raw_storage;
 pub mod remasc;
 pub mod rsk_handler;
 pub mod rsk_instructions;
+pub mod silent;
 pub mod state;
 
 /// `ContextTr` with the RSK chain extension (raw-bytes storage overlay).

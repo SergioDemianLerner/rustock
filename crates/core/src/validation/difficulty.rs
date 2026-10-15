@@ -49,9 +49,20 @@ impl DifficultyRule {
     fn calculate_expected_difficulty(&self, header: &Header, parent: &Header) -> U256 {
         let activations = &self.config.activation_heights;
 
-        // Pre-RSKIP97 (before orchid): if more than 10 minutes since parent,
-        // reset difficulty to minimum to allow fallback private mining.
-        let rskip97_active = header.number >= activations.orchid;
+        // Before RSKIP97: a block more than ten minutes after its parent
+        // resets to the minimum difficulty, so private fallback mining can
+        // recover a stalled chain.
+        //
+        // Gated on its own height, not on orchid. reference.conf defaults
+        // `rskip97 = orchid` -- which is mainnet -- but testnet.conf and
+        // regtest.conf both override it to -1, so on those chains the drop
+        // never goes away. Reading it as orchid made rustock compute
+        // 1,027,605 for testnet block #1 against the real 131,072, reject the
+        // header, and then fail on #2 for not extending the executed head.
+        let rskip97_active = match activations.rskip97 {
+            Some(height) => header.number >= height,
+            None => false,
+        };
         if !rskip97_active {
             let delta_ts = header.timestamp.saturating_sub(parent.timestamp);
             if delta_ts >= TEN_MINUTES {
@@ -106,5 +117,97 @@ impl DifficultyRule {
         } else {
             from_parent
         }
+    }
+}
+
+#[cfg(test)]
+mod rskip97_tests {
+    use super::*;
+    use crate::config::ChainConfig;
+    use alloy_primitives::{Bytes, B256};
+    use std::sync::Arc;
+
+    fn header_at(number: u64, timestamp: u64, difficulty: U256) -> Header {
+        let mut h = Header {
+            parent_hash: B256::ZERO,
+            ommers_hash: B256::ZERO,
+            beneficiary: Default::default(),
+            state_root: B256::ZERO,
+            transactions_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: Default::default(),
+            extension_data: None,
+            difficulty,
+            number,
+            gas_limit: U256::from(1_000_000),
+            gas_used: 0,
+            timestamp,
+            extra_data: Bytes::new(),
+            paid_fees: U256::ZERO,
+            minimum_gas_price: U256::ZERO,
+            uncle_count: 0,
+            umm_root: None,
+            version_fields: None,
+            bitcoin_merged_mining_header: None,
+            bitcoin_merged_mining_merkle_proof: None,
+            bitcoin_merged_mining_coinbase_transaction: None,
+            cached_hash: None,
+            cached_hash_for_merged_mining: None,
+        };
+        h.cached_hash = None;
+        h
+    }
+
+    /// Testnet block #1, from the live chain: genesis sits at timestamp 0 with
+    /// difficulty 1,048,576, and #1 arrives 1,562,334,434 seconds later with
+    /// difficulty 131,072 -- the floor, because RSKIP97 never activates on
+    /// testnet and the ten-minute drop still applies.
+    ///
+    /// Before this was modelled, rustock computed 1,027,605 (the ordinary
+    /// `parent - parent/50` step), rejected the header, and then failed on
+    /// block #2 for not extending the executed head. The testnet sync could
+    /// not get past block 1.
+    #[test]
+    fn testnet_block_1_falls_to_the_minimum_difficulty() {
+        let rule = DifficultyRule { config: Arc::new(ChainConfig::testnet()) };
+        let genesis = header_at(0, 0, U256::from(1_048_576u64));
+        let got = rule.difficulty_for_child(&genesis, 1, 1_562_334_434, 0);
+        assert_eq!(got, U256::from(131_072u64), "must fall to the floor, as testnet block #1 does");
+    }
+
+    /// The same gap on mainnet after orchid does *not* drop: RSKIP97 is active
+    /// there from #729,000, so the rule is gone.
+    #[test]
+    fn mainnet_after_orchid_does_not_drop() {
+        let rule = DifficultyRule { config: Arc::new(ChainConfig::mainnet()) };
+        let parent = header_at(800_000, 1_000_000, U256::from(1_048_576u64));
+        let got = rule.difficulty_for_child(&parent, 800_001, 1_000_000 + 3600, 0);
+        assert_ne!(got, U256::from(131_072u64), "RSKIP97 is active on mainnet here");
+    }
+
+    /// And before orchid, mainnet drops like testnet always does -- the two
+    /// chains differ in *when* the rule stops, not in what it does.
+    ///
+    /// Mainnet's floor is 7e15 (FALLBACK_MINING_DIFFICULTY / 2), not
+    /// testnet's 131,072, so the drop lands somewhere else entirely. The
+    /// minimum is per-chain; only the rule is shared.
+    #[test]
+    fn mainnet_before_orchid_still_drops() {
+        let config = Arc::new(ChainConfig::mainnet());
+        let floor = config.min_difficulty;
+        let rule = DifficultyRule { config };
+        let parent = header_at(1000, 1_000_000, U256::from(1_048_576u64));
+        let got = rule.difficulty_for_child(&parent, 1001, 1_000_000 + 601, 0);
+        assert_eq!(got, floor, "the ten-minute drop applies before orchid on mainnet too");
+        assert_ne!(floor, U256::from(131_072u64), "and mainnet's floor is not testnet's");
+    }
+
+    /// Under ten minutes, no drop on either chain.
+    #[test]
+    fn a_short_gap_does_not_drop_on_testnet() {
+        let rule = DifficultyRule { config: Arc::new(ChainConfig::testnet()) };
+        let parent = header_at(100, 1_000_000, U256::from(1_048_576u64));
+        let got = rule.difficulty_for_child(&parent, 101, 1_000_000 + 599, 0);
+        assert_ne!(got, U256::from(131_072u64), "599s is under the ten-minute threshold");
     }
 }

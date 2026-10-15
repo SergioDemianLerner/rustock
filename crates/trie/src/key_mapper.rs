@@ -89,6 +89,85 @@ pub fn storage_key_from_bytes(addr_bytes: &[u8], slot_bytes: &[u8]) -> Vec<u8> {
     key
 }
 
+/// What a unitrie key names, recovered from the key itself.
+///
+/// The unitrie keyspace is unified and self-describing: every key carries its
+/// address in the clear after a 10-byte keccak prefix, so a key picked out of
+/// a trie diff can be named without consulting the state. That is what makes
+/// an offline "what did this block write?" report readable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrieKeyKind {
+    /// `0x00 || keccak(addr)[0:10] || addr`. The address is raw bytes because
+    /// RSK has short addresses: REMASC's sender is the single byte `0x00`.
+    Account { address: Vec<u8> },
+    /// `account_key || 0x80`.
+    Code { address: Vec<u8> },
+    /// `account_key || 0x00`, the `setupContract` marker.
+    StoragePrefix { address: Vec<u8> },
+    /// `account_key || 0x00 || keccak(slot)[0:10] || strip_leading_zeros(slot)`.
+    ///
+    /// `slot` is the recovered 32-byte word when the stripped tail re-pads to
+    /// a word whose keccak prefix matches; otherwise `None` and only the
+    /// stored `tail` is known.
+    Storage { address: Vec<u8>, slot: Option<B256>, tail: Vec<u8> },
+    /// Not a key this mapper produces.
+    Unknown,
+}
+
+/// Longest address RSK uses. Addresses are tried longest-first so a 20-byte
+/// address is never mis-read as a shorter one that happens to collide.
+const MAX_ADDR_LEN: usize = 20;
+
+/// Recovers the address by trusting the 10-byte keccak prefix rather than
+/// guessing from the key length: `account_key || 0x80` for a 1-byte address is
+/// 13 bytes, which no length rule distinguishes from some other key's prefix.
+/// Verifying the digest makes the decode exact.
+fn recover_address(key: &[u8]) -> Option<&[u8]> {
+    if key.first() != Some(&DOMAIN_PREFIX) || key.len() < 1 + SECURE_KEY_SIZE + 1 {
+        return None;
+    }
+    let body = &key[1 + SECURE_KEY_SIZE..];
+    let claimed = &key[1..1 + SECURE_KEY_SIZE];
+    let max = MAX_ADDR_LEN.min(body.len());
+    (1..=max).rev().find(|&len| secure_prefix(&body[..len]) == claimed).map(|len| &body[..len])
+}
+
+/// Recovers the full 32-byte slot from the stripped tail. Storage slots are
+/// always `DataWord`s in rskj, so left-padding to 32 and checking the digest
+/// recovers exactly the word that was hashed — including slot zero, which
+/// `strip_leading_zeros` stores as the single byte `0x00`.
+fn recover_slot(claimed: &[u8], tail: &[u8]) -> Option<B256> {
+    if tail.len() > 32 {
+        return None;
+    }
+    let mut word = [0u8; 32];
+    word[32 - tail.len()..].copy_from_slice(tail);
+    (secure_prefix(&word) == claimed).then_some(B256::from(word))
+}
+
+/// Inverse of the key builders above: names what a raw unitrie key refers to.
+///
+/// Unrecognised keys are reported as [`TrieKeyKind::Unknown`] rather than
+/// guessed at, so a diagnostic built on this never invents an address.
+pub fn classify_key(key: &[u8]) -> TrieKeyKind {
+    let Some(address) = recover_address(key) else {
+        return TrieKeyKind::Unknown;
+    };
+    let address = address.to_vec();
+    let rest = &key[1 + SECURE_KEY_SIZE + address.len()..];
+    match rest {
+        [] => TrieKeyKind::Account { address },
+        [CODE_PREFIX] => TrieKeyKind::Code { address },
+        [STORAGE_PREFIX] => TrieKeyKind::StoragePrefix { address },
+        [STORAGE_PREFIX, slot_part @ ..] if slot_part.len() > SECURE_KEY_SIZE => {
+            let (claimed, tail) = slot_part.split_at(SECURE_KEY_SIZE);
+            let slot = recover_slot(claimed, tail);
+            TrieKeyKind::Storage { address, slot, tail: tail.to_vec() }
+        }
+        _ => TrieKeyKind::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +242,110 @@ mod tests {
         let k1 = account_key(&addr);
         let k2 = account_key(&addr);
         assert_eq!(k1, k2);
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+    use alloy_primitives::U256;
+
+    const ADDR: Address = Address::new([
+        0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+        0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    ]);
+
+    #[test]
+    fn every_key_the_mapper_builds_classifies_back_to_itself() {
+        assert_eq!(
+            classify_key(&account_key(&ADDR)),
+            TrieKeyKind::Account { address: ADDR.to_vec() }
+        );
+        assert_eq!(classify_key(&code_key(&ADDR)), TrieKeyKind::Code { address: ADDR.to_vec() });
+        assert_eq!(
+            classify_key(&storage_prefix_key(&ADDR)),
+            TrieKeyKind::StoragePrefix { address: ADDR.to_vec() }
+        );
+    }
+
+    #[test]
+    fn a_storage_key_gives_back_the_whole_32_byte_slot() {
+        // The key stores the slot with leading zeros stripped, but the secure
+        // prefix is over the full word, so the word is recoverable.
+        let slot = B256::from(U256::from(0x1234u64));
+        match classify_key(&storage_key(&ADDR, &slot)) {
+            TrieKeyKind::Storage { address, slot: recovered, tail } => {
+                assert_eq!(address, ADDR.to_vec());
+                assert_eq!(recovered, Some(slot));
+                assert_eq!(tail, vec![0x12, 0x34]);
+            }
+            other => panic!("expected storage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slot_zero_survives_the_round_trip() {
+        // strip_leading_zeros keeps one 0x00 byte for the all-zero word; if
+        // the recovery re-padded from an empty tail it would still produce
+        // the zero word, so this pins the tail too.
+        let slot = B256::ZERO;
+        match classify_key(&storage_key(&ADDR, &slot)) {
+            TrieKeyKind::Storage { slot: recovered, tail, .. } => {
+                assert_eq!(recovered, Some(B256::ZERO));
+                assert_eq!(tail, vec![0x00]);
+            }
+            other => panic!("expected storage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_full_width_slot_is_recovered() {
+        let slot = B256::repeat_byte(0xA7);
+        match classify_key(&storage_key(&ADDR, &slot)) {
+            TrieKeyKind::Storage { slot: recovered, tail, .. } => {
+                assert_eq!(recovered, Some(slot));
+                assert_eq!(tail.len(), 32);
+            }
+            other => panic!("expected storage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remascs_one_byte_address_is_not_mistaken_for_a_longer_one() {
+        // REMASC's sender is the single byte 0x00, so its account key is 12
+        // bytes and its code key 13 — lengths no 20-byte-address rule covers.
+        let acct = account_key_from_bytes(&[0x00]);
+        assert_eq!(acct.len(), 12);
+        assert_eq!(classify_key(&acct), TrieKeyKind::Account { address: vec![0x00] });
+
+        let code = code_key_from_bytes(&[0x00]);
+        assert_eq!(classify_key(&code), TrieKeyKind::Code { address: vec![0x00] });
+
+        let storage = storage_key_from_bytes(&[0x00], B256::from(U256::from(7u64)).as_slice());
+        match classify_key(&storage) {
+            TrieKeyKind::Storage { address, slot, .. } => {
+                assert_eq!(address, vec![0x00]);
+                assert_eq!(slot, Some(B256::from(U256::from(7u64))));
+            }
+            other => panic!("expected storage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keys_this_mapper_never_builds_are_reported_unknown_not_guessed() {
+        // Wrong domain byte.
+        assert_eq!(classify_key(&[0x01; 31]), TrieKeyKind::Unknown);
+        // Too short to carry a secure prefix.
+        assert_eq!(classify_key(&[]), TrieKeyKind::Unknown);
+        assert_eq!(classify_key(&[0x00; 10]), TrieKeyKind::Unknown);
+        // Right shape, but the secure prefix does not hash to the address, so
+        // the address is not invented.
+        let mut forged = account_key(&ADDR);
+        forged[1] ^= 0xff;
+        assert_eq!(classify_key(&forged), TrieKeyKind::Unknown);
+        // A trailing byte that is neither the code nor the storage prefix.
+        let mut odd = account_key(&ADDR);
+        odd.push(0x42);
+        assert_eq!(classify_key(&odd), TrieKeyKind::Unknown);
     }
 }

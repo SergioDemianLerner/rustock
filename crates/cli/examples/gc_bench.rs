@@ -123,6 +123,8 @@ fn main() -> Result<()> {
                 burial_depth: args.burial,
                 rotate_bytes: args.rotate_mb * (1 << 20),
             },
+            // The benchmark drives block heights itself from an empty store.
+            None,
         )?))
     } else {
         None
