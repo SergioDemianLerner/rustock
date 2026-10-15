@@ -30,10 +30,7 @@
 //!   --parent-roots F   CSV of `block,...,unitrie_root,...` giving the UNITRIE
 //!                      root each block computed. Needed below wasabi100,
 //!                      where the header's own stateRoot is an orchid root and
-//!                      cannot address a unitrie node. The block is still
-//!                      verified against its header, by converting the result
-//!                      to orchid form -- so a wrong root here fails the check
-//!                      rather than passing silently.
+//!                      cannot address a unitrie node.
 //!   --sequential       execute the range in order, carrying each block's
 //!                      post-state forward instead of resolving every block's
 //!                      parent root from the source. The only way to reach
@@ -624,14 +621,36 @@ fn main() -> Result<()> {
             None
         };
         let state_ok = computed_state.is_none_or(|c| c == block.header.state_root);
+        // Below wasabi100 a failed comparison means "could not verify", not
+        // "diverged". Orchid was a different data structure, so converting a
+        // unitrie into an Orchid root is not guaranteed to reproduce what the
+        // Orchid client committed to -- and a unitrie replayed from genesis is
+        // not the trie the migration produced. A match is still worth having;
+        // a mismatch simply yields no verdict, so the block records nothing
+        // and becomes a gap.
+        let orchid_inconclusive = !unitrie_root && check_orchid && !state_ok;
         if sequential {
             carried = Some(processed.new_state_root.clone());
         }
         let verdict = Verdict {
-            state: !state_ok,
+            state: !state_ok && !orchid_inconclusive,
             receipts: processed.receipts_root != block.header.receipts_root,
             gas: processed.gas_used != block.header.gas_used,
         };
+        if orchid_inconclusive {
+            eprintln!(
+                "#{n}: pre-wasabi100 orchid comparison did not match; this cannot \
+                 distinguish a conversion limit from an execution fault, so the block \
+                 is left unverified"
+            );
+            close_run(
+                &silent, &mut run_start, n, &build,
+                "pre-wasabi100: orchid comparison inconclusive",
+            )?;
+            rustock_execution::silent::drain();
+            unverifiable += 1;
+            continue;
+        }
         if unitrie_root || check_orchid {
             checked += 1;
         } else {

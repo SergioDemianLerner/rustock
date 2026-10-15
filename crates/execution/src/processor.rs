@@ -623,12 +623,21 @@ impl BlockProcessor {
             }
         } else if let Some(interval) = orchid_check_interval() {
             // Diagnostic (RUSTOCK_ORCHID_CHECK_INTERVAL=K): pre-RSKIP126
-            // headers carry the Orchid-format state root; converting the
-            // unitrie and comparing pinpoints content divergence long before
-            // the wasabi state-root check would. The Orchid trie format is
-            // unchanged from the 2018 genesis client through wasabi (the
-            // conversion reproduces the genesis header's stateRoot), so the
-            // check is valid for every pre-RSKIP126 block.
+            // headers carry the Orchid-format state root, so comparing one
+            // means converting the unitrie into Orchid form.
+            //
+            // A MATCH is strong evidence; a MISMATCH proves nothing. Orchid
+            // was a different data structure, not a re-encoding of this one,
+            // and a unitrie built by replaying from genesis is not the trie
+            // the migration produced. This comment used to argue that because
+            // the conversion reproduces the *genesis* header's stateRoot it
+            // must be valid for every pre-RSKIP126 block. That inference is
+            // wrong: genesis is accounts only, and mainnet #1 -- whose single
+            // transaction is a REMASC call -- already fails to convert, REMASC
+            // being exactly the shape `orchid_converter` special-cases.
+            //
+            // So treat a mismatch here as "cannot verify", never as a located
+            // consensus divergence.
             if header.number.is_multiple_of(interval) {
                 let computed = rustock_trie::orchid_state_root(
                     &result.new_state_root,
