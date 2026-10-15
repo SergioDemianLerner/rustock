@@ -15,6 +15,8 @@
 //!               btc_tx_marked_processed, whitelist_entry_consumed,
 //!               refund_build_failed (default: every kind)
 //!   --coverage  print which ranges were replayed, and stop
+//!   --prune-gaps  drop gap records whose block has since been covered, and
+//!                 stop. The only mode that writes.
 //!   --account   total the bitcoin that reached the federation and was never
 //!               returned, by reason
 //! ```
@@ -53,11 +55,13 @@ fn main() -> Result<()> {
     let mut from = 0u64;
     let mut to = u64::MAX;
     let mut coverage_only = false;
+    let mut prune = false;
     let mut account = false;
     let mut it = argv.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--coverage" => coverage_only = true,
+            "--prune-gaps" => prune = true,
             "--account" => account = true,
             "--from" => from = it.next().context("--from needs a value")?.parse()?,
             "--to" => to = it.next().context("--to needs a value")?.parse()?,
@@ -66,6 +70,13 @@ fn main() -> Result<()> {
         }
     }
     anyhow::ensure!(!positional.is_empty(), "{USAGE}");
+    if prune {
+        let store = SilentStore::open(&positional[0])?;
+        let gone = store.prune_gaps()?;
+        println!("cleared {gone} gap(s) whose block is now covered");
+        println!("{} gap(s) remain", store.gaps()?.len());
+        return Ok(());
+    }
     let store = SilentStore::open_read_only(&positional[0])?;
 
     let spans = store.coverage()?;

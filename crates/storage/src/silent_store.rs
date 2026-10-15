@@ -163,6 +163,39 @@ impl SilentStore {
             .context("writing a coverage gap")
     }
 
+    /// Removes the gap recorded for `block`, if any.
+    ///
+    /// A gap says "this block could not be examined". Once it has been, the
+    /// record is not merely stale but actively misleading: a reader counting
+    /// gaps would believe work remains that is already done. Clearing is safe
+    /// because coverage, not the absence of a gap, is what licenses a claim.
+    pub fn clear_gap(&self, block: u64) -> Result<()> {
+        let cf = self.db.cf_handle(CF_META).context("meta cf")?;
+        let mut key = b"gap:".to_vec();
+        key.extend_from_slice(&block.to_be_bytes());
+        self.db.delete_cf(cf, key).context("clearing a coverage gap")
+    }
+
+    /// Drops every gap whose block is now covered. Returns how many went.
+    pub fn prune_gaps(&self) -> Result<usize> {
+        let mut gone = 0;
+        for g in self.gaps()? {
+            let Some(i) = g.find("\"block\":") else { continue };
+            let Some(n) = g[i + 8..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|d| d.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if self.covers(n, n)? {
+                self.clear_gap(n)?;
+                gone += 1;
+            }
+        }
+        Ok(gone)
+    }
+
     pub fn gaps(&self) -> Result<Vec<String>> {
         let cf = self.db.cf_handle(CF_META).context("meta cf")?;
         let mut out = Vec::new();
@@ -333,6 +366,24 @@ mod tests {
     }
 
     /// A hole must say why it is there.
+    /// A block that was a gap and has since been verified must stop being
+    /// counted as one, or the store overstates the work left.
+    #[test]
+    fn a_gap_clears_once_its_block_is_covered() {
+        let (_d, s) = store();
+        s.add_gap(100, "state root diverged").unwrap();
+        s.add_gap(200, "header missing").unwrap();
+        assert_eq!(s.gaps().unwrap().len(), 2);
+
+        s.add_coverage(&Coverage {
+            from: 100, to: 100, build: "x".into(), recorded_at: 0, verified: 1, diverged: 0,
+        }).unwrap();
+        assert_eq!(s.prune_gaps().unwrap(), 1, "only the covered one goes");
+        let left = s.gaps().unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].contains("\"block\":200"), "{}", left[0]);
+    }
+
     #[test]
     fn a_gap_is_recorded_with_its_reason() {
         let (_d, s) = store();

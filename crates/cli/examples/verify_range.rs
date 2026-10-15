@@ -203,6 +203,11 @@ fn write_coverage(
     if end < start {
         return Ok(());
     }
+    // A block that verifies is no longer a gap, whatever an earlier attempt
+    // recorded about it.
+    for b in start..=end {
+        store.clear_gap(b)?;
+    }
     store.add_coverage(&rustock_storage::silent_store::Coverage {
         from: start,
         to: end,
