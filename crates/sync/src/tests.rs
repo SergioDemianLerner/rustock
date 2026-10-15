@@ -541,7 +541,7 @@ async fn test_unanswered_follow_body_requests_expire() {
 
     let h = dummy_header(1, genesis.hash(), U256::from(1));
     // A fresh request is left alone.
-    service.pending_follow_bodies.insert(7, (h.hash(), h.clone(), std::time::Instant::now()));
+    service.pending_follow_bodies.insert(7, (h.hash(), h.clone(), std::time::Instant::now(), B512::repeat_byte(1)));
     service.on_tick().await;
     assert_eq!(service.pending_follow_bodies.len(), 1, "a fresh request must not be dropped");
 
@@ -549,7 +549,7 @@ async fn test_unanswered_follow_body_requests_expire() {
     // and the recovery paths can see an idle pipeline.
     service.pending_follow_bodies.insert(
         7,
-        (h.hash(), h, std::time::Instant::now() - std::time::Duration::from_secs(120)),
+        (h.hash(), h, std::time::Instant::now() - std::time::Duration::from_secs(120), B512::repeat_byte(1)),
     );
     service.on_tick().await;
     assert!(
@@ -1093,12 +1093,16 @@ async fn test_skeleton_round_transitions_to_next_skeleton() {
         _ => panic!("Expected DownloadingBodies after completing last chunk, got {:?}", service.state),
     }
 
-    // Simulate body responses to complete the phase
-    if let SyncState::DownloadingBodies { id_index, .. } = &service.state {
-        let req_ids: Vec<u64> = id_index.keys().copied().collect();
-        for req_id in req_ids {
-            service.on_body_response(B512::repeat_byte(9), req_id, vec![], vec![]).await;
-        }
+    // Simulate body responses to complete the phase. Each answer comes from
+    // the peer its request was sent to, which is what the service accepts.
+    let pending: Vec<(u64, B512)> =
+        if let SyncState::DownloadingBodies { id_index, .. } = &service.state {
+            id_index.iter().map(|(id, (_, asked))| (*id, *asked)).collect()
+        } else {
+            Vec::new()
+        };
+    for (req_id, asked) in pending {
+        service.on_body_response(asked, req_id, vec![], vec![]).await;
     }
 
     // After all bodies downloaded, should continue to DownloadingSkeleton
@@ -1167,7 +1171,7 @@ async fn a_body_that_does_not_match_its_header_is_charged_and_refetched() {
     let mut in_flight = std::collections::HashMap::new();
     in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now(), peer });
     let mut id_index = std::collections::HashMap::new();
-    id_index.insert(7u64, 0usize);
+    id_index.insert(7u64, (0usize, peer));
     service.state = SyncState::DownloadingBodies {
         peer_best: 10,
         pending_headers: vec![(b1.hash(), b1.clone())],
@@ -1225,7 +1229,7 @@ async fn a_matching_body_is_stored_and_its_supplier_remembered() {
     let mut in_flight = std::collections::HashMap::new();
     in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now(), peer });
     let mut id_index = std::collections::HashMap::new();
-    id_index.insert(7u64, 0usize);
+    id_index.insert(7u64, (0usize, peer));
     service.state = SyncState::DownloadingBodies {
         peer_best: 10,
         pending_headers: vec![(b1.hash(), b1.clone())],
@@ -1309,7 +1313,7 @@ async fn test_failed_body_send_stays_tracked_for_retry() {
     let mut in_flight = std::collections::HashMap::new();
     in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now(), peer }); // b1 in flight
     let mut id_index = std::collections::HashMap::new();
-    id_index.insert(7u64, 0usize);
+    id_index.insert(7u64, (0usize, peer));
     service.state = SyncState::DownloadingBodies {
         peer_best: 10,
         pending_headers: vec![(b1.hash(), b1.clone()), (b2.hash(), b2.clone())],
@@ -1371,7 +1375,7 @@ async fn test_stalled_body_retry_rotates_across_peers() {
         InFlightBody { req_id: 7, sent: Instant::now(), peer: B512::repeat_byte(1) },
     );
     let mut id_index = std::collections::HashMap::new();
-    id_index.insert(7u64, 0usize);
+    id_index.insert(7u64, (0usize, B512::repeat_byte(1)));
     service.state = SyncState::DownloadingBodies {
         peer_best: 10,
         pending_headers: vec![(b1.hash(), b1.clone())],
@@ -1512,8 +1516,8 @@ async fn test_late_body_response_on_superseded_id_still_applies() {
     in_flight.insert(0usize, InFlightBody { req_id: 7, sent: stale, peer });
     in_flight.insert(1usize, InFlightBody { req_id: 8, sent: Instant::now(), peer });
     let mut id_index = std::collections::HashMap::new();
-    id_index.insert(7u64, 0usize);
-    id_index.insert(8u64, 1usize);
+    id_index.insert(7u64, (0usize, peer));
+    id_index.insert(8u64, (1usize, peer));
     service.state = SyncState::DownloadingBodies {
         peer_best: 10,
         pending_headers: vec![(b1.hash(), b1.clone()), (b2.hash(), b2.clone())],
@@ -1530,8 +1534,10 @@ async fn test_late_body_response_on_superseded_id_still_applies() {
     };
     assert_ne!(new_id, 7, "retry must issue a fresh request id");
 
-    // Late response on the SUPERSEDED id 7 must still store b1.
-    service.on_body_response(B512::repeat_byte(9), 7, vec![], vec![]).await;
+    // Late response on the SUPERSEDED id 7 must still store b1. It comes from
+    // the peer id 7 was sent to -- the retry went to a fresh id, and the old
+    // id keeps its own peer, which is what lets a late answer still land.
+    service.on_body_response(peer, 7, vec![], vec![]).await;
     assert!(
         store.body(b1.hash()).unwrap().is_some(),
         "late response on a superseded id must still apply its body"
@@ -2231,7 +2237,10 @@ async fn test_follow_mode_buffers_out_of_order_body() {
 
     // Body for #102 arrives while #101 is still missing.
     let req_id = 42u64;
-    service.pending_follow_bodies.insert(req_id, (h102_hash, h102, std::time::Instant::now()));
+    service.pending_follow_bodies.insert(
+        req_id,
+        (h102_hash, h102, std::time::Instant::now(), B512::repeat_byte(9)),
+    );
     service.on_body_response(B512::repeat_byte(9), req_id, vec![], vec![]).await;
 
     // #102 must remain buffered (parent #101 is not our head), not executed.
@@ -3629,10 +3638,14 @@ async fn test_body_download_state_machine() {
         _ => panic!("Expected DownloadingBodies, got {:?}", service.state),
     }
 
-    // Simulate receiving the body response
-    if let SyncState::DownloadingBodies { id_index, .. } = &service.state {
-        let req_id = *id_index.keys().next().unwrap();
-        service.on_body_response(B512::repeat_byte(9), req_id, vec![], vec![]).await;
+    // Simulate receiving the body response, from the peer it was asked of.
+    let pending = if let SyncState::DownloadingBodies { id_index, .. } = &service.state {
+        id_index.iter().next().map(|(id, (_, asked))| (*id, *asked))
+    } else {
+        None
+    };
+    if let Some((req_id, asked)) = pending {
+        service.on_body_response(asked, req_id, vec![], vec![]).await;
     }
 
     assert!(matches!(service.state, SyncState::Following),
@@ -4923,7 +4936,7 @@ async fn test_follow_mode_does_not_pile_on_outstanding_requests() {
     // A request for #1 is already outstanding.
     service
         .pending_follow_bodies
-        .insert(1, (b1.hash(), b1.clone(), Instant::now()));
+        .insert(1, (b1.hash(), b1.clone(), Instant::now(), peer));
 
     service.fill_follow_body_gap().await;
 
@@ -6682,4 +6695,65 @@ async fn an_underivable_header_is_requested_and_remembered() {
         }
         other => panic!("expected DownloadingBodies, got {other:?}"),
     }
+}
+
+/// A body answer is only taken from the peer the request was sent to.
+///
+/// Request ids are random, so another peer cannot realistically land on one
+/// -- but that makes the binding a property of the id generator rather than
+/// of this code, and it would fall silently if the generator ever changed.
+/// The check is what keeps it true; this is what keeps the check.
+#[tokio::test]
+async fn a_body_from_a_peer_that_was_not_asked_is_ignored() {
+    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+
+    let asked = B512::repeat_byte(0x01);
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    peer_store.add_peer(asked, tx).await;
+
+    let mut in_flight = std::collections::HashMap::new();
+    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now(), peer: asked });
+    let mut id_index = std::collections::HashMap::new();
+    id_index.insert(7u64, (0usize, asked));
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 1,
+        pending_headers: vec![(b1.hash(), b1.clone())],
+        next_request: 1,
+        in_flight,
+        id_index,
+    };
+
+    // b1's header commits to an empty body, so this payload is the correct
+    // one. It is still refused, because of who sent it.
+    let stranger = B512::repeat_byte(0x09);
+    service.on_body_response(stranger, 7, vec![], vec![]).await;
+
+    assert!(
+        store.body(b1.hash()).unwrap().is_none(),
+        "a body from a peer that was not asked must not be stored"
+    );
+    match &service.state {
+        SyncState::DownloadingBodies { in_flight, id_index, .. } => {
+            assert!(in_flight.contains_key(&0), "the request must stay outstanding");
+            assert!(id_index.contains_key(&7), "and keep its id mapped");
+        }
+        other => panic!("expected DownloadingBodies, got {other:?}"),
+    }
+
+    // The peer that was asked is still able to answer it.
+    service.on_body_response(asked, 7, vec![], vec![]).await;
+    assert!(
+        store.body(b1.hash()).unwrap().is_some(),
+        "the genuine answer must still be accepted"
+    );
 }

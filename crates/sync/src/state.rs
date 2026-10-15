@@ -73,7 +73,12 @@ pub enum SyncState {
         /// header index, so a late response to an old id still applies its body
         /// instead of being discarded as "unknown". Entries are pruned as the
         /// matching blocks are stored.
-        id_index: std::collections::HashMap<u64, usize>,
+        /// Maps each request id to the chunk index it was issued for **and
+        /// the peer it was sent to**. Superseded ids stay mapped so a late
+        /// answer to a retried request still lands, which is why the peer
+        /// lives here rather than only in `in_flight`: that holds the newest
+        /// attempt, while a late answer belongs to an older one.
+        id_index: std::collections::HashMap<u64, (usize, B512)>,
     },
     /// At or near the chain tip — listening for NewBlockHashes announcements
     /// and fetching individual headers as they arrive.
