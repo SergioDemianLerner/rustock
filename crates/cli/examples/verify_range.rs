@@ -478,15 +478,21 @@ fn main() -> Result<()> {
     // The build that produced the records. A replay is only as good as the
     // code that ran it, and this is the only way to tell later which rows
     // came from which rules.
-    let build = option_env!("RUSTOCK_BUILD").map(str::to_string).unwrap_or_else(|| {
-        std::process::Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    });
+    let build = std::env::var("RUSTOCK_BUILD")
+        .ok()
+        .or_else(|| option_env!("RUSTOCK_BUILD").map(str::to_string))
+        .unwrap_or_else(|| {
+            // `-C` the crate's own directory rather than the current one: a
+            // run launched from outside the repo recorded "unknown", which is
+            // precisely the provenance this field exists to carry.
+            std::process::Command::new("git")
+                .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
     // The first block of the contiguous run being recorded; a divergence or
     // an unverifiable block closes the run and starts a new one, so coverage
     // describes only blocks that actually verified.

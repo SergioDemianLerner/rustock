@@ -17,11 +17,11 @@ as it makes them, so the replay is paid for once rather than per question.
 ## Using it
 
 Recording rides on `verify_range`, which already executes every block against
-rskj's own pre-state:
+a trusted pre-state:
 
 ```
-verify_range <data-dir> <rskj-unitrie> <from> <to> --record-silent <store-dir>
-scan_silent  <store-dir> [kind] [--from N] [--to N] [--coverage]
+verify_range <data-dir> <state-dir> <from> <to> --record-silent <store-dir>
+scan_silent  <store-dir> [kind] [--from N] [--to N] [--coverage] [--account]
 ```
 
 Two properties are load-bearing:
@@ -29,14 +29,98 @@ Two properties are load-bearing:
 - **Only verified blocks contribute.** A block whose state root disagrees with
   the chain was executed by this implementation and not by the network, so its
   decisions are ours, not the chain's. Those blocks become recorded *gaps*,
-  with the reason they failed.
+  with the reason they failed, and a gap is cleared if the block is verified
+  later (`scan_silent --prune-gaps` sweeps a store written before that was so).
 - **Coverage is stored, so silence is not mistaken for absence.** `scan_silent`
   says up front whether the range it was asked about was ever replayed. "No
   refunds in #1..#2,392,699" and "nobody has looked" are different answers.
 
-Each coverage span records the build that produced it. A replay is only as good
-as the rules that ran it, and that is the only way to tell later which rows came
-from which code.
+Each coverage span records the build that produced it. Set `RUSTOCK_BUILD` or
+run from anywhere — the build is read from the crate's own git directory, not
+the current one.
+
+## Regenerating it
+
+The store is **derived**: delete it and everything below rebuilds it. What it
+costs is dominated by how many blocks must be replayed, so the whole method is
+to narrow that set first.
+
+### 1. Find the blocks worth replaying
+
+Replaying every block is never necessary. Two ways to narrow:
+
+```sh
+# From the event index, where the decision leaves an event (arrowhead600 on):
+bridge_events /var/lib/rustock 'rejected_pegin(bytes32,int256)' \
+  | grep -oE '#[0-9]+' | tr -d '#' | sort -nu > blocks.txt      # 33,447 blocks
+
+# From the transactions, where it does not (anything, any era):
+scan_pegin_calls /var/lib/rustock <from> <to> --list-blocks > blocks.txt
+```
+
+`scan_pegin_calls` reads blocks without executing them — ~900 blocks/s on the
+early chain. **It sees only top-level calls**: `registerBtcTransaction` is
+`TransactionCallable` with no `isContractTx` restriction, so a contract may
+call it and that call is invisible without execution. Flyover peg-ins are
+*always* internal (`registerFlyoverBtcTransaction` requires `call_depth > 1`),
+so they are never on such a list. Use it to narrow, never to conclude.
+
+### 2. Replay them, recording
+
+State source by era — this is the part that is easy to get wrong:
+
+| era | source | extra |
+|---|---|---|
+| ≥ wasabi100 (#1,591,000) | rskj unitrie, or `/mnt/import/rustock-trie` | `--state-format rustock` for the latter |
+| < wasabi100 | rskj unitrie | **`--state-roots /mnt/import/rskj-snapshot/stateRoots`** |
+
+Below wasabi100 a header's `stateRoot` is an **orchid** root and names no
+unitrie node, so without the translation table every block is unverifiable and
+looks pruned. See `mainnet-pegin-refunds.md` for the two blind alleys this
+cost, and do not re-walk them.
+
+```sh
+verify_range /var/lib/rustock /mnt/import/rskj-snapshot/unitrie \
+    --blocks blocks.txt --network-id 30 \
+    --state-roots /mnt/import/rskj-snapshot/stateRoots \
+    --cache-mb 384 --max-failures 0 \
+    --scratch <scratch-dir> --record-silent <store-dir>
+```
+
+Operational notes, each learned the hard way:
+
+- **Chunk long runs.** The scratch trie grows ~70 KB/block and is deleted
+  between chunks; `/home/paseo/silent-run/run.sh` does this in 1,000-block
+  chunks with a `.done` marker each, so an interruption costs one chunk. It
+  also waits for free disk rather than starting work it cannot finish.
+- **Keep `--cache-mb` modest** (384-1024). The box has 7.7 GB and runs the
+  production node.
+- **A full-disk write failure aborts the run** rather than producing wrong
+  roots quietly — but do not rely on that; watch the free space.
+
+### 3. Read it
+
+```sh
+scan_silent <store-dir> --account            # value never returned, by reason
+scan_silent <store-dir> pegin_refunded       # every refund, with its address
+scan_silent <store-dir> --coverage           # what has been replayed, by which build
+```
+
+`--account` totals over **distinct `btcTxHash`**, not over records. A rejected
+peg-in is marked processed only under `RSKIP459 && !RSKIP551`, so outside that
+window the same bitcoin transaction can be resubmitted indefinitely and is
+rejected afresh each time. On mainnet 37,268 rejection events are **9**
+transactions; counting events overstates the value lost ~350-fold.
+
+### What the store currently holds
+
+| range | blocks | how |
+|---|---|---|
+| #6,916 – #2,391,061 | 129 | every pre-papyrus200 peg-in block |
+| #6,223,964 – #8,488,233 | 33,447 | every block with a `rejected_pegin` event |
+
+Everything else is uncovered, and `scan_silent` says so for any range touching
+it.
 
 ## Recording never changes execution
 
@@ -97,18 +181,24 @@ Not yet, and each would need the same care about writes as the cap check did:
 - Fee-per-kb and lock-whitelist administrative votes.
 - `receiveHeaders` rejections (a BTC header refused by the chain rules).
 
-## What it reproduced
+## What it found
 
-Replaying the two known refund blocks recovers both, with the fields the event
-log never carried:
+Nine peg-in refunds on mainnet, where the event log alone shows two:
 
 ```
-#2745770 tx[1]  PEGIN_CAP_SURPASSED           20.00000000 BTC  v0  P2PKH
-                refund 1BAfwW2h4dqyY5zGEMPZL48nUBwekAghg3  (P2PKH)   logged: false
-#2851909 tx[2]  LEGACY_PEGIN_MULTISIG_SENDER  19.70976990 BTC  v0  P2SH-MULTISIG
-                refund 35JUi1FxabGdhygLhnNUEFG4AgvpNMgxK1  (P2SH)    logged: false
+#268,846 .. #1,923,835   7 refunds, 2.78799874 BTC   LOCK_WHITELIST_REJECTED
+#2,745,770               1 refund, 20.00000000 BTC   PEGIN_CAP_SURPASSED
+#2,851,909               1 refund, 19.70976990 BTC   LEGACY_PEGIN_MULTISIG_SENDER
 ```
 
-These agree with the independent event-based analysis in
-`mainnet-pegin-refunds.md` on every field, derived here from execution rather
-than from pairing `release_requested` against `registerBtcTransaction`.
+The seven are invisible to any event-based method: a whitelist rejection emits
+nothing, in any era. The two that are visible agree with the event-based
+analysis on every field, derived here from execution rather than from pairing
+`release_requested` against `registerBtcTransaction`.
+
+And 0.06519234 BTC of peg-in value kept and never returned over
+#6,223,964..#8,488,233 — 94% of it from peg-ins sent from native segwit
+(bech32) addresses, whose sender rskj cannot classify, so no refund address can
+be derived and the bitcoin stays with the federation.
+
+Full analysis in `/home/paseo/doc/mainnet-pegin-refunds.md` (outside git).
