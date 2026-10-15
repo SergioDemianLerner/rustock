@@ -27,6 +27,12 @@
 //!                      flat RocksDB keyed by node hash) or "rustock" (one of
 //!                      our own trie stores, e.g. a segbuild chunk's `sealed`
 //!                      directory, which keys nodes in a `trie_nodes` CF)
+//!   --state-roots DIR  rskj's `stateRoots` table, which maps a pre-RSKIP126
+//!                      header's ORCHID state root to the UNITRIE root holding
+//!                      the same state. It is what makes the early chain
+//!                      reachable at all: it supplies both the parent to read
+//!                      and the root to verify against, with no Orchid
+//!                      conversion anywhere.
 //!   --parent-roots F   CSV of `block,...,unitrie_root,...` giving the UNITRIE
 //!                      root each block computed. Needed below wasabi100,
 //!                      where the header's own stateRoot is an orchid root and
@@ -69,6 +75,7 @@
 #[path = "support/mod.rs"]
 mod support;
 
+use alloy_primitives::B256;
 use anyhow::{Context, Result};
 use rocksdb::{DB, Options};
 use rustock_core::Block;
@@ -89,7 +96,7 @@ const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <t
 /// read as a positional -- a mistyped `--max-failures` that became a block
 /// number would be worse than no option at all.
 fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)>)> {
-    const WITH_VALUE: [&str; 8] = [
+    const WITH_VALUE: [&str; 9] = [
         "--network-id",
         "--scratch",
         "--max-failures",
@@ -98,6 +105,7 @@ fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)
         "--blocks",
         "--state-format",
         "--parent-roots",
+        "--state-roots",
     ];
     const SEED: [&str; 2] = ["--seed-genesis", "--sequential"];
     const FLAGS: [&str; 1] = ["--explain"];
@@ -278,6 +286,28 @@ fn main() -> Result<()> {
     let explain = options.iter().any(|(k, _)| k == "--explain");
     let seed_genesis = options.iter().any(|(k, _)| k == "--seed-genesis");
     let sequential = options.iter().any(|(k, _)| k == "--sequential");
+    let state_roots: Option<DB> = match options
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "--state-roots")
+        .map(|(_, v)| v.clone())
+    {
+        None => None,
+        Some(dir) => {
+            let db = DB::open_for_read_only(&Options::default(), &dir, false)
+                .with_context(|| format!("opening rskj stateRoots at {dir} read-only"))?;
+            eprintln!("  roots   {dir} (orchid -> unitrie translation)");
+            Some(db)
+        }
+    };
+    // rskj `stateRootsDB`: the Unitrie root holding the state an Orchid root
+    // named. `None` when the table has no entry, which for a pre-wasabi block
+    // means the block cannot be addressed or checked at all.
+    let translate = |orchid: &B256| -> Option<B256> {
+        let db = state_roots.as_ref()?;
+        let v = db.get(orchid.as_slice()).ok().flatten()?;
+        (v.len() == 32).then(|| B256::from_slice(&v))
+    };
     let parent_roots: std::collections::HashMap<u64, Vec<u8>> = match options
         .iter()
         .rev()
@@ -534,10 +564,13 @@ fn main() -> Result<()> {
         // Below wasabi100 the header's stateRoot is an orchid root and names
         // no unitrie node, so the recorded unitrie root of the parent is used
         // instead where one was supplied.
-        let parent_key: Vec<u8> = parent_roots
-            .get(&parent.number)
-            .cloned()
-            .unwrap_or_else(|| parent.state_root.as_slice().to_vec());
+        let parent_key: Vec<u8> = match translate(&parent.state_root) {
+            Some(unitrie) => unitrie.as_slice().to_vec(),
+            None => parent_roots
+                .get(&parent.number)
+                .cloned()
+                .unwrap_or_else(|| parent.state_root.as_slice().to_vec()),
+        };
         let Some(root_data) = trie.get(&parent_key) else {
             // States the fact, not a cause: an absent root means the source
             // was pruned below here, or that these blocks and this unitrie
@@ -604,31 +637,48 @@ fn main() -> Result<()> {
         let unitrie_root = hardfork_cfg.has_unitrie_state_root(n);
         let decisions_here =
             if silent.is_some() { rustock_execution::silent::drain() } else { Vec::new() };
-        // A block the caller named explicitly is always worth the conversion:
-        // it was asked about, so an unchecked answer is no answer.
+
+        // Below wasabi100 the header's root is an Orchid one and cannot be
+        // compared with what we compute. There are two ways to get a verdict,
+        // and they are not equally good:
+        //
+        //  - rskj's own translation table gives the Unitrie root holding the
+        //    state that Orchid root named. Comparing that against ours is
+        //    like with like, costs a single lookup, and reconstructs no
+        //    Orchid trie. Preferred whenever the table is supplied.
+        //  - Converting our Unitrie into an Orchid root is the fallback, and
+        //    a weak one: Orchid was a different structure, so a mismatch
+        //    cannot be told apart from a limit of the conversion.
+        let translated = (!unitrie_root)
+            .then(|| translate(&block.header.state_root))
+            .flatten();
+        // Only worth the conversion when nothing better is available, and
+        // then only where the answer matters: a block that decided something,
+        // one the caller named, or a periodic tripwire.
         let check_orchid = !unitrie_root
+            && translated.is_none()
             && (blocks_file.is_some()
                 || !decisions_here.is_empty()
                 || (orchid_every > 0 && n.is_multiple_of(orchid_every)));
-        // Whichever root was actually compared, so the report shows the
-        // number the verdict rests on. Printing the unitrie hash beside an
-        // orchid header root invites exactly the wrong conclusion.
-        let computed_state = if unitrie_root {
-            Some(processed.state_root_hash)
+        // What was compared, and against what -- so the report shows the two
+        // numbers the verdict actually rests on.
+        let (computed_state, expected_state, via_orchid) = if unitrie_root {
+            (Some(processed.state_root_hash), block.header.state_root, false)
+        } else if let Some(expected) = translated {
+            (Some(processed.state_root_hash), expected, false)
         } else if check_orchid {
-            Some(rustock_trie::orchid_state_root(&processed.new_state_root, trie.as_ref()))
+            (
+                Some(rustock_trie::orchid_state_root(&processed.new_state_root, trie.as_ref())),
+                block.header.state_root,
+                true,
+            )
         } else {
-            None
+            (None, block.header.state_root, false)
         };
-        let state_ok = computed_state.is_none_or(|c| c == block.header.state_root);
-        // Below wasabi100 a failed comparison means "could not verify", not
-        // "diverged". Orchid was a different data structure, so converting a
-        // unitrie into an Orchid root is not guaranteed to reproduce what the
-        // Orchid client committed to -- and a unitrie replayed from genesis is
-        // not the trie the migration produced. A match is still worth having;
-        // a mismatch simply yields no verdict, so the block records nothing
-        // and becomes a gap.
-        let orchid_inconclusive = !unitrie_root && check_orchid && !state_ok;
+        let state_ok = computed_state.is_none_or(|c| c == expected_state);
+        let checked_here = unitrie_root || translated.is_some() || check_orchid;
+        // A conversion mismatch yields no verdict rather than a divergence.
+        let orchid_inconclusive = via_orchid && !state_ok;
         if sequential {
             carried = Some(processed.new_state_root.clone());
         }
@@ -651,7 +701,7 @@ fn main() -> Result<()> {
             unverifiable += 1;
             continue;
         }
-        if unitrie_root || check_orchid {
+        if checked_here {
             checked += 1;
         } else {
             unchecked += 1;
@@ -677,7 +727,7 @@ fn main() -> Result<()> {
                 if contiguous {
                     // A block whose root was never compared is executed, not
                 // verified; it carries state forward but must not be claimed.
-                if unitrie_root || check_orchid {
+                if checked_here {
                     run_start.get_or_insert(n);
                 } else if run_start.is_some() {
                     close_run(
@@ -701,12 +751,12 @@ fn main() -> Result<()> {
                 println!(
                     "    state    computed {:?}{}",
                     computed_state.unwrap_or(processed.state_root_hash),
-                    if unitrie_root { "" } else { "  (orchid form)" }
+                    if via_orchid { "  (orchid form)" } else { "" }
                 );
-                println!("             header   {:?}", block.header.state_root);
-                if !unitrie_root {
-                    println!("             unitrie  {:?}", processed.state_root_hash);
-                }
+                println!(
+                    "             expected {expected_state:?}{}",
+                    if unitrie_root || via_orchid { "" } else { "  (rskj stateRoots translation)" }
+                );
             }
             if verdict.receipts {
                 println!("    receipts computed {:?}", processed.receipts_root);
