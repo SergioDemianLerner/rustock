@@ -27,6 +27,22 @@
 //!                      flat RocksDB keyed by node hash) or "rustock" (one of
 //!                      our own trie stores, e.g. a segbuild chunk's `sealed`
 //!                      directory, which keys nodes in a `trie_nodes` CF)
+//!   --parent-roots F   CSV of `block,...,unitrie_root,...` giving the UNITRIE
+//!                      root each block computed. Needed below wasabi100,
+//!                      where the header's own stateRoot is an orchid root and
+//!                      cannot address a unitrie node. The block is still
+//!                      verified against its header, by converting the result
+//!                      to orchid form -- so a wrong root here fails the check
+//!                      rather than passing silently.
+//!   --sequential       execute the range in order, carrying each block's
+//!                      post-state forward instead of resolving every block's
+//!                      parent root from the source. The only way to reach
+//!                      blocks below wasabi100 (#1,591,000 on mainnet), whose
+//!                      headers carry an ORCHID-format state root that is not
+//!                      a unitrie node hash and so can never be looked up.
+//!   --seed-genesis     build the genesis state into the scratch store before
+//!                      starting, so a contiguous replay from #1 needs no
+//!                      historical state source at all
 //!   --blocks FILE      verify only the block numbers in FILE (one per line)
 //!                      instead of a contiguous range; <from> and <to> are
 //!                      then omitted
@@ -76,7 +92,7 @@ const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <t
 /// read as a positional -- a mistyped `--max-failures` that became a block
 /// number would be worse than no option at all.
 fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)>)> {
-    const WITH_VALUE: [&str; 7] = [
+    const WITH_VALUE: [&str; 8] = [
         "--network-id",
         "--scratch",
         "--max-failures",
@@ -84,7 +100,9 @@ fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)
         "--record-silent",
         "--blocks",
         "--state-format",
+        "--parent-roots",
     ];
+    const SEED: [&str; 2] = ["--seed-genesis", "--sequential"];
     const FLAGS: [&str; 1] = ["--explain"];
     let mut positional = Vec::new();
     let mut options = Vec::new();
@@ -98,7 +116,7 @@ fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)
             Some((k, v)) => (k.to_string(), Some(v.to_string())),
             None => (a.clone(), None),
         };
-        if FLAGS.contains(&key.as_str()) {
+        if FLAGS.contains(&key.as_str()) || SEED.contains(&key.as_str()) {
             options.push((key, "true".to_string()));
             continue;
         }
@@ -261,6 +279,36 @@ fn main() -> Result<()> {
     // a cache sized for the database rather than the box gets it killed.
     let cache_mb: usize = option(&options, "--cache-mb", 256)?;
     let explain = options.iter().any(|(k, _)| k == "--explain");
+    let seed_genesis = options.iter().any(|(k, _)| k == "--seed-genesis");
+    let sequential = options.iter().any(|(k, _)| k == "--sequential");
+    let parent_roots: std::collections::HashMap<u64, Vec<u8>> = match options
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "--parent-roots")
+        .map(|(_, v)| v.clone())
+    {
+        None => Default::default(),
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading parent roots from {path}"))?;
+            let mut m = std::collections::HashMap::new();
+            for line in text.lines().skip(1) {
+                let mut it = line.split(',');
+                let (Some(b), Some(_), Some(r)) = (it.next(), it.next(), it.next()) else {
+                    continue;
+                };
+                let (Ok(b), Some(r)) = (b.trim().parse::<u64>(), r.trim().strip_prefix("0x"))
+                else {
+                    continue;
+                };
+                if let Ok(bytes) = alloy_primitives::hex::decode(r) {
+                    m.insert(b, bytes);
+                }
+            }
+            eprintln!("  parent roots: {} entries from {path}", m.len());
+            m
+        }
+    };
     let state_format: String = options
         .iter()
         .rev()
@@ -326,6 +374,51 @@ fn main() -> Result<()> {
     let spill: Arc<dyn TrieStore> = scratch_store.clone();
     let trie: Arc<dyn TrieStore> = Arc::new(OverlayTrieStore::with_spill(source, spill));
 
+    // The earliest chain has no state source on this machine: the rskj
+    // snapshot and the full trie both start above #1.5M, and a segbuild chunk
+    // captures its producer's read set rather than roots addressable by hash.
+    // None of that is needed, because genesis state is not read from anywhere
+    // -- it is constructed from the chain config. Build it into the scratch
+    // store and a contiguous replay from #1 carries its own state forward,
+    // each block's parent root having been written by the one before.
+    // In sequential mode the state is carried here rather than resolved per
+    // block from the source.
+    let mut carried: Option<TrieNode> = None;
+    anyhow::ensure!(
+        !sequential || blocks_file.is_none(),
+        "--sequential replays a contiguous range; it cannot take --blocks"
+    );
+    if seed_genesis {
+        use rustock_trie::{account_key, AccountState, TrieKeySlice};
+        let config = if network_id == support::MAINNET {
+            rustock_core::config::ChainConfig::mainnet()
+        } else {
+            rustock_core::config::ChainConfig::testnet()
+        };
+        let mut genesis = TrieNode::empty();
+        for e in &config.genesis_alloc() {
+            genesis = genesis.put(
+                &TrieKeySlice::from_key(&account_key(&e.address)),
+                &AccountState::new(e.nonce, e.balance).encode(),
+                trie.as_ref(),
+            );
+        }
+        genesis.save(trie.as_ref(), true);
+        // The genesis header predates RSKIP126, so its stateRoot is the
+        // ORCHID root of this trie, not the unitrie node hash. Comparing the
+        // wrong one of those is how a correct genesis looks broken.
+        let built = rustock_trie::orchid_state_root(&genesis, trie.as_ref());
+        let expected = config.genesis_header().state_root;
+        // Checked, not assumed: a wrong genesis would make every block below
+        // the first real state source diverge, and look like a consensus bug.
+        anyhow::ensure!(
+            built == expected,
+            "constructed genesis state root {built:?} does not match the genesis header {expected:?}"
+        );
+        eprintln!("  seeded genesis state (orchid root {built:?})");
+        carried = Some(genesis);
+    }
+
     let hardfork_cfg = support::hardfork_for(network_id);
     eprintln!(
         "verifying {} block(s) in #{from}..=#{to} on network-id {network_id} (chain_id {})",
@@ -338,7 +431,7 @@ fn main() -> Result<()> {
     eprintln!("  blocks  {data_dir} (read-only)");
     eprintln!("  state   {unitrie_dir} (read-only, {state_format} format)");
     eprintln!("  scratch {}", scratch_path.display());
-    let processor = BlockProcessor::new(hardfork_cfg, store.clone());
+    let processor = BlockProcessor::new(hardfork_cfg.clone(), store.clone());
 
     let silent = match &record_silent {
         Some(dir) => {
@@ -372,10 +465,20 @@ fn main() -> Result<()> {
         eprintln!("  stopping after {max_failures} divergent or unverifiable block(s)");
     }
 
+    // How often to pay for an orchid conversion on pre-RSKIP126 blocks that
+    // decided nothing. 0 disables the tripwire.
+    let orchid_every: u64 = std::env::var("RUSTOCK_ORCHID_CHECK_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let started = std::time::Instant::now();
     let mut checked = 0u64;
     let mut diverged = 0u64;
     let mut unverifiable = 0u64;
+    // Executed to carry state forward, but with no root comparison available:
+    // pre-RSKIP126 blocks that decided nothing. Counted apart from `checked`
+    // so the summary never calls them verified.
+    let mut unchecked = 0u64;
     let mut first_bad: Option<u64> = None;
     let mut stopped_at: Option<u64> = None;
 
@@ -419,7 +522,26 @@ fn main() -> Result<()> {
             unverifiable += 1;
             continue;
         };
-        let Some(root_data) = trie.get(parent.state_root.as_slice()) else {
+        let pre = if sequential {
+            match carried.take() {
+                Some(r) => r,
+                None => {
+                    eprintln!("#{n}: no carried state; --sequential needs --seed-genesis \
+                               (or a predecessor that succeeded)");
+                    close_run(&silent, &mut run_start, n, &build, "no carried state")?;
+                    unverifiable += 1;
+                    continue;
+                }
+            }
+        } else {
+        // Below wasabi100 the header's stateRoot is an orchid root and names
+        // no unitrie node, so the recorded unitrie root of the parent is used
+        // instead where one was supplied.
+        let parent_key: Vec<u8> = parent_roots
+            .get(&parent.number)
+            .cloned()
+            .unwrap_or_else(|| parent.state_root.as_slice().to_vec());
+        let Some(root_data) = trie.get(&parent_key) else {
             // States the fact, not a cause: an absent root means the source
             // was pruned below here, or that these blocks and this unitrie
             // are from different chains. Naming only one of those sends the
@@ -439,7 +561,8 @@ fn main() -> Result<()> {
             unverifiable += 1;
             continue;
         };
-        let pre = TrieNode::from_message(&root_data, trie.as_ref());
+            TrieNode::from_message(&root_data, trie.as_ref())
+        };
 
         let block = Block { header, transactions, ommers };
         let processed = match processor.execute_block(&block, &pre, trie.clone()) {
@@ -475,16 +598,48 @@ fn main() -> Result<()> {
             );
         }
 
+        // Before RSKIP126 the header carries an orchid root, so the unitrie
+        // hash cannot be compared against it. Converting is expensive -- it
+        // walks the whole state -- so it is paid for only where the answer
+        // matters: a block that recorded a decision, or every `orchid_every`
+        // blocks as a tripwire. Elsewhere state is carried forward unchecked,
+        // and the coverage records say so by omitting those blocks.
+        let unitrie_root = hardfork_cfg.has_unitrie_state_root(n);
+        let decisions_here =
+            if silent.is_some() { rustock_execution::silent::drain() } else { Vec::new() };
+        // A block the caller named explicitly is always worth the conversion:
+        // it was asked about, so an unchecked answer is no answer.
+        let check_orchid = !unitrie_root
+            && (blocks_file.is_some()
+                || !decisions_here.is_empty()
+                || (orchid_every > 0 && n.is_multiple_of(orchid_every)));
+        // Whichever root was actually compared, so the report shows the
+        // number the verdict rests on. Printing the unitrie hash beside an
+        // orchid header root invites exactly the wrong conclusion.
+        let computed_state = if unitrie_root {
+            Some(processed.state_root_hash)
+        } else if check_orchid {
+            Some(rustock_trie::orchid_state_root(&processed.new_state_root, trie.as_ref()))
+        } else {
+            None
+        };
+        let state_ok = computed_state.is_none_or(|c| c == block.header.state_root);
+        if sequential {
+            carried = Some(processed.new_state_root.clone());
+        }
         let verdict = Verdict {
-            state: processed.state_root_hash != block.header.state_root,
+            state: !state_ok,
             receipts: processed.receipts_root != block.header.receipts_root,
             gas: processed.gas_used != block.header.gas_used,
         };
-        checked += 1;
-        // Taken whether or not it is kept: leaving a diverged block's records
-        // in the sink would attribute them to the next block.
-        let decisions =
-            if silent.is_some() { rustock_execution::silent::drain() } else { Vec::new() };
+        if unitrie_root || check_orchid {
+            checked += 1;
+        } else {
+            unchecked += 1;
+        }
+        // Drained above, before the verdict, because the orchid check needs
+        // to know whether this block decided anything.
+        let decisions = decisions_here;
         if let Some(store) = &silent {
             if verdict.ok() {
                 if !decisions.is_empty() {
@@ -501,7 +656,16 @@ fn main() -> Result<()> {
                     store.put_records(&rows)?;
                 }
                 if contiguous {
+                    // A block whose root was never compared is executed, not
+                // verified; it carries state forward but must not be claimed.
+                if unitrie_root || check_orchid {
                     run_start.get_or_insert(n);
+                } else if run_start.is_some() {
+                    close_run(
+                        &silent, &mut run_start, n, &build,
+                        "state not checked at this height",
+                    )?;
+                }
                 } else {
                     // One span per block: truthful about a scattered replay.
                     write_coverage(&silent, n, n, &build)?;
@@ -515,8 +679,15 @@ fn main() -> Result<()> {
             first_bad.get_or_insert(n);
             println!("#{n}  DIVERGES  ({})", verdict.label());
             if verdict.state {
-                println!("    state    computed {:?}", processed.state_root_hash);
+                println!(
+                    "    state    computed {:?}{}",
+                    computed_state.unwrap_or(processed.state_root_hash),
+                    if unitrie_root { "" } else { "  (orchid form)" }
+                );
                 println!("             header   {:?}", block.header.state_root);
+                if !unitrie_root {
+                    println!("             unitrie  {:?}", processed.state_root_hash);
+                }
             }
             if verdict.receipts {
                 println!("    receipts computed {:?}", processed.receipts_root);
@@ -664,6 +835,12 @@ fn main() -> Result<()> {
         println!("  STOPPED EARLY at #{at}; #{}..=#{to} was not examined", at + 1);
     }
     println!("  verified      {checked}");
+    if unchecked > 0 {
+        println!(
+            "  executed      {unchecked}  (pre-RSKIP126, no root comparison made: state\n\
+             \x20               carried forward but NOT verified, and not recorded as coverage)"
+        );
+    }
     println!("  diverged      {diverged}");
     println!("  unverifiable  {unverifiable}");
     if let Some(n) = first_bad {
