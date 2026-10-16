@@ -539,6 +539,13 @@ pub struct SyncService {
     /// paths check this map for in-flight work and stand down when it is
     /// non-empty, so a single stuck entry disabled both of them.
     pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header, Instant)>,
+    /// Blocks whose body was derived from the header rather than requested.
+    /// Counted so the saving can be checked against an offline prediction.
+    pub(crate) derived_bodies: u64,
+    /// Headers a derivation attempt has already refused. Without this a
+    /// header that cannot be derived would be re-tested on every pass over
+    /// the queue, paying the predicate repeatedly to learn the same thing.
+    pub(crate) underivable: std::collections::HashSet<B256>,
     /// Follow-mode blocks whose bodies have arrived, keyed by block number so
     /// they execute in strict order. Body responses for the several headers a
     /// gap-pull requests can land out of order; executing them as they arrive
@@ -663,6 +670,8 @@ impl SyncService {
             violation_since: None,
             follow_gap_since: None,
             pending_follow_bodies: HashMap::new(),
+            derived_bodies: 0,
+            underivable: std::collections::HashSet::new(),
             follow_buffer: BTreeMap::new(),
             tx_pool: None,
             blocks_since_flush: 0,
@@ -4130,7 +4139,15 @@ impl SyncService {
             debug!(target: "rustock::sync", "No connected peers for body requests");
             return;
         }
-        let SyncService { state, body_peer_strikes, peer_store, manager, .. } = self;
+        let SyncService {
+            state,
+            body_peer_strikes,
+            peer_store,
+            manager,
+            derived_bodies,
+            underivable,
+            ..
+        } = self;
         let SyncState::DownloadingBodies {
             pending_headers,
             next_request,
@@ -4163,6 +4180,45 @@ impl SyncService {
             if matches!(manager.store.body(*hash), Ok(Some(_))) {
                 *next_request += 1;
                 continue;
+            }
+
+            // Nor does one the header already determines. The protocol
+            // carries a single body per request, so each one skipped is a
+            // whole round trip saved, and around a fifth of mainnet
+            // qualifies. Storing it here is all that is needed: this loop
+            // and the completion check both key off the store, so a derived
+            // body advances the batch exactly as a delivered one does.
+            if !underivable.contains(hash) {
+                match crate::body_check::derivable_body(_header) {
+                    Some(transactions) => {
+                        match manager.store.put_body(*hash, &transactions, &[]) {
+                            Ok(()) => {
+                                *derived_bodies += 1;
+                                trace!(
+                                    target: "rustock::sync",
+                                    "Derived body for #{} instead of requesting it",
+                                    _header.number
+                                );
+                                *next_request += 1;
+                                continue;
+                            }
+                            // Storing failed, so ask for it the ordinary way
+                            // rather than lose the block. Not marked
+                            // underivable: the header was fine, the store
+                            // was not.
+                            Err(e) => warn!(
+                                target: "rustock::sync",
+                                "Could not store derived body for #{}: {e:?}; requesting it",
+                                _header.number
+                            ),
+                        }
+                    }
+                    // Remembered so the predicate is paid once per header.
+                    // No peer is charged, because no peer sent anything.
+                    None => {
+                        underivable.insert(*hash);
+                    }
+                }
             }
             let Some(peer) = pick_body_peer(&load, body_peer_strikes, None) else {
                 // Every peer is at its per-peer cap; stop topping up and let
@@ -4422,8 +4478,9 @@ impl SyncService {
                 if all_done {
                     info!(
                         target: "rustock::sync",
-                        "All {} block bodies downloaded",
-                        pending_headers.len()
+                        "All {} block bodies downloaded ({} derived from their headers so far)",
+                        pending_headers.len(),
+                        self.derived_bodies
                     );
                     self.finish_batch(&pending_headers, peer_best).await;
                 } else {

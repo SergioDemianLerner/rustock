@@ -15,7 +15,7 @@ use alloy_primitives::U256;
 /// transaction of every RSK block is sent to. Mirrors
 /// `rustock_execution::precompiles::REMASC_ADDR`, duplicated here because
 /// `rustock-core` sits below the execution crate.
-const REMASC_ADDR: [u8; 20] = [
+pub(crate) const REMASC_ADDR: [u8; 20] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x00, 0x08,
 ];
 
