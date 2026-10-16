@@ -180,16 +180,112 @@ pub enum FederationChangeResponseCode {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Memoises [`rsk_address_from_public_key`].
+///
+/// Decompressing a compressed secp256k1 point costs a modular square root,
+/// and REMASC derives an address for every federation member on every block.
+/// The federation changes a handful of times in the chain's whole history --
+/// thirteen `commit_federation` events on mainnet -- so almost every one of
+/// those square roots recomputes an answer already known.
+///
+/// Memoising cannot change consensus: the mapping is a pure function of the
+/// key bytes, so a hit and a miss return the same address.
+///
+/// Bounded, because this is also reached from the governance paths with keys
+/// read out of Bridge storage, and a map keyed by those would grow with them.
+/// The live set is a dozen or so, so the cap is never approached in practice;
+/// it exists so that an unusual history cannot make this grow without end.
+/// Past the cap new keys are still derived, just not remembered.
+const ADDRESS_CACHE_LIMIT: usize = 256;
+
+fn address_cache() -> &'static std::sync::RwLock<
+    std::collections::HashMap<Vec<u8>, alloy_primitives::Address>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<Vec<u8>, alloy_primitives::Address>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 /// RSK address of a federation member from its secp256k1 public key
 /// (compressed or uncompressed): keccak256 of the uncompressed point's
 /// 64 coordinate bytes, last 20 bytes (rskj ECKey.getAddress).
 pub fn rsk_address_from_public_key(key: &[u8]) -> Option<alloy_primitives::Address> {
+    // A poisoned lock means some other thread panicked mid-update. That is a
+    // reason to stop trusting the cache, not a reason to fail: the answer is
+    // still computable, so fall through and derive it.
+    if let Ok(cache) = address_cache().read() {
+        if let Some(hit) = cache.get(key) {
+            return Some(*hit);
+        }
+    }
+
+    let derived = derive_rsk_address_from_public_key(key)?;
+
+    if let Ok(mut cache) = address_cache().write() {
+        if cache.len() < ADDRESS_CACHE_LIMIT {
+            cache.insert(key.to_vec(), derived);
+        }
+    }
+    Some(derived)
+}
+
+/// The derivation itself, without the memo. Kept separate so a test can
+/// compare the two and show the cache changes nothing.
+fn derive_rsk_address_from_public_key(key: &[u8]) -> Option<alloy_primitives::Address> {
     use k256::elliptic_curve::sec1::ToEncodedPoint;
     use sha3::Digest;
     let parsed = k256::PublicKey::from_sec1_bytes(key).ok()?;
     let point = parsed.to_encoded_point(false);
     let digest = sha3::Keccak256::digest(&point.as_bytes()[1..]);
     Some(alloy_primitives::Address::from_slice(&digest[12..]))
+}
+
+#[cfg(test)]
+mod address_cache_tests {
+    use super::{derive_rsk_address_from_public_key, rsk_address_from_public_key};
+
+    /// A compressed key and its uncompressed form name the same point, so
+    /// they must name the same address -- and the cache, keyed by bytes,
+    /// must not let one answer stand in for the other.
+    #[test]
+    fn the_memo_returns_what_the_derivation_returns() {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+
+        // Deterministic keys: scalar 1..=4 on the curve.
+        for i in 1u8..=4 {
+            let mut sk = [0u8; 32];
+            sk[31] = i;
+            let secret = k256::SecretKey::from_slice(&sk).expect("valid scalar");
+            let public = secret.public_key();
+            for compressed in [true, false] {
+                let bytes = public.to_encoded_point(compressed).as_bytes().to_vec();
+                let plain = derive_rsk_address_from_public_key(&bytes);
+                assert!(plain.is_some(), "key {i} should derive");
+                // First call populates, second is served from the memo.
+                assert_eq!(rsk_address_from_public_key(&bytes), plain);
+                assert_eq!(rsk_address_from_public_key(&bytes), plain, "second call");
+            }
+        }
+    }
+
+    /// Bytes that are not a point stay rejected, and are not remembered as
+    /// anything.
+    ///
+    /// The cases are chosen to fail for structural reasons rather than
+    /// arithmetic ones: `[0x02; 33]` looks like junk but is a real point, so
+    /// it would have tested the opposite of what it appears to.
+    #[test]
+    fn a_key_that_is_not_a_point_is_still_refused() {
+        // An invalid SEC1 tag, and a length no encoding uses.
+        let bad_tag = [0x05u8; 33];
+        let too_short = [0x02u8; 5];
+        for junk in [&bad_tag[..], &too_short[..]] {
+            assert_eq!(derive_rsk_address_from_public_key(junk), None);
+            assert_eq!(rsk_address_from_public_key(junk), None);
+            assert_eq!(rsk_address_from_public_key(junk), None, "and again");
+        }
+    }
 }
 
 #[cfg(test)]
