@@ -69,6 +69,12 @@
 # ws = false                        # default — WebSocket JSON-RPC, for eth_subscribe
 # ws_port = 4445                    # default
 
+[metrics]
+# Prometheus metrics, served on their own listener. Absent port means no
+# listener is opened at all, which is the default.
+# port = 9898                       # default: unset — serving metrics is opt-in
+# host = "127.0.0.1"                # default — bind elsewhere to scrape from another host
+
 [peers]
 # max_peers = 25                    # default
 # max_inbound_peers = 32            # default

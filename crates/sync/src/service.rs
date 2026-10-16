@@ -1357,6 +1357,23 @@ impl SyncService {
     }
 
     pub(crate) async fn on_tick(&mut self) {
+        // Gauges are sampled here rather than written wherever they change.
+        // A gauge is a level, not an event: a scrape wants its value now, and
+        // the tick is the one place that reliably has all three without
+        // adding a write to a hot path.
+        {
+            use rustock_core::metrics;
+            metrics::PEERS.set(self.peer_store.peers().await.len() as u64);
+            if let Ok(Some(hash)) = self.manager.store.head() {
+                if let Ok(Some(header)) = self.manager.store.header(hash) {
+                    metrics::SYNC_HEIGHT.set(header.number);
+                }
+            }
+            if let Some((_, meta)) = self.peer_store.best_peer().await {
+                metrics::SYNC_TARGET.set(meta.best_number);
+            }
+        }
+
         // Reap a finished background execution before driving the state machine
         // so a parked next batch can start executing and downloads can resume.
         self.poll_execution().await;
@@ -3509,6 +3526,7 @@ impl SyncService {
     }
 
     pub(crate) async fn on_headers_response(&mut self, peer: B512, headers: Vec<Header>) {
+        rustock_core::metrics::HEADERS_RECEIVED.add(headers.len() as u64);
         let old = std::mem::take(&mut self.state);
         match old {
             SyncState::DownloadingHeaders {
@@ -4194,6 +4212,7 @@ impl SyncService {
                         match manager.store.put_body(*hash, &transactions, &[]) {
                             Ok(()) => {
                                 *derived_bodies += 1;
+                                rustock_core::metrics::BODIES_DERIVED.inc();
                                 trace!(
                                     target: "rustock::sync",
                                     "Derived body for #{} instead of requesting it",
@@ -4240,6 +4259,11 @@ impl SyncService {
             // would orphan the block and the batch could never finish.
             in_flight.insert(idx, InFlightBody { req_id, sent: Instant::now(), peer });
             id_index.insert(req_id, idx);
+            // Counted here rather than on a successful send, because the
+            // request is tracked here either way: a send that failed is
+            // still outstanding and still waiting on the reclaim timeout.
+            rustock_core::metrics::BODIES_REQUESTED.inc();
+            rustock_core::metrics::BODY_REQUESTS_IN_FLIGHT.set(in_flight.len() as u64);
             *load.entry(peer).or_default() += 1;
             *next_request += 1;
         }
@@ -4385,6 +4409,7 @@ impl SyncService {
         transactions: Vec<Transaction>,
         uncles: Vec<Header>,
     ) {
+        rustock_core::metrics::BODIES_RECEIVED.inc();
         let old = std::mem::take(&mut self.state);
         match old {
             SyncState::DownloadingBodies {

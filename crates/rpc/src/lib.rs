@@ -6,6 +6,7 @@ pub mod helpers;
 pub mod evm;
 pub mod logs;
 pub mod mnr;
+pub mod metrics_server;
 pub mod admin;
 pub mod net;
 pub mod rsk;
