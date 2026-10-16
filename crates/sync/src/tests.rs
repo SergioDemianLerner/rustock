@@ -9,7 +9,7 @@ fn test_peer() -> B512 {
     B512::repeat_byte(0xAB)
 }
 
-fn dummy_header(number: u64, parent: B256, difficulty: U256) -> Header {
+pub(crate) fn dummy_header(number: u64, parent: B256, difficulty: U256) -> Header {
     Header {
         number,
         parent_hash: parent,
@@ -6577,4 +6577,109 @@ async fn an_uncle_beyond_the_generation_limit_is_not_counted() {
         Some(before + U256::from(10)),
         "an uncle ten generations back must not bring its 5,000 with it"
     );
+}
+
+/// A block whose header determines its body is never asked for.
+///
+/// This is the whole point of the mechanism, so it is tested at the level
+/// where the saving happens: after a pass over the queue the body is in the
+/// store and nothing is in flight.
+#[tokio::test]
+async fn a_derivable_body_is_built_rather_than_requested() {
+    use rustock_core::ordered_tx_trie_root;
+
+    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    // An empty block: REMASC alone, no uncles.
+    let number = 4_000_000;
+    let txs = vec![rustock_core::Transaction::remasc(number)];
+    let mut b1 = dummy_header(number, genesis.hash(), U256::from(1));
+    b1.transactions_root = ordered_tx_trie_root(&txs, true);
+    b1.ommers_hash = rustock_execution::processor::compute_ommers_hash(&[]);
+    store.put_header(&b1).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+
+    let peer = B512::repeat_byte(0x01);
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    peer_store.add_peer(peer, tx).await;
+
+    service.state = SyncState::DownloadingBodies {
+        peer_best: number,
+        pending_headers: vec![(b1.hash(), b1.clone())],
+        next_request: 0,
+        in_flight: std::collections::HashMap::new(),
+        id_index: std::collections::HashMap::new(),
+    };
+
+    service.send_body_requests().await;
+
+    assert_eq!(service.derived_bodies, 1, "the body should have been derived");
+    let stored = store.body(b1.hash()).unwrap();
+    assert!(stored.is_some(), "a derived body must be stored like any other");
+    let (stored_txs, stored_uncles) = stored.unwrap();
+    assert_eq!(stored_txs, txs, "and must be the transaction the header commits to");
+    assert!(stored_uncles.is_empty());
+
+    match &service.state {
+        SyncState::DownloadingBodies { in_flight, .. } => {
+            assert!(in_flight.is_empty(), "no request should have been sent");
+        }
+        // Advancing straight out of the batch is also a pass: the one block
+        // it held is done.
+        other => assert!(
+            !matches!(other, SyncState::DownloadingBodies { .. }),
+            "unexpected state {other:?}"
+        ),
+    }
+}
+
+/// A block that carries real transactions is still requested, and the
+/// refusal is remembered so the predicate is not paid for it twice.
+#[tokio::test]
+async fn an_underivable_header_is_requested_and_remembered() {
+    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    // A header committing to a transaction set that is not REMASC alone.
+    let mut b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    b1.transactions_root = B256::repeat_byte(0x33);
+    store.put_header(&b1).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+
+    let peer = B512::repeat_byte(0x01);
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    peer_store.add_peer(peer, tx).await;
+
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 1,
+        pending_headers: vec![(b1.hash(), b1.clone())],
+        next_request: 0,
+        in_flight: std::collections::HashMap::new(),
+        id_index: std::collections::HashMap::new(),
+    };
+
+    service.send_body_requests().await;
+
+    assert_eq!(service.derived_bodies, 0);
+    assert!(store.body(b1.hash()).unwrap().is_none(), "nothing may be stored");
+    assert!(service.underivable.contains(&b1.hash()), "the refusal is remembered");
+    match &service.state {
+        SyncState::DownloadingBodies { in_flight, .. } => {
+            assert_eq!(in_flight.len(), 1, "it must be requested from a peer");
+        }
+        other => panic!("expected DownloadingBodies, got {other:?}"),
+    }
 }

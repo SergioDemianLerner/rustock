@@ -457,3 +457,141 @@ mod tests {
         assert_eq!(sender, expected, "sender must recover from the original encoding");
     }
 }
+
+impl Transaction {
+    /// The synthetic REMASC transaction a block of this height carries.
+    ///
+    /// Every RSK block ends with one, and it is a pure function of the
+    /// height: nonce `number - 1`, zero gas price, gas limit and value, the
+    /// fixed REMASC recipient, no data and no signature. Nothing outside the
+    /// header is needed to rebuild it, which is what lets a body consisting
+    /// of this transaction alone be derived rather than requested.
+    ///
+    /// The encoding is built here rather than left to the derive, because
+    /// this transaction is not canonical RLP: gas price and gas limit are
+    /// written as the one-byte array `{0}`, encoding as `0x00`, where
+    /// canonical RLP writes the empty string. Value is zero too and *is*
+    /// written empty, which is the asymmetry that makes this worth pinning
+    /// rather than reasoning about. A single wrong byte changes the
+    /// transaction hash and so the transactions root, so the bytes are held
+    /// against real blocks in the tests below.
+    pub fn remasc(block_number: u64) -> Self {
+        use crate::validation::block_rules::REMASC_ADDR;
+
+        let nonce = block_number.saturating_sub(1);
+        let mut payload = Vec::with_capacity(40);
+        // Minimal big-endian, and the empty string for zero -- ordinary RLP
+        // for an integer. Not the signed `BigInteger.toByteArray` form some
+        // header fields use: #9,000,001's nonce is `83 895440`, with no
+        // leading zero though its top bit is set.
+        nonce.encode(&mut payload);
+        // gasPrice, gasLimit: `{0}`, not the empty string.
+        [0u8].as_slice().encode(&mut payload);
+        [0u8].as_slice().encode(&mut payload);
+        REMASC_ADDR.as_slice().encode(&mut payload);
+        // value, data, and the absent signature: empty.
+        //
+        // Note the asymmetry, which is not guessable and is why these bytes
+        // are pinned against real blocks: gas price and gas limit are the
+        // one-byte array `{0}`, but value is the empty string, though all
+        // three are zero.
+        for _ in 0..5 {
+            [].as_slice().encode(&mut payload);
+        }
+
+        let mut encoded = Vec::with_capacity(payload.len() + 3);
+        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut encoded);
+        encoded.extend_from_slice(&payload);
+
+        Self {
+            nonce,
+            gas_price: U256::ZERO,
+            gas_limit: U256::ZERO,
+            to: Bytes::copy_from_slice(&REMASC_ADDR),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: Some(encoded),
+        }
+    }
+}
+
+#[cfg(test)]
+mod remasc_derivation_tests {
+    use super::*;
+
+    /// Real mainnet blocks whose body is REMASC alone: height and the hash
+    /// that transaction actually has on chain. Spread across the chain and
+    /// straddling wasabi100 (#1,591,000), since the transaction-trie
+    /// encoding changes there even though this transaction does not.
+    const VECTORS: &[(u64, &str)] = &[
+        // Block 1 is the zero-nonce case: the nonce is the empty string.
+        (1, "4aa0649fdc1a4b0e07b64c26e43138400c84d6a127d0242027226b7ade17a53e"),
+        (100_000, "10dde225116990b51234fbb2f888f554593e09ffc0805f470bf8dea2f0e26143"),
+        (500_000, "44ecae85b8d95be83941927f3fa555b5eb96e10695c9932ada7fadd4761abba8"),
+        (1_000_009, "4e422483d083ef8158313a5de3e650d84016f7ba921c19349343fc8899f4ef87"),
+        (1_590_002, "837dde1f15815d5b42a59435b5daa1eb4a299dde0a0d65e93c1bd13364a10003"),
+        (1_591_500, "2e6ae619557544c2c1d11f89839fa0735bac4fadcd0bc51f96d643ad622b443c"),
+        (3_000_003, "65116b495c01dc810b7936bc8f6c8a7a6bce19981f89893a433baa0efd396efd"),
+        (6_000_005, "8fad0d8167a8d8c83b5d7d3c98619e019ad3b7da5a4e8b5d6c43e41e6ade8c38"),
+        (9_000_001, "5771471f2fa38695fc333b24e3fab2fc9ed96413d143f8d352978c4e151c7dc9"),
+    ];
+
+    /// The derived transaction must be the one the chain carries, byte for
+    /// byte. A hash is the only honest test of that: it fails for a single
+    /// wrong byte, which is exactly the failure mode the encoding invites.
+    #[test]
+    fn the_derived_transaction_is_the_one_on_chain() {
+        for (number, want) in VECTORS {
+            let tx = Transaction::remasc(*number);
+            let got = hex_of(&Keccak256::digest(tx.rlp_for_trie()));
+            assert_eq!(&got, want, "REMASC transaction of #{number}");
+            assert_eq!(tx.nonce, number - 1);
+        }
+    }
+
+    /// The transactions root each of those blocks carries in its header.
+    ///
+    /// The transaction hash matching is necessary but not sufficient: what
+    /// sync compares is the root of a one-entry trie, and that encoding
+    /// changes at wasabi100 (#1,591,000). #1,590,002 and #1,591,500 sit on
+    /// either side of it.
+    const ROOTS: &[(u64, &str)] = &[
+        (1, "1b4008e6fba070d33fb937e369ddbea5c2b66e5bcb12cfc829f15e1f25e568d0"),
+        (100_000, "0024d978787b6f2d0c0a8ee07fc4d5599436469bc7cbf05b422cf4836ed71aa0"),
+        (500_000, "c5076a2d77b91b2a523e1a16b186691504d5722f10ed0bc59afbde3fbce70c74"),
+        (1_000_009, "f0ab86d3621fd5f2054f2c6de8e5bb7ea017930f5ffbf443f7a8d5199bc49bc4"),
+        (1_590_002, "d22fcb9e7311436b1792048f1b31be0cecfb35748b3483e1e0822001b7c5a24a"),
+        (1_591_500, "4987cd9d0b4bd806e31d25b7f2792a5b7055084895938471b74520c217db1a2b"),
+        (3_000_003, "aac82defd679098fb9e0e58e3dff84f1c7b2e375264e721acc6d2a6ee488d9d3"),
+        (6_000_005, "84423ab7162c3862535b61f51a678a570f5726d15776ddb588fd5f9f581c7e22"),
+        (9_000_001, "5c679a76060a344c027188942fe17d2a3033d0f43de235c7a088db05574bb7e1"),
+    ];
+
+    /// A body of this transaction alone must hash to the root its header
+    /// commits to. This is the test derivation actually rests on: it is what
+    /// lets the body be used without asking a peer for it.
+    #[test]
+    fn the_derived_body_matches_the_committed_transactions_root() {
+        use crate::types::receipt::ordered_tx_trie_root;
+
+        for (number, want) in ROOTS {
+            let body = [Transaction::remasc(*number)];
+            // Either era's encoding is accepted, as sync does: the root is a
+            // commitment, so matching one of them proves the transaction set
+            // whichever era it belongs to.
+            let orchid = hex_of(ordered_tx_trie_root(&body, false).as_slice());
+            let unitrie = hex_of(ordered_tx_trie_root(&body, true).as_slice());
+            assert!(
+                &orchid == want || &unitrie == want,
+                "#{number}: neither encoding gave the header root\n  want    {want}\n  orchid  {orchid}\n  unitrie {unitrie}"
+            );
+        }
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
