@@ -392,6 +392,15 @@ struct Args {
     #[arg(long, default_value_t = 4444)]
     rpc_port: u16,
 
+    /// Serve Prometheus metrics on this port. Unset means no metrics
+    /// listener is opened at all.
+    #[arg(long)]
+    metrics_port: Option<u16>,
+
+    /// Address the metrics server binds to
+    #[arg(long, default_value = "127.0.0.1")]
+    metrics_host: String,
+
     /// JSON-RPC server bind address
     #[arg(long, default_value = "127.0.0.1")]
     rpc_host: String,
@@ -1109,6 +1118,9 @@ fn apply_file_config(
     apply(matches, "exit_when_synced", f.node.exit_when_synced.as_ref(), &mut a.exit_when_synced);
     apply(matches, "rskj_multisig_senders", f.node.rskj_multisig_senders.as_ref(),
         &mut a.rskj_multisig_senders);
+
+    apply_opt(matches, "metrics_port", f.metrics.port.as_ref(), &mut a.metrics_port);
+    apply(matches, "metrics_host", f.metrics.host.as_ref(), &mut a.metrics_host);
 
     apply(matches, "rpc_host", f.rpc.host.as_ref(), &mut a.rpc_host);
     apply(matches, "rpc_port", f.rpc.port.as_ref(), &mut a.rpc_port);
@@ -3026,6 +3038,19 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         tokio::spawn(async move {
             if let Err(e) = rustock_rpc::server::start_rpc_server(&rpc_host, rpc_port, rpc_state).await {
                 tracing::error!("RPC server error: {}", e);
+            }
+        });
+    }
+
+    // Independent of the RPC server: metrics are useful on a node that
+    // serves no RPC at all, and a scrape should not need the RPC port open.
+    if let Some(metrics_port) = args.metrics_port {
+        let metrics_host = args.metrics_host.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                rustock_rpc::metrics_server::start_metrics_server(&metrics_host, metrics_port).await
+            {
+                tracing::error!("Metrics server error: {}", e);
             }
         });
     }

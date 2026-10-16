@@ -191,6 +191,26 @@ impl BlockProcessor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
+        let started = std::time::Instant::now();
+        let out = self.execute_block_inner(block, state_root, trie_store);
+        // Timed whether or not it succeeded: a block that fails still spent
+        // the time, and a measurement that only counts successes reads as a
+        // faster node the worse things get.
+        rustock_core::metrics::EXECUTION_SECONDS.add(started.elapsed());
+        if let Ok(processed) = &out {
+            rustock_core::metrics::BLOCKS_EXECUTED.inc();
+            rustock_core::metrics::GAS_USED.add(processed.gas_used);
+            rustock_core::metrics::TRANSACTIONS_EXECUTED.add(block.transactions.len() as u64);
+        }
+        out
+    }
+
+    fn execute_block_inner(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+    ) -> Result<ProcessedBlock, ProcessError> {
         let header = &block.header;
         let chain_id = self.hardfork_cfg.chain_id;
 
@@ -899,6 +919,43 @@ mod tests {
 
         assert_eq!(result.gas_used, 0);
         assert!(result.receipts.is_empty());
+    }
+
+    /// The counters have to sit on a path that actually runs. A metric wired
+    /// to code nothing reaches reads as a node doing nothing, which is the
+    /// one failure a dashboard cannot distinguish from a healthy idle node.
+    ///
+    /// Compared as an increase rather than an absolute: these are process
+    /// globals, and other tests execute blocks on other threads.
+    #[test]
+    fn executing_a_block_moves_the_counters() {
+        use rustock_core::metrics;
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+
+        let block = Block {
+            header: dummy_header(8_000_000),
+            transactions: vec![],
+            ommers: vec![],
+        };
+
+        let blocks_before = metrics::BLOCKS_EXECUTED.get();
+        let seconds_before = metrics::EXECUTION_SECONDS.seconds();
+
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+        processor.execute_block(&block, &root, store).unwrap();
+
+        assert!(
+            metrics::BLOCKS_EXECUTED.get() > blocks_before,
+            "executing a block must count as one"
+        );
+        assert!(
+            metrics::EXECUTION_SECONDS.seconds() >= seconds_before,
+            "execution time must not go backwards"
+        );
     }
 
     #[test]

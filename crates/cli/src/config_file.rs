@@ -58,6 +58,18 @@ pub struct FileConfig {
     pub snapshot: SnapshotSection,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
+    #[serde(default)]
+    pub metrics: MetricsSection,
+}
+
+/// Prometheus metrics. Separate from `[rpc]` because the listener is: a
+/// scrape is not an RPC call, and a node may want one without the other.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSection {
+    /// Serve metrics on this port. Absent means no listener is opened.
+    pub port: Option<u16>,
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -362,6 +374,8 @@ pub const CONFIGURABLE: &[&str] = &[
     "exit_when_synced",
     "rpc_host",
     "rpc_port",
+    "metrics_host",
+    "metrics_port",
     "rpc_admin",
     "no_rpc",
     "ws",
