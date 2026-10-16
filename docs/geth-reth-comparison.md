@@ -39,7 +39,10 @@ describe a protocol RSK does not implement.
 
 ## Where rustock stands today
 
-77 dispatched JSON-RPC methods across ten namespaces — `eth` (37), `rsk` (10),
+*Counts refreshed 2026-10-16; the gap tables below were re-checked against the
+tree on the same date and every absence they list still holds.*
+
+96 dispatched JSON-RPC methods across ten namespaces — `eth` (37), `rsk` (10),
 `sco` (7), `debug` (5), `trace` (4), `net` (4), `mnr` (4), `txpool` (3),
 `web3` (2), `rpc` (1) — plus `eth_subscribe`/`eth_unsubscribe` over WebSocket,
 and five wallet methods that exist only to return a clear error.
@@ -135,12 +138,13 @@ declared target. The five above are reth-and-Erigon extensions.
 | **Staged sync pipeline** | ✖ | ✔ | 🔸 | reth's headers → bodies → execution → merkle → indexing stages, each independently resumable and unwindable, with `reth stage run/unwind`. rustock's sync is a state machine with its own recovery invariants; different design, comparable intent. |
 | **Execution Extensions (ExEx)** | ✖ | ✔ | ✅ | In-process post-execution hooks, reorg-aware, for building indexers without an external ETL. Nothing equivalent exists in rustock; the closest is `eth_subscribe`. |
 | **Prometheus metrics** | ✔ | ✔ | ✅ | **rustock exposes no metrics endpoint at all** — no Prometheus, no expvar, no counters over RPC. Operational state is visible only through logs and a handful of RPC calls. For a node meant to run unattended this is the most practically felt gap in this table. |
+| **Log bloom index** | ✔ bloombits | ✔ | 🔸 | geth indexes block blooms into a bit-sliced structure so a wide `eth_getLogs` need not touch every header. rustock scans the headers' own blooms: measured at 0.16 s over a 10,000-block span, which is also the default range cap. The index pays off at ranges rustock does not allow, so this is a consequence of that cap rather than a gap behind it. |
 | **pprof / runtime profiling** | ✔ | ⚠ | 🔸 | Partly language-specific. |
 | **IPC transport** | ✔ | ✔ | 🔸 | Unix-socket JSON-RPC. rustock serves HTTP and WebSocket only. Common in local tooling and avoids exposing a TCP port. |
 | **GraphQL endpoint** | ✔ | ✖ | 🔸 | geth only, and lightly used. |
 | **discv5** | ✔ | ✔ | 🔸 | rustock and rskj both use discv4-style discovery. ENR-based discv5 buys little unless the RSK network adopts it. |
 | **Key management / keystore / Clef** | ✔ | ⚠ | 🔸 | Deliberately absent: rustock has no wallet, and `eth_sendTransaction`/`eth_sign`/`personal_*` return errors on purpose. |
-| **Database tooling subcommands** | ✔ `geth db`, `snapshot` | ✔ `reth db` | 🔸 | rustock ships 42 read-only example binaries that cover this ground, 21 of which open the store without a lock. Different packaging, comparable capability — arguably better, since they cannot write. |
+| **Database tooling subcommands** | ✔ `geth db`, `snapshot` | ✔ `reth db` | 🔸 | rustock ships 51 read-only example binaries that cover this ground, 27 of which open the store without a lock. Different packaging, comparable capability — arguably better, since they cannot write. |
 | **Per-table pruning configuration** | ⚠ | ✔ | 🔸 | reth prunes receipts, history and tx-lookup independently. rustock has block pruning and epoch GC, both coarser. |
 
 ---
@@ -171,6 +175,20 @@ Ordered by value per unit of work, not by size:
 
 1. **Prometheus metrics.** Nothing else on this list is felt daily by whoever
    operates the node. There is no observability surface at all right now.
+
+   What this costs stopped being hypothetical in October 2026. Two sync
+   improvements were built and merged — one removing ~22% of body requests,
+   one returning CPU in REMASC — and **neither can be given a figure in
+   blocks per second**, because nothing records where a sync spends its time
+   or how many peers it held while doing so. The question "are we
+   network-bound or execution-bound?" had to be filed as its own issue
+   before either change could be valued, and both were measured instead by
+   hand: a sampled count of qualifying blocks, and a microbenchmark of one
+   function. Those are answers about the parts, not about the node.
+
+   It follows that every future optimisation is an argument rather than a
+   measurement, and that a slow degradation in production is noticed through
+   a symptom instead of a curve.
 2. **`eth_getBlockReceipts`** and **`txpool_contentFrom`.** Both are small,
    both are asked for constantly by indexers, and both read data already laid
    out the right way.
