@@ -154,19 +154,55 @@ reference to how execution happens to be scheduled. `processor.rs` starts it
 only for a block that actually splits, so a chain where RSKIP-144 is
 unscheduled (mainnet) or active-but-unused pays nothing.
 
-rskj records keys as they pass through its repository (`internalGet` a read,
-`internalPut` a write). rustock has no such chokepoint: revm's journal caches
-across the whole block, so a database-level hook would miss every access an
-earlier transaction had already warmed. The sets are therefore read **out of
-the journal after each transaction**, using the per-transaction stamp revm
-keeps on every account and slot (`transaction_id`, updated on first access,
-including a read — `JournalInner::load_account_mut_optional`). An entry
-carrying this transaction's id was accessed by it; whether it was *written* is
-`info` against `original_info`, the baseline revm resets at each transaction's
-first touch.
+**Reads** come out of revm's journal after each transaction, using the
+per-transaction stamp it keeps on every account and slot (`transaction_id`,
+updated on first access, including a read —
+`JournalInner::load_account_mut_optional`). That evidence survives a rollback:
+reverting an entry restores values and flips flags but never removes the
+account or the slot, and `Account::mark_cold` leaves `transaction_id` alone.
+Which is what we want, because **reads are never netted**: the value a sublist
+read determined what it computed, including whether a frame reverted at all.
 
-The Bridge's byte-array cells bypass the journal entirely (§3), so they are
-read separately out of `RawStorage::tx_writes`.
+**Writes are the attempted ones, not the surviving ones**, because that is the
+deployed rule — see below. revm records a write by pushing a journal entry and
+undoes it by popping that entry, so the entries are read off immediately
+*before* every point that can revert a checkpoint: the two
+`frame_return_result` calls in `rsk_handler`'s `run_exec_loop`, and the direct
+Bridge call's two revert branches in `executor.rs`. A mark tracks how far the
+entry log has been read and comes back down with it after a revert, so each
+entry is read once.
+
+Two things the journal cannot show, each handled where it happens:
+
+- an `SSTORE` that stores the value a cell already holds is not journalled
+  (`sstore_concrete_error`: `if slot.present_value != new`), while rskj's
+  `Program.storageSave` records it regardless. Hooked inside rustock's own
+  `SSTORE` in `rsk_instructions`, after the gas is spent — rskj spends gas
+  before `storageSave`, so an out-of-gas `SSTORE` writes nothing;
+- the Bridge's byte-array cells bypass the journal entirely (§3), so they come
+  from `RawStorage::tx_writes`.
+
+### Attempted writes, and the mode that is kept dormant
+
+A write a transaction reverted **cannot** make parallel execution differ from
+sequential execution. Each sublist runs against the parent state on an
+isolated repository; `detectCollision` runs before any of them is merged; the
+commits follow in sublist order. No sublist observes another's uncommitted
+work, and a reverted write is not in its own sublist's commit either.
+
+rskj counts it anyway — its tracker lives in `MutableRepository`,
+`startTracking()` hands the *same* tracker to every nested repository, and a
+rollback discards only the state cache. RSKIP-144 does not mention reverts at
+all, so this is not a simplification the specification chose; it is where the
+tracker happened to be placed.
+
+So the rule rejects valid blocks, and we implement it, because being right is
+not being compatible. `collision::WriteSemantics` carries both readings and
+`collision::write_semantics` returns the deployed one. The other,
+`NetChanges`, is complete and tested and unreachable: activating it is a
+consensus change and must be gated on a fork, which is why that function takes
+a block number. The proposal is in `RSKIP-sublist-net-writes.md`, outside this
+repository.
 
 ### What is deliberately not recorded
 
@@ -188,21 +224,18 @@ The sequential set is not recorded either, which is not an omission:
 and the sequential set is exactly where a miner puts the transactions that do
 conflict.
 
-### Known gaps, all in the safe direction
+### What remains narrower than rskj
 
-Our key sets are a **subset** of rskj's, so we can fail to reject a block rskj
-rejects, but never reject one rskj accepts. That asymmetry is deliberate: the
-first failure leaves the node where it was before the check existed, the
-second forks it off a chain everyone else considers valid.
-
-- **A reverted write reads as a read.** revm has undone it by the time the
-  transaction ends. rskj's tracker is monotonic — `startTracking` hands the
-  *same* tracker to every nested repository, so a rolled-back write stays in
-  the set.
 - **Reads of Bridge byte-array state are not recorded**, only writes: the
   raw-storage overlay's read path has no hook.
-- **Code and storage-prefix cells** are recorded as writes only for a contract
-  that deployed non-empty code, matching what `apply_state_changes` writes.
+- **Code and storage-prefix cells are not recorded as reads.** rskj reads them
+  in `getCode`/`getCodeLength` and `isContract`; we record only the account
+  cell, which `getCodeLength` reads first anyway and which is what a second
+  sublist would collide on.
+
+Both miss a collision rather than inventing one, which is the direction to err
+in: the first leaves a block accepted, the second forks the node off a chain
+everyone else considers valid.
 
 ### Verification
 
@@ -214,7 +247,9 @@ sequential set, so the check always compares exactly one pair.
 
 Five ranges of 301 blocks, spread from the first splitting block to the
 chain head, replay against rskj's own state with **zero divergences and zero
-collisions**: 1,505 blocks, of which 685 split.
+collisions**: 1,505 blocks, of which 685 split. Re-run after the switch to
+attempted writes, with the same result — the stricter rule invents nothing on
+real blocks.
 
 | range | blocks | of which split |
 |---|---|---|
