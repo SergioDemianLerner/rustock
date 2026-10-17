@@ -660,6 +660,9 @@ impl RskExecutor {
                 if !markers.precompiles.contains(&addr) {
                     markers.precompiles.push(addr);
                 }
+                // Written by the block, not by any sublist, so it must not
+                // be attributed to the first transaction's sublist.
+                crate::collision::exclude(addr);
             }
         }
 
@@ -743,11 +746,21 @@ impl RskExecutor {
                     logs,
                     created_address: None,
                 });
-            if crate::supply::per_transaction_enabled() {
-                use revm::context_interface::ContextTr;
-                let st = &evm.ctx.journal_mut().inner.state;
-                Self::check_tx_supply(st, supply_tid, header.number, i)?;
-            }
+                if crate::supply::per_transaction_enabled() {
+                    use revm::context_interface::ContextTr;
+                    let st = &evm.ctx.journal_mut().inner.state;
+                    Self::check_tx_supply(st, supply_tid, header.number, i)?;
+                }
+                // RSKIP-144: what this transaction read and wrote, attributed
+                // to its sublist. Inert unless the block declares sublist
+                // edges.
+                if crate::collision::is_recording() {
+                    use revm::context_interface::ContextTr;
+                    let st = &evm.ctx.journal_mut().inner.state;
+                    crate::collision::record_transaction(i, supply_tid, st);
+                    let raw = evm.ctx.chain_mut().raw_storage.tx_writes();
+                    crate::collision::record_raw_writes(i, raw);
+                }
                 continue;
             }
 
@@ -924,6 +937,15 @@ impl RskExecutor {
                     let st = &evm.ctx.journal_mut().inner.state;
                     Self::check_tx_supply(st, supply_tid, header.number, i)?;
                 }
+                // RSKIP-144: what this transaction read and wrote, attributed to
+                // its sublist. Inert unless the block declares sublist edges.
+                if crate::collision::is_recording() {
+                    use revm::context_interface::ContextTr;
+                    let st = &evm.ctx.journal_mut().inner.state;
+                    crate::collision::record_transaction(i, supply_tid, st);
+                    let raw = evm.ctx.chain_mut().raw_storage.tx_writes();
+                    crate::collision::record_raw_writes(i, raw);
+                }
                 continue;
             }
 
@@ -1071,6 +1093,15 @@ impl RskExecutor {
                 use revm::context_interface::ContextTr;
                 let st = &evm.ctx.journal_mut().inner.state;
                 Self::check_tx_supply(st, supply_tid, header.number, i)?;
+            }
+            // RSKIP-144: what this transaction read and wrote, attributed to
+            // its sublist. Inert unless the block declares sublist edges.
+            if crate::collision::is_recording() {
+                use revm::context_interface::ContextTr;
+                let st = &evm.ctx.journal_mut().inner.state;
+                crate::collision::record_transaction(i, supply_tid, st);
+                let raw = evm.ctx.chain_mut().raw_storage.tx_writes();
+                crate::collision::record_raw_writes(i, raw);
             }
             // rskj TransactionExecutor.finalization deletes suicided accounts
             // at the END of each transaction (track.delete), so a LATER tx in

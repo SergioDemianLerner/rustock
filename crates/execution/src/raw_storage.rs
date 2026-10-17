@@ -123,6 +123,17 @@ impl RawStorage {
         self.pending.clear();
     }
 
+    /// The writes the current transaction has committed so far.
+    ///
+    /// Valid between [`RawStorage::begin_tx`] and the next one, which is
+    /// where RSKIP-144 collision tracking reads it: these are unitrie cells
+    /// like any other, and two parallel sublists that both drive the Bridge
+    /// into writing one have collided. Already net of
+    /// [`RawStorage::discard_tx`], so a failed transaction reports nothing.
+    pub fn tx_writes(&self) -> &[RawWrite] {
+        &self.committed[self.tx_start..]
+    }
+
     /// Take all committed writes for trie projection (block end).
     pub fn drain(&mut self) -> Vec<RawWrite> {
         self.pending.clear();
