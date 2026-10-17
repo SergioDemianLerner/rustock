@@ -116,3 +116,114 @@ bloom. A tool that calls the former and compares only the state root proves the
 state transition and nothing else — see
 [`trie-segments-design.md`](./trie-segments-design.md) §8 for a case where
 exactly that distinction mattered.
+
+## 6. Sublists run in sequence, and their independence is checked
+
+RSKIP-144 splits a block's transactions into sublists that rskj executes **in
+parallel**, one thread each, plus a sequential set that runs afterwards on the
+main thread. The split is declared by the header's `txExecutionSublistsEdges`.
+rustock executes every transaction in order, on one thread.
+
+That is a performance difference and not a consensus one — but only because of
+a rule that is easy to miss, and that rustock did not implement until
+[#305](https://github.com/SergioDemianLerner/rustock/issues/305). The sublists
+must be **independent**, and the validator has to establish it:
+
+> - If a key belongs to a `writeMap` and a `readMap` of another parallel
+>   sublist, then the block is considered invalid.
+> - If a key belongs to a `writeMap` and a `writeMap` of another parallel
+>   sublist, then the block is also invalid.
+
+The tempting shortcut — "we execute sequentially, so we get a valid answer
+either way" — is wrong twice over. A sequential executor computes *one* of the
+interleavings; where sublists conflict, that interleaving is the parallel
+result sometimes and not others, so the two clients agree by luck. And the
+rule is a condition on the *block*, not a property a validator may assume the
+miner established: a block whose sublists conflict is invalid, and a node that
+skips the check accepts it, computes a state root nobody else reaches, and
+forks.
+
+Read against read is not a collision. Only a write makes an ordering
+observable.
+
+### How the sets are built without parallel execution
+
+`collision.rs` holds a `CollisionTracker` keyed by sublist index — rskj keys
+its `ReadWrittenKeysTracker` by thread id, which is the same thing said with
+reference to how execution happens to be scheduled. `processor.rs` starts it
+only for a block that actually splits, so a chain where RSKIP-144 is
+unscheduled (mainnet) or active-but-unused pays nothing.
+
+rskj records keys as they pass through its repository (`internalGet` a read,
+`internalPut` a write). rustock has no such chokepoint: revm's journal caches
+across the whole block, so a database-level hook would miss every access an
+earlier transaction had already warmed. The sets are therefore read **out of
+the journal after each transaction**, using the per-transaction stamp revm
+keeps on every account and slot (`transaction_id`, updated on first access,
+including a read — `JournalInner::load_account_mut_optional`). An entry
+carrying this transaction's id was accessed by it; whether it was *written* is
+`info` against `original_info`, the baseline revm resets at each transaction's
+first touch.
+
+The Bridge's byte-array cells bypass the journal entirely (§3), so they are
+read separately out of `RawStorage::tx_writes`.
+
+### What is deliberately not recorded
+
+Two addresses are excluded, because rustock writes them from inside a
+transaction and rskj does not:
+
+- **REMASC.** rustock credits the fee beneficiary per transaction; rskj builds
+  every sublist executor with `postponeFeePayment = true`
+  (`TransactionListExecutor`), accumulating fees per sublist and settling them
+  afterwards. Without the exclusion every sublist writes REMASC's account cell
+  and *every* split block collides — which is what happened: testnet
+  #7,690,880 onwards were all rejected until the exclusion was right.
+- **Precompiles maintained at an activation block.** rskj's
+  `maintainPrecompiledContractStorageRoots` runs on the block's repository
+  before any sublist starts, so those writes belong to no sublist.
+
+The sequential set is not recorded either, which is not an omission:
+`BlockExecutor.executeParallel` calls `detectCollision()` *before* it runs,
+and the sequential set is exactly where a miner puts the transactions that do
+conflict.
+
+### Known gaps, all in the safe direction
+
+Our key sets are a **subset** of rskj's, so we can fail to reject a block rskj
+rejects, but never reject one rskj accepts. That asymmetry is deliberate: the
+first failure leaves the node where it was before the check existed, the
+second forks it off a chain everyone else considers valid.
+
+- **A reverted write reads as a read.** revm has undone it by the time the
+  transaction ends. rskj's tracker is monotonic — `startTracking` hands the
+  *same* tracker to every nested repository, so a rolled-back write stays in
+  the set.
+- **Reads of Bridge byte-array state are not recorded**, only writes: the
+  raw-storage overlay's read path has no hook.
+- **Code and storage-prefix cells** are recorded as writes only for a contract
+  that deployed non-empty code, matching what `apply_state_changes` writes.
+
+### Verification
+
+Testnet is the only chain where this fires: reed810 is unscheduled on mainnet,
+so no mainnet header has ever carried a non-empty edges field. Of 1,020,420
+canonical testnet headers above the activation height, 203,419 split — the
+first at #7,690,876, and the widest into two parallel sublists plus the
+sequential set, so the check always compares exactly one pair.
+
+Five ranges of 301 blocks, spread from the first splitting block to the
+chain head, replay against rskj's own state with **zero divergences and zero
+collisions**: 1,505 blocks, of which 685 split.
+
+| range | blocks | of which split |
+|---|---|---|
+| #7,690,870–#7,691,170 | 301 | 165 |
+| #7,800,000–#7,800,300 | 301 | 153 |
+| #7,950,000–#7,950,300 | 301 | 137 |
+| #8,050,000–#8,050,300 | 301 | 151 |
+| #8,159,700–#8,160,000 | 301 | 79 |
+
+This matters more than the unit tests do. The REMASC exclusion above was found
+here and nowhere else: every unit test passed while every splitting block on
+the chain was being rejected.
