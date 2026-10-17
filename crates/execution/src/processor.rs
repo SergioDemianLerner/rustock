@@ -43,6 +43,12 @@ pub enum ProcessError {
     /// this cannot be legitimate however the block was produced.
     #[error("supply increased by {created} wei in block #{number}: native BTC created from nothing")]
     SupplyCreated { number: u64, created: alloy_primitives::U256 },
+    /// RSKIP-144: two parallel sublists touched the same key, with at least
+    /// one of them writing it. The block's transactions cannot be split the
+    /// way its header says they were, so the block is invalid -- rskj's
+    /// `BlockExecutor.executeParallel` abandons it at the same point.
+    #[error("block #{number} is invalid under RSKIP-144: {collision}")]
+    SublistCollision { number: u64, collision: crate::collision::Collision },
     #[error("storage error: {0}")]
     Storage(#[from] anyhow::Error),
 }
@@ -223,17 +229,6 @@ impl BlockProcessor {
             .zip(tx_senders.iter().copied())
             .collect();
 
-        let exec_result = self.executor.execute_block(
-            header,
-            &transactions,
-            state_root,
-            trie_store.clone(),
-        )?;
-
-        let mut receipts = Vec::with_capacity(exec_result.tx_results.len());
-        let mut cumulative_gas = 0u64;
-        let mut block_bloom = Bloom::ZERO;
-
         // RSKIP-144: a block whose transactions are split across sublists
         // accumulates gas *per sublist*, not across the block. `edges` holds
         // the index each sublist after the first begins at, so the running
@@ -249,6 +244,51 @@ impl BlockProcessor {
             .as_ref()
             .and_then(|v| v.edges.as_deref())
             .unwrap_or(&[]);
+
+        // The sublists also have to be *independent*, and that is a rule the
+        // validator applies rather than a property it may assume. Recording
+        // is started only for a block that actually splits, so every block
+        // mainnet has produced -- reed810 is unscheduled there, and the field
+        // is absent or empty throughout -- pays nothing for it.
+        let check_collisions =
+            self.hardfork_cfg.has_rskip144(header.number) && !sublist_starts.is_empty();
+        if check_collisions {
+            // REMASC, not `header.beneficiary`. The header's coinbase names
+            // the miner, but it is never credited during execution:
+            // `block_env_from_header` makes REMASC the block beneficiary and
+            // the handler pays the fees there, once per transaction.
+            // Excluding the header's address instead left every sublist
+            // writing REMASC's account cell, and every testnet block that
+            // actually splits was rejected, starting at #7,690,880.
+            crate::collision::start(
+                sublist_starts,
+                &[crate::precompiles::REMASC_ADDR],
+                crate::collision::write_semantics(header.number),
+            );
+        }
+
+        let exec_result = self.executor.execute_block(
+            header,
+            &transactions,
+            state_root,
+            trie_store.clone(),
+        );
+        // Taken whether or not execution succeeded, so a failure cannot leave
+        // this block's keys behind for the next one to trip over.
+        let collisions = crate::collision::finish();
+        let exec_result = exec_result?;
+        if let Some(collision) = collisions.as_ref().and_then(|t| t.first_collision()) {
+            tracing::warn!(
+                target: "rustock::execution",
+                number = header.number, hash = %header.hash(),
+                "RSKIP-144 collision: {collision}; block rejected"
+            );
+            return Err(ProcessError::SublistCollision { number: header.number, collision });
+        }
+
+        let mut receipts = Vec::with_capacity(exec_result.tx_results.len());
+        let mut cumulative_gas = 0u64;
+        let mut block_bloom = Bloom::ZERO;
 
         for (i, tx_result) in exec_result.tx_results.iter().enumerate() {
             cumulative_gas = next_cumulative_gas(cumulative_gas, i, tx_result.gas_used, sublist_starts);
