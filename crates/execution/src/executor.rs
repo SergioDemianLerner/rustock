@@ -678,6 +678,9 @@ impl RskExecutor {
                 use revm::context_interface::ContextTr;
                 evm.ctx.chain_mut().raw_storage.begin_tx();
             }
+            // RSKIP-144: everything this transaction touches belongs to the
+            // sublist that runs it. Inert unless the block declares edges.
+            crate::collision::begin_transaction(i);
             if Self::is_remasc_tx(tx) {
                 debug!(tx_index = i, "executing REMASC system call");
                 if traced.includes(i) {
@@ -756,10 +759,11 @@ impl RskExecutor {
                 // edges.
                 if crate::collision::is_recording() {
                     use revm::context_interface::ContextTr;
-                    let st = &evm.ctx.journal_mut().inner.state;
-                    crate::collision::record_transaction(i, supply_tid, st);
+                    let j = &evm.ctx.journal_mut().inner;
+                    crate::collision::note_journal_entries(&j.journal, &j.state);
+                    crate::collision::record_transaction(supply_tid, &j.state);
                     let raw = evm.ctx.chain_mut().raw_storage.tx_writes();
-                    crate::collision::record_raw_writes(i, raw);
+                    crate::collision::record_raw_writes(raw);
                 }
                 continue;
             }
@@ -891,13 +895,35 @@ impl RskExecutor {
                             // the spent gas, no logs, no endowment — but the
                             // sender is charged the FULL gas limit.
                             evm.ctx.chain_mut().raw_storage.discard_call();
+                            // RSKIP-144: the writes this call attempted are
+                            // about to be popped off the journal. The EVM's
+                            // own frames are covered in `rsk_handler`; a
+                            // direct bridge call never enters one.
+                            if crate::collision::records_attempted_writes() {
+                                let j = &evm.ctx.journal_mut().inner;
+                                crate::collision::note_journal_entries(&j.journal, &j.state);
+                            }
                             evm.ctx.journal_mut().checkpoint_revert(checkpoint);
+                            crate::collision::forget_entries_above(
+                                evm.ctx.journal_mut().inner.journal.len(),
+                            );
                             invisible_exception = true;
                             (true, Vec::new(), Vec::new())
                         }
                         Err(e) => {
                             evm.ctx.chain_mut().raw_storage.discard_call();
+                            // RSKIP-144: the writes this call attempted are
+                            // about to be popped off the journal. The EVM's
+                            // own frames are covered in `rsk_handler`; a
+                            // direct bridge call never enters one.
+                            if crate::collision::records_attempted_writes() {
+                                let j = &evm.ctx.journal_mut().inner;
+                                crate::collision::note_journal_entries(&j.journal, &j.state);
+                            }
                             evm.ctx.journal_mut().checkpoint_revert(checkpoint);
+                            crate::collision::forget_entries_above(
+                                evm.ctx.journal_mut().inner.journal.len(),
+                            );
                             debug!(tx_index = i, error = %e, "direct bridge call failed");
                             (false, Vec::new(), Vec::new())
                         }
@@ -941,10 +967,11 @@ impl RskExecutor {
                 // its sublist. Inert unless the block declares sublist edges.
                 if crate::collision::is_recording() {
                     use revm::context_interface::ContextTr;
-                    let st = &evm.ctx.journal_mut().inner.state;
-                    crate::collision::record_transaction(i, supply_tid, st);
+                    let j = &evm.ctx.journal_mut().inner;
+                    crate::collision::note_journal_entries(&j.journal, &j.state);
+                    crate::collision::record_transaction(supply_tid, &j.state);
                     let raw = evm.ctx.chain_mut().raw_storage.tx_writes();
-                    crate::collision::record_raw_writes(i, raw);
+                    crate::collision::record_raw_writes(raw);
                 }
                 continue;
             }
@@ -1098,10 +1125,11 @@ impl RskExecutor {
             // its sublist. Inert unless the block declares sublist edges.
             if crate::collision::is_recording() {
                 use revm::context_interface::ContextTr;
-                let st = &evm.ctx.journal_mut().inner.state;
-                crate::collision::record_transaction(i, supply_tid, st);
+                let j = &evm.ctx.journal_mut().inner;
+                crate::collision::note_journal_entries(&j.journal, &j.state);
+                crate::collision::record_transaction(supply_tid, &j.state);
                 let raw = evm.ctx.chain_mut().raw_storage.tx_writes();
-                crate::collision::record_raw_writes(i, raw);
+                crate::collision::record_raw_writes(raw);
             }
             // rskj TransactionExecutor.finalization deletes suicided accounts
             // at the END of each transaction (track.delete), so a LATER tx in

@@ -260,7 +260,11 @@ impl BlockProcessor {
             // Excluding the header's address instead left every sublist
             // writing REMASC's account cell, and every testnet block that
             // actually splits was rejected, starting at #7,690,880.
-            crate::collision::start(sublist_starts, &[crate::precompiles::REMASC_ADDR]);
+            crate::collision::start(
+                sublist_starts,
+                &[crate::precompiles::REMASC_ADDR],
+                crate::collision::write_semantics(header.number),
+            );
         }
 
         let exec_result = self.executor.execute_block(

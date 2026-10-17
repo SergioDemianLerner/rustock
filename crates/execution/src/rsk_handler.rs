@@ -44,6 +44,7 @@ use revm::interpreter::interpreter_action::FrameInit;
 use revm::interpreter::{CallOutcome, CreateOutcome, InstructionResult, InterpreterAction};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, Bytes, U256};
+use revm::inspector::JournalExt;
 use revm::state::EvmState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -142,7 +143,11 @@ impl<CTX, ERROR, FRAME> Default for RskHandler<CTX, ERROR, FRAME> {
 impl<EVM, ERROR> Handler for RskHandler<EVM, ERROR, EthFrame<EthInterpreter>>
 where
     EVM: EvmTr<
-        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        // `JournalExt` is what exposes the entry log, and it is the bound
+        // revm's own inspectors carry. RSKIP-144 collision tracking needs it
+        // for the same reason: a write is only visible while it still stands,
+        // and a revert pops the entry that recorded it.
+        Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
         Frame = EthFrame<EthInterpreter>,
         Instructions: InstructionProvider<
             Context = <EVM as EvmTr>::Context,
@@ -316,7 +321,10 @@ where
                                     init.depth
                                 );
                             }
-                            if let Some(result) = evm.frame_return_result(synth)? {
+                            note_attempted_writes(evm);
+                            let returned = evm.frame_return_result(synth)?;
+                            forget_reverted_entries(evm);
+                            if let Some(result) = returned {
                                 return Ok(result);
                             }
                             if let Some(buffer) = preserved_return_buffer {
@@ -419,7 +427,13 @@ where
                     outcome.result.gas.set_refund(0);
                 }
             }
-            if let Some(result) = evm.frame_return_result(result)? {
+            // RSKIP-144: a frame that fails is about to have its journal
+            // entries popped, so the writes it attempted are read off here
+            // while they still stand.
+            note_attempted_writes(evm);
+            let returned = evm.frame_return_result(result)?;
+            forget_reverted_entries(evm);
+            if let Some(result) = returned {
                 return Ok(result);
             }
             if let Some((mem_start, output)) = unbounded_output {
@@ -432,6 +446,40 @@ where
             }
         }
     }
+}
+
+/// Hands the journal's entries to the RSKIP-144 collision tracker.
+///
+/// Called immediately before every point that can revert a checkpoint. Under
+/// the deployed write semantics a reverted write still counts, and revm
+/// records a write by pushing an entry and undoes it by popping that entry,
+/// so this is the last moment the write exists.
+///
+/// Inert unless a block declared sublist edges *and* attempted writes are
+/// being collected, which is a thread-local load on a path that is otherwise
+/// untouched.
+fn note_attempted_writes<EVM>(evm: &mut EVM)
+where
+    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>>,
+{
+    if !crate::collision::records_attempted_writes() {
+        return;
+    }
+    let journal = evm.ctx().journal_mut();
+    crate::collision::note_journal_entries(journal.journal(), journal.evm_state());
+}
+
+/// Pulls the tracker's entry mark back down to what survived the revert, so
+/// entries appended afterwards are read exactly once.
+fn forget_reverted_entries<EVM>(evm: &mut EVM)
+where
+    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>>,
+{
+    if !crate::collision::records_attempted_writes() {
+        return;
+    }
+    let len = evm.ctx().journal_mut().journal().len();
+    crate::collision::forget_entries_above(len);
 }
 
 /// `EvmTr::frame_run` with the create-return path replaced by

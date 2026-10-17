@@ -959,6 +959,23 @@ fn rsk_sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     }
 
+    // RSKIP-144: the cell counts as written whatever value went into it.
+    // revm journals an `SSTORE` only when the value changes
+    // (`JournaledAccount::sstore_concrete_error`: `if slot.present_value !=
+    // new`), so storing a value a cell already holds leaves no entry for the
+    // collision tracker to find. rskj has no such check --
+    // `Program.storageSave` calls `addStorageRow` unconditionally -- so a
+    // sublist that stores an unchanged value collides there with one that
+    // merely reads the cell, and without this we would accept a block the
+    // network rejects.
+    //
+    // Recorded here rather than beside `host.sstore` above because rskj
+    // spends the gas before `storageSave` (`VM.doSSTORE`): an SSTORE that
+    // runs out of gas writes nothing and must record nothing.
+    if crate::collision::records_attempted_writes() {
+        crate::collision::note_storage_write_attempt(target, B256::from(index));
+    }
+
     context
         .interpreter
         .gas
