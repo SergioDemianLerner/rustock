@@ -57,6 +57,13 @@ pub struct RskExecutor {
     /// executor runs. `None` disables it, which is the default so that tools
     /// and tests get unchanged behaviour without opting out.
     btc_block_cache: Option<Arc<crate::bridge::btc_block_cache::BtcBlockCache>>,
+    /// How many threads may run a block's parallel sublists (RSKIP-144).
+    ///
+    /// 1 means every transaction runs in order on the calling thread, which
+    /// is also what happens at any setting for a block that declares no
+    /// sublists -- which is every block on a chain where RSKIP-144 is
+    /// unscheduled.
+    execution_threads: usize,
 }
 
 impl RskExecutor {
@@ -72,6 +79,22 @@ impl RskExecutor {
     ) -> Self {
         self.btc_block_cache = Some(cache);
         self
+    }
+
+    /// How many threads a block's parallel sublists may use.
+    ///
+    /// Clamped to at least 1, and to at most the number of parallel sublists
+    /// a block may declare (`TX_EXECUTION_THREADS`): asking for more buys
+    /// nothing, because the partition the header declares is the only source
+    /// of work to divide.
+    pub fn with_execution_threads(mut self, threads: usize) -> Self {
+        self.execution_threads =
+            threads.clamp(1, rustock_core::validation::block_rules::TX_EXECUTION_THREADS);
+        self
+    }
+
+    pub fn execution_threads(&self) -> usize {
+        self.execution_threads
     }
 
     /// The cache in use, if any -- for the periodic report.
@@ -114,6 +137,9 @@ impl RskExecutor {
             bridge_constants,
             free_bridge_senders,
             btc_block_cache: None,
+            // Sequential unless a caller asks otherwise, so an executor built
+            // by a tool or a test behaves as it always has.
+            execution_threads: 1,
         }
     }
 

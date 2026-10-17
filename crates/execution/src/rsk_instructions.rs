@@ -65,6 +65,38 @@ thread_local! {
     /// rskj's `OpCode.COINBASE` returns the actual miner. Set by `install`.
     static REAL_COINBASE: core::cell::Cell<Address> =
         const { core::cell::Cell::new(Address::ZERO) };
+    /// Whether [`install`] has run on *this* thread.
+    ///
+    /// The three entries above are consensus configuration living in
+    /// thread-local storage, and an unset one reads as a perfectly plausible
+    /// value: no precompile gets RSKIP90's `EXTCODESIZE`, no precompile gets
+    /// the empty-code `EXTCODEHASH`, and `COINBASE` pushes `0x0`. When
+    /// RSKIP-144 sublists began running on worker threads, configuring on one
+    /// thread and executing on another would have produced a state root no
+    /// other node reaches, with nothing failing to compile and no test
+    /// noticing.
+    ///
+    /// So the rule is that an EVM is configured on the thread that will use
+    /// it, and this is what lets the rule be checked instead of trusted.
+    static CONFIGURED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Whether this thread has had an instruction table installed on it.
+///
+/// Callers that build an EVM on one thread and run it on another are the
+/// hazard; see `CONFIGURED`.
+pub fn is_configured_on_this_thread() -> bool {
+    CONFIGURED.with(|c| c.get())
+}
+
+/// Panics in debug builds when consensus configuration is read on a thread
+/// that never had [`install`] run on it.
+#[inline]
+fn assert_configured(what: &str) {
+    debug_assert!(
+        is_configured_on_this_thread(),
+        "{what} was read on a thread where `rsk_instructions::install` never ran:          the value is the thread-local default, not this block's configuration.          An EVM must be configured on the thread that executes it."
+    );
 }
 
 /// Install the rskj-semantics CALL family into an instruction table.
@@ -272,6 +304,7 @@ pub fn install<WIRE, HOST>(
     // `block.beneficiary = REMASC_ADDR` (for gas-fee routing) so the default
     // COINBASE would return REMASC. Push the real coinbase instead.
     REAL_COINBASE.with(|c| c.set(real_coinbase));
+    CONFIGURED.with(|c| c.set(true));
     instructions.insert_instruction(
         opcode::COINBASE,
         Instruction::new(rsk_coinbase::<WIRE, HOST>, 2),
@@ -376,6 +409,7 @@ fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ?Sized>(
     };
     let addr = Address::from_word(B256::from(*top));
 
+    assert_configured("EXTCODEHASH_PRECOMPILES");
     if EXTCODEHASH_PRECOMPILES.with(|p| p.borrow().contains(&addr)) {
         *top = KECCAK_EMPTY.into();
         return;
@@ -514,6 +548,7 @@ fn rsk_mcopy<WIRE: InterpreterTypes, H: Host + ?Sized>(
 fn rsk_coinbase<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
+    assert_configured("REAL_COINBASE");
     let coinbase = REAL_COINBASE.with(|c| c.get());
     if !context.interpreter.stack.push(U256::from_be_bytes(coinbase.into_word().0)) {
         context.interpreter.halt_overflow();
@@ -547,6 +582,7 @@ fn rsk_extcodesize<WIRE: InterpreterTypes, H: Host + ?Sized>(
         };
         Address::from_word(B256::from(*top))
     };
+    assert_configured("EXTCODESIZE_MAX_PRECOMPILES");
     let is_precompile = EXTCODESIZE_MAX_PRECOMPILES.with(|p| p.borrow().contains(&addr));
     if is_precompile {
         if let Some(([], top)) = context.interpreter.stack.popn_top::<0>() {
@@ -1138,4 +1174,66 @@ mod tests {
         assert_eq!(r.start, usize::MAX);
         assert!(r.is_empty());
     }
+}
+
+#[cfg(test)]
+mod thread_affinity_tests {
+    use super::*;
+
+    /// The hazard, demonstrated rather than described: installing on one
+    /// thread leaves every other thread holding the defaults, and the
+    /// defaults are all plausible consensus values. This is why an EVM is
+    /// configured on the thread that executes it.
+    #[test]
+    fn configuration_does_not_cross_threads() {
+        assert!(
+            !is_configured_on_this_thread(),
+            "nothing has been installed on the test thread"
+        );
+
+        let child_saw = std::thread::spawn(|| {
+            let mut table =
+                EthInstructions::<revm::interpreter::interpreter::EthInterpreter, DummyHost>::new_mainnet_with_spec(revm::primitives::hardfork::SpecId::SHANGHAI);
+            install(
+                &mut table,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                &[Address::new([0x01; 20])],
+                &[Address::new([0x01; 20])],
+                Address::new([0xbb; 20]),
+            );
+            (
+                is_configured_on_this_thread(),
+                REAL_COINBASE.with(|c| c.get()),
+                EXTCODESIZE_MAX_PRECOMPILES.with(|p| p.borrow().len()),
+            )
+        })
+        .join()
+        .expect("child thread");
+
+        assert_eq!(
+            child_saw,
+            (true, Address::new([0xbb; 20]), 1),
+            "the thread that installed sees its own configuration"
+        );
+        assert!(
+            !is_configured_on_this_thread(),
+            "and no other thread sees any of it -- a worker executing with \
+             these defaults would push COINBASE 0x0 and lose RSKIP90"
+        );
+    }
+
+    /// `DummyHost` only needs to exist for the table to be generic over
+    /// something; no instruction runs here.
+    type DummyHost = revm::context::Context<
+        revm::context::BlockEnv,
+        revm::context::TxEnv,
+        revm::context::CfgEnv,
+        revm::database::EmptyDB,
+    >;
 }

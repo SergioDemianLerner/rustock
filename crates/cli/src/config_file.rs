@@ -94,6 +94,9 @@ pub struct NodeSection {
     pub simulate_height: Option<u64>,
     /// Exit once the chain is synced, reporting how long it took.
     pub exit_when_synced: Option<bool>,
+    /// How many threads may execute a block's parallel sublists (RSKIP-144).
+    /// 1 executes every transaction in order on one thread.
+    pub execution_threads: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -367,6 +370,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "secret_key",
     "external_ip",
     "supply_check",
+    "execution_threads",
     "rskj_multisig_senders",
     "read_only",
     "follow_up",
