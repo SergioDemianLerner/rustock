@@ -850,11 +850,63 @@ impl BlockStore {
         // Update canonical chain only if the head actually changed.
         if best_hash != current_head_hash {
             if let Some(new_head) = best_hash {
-                self.update_canonical_chain(new_head)?;
+                self.move_head_to(new_head, current_head_hash)?;
             }
         }
 
         Ok(best_hash)
+    }
+
+    /// Move the head to `new_head` through [`Transition`], so the canonical
+    /// lineage, the entries the old chain stranded above the new tip, and the
+    /// executed cursor all move in one batch.
+    ///
+    /// This path used to call `update_canonical_chain`, which writes the
+    /// lineage and the head and nothing else. That is fine while the head
+    /// climbs and wrong the moment it does not: a reorg onto a heavier but
+    /// *shorter* chain left the executed head standing above the validated
+    /// one -- coherence violation I4 -- and the node then made no progress
+    /// until the chain grew back past the reorg point. On mainnet that was
+    /// about 54 times a day, one to six minutes each (issue #307).
+    ///
+    /// `Transition` has pulled execution down since it was written; the
+    /// batch-sync paths have always gone through it. This one, which moves
+    /// the head far more often than they do, did not.
+    fn move_head_to(&self, new_head: B256, previous: Option<B256>) -> Result<()> {
+        let proved = match Validated::prove(self, new_head) {
+            Ok(proved) => proved,
+            Err(unprovable) => {
+                // A header on the way down is missing. That is ordinary
+                // during skeleton sync, where headers arrive out of order and
+                // the old walk simply stopped at the hole, so this keeps
+                // doing that rather than refusing a batch the node has always
+                // accepted.
+                //
+                // It cannot hide the bug above: an unprovable lineage means
+                // the head is moving into a part of the chain that is still
+                // being downloaded, where execution is far below and there is
+                // nothing to pull down.
+                debug!(
+                    target: "rustock::storage",
+                    "head {new_head} has no provable lineage ({unprovable});                      writing the canonical pointers without a transition"
+                );
+                return self.update_canonical_chain(new_head);
+            }
+        };
+
+        // Identical work either way -- the distinction is what the logs say
+        // happened, and a retreat is worth being able to see.
+        let descending = previous
+            .and_then(|h| self.header(h).ok().flatten())
+            .is_some_and(|h| proved.number() < h.number);
+        let transition = if descending {
+            Transition::Retreat { to: proved }
+        } else {
+            Transition::Adopt { head: proved }
+        };
+
+        self.apply(&transition)?;
+        Ok(())
     }
 
     /// Walks backward from `new_head` using `parent_hash` links, updating
@@ -2259,6 +2311,90 @@ mod tests {
         // Old fork A headers should still be retrievable by hash
         assert!(store.header(chain_a[1].0.hash()).unwrap().is_some());
         assert!(store.header(chain_a[2].0.hash()).unwrap().is_some());
+    }
+
+    /// A reorg that lands the head *below* the executed block must bring
+    /// execution down with it.
+    ///
+    /// This is mainnet's shape, seen ~54 times a day: two blocks execute, a
+    /// one-block reorg takes the better chain, and the executed head is left
+    /// standing above the validated one. The node then refuses to make
+    /// progress until the chain grows back past the reorg point -- minutes,
+    /// each time (issue #307).
+    ///
+    /// The batch-sync paths go through `Transition`, which has pulled
+    /// execution down since it was written. The header-ingest path did not,
+    /// which is why no test caught this.
+    #[test]
+    fn a_reorg_below_the_executed_block_brings_execution_down() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Chain A: genesis -> 1A -> 2A, all canonical, and executed to 2A.
+        let chain_a = build_and_store_chain(&store, 3, 10, 0xAA);
+        let a2 = &chain_a[2].0;
+        store.set_exec_head(a2.hash(), a2.state_root).unwrap();
+
+        let cursor = store.cursor().unwrap().expect("a cursor");
+        assert_eq!(cursor.validated_head.number, 2);
+        assert_eq!(cursor.executed.number, 2);
+
+        // Chain B forks at genesis and is one block shorter, but heavier:
+        // a single block of difficulty 40 against two of 10.
+        let genesis = &chain_a[0];
+        let b1 = make_chain_header(1, genesis.0.hash(), 40, 0xBB);
+        let td_b1 = genesis.1 + b1.difficulty;
+
+        store
+            .store_headers_batch(&[(&b1, td_b1)], Some(a2.hash()), chain_a[2].1)
+            .unwrap();
+
+        assert_eq!(store.head().unwrap(), Some(b1.hash()), "the heavier chain wins");
+
+        let after = store.cursor().unwrap().expect("a cursor");
+        assert_eq!(after.validated_head.number, 1, "the head retreated");
+
+        // To the fork point, not to the new head. #1 on the winning chain is
+        // a block this node never executed, and recording it as executed
+        // would claim its state root without having computed it. Genesis is
+        // the deepest block still on the chain that was actually executed,
+        // so #1 is re-executed from there.
+        assert_eq!(
+            after.executed.number, 0,
+            "execution came down -- leaving it at #2 is I4, and the node \
+             stops until the chain grows past the reorg"
+        );
+        assert_eq!(after.executed.hash, genesis.0.hash());
+
+        // The whole point of the invariant: it must now hold.
+        verify_local_coherence(&store, &after).expect("coherent after the reorg");
+    }
+
+    /// The canonical entry the old chain left above the new head goes too.
+    /// A block that is held, linked and above the head is unreachable --
+    /// every path that looks for work reads the head.
+    #[test]
+    fn a_reorg_drops_the_canonical_entries_it_stranded() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let chain_a = build_and_store_chain(&store, 3, 10, 0xAA);
+        let a2 = &chain_a[2].0;
+        store.set_exec_head(a2.hash(), a2.state_root).unwrap();
+        assert!(store.canonical_hash(2).unwrap().is_some());
+
+        let genesis = &chain_a[0];
+        let b1 = make_chain_header(1, genesis.0.hash(), 40, 0xBB);
+        let td_b1 = genesis.1 + b1.difficulty;
+        store
+            .store_headers_batch(&[(&b1, td_b1)], Some(a2.hash()), chain_a[2].1)
+            .unwrap();
+
+        assert_eq!(
+            store.canonical_hash(2).unwrap(),
+            None,
+            "nothing canonical may be left above the head"
+        );
     }
 
     #[test]
