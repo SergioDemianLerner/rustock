@@ -2215,7 +2215,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     if let Some(cache) = &btc_block_cache {
         block_processor = block_processor.with_btc_block_cache(cache.clone());
     }
-    info!("Block processor wired (hardfork config: {:?})", hardfork_cfg);
+    block_processor = block_processor.with_execution_threads(args.execution_threads);
+    info!(
+        "Block processor wired (hardfork config: {:?}, execution threads: {})",
+        hardfork_cfg,
+        block_processor.execution_threads()
+    );
 
     if let Some(count) = args.measure_block_reads {
         // Re-execute recent blocks and record what each one had to be given.

@@ -162,6 +162,22 @@ impl BlockProcessor {
     /// Latency only: the cache is filled solely from reads consensus already
     /// performed and holds no negative entries, so a node with it and a node
     /// without it read the same trie nodes and reach the same answers.
+    /// How many threads a block's parallel sublists may use. See
+    /// [`crate::RskExecutor::with_execution_threads`].
+    pub fn with_execution_threads(mut self, threads: usize) -> Self {
+        self.executor = std::mem::replace(
+            &mut self.executor,
+            RskExecutor::new(self.hardfork_cfg.clone(), self.block_store.clone()),
+        )
+        .with_execution_threads(threads);
+        self
+    }
+
+    /// The thread count in force, after clamping.
+    pub fn execution_threads(&self) -> usize {
+        self.executor.execution_threads()
+    }
+
     pub fn with_btc_block_cache(
         mut self,
         cache: std::sync::Arc<crate::bridge::btc_block_cache::BtcBlockCache>,
@@ -281,7 +297,7 @@ impl BlockProcessor {
         // Taken whether or not execution succeeded, so a failure cannot leave
         // this block's keys behind for the next one to trip over.
         let collisions = crate::collision::finish();
-        let exec_result = exec_result?;
+        let mut exec_result = exec_result?;
         if let Some(collision) = collisions.as_ref().and_then(|t| t.first_collision()) {
             tracing::warn!(
                 target: "rustock::execution",
@@ -341,12 +357,19 @@ impl BlockProcessor {
             return Err(ProcessError::SupplyCreated { number: header.number, created });
         }
 
-        let mut new_state_root = apply_state_changes(
-            state_root,
-            trie_store.as_ref(),
-            &exec_result.state_changes,
-            &exec_result.markers,
-        );
+        // A block whose sublists ran separately applied itself: each
+        // sublist's changes are committed in sublist order, because that
+        // ordering is what gives the sequential sublist a state to start
+        // from. Re-applying the merged result here would not reproduce it.
+        let mut new_state_root = match exec_result.applied_root.take() {
+            Some(root) => root,
+            None => apply_state_changes(
+                state_root,
+                trie_store.as_ref(),
+                &exec_result.state_changes,
+                &exec_result.markers,
+            ),
+        };
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
         new_state_root.save(trie_store.as_ref(), true);
         // Reload the root lazily: children become hash references resolved on
