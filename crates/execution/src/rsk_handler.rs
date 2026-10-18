@@ -67,7 +67,21 @@ pub struct RskHandler<CTX, ERROR, FRAME> {
     /// leftover refund and REMASC receives gasLimit * gasPrice — while the
     /// receipt stays SUCCESS with only the spent gas (mainnet #764,123:
     /// receipt 47,408 gas, fee charged for the full 1,000,000 limit).
-    invisible_exception: Arc<AtomicBool>,
+invisible_exception: Arc<AtomicBool>,
+    /// Accumulate the fee instead of crediting it to the beneficiary.
+    ///
+    /// rskj builds every sublist executor with `postponeFeePayment = true`
+    /// once RSKIP-144 is active, and settles the block's whole fee total into
+    /// REMASC just before the REMASC transaction
+    /// (`TransactionListExecutor.addFeesToRemascIfEnabled`). Before RSKIP-144
+    /// it credits per transaction (`postponeFeePayment = false`), which is
+    /// what this node always did.
+    ///
+    /// The end state is the same either way -- the same total reaches the
+    /// same account before anything can observe it, since REMASC is the last
+    /// transaction. What differs is what a transaction *earlier* in the block
+    /// sees if it reads REMASC's balance.
+    postpone_fees: bool,
     /// Pre-RSKIP150 (twoToThree, mainnet 2_018_000): rskj's
     /// `Program.callToPrecompiledAddress` saves a successful precompile's
     /// FULL output to the caller's memory at outOffs (`memorySave`, NOT
@@ -113,6 +127,13 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         )
     }
 
+    /// Hold the block's fees back from the beneficiary, to be settled at the
+    /// REMASC transaction. See the field.
+    pub fn postponing_fees(mut self, postpone: bool) -> Self {
+        self.postpone_fees = postpone;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn with_rskip125(
         empty_create_on_unpayable_deposit: bool,
@@ -129,6 +150,8 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             pre_rskip150_precompiles,
             active_precompiles,
             rskip171_active,
+            // Per-transaction, as before RSKIP-144; `postponing_fees` opts in.
+            postpone_fees: false,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -200,6 +223,11 @@ where
     ) -> Result<(), Self::Error> {
         use revm::context_interface::journaled_state::account::JournaledAccountTr;
         use revm::context_interface::{Block, Transaction};
+        if self.postpone_fees {
+            // The executor accumulates the same total and settles it at the
+            // REMASC transaction, as rskj does once RSKIP-144 is active.
+            return Ok(());
+        }
         if !self.invisible_exception.load(Ordering::Relaxed) {
             // rskj routes the WHOLE tx fee (gasUsed * gasPrice) to REMASC (the
             // block beneficiary) — RSK never adopted EIP-1559, so no base fee is

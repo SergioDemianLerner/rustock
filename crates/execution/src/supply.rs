@@ -99,6 +99,25 @@ impl SupplyReport {
         self.inflow > self.outflow
     }
 
+    /// Account for fees that are in transit rather than credited.
+    ///
+    /// Once RSKIP-144 is active the gas fee does not reach REMASC inside the
+    /// transaction that paid it: the sublist executors postpone it and the
+    /// block's whole total is credited once, at the REMASC transaction. So an
+    /// ordinary transaction looks short by its own fee, and the REMASC
+    /// transaction looks as though it minted the lot.
+    ///
+    /// Neither is a supply event. `withheld` is what this transaction paid
+    /// into the pending pool and counts as though it had been credited;
+    /// `settled` is what came back out and counts as though it had been paid
+    /// in. With both zero this is the accounting as it stands before
+    /// RSKIP-144.
+    pub fn with_fees_in_transit(mut self, withheld: U256, settled: U256) -> Self {
+        self.inflow = self.inflow.saturating_add(withheld);
+        self.outflow = self.outflow.saturating_add(settled);
+        self
+    }
+
     /// BTC was destroyed. Worth recording, not fatal.
     pub fn destroyed_supply(&self) -> bool {
         self.outflow > self.inflow

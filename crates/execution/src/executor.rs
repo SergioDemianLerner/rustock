@@ -464,8 +464,11 @@ impl RskExecutor {
         transaction_id: usize,
         number: u64,
         index: usize,
+        fees_withheld: U256,
+        fees_settled: U256,
     ) -> Result<(), ExecutionError> {
-        let report = crate::supply::transaction_supply_change(state, transaction_id);
+        let report = crate::supply::transaction_supply_change(state, transaction_id)
+            .with_fees_in_transit(fees_withheld, fees_settled);
         if report.is_balanced() {
             return Ok(());
         }
@@ -645,6 +648,24 @@ impl RskExecutor {
             header.beneficiary,
         );
 
+        // rskj builds every sublist executor with `postponeFeePayment = true`
+        // once RSKIP-144 is active (`TransactionListExecutor`), accumulates
+        // the fees, and credits the block's whole total to REMASC just before
+        // the REMASC transaction runs
+        // (`addFeesToRemascIfEnabled`). Before RSKIP-144 it credits per
+        // transaction, which is what this node did at every height.
+        //
+        // The end state is identical -- the same total reaches the same
+        // account before anything can observe it, REMASC being last. What
+        // differs is what an earlier transaction sees if it reads REMASC's
+        // balance, and that is consensus.
+        //
+        // It is also what makes parallel sublists mergeable at all: crediting
+        // per transaction has every sublist writing REMASC's account cell,
+        // and those writes would have to be summed rather than merged.
+        let postpone_fees = self.hardfork_cfg.has_rskip144(header.number);
+        let mut remasc_tx_seen = false;
+
         let mut total_gas = 0u64;
         let mut total_fees = U256::ZERO;
         let mut tx_results = Vec::with_capacity(transactions.len());
@@ -718,6 +739,25 @@ impl RskExecutor {
                     // zero-gas, no-subtrace `call` rskj emits.
                     traces.insert(i, crate::tracer::ProgramTrace::default());
                 }
+                // rskj `TransactionListExecutor.addFeesToRemascIfEnabled`:
+                // with the fees postponed, the block's whole total is
+                // credited to REMASC immediately BEFORE the REMASC
+                // transaction executes, so REMASC's own distribution sees it.
+                remasc_tx_seen = true;
+                // What the settlement below takes out of the pending fee
+                // pool, for the per-transaction supply check: REMASC gains it
+                // without anybody losing it in this transaction.
+                let settled_now = if postpone_fees { total_fees } else { U256::ZERO };
+                if postpone_fees && !total_fees.is_zero() {
+                    use revm::context_interface::journaled_state::account::JournaledAccountTr;
+                    use revm::context_interface::{ContextTr, JournalTr};
+                    evm.ctx
+                        .journal_mut()
+                        .load_account_mut(REMASC_ADDR)
+                        .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?
+                        .incr_balance(total_fees);
+                }
+
                 // Warm the REMASC account: outside revm's transact flow the
                 // journal rejects storage ops on accounts it has not loaded.
                 // Touch it too: rskj transfers the (zero) endowment to the
@@ -778,7 +818,7 @@ impl RskExecutor {
                 if crate::supply::per_transaction_enabled() {
                     use revm::context_interface::ContextTr;
                     let st = &evm.ctx.journal_mut().inner.state;
-                    Self::check_tx_supply(st, supply_tid, header.number, i)?;
+                    Self::check_tx_supply(st, supply_tid, header.number, i, U256::ZERO, settled_now)?;
                 }
                 // RSKIP-144: what this transaction read and wrote, attributed
                 // to its sublist. Inert unless the block declares sublist
@@ -974,6 +1014,9 @@ impl RskExecutor {
                         fee,
                     );
                 }
+                // What this transaction paid in that nobody was credited
+                // with, for the per-transaction supply check.
+                let withheld_now = if postpone_fees { fee } else { U256::ZERO };
                 total_fees += fee;
 
                 total_gas += gas_used;
@@ -987,7 +1030,7 @@ impl RskExecutor {
                 if crate::supply::per_transaction_enabled() {
                     use revm::context_interface::ContextTr;
                     let st = &evm.ctx.journal_mut().inner.state;
-                    Self::check_tx_supply(st, supply_tid, header.number, i)?;
+                    Self::check_tx_supply(st, supply_tid, header.number, i, withheld_now, U256::ZERO)?;
                 }
                 // RSKIP-144: what this transaction read and wrote, attributed to
                 // its sublist. Inert unless the block declares sublist edges.
@@ -1069,7 +1112,8 @@ impl RskExecutor {
                 pre_rskip150_precompiles.clone(),
                 active_precompiles.clone(),
                 self.hardfork_cfg.has_rskip171(header.number),
-            );
+            )
+            .postponing_fees(postpone_fees);
                 // `inspect_run` for the one transaction being traced, `run`
                 // for every other -- and `run` is the same code path an EVM
                 // built without an inspector takes, because revm carries the
@@ -1131,7 +1175,9 @@ impl RskExecutor {
             } else {
                 gas_used
             };
-            total_fees += U256::from(fee_gas) * tx.gas_price;
+            let fee_paid = U256::from(fee_gas) * tx.gas_price;
+            let withheld_now = if postpone_fees { fee_paid } else { U256::ZERO };
+            total_fees += fee_paid;
 
             total_gas += gas_used;
             tx_results.push(TxExecutionResult {
@@ -1145,7 +1191,7 @@ impl RskExecutor {
             if crate::supply::per_transaction_enabled() {
                 use revm::context_interface::ContextTr;
                 let st = &evm.ctx.journal_mut().inner.state;
-                Self::check_tx_supply(st, supply_tid, header.number, i)?;
+                Self::check_tx_supply(st, supply_tid, header.number, i, withheld_now, U256::ZERO)?;
             }
             // RSKIP-144: what this transaction read and wrote, attributed to
             // its sublist. Inert unless the block declares sublist edges.
@@ -1184,6 +1230,22 @@ impl RskExecutor {
             }
 
             debug!(tx_index = i, gas_used, success, "executed transaction");
+        }
+
+        // rskj `TransactionListExecutor.payToRemascWhenThereIsNoRemascTx`: a
+        // block without a REMASC transaction settles the postponed fees after
+        // its last one instead. rskj calls this case testing-only -- "the last
+        // tx should be always the REMASC" -- and it is reachable here for the
+        // same reason, from a hand-built block.
+        if postpone_fees && !remasc_tx_seen && !total_fees.is_zero() {
+            use revm::context_interface::journaled_state::account::JournaledAccountTr;
+            use revm::context_interface::{ContextTr, JournalTr};
+            evm.ctx
+                .journal_mut()
+                .load_account_mut(REMASC_ADDR)
+                .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?
+                .incr_balance(total_fees);
+            evm.ctx.journal_mut().touch_account(REMASC_ADDR);
         }
 
         {

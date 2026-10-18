@@ -253,16 +253,21 @@ impl BlockProcessor {
         let check_collisions =
             self.hardfork_cfg.has_rskip144(header.number) && !sublist_starts.is_empty();
         if check_collisions {
-            // REMASC, not `header.beneficiary`. The header's coinbase names
-            // the miner, but it is never credited during execution:
-            // `block_env_from_header` makes REMASC the block beneficiary and
-            // the handler pays the fees there, once per transaction.
-            // Excluding the header's address instead left every sublist
-            // writing REMASC's account cell, and every testnet block that
-            // actually splits was rejected, starting at #7,690,880.
+            // No address is excluded on account of fees any more. The fees
+            // are postponed whenever RSKIP-144 is active -- which is whenever
+            // this check runs -- and settled once at the REMASC transaction,
+            // which is in the sequential set. So no parallel sublist writes
+            // REMASC's account cell on their account, and excluding it would
+            // only hide a genuine transfer to the Bridge's counterpart that
+            // rskj does record.
+            //
+            // Before the fees were postponed this exclusion was mandatory:
+            // every sublist credited REMASC per transaction, and every
+            // testnet block that splits was rejected write-write, starting at
+            // #7,690,880.
             crate::collision::start(
                 sublist_starts,
-                &[crate::precompiles::REMASC_ADDR],
+                &[],
                 crate::collision::write_semantics(header.number),
             );
         }
