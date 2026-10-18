@@ -568,24 +568,53 @@ impl RskHardforkConfig {
         block_number >= height
     }
 
+    /// The height at which `upgrade` is scheduled on this network, or `None`
+    /// when it is not scheduled at all.
+    ///
+    /// rskj spells "not scheduled" as an activation height of `-1`, which the
+    /// activation tables here spell as an absent entry. The distinction
+    /// matters for any upgrade a network skips: an ordinal
+    /// `active_upgrade() >= X` reads a *later* upgrade as implying `X`, which
+    /// is right for a chain that passed through `X` and wrong for one that
+    /// never scheduled it.
+    pub fn upgrade_height(&self, upgrade: RskNetworkUpgrade) -> Option<u64> {
+        self.activations
+            .iter()
+            .find(|(_, u)| *u == upgrade)
+            .map(|(h, _)| *h)
+    }
+
     /// RSKIP144: parallel transaction execution, and the
     /// `txExecutionSublistsEdges` header field that carries the sublist
     /// boundaries.
     ///
-    /// Testnet-only as rskj is configured today: `reed810` is `-1` in
-    /// `main.conf` and `7_139_600` in `testnet.conf`.
+    /// **Not an ordinal comparison**, unlike most of its neighbours. rskj
+    /// maps `rskip144` to `reed810` (`reference.conf`), and `reed810` is
+    /// `-1` in `main.conf` against `7_139_600` in `testnet.conf`. Mainnet
+    /// never schedules it, and `main.conf`'s `consensusRules` overrides only
+    /// `rskip536` -- so no later mainnet upgrade turns this on.
+    ///
+    /// `active_upgrade() >= Reed810` would: mainnet's table jumps Reed800 to
+    /// Vetiver900, which outranks Reed810, so this would have gone true at
+    /// mainnet #8,804,200 -- a height the chain passed months ago. It was
+    /// inert only because nothing read this predicate yet and mainnet headers
+    /// carry no sublist edges. The first thing to depend on it would have
+    /// forked the node.
     pub fn has_rskip144(&self, block_number: u64) -> bool {
-        self.active_upgrade(block_number) >= RskNetworkUpgrade::Reed810
+        self.upgrade_height(RskNetworkUpgrade::Reed810)
+            .is_some_and(|h| block_number >= h)
     }
 
     /// RSKIP351: the compressed ("mini") block header, where the logs-bloom
     /// slot carries `RLP([version, extension_hash])` instead of the bloom.
     ///
-    /// Same gate as RSKIP144. rskj's `ValidTxExecutionSublistsEdgesRule`
-    /// requires *both* before it validates anything, so they are kept as two
-    /// predicates rather than one even though they currently coincide.
+    /// Same gate as RSKIP144, and not an ordinal comparison for the same
+    /// reason. rskj's `ValidTxExecutionSublistsEdgesRule` requires *both*
+    /// before it validates anything, so they are kept as two predicates even
+    /// though they coincide.
     pub fn has_rskip351(&self, block_number: u64) -> bool {
-        self.active_upgrade(block_number) >= RskNetworkUpgrade::Reed810
+        self.upgrade_height(RskNetworkUpgrade::Reed810)
+            .is_some_and(|h| block_number >= h)
     }
 
     /// RSKIP535: the `baseEvent` header-extension field, which makes the
@@ -601,6 +630,10 @@ impl RskHardforkConfig {
     /// reference.conf; mainnet overrides it to the vetiver900 height (8_804_200)
     /// via main.conf consensusRules. `>= Reed810` is exact on both networks
     /// because mainnet jumps Reed800 -> Vetiver900 at that height.
+    ///
+    /// So this one *is* an ordinal comparison, deliberately, and differs from
+    /// `has_rskip144` right above it: both map to reed810 in reference.conf,
+    /// but mainnet overrides this one and not that one.
     pub fn has_rskip536(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Reed810
     }
@@ -660,6 +693,69 @@ fn upgrade_to_spec_id(upgrade: RskNetworkUpgrade) -> SpecId {
         | RskNetworkUpgrade::Reed800
         | RskNetworkUpgrade::Reed810
         | RskNetworkUpgrade::Vetiver900 => SpecId::SHANGHAI,
+    }
+}
+
+#[cfg(test)]
+mod fee_settlement_tests {
+    use super::*;
+
+    /// Postponing the gas fee to the REMASC transaction is gated on
+    /// RSKIP-144, and RSKIP-144 is unscheduled on mainnet. So every mainnet
+    /// block credits the fee inside the transaction that paid it, as it
+    /// always has, and this change cannot reach the chain this node follows.
+    #[test]
+    fn mainnet_never_postpones_the_fee() {
+        let cfg = RskHardforkConfig::mainnet();
+        for block in [0u64, 1, 2_392_700, 7_338_024, 9_000_000, u64::MAX] {
+            assert!(
+                !cfg.has_rskip144(block),
+                "RSKIP-144 must stay unscheduled on mainnet (block {block})"
+            );
+        }
+    }
+
+    /// Testnet does postpone, from reed810 and not before.
+    #[test]
+    fn testnet_postpones_from_reed810() {
+        let cfg = RskHardforkConfig::testnet();
+        assert!(!cfg.has_rskip144(7_139_599));
+        assert!(cfg.has_rskip144(7_139_600));
+        assert!(cfg.has_rskip144(8_000_000));
+    }
+
+    /// The trap this nearly fell into. Mainnet's table jumps Reed800 to
+    /// Vetiver900, and Vetiver900 outranks Reed810, so an ordinal
+    /// `active_upgrade() >= Reed810` reads as "RSKIP-144 is on" from
+    /// #8,804,200 -- a height mainnet passed months ago. rskj never turns it
+    /// on there: `reed810 = -1` in `main.conf`, whose `consensusRules`
+    /// override only `rskip536`.
+    #[test]
+    fn a_later_mainnet_upgrade_does_not_imply_an_unscheduled_one() {
+        let cfg = RskHardforkConfig::mainnet();
+        let vetiver900 = cfg
+            .upgrade_height(RskNetworkUpgrade::Vetiver900)
+            .expect("mainnet schedules vetiver900");
+        assert_eq!(
+            cfg.upgrade_height(RskNetworkUpgrade::Reed810),
+            None,
+            "mainnet must never schedule reed810"
+        );
+        assert!(
+            cfg.active_upgrade(vetiver900) >= RskNetworkUpgrade::Reed810,
+            "the ordinal comparison does read as active -- which is the trap"
+        );
+        assert!(!cfg.has_rskip144(vetiver900), "and the predicate must not");
+        assert!(!cfg.has_rskip351(vetiver900));
+    }
+
+    /// RSKIP536 keeps the ordinal comparison on purpose: mainnet overrides it
+    /// to the vetiver900 height, so there it really is active from then.
+    #[test]
+    fn rskip536_is_the_one_mainnet_does_schedule() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_rskip536(8_804_199));
+        assert!(cfg.has_rskip536(8_804_200));
     }
 }
 
