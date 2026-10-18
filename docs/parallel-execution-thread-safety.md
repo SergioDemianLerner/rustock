@@ -141,6 +141,41 @@ clock rather than CPU time, which is the point, but it means
 `EXECUTION_SECONDS` stops being comparable across a change to the thread
 count.
 
+## The shape, as built
+
+`RskExecutor::run_sublist` executes one contiguous run of a block's
+transactions against a state, in the block's own transaction indices. That is
+the whole block when it declares no sublists -- every block on a chain where
+RSKIP-144 is unscheduled -- and one call per sublist when it does.
+
+A block runs as one unless **all** of these hold: more than one execution
+thread, at least two parallel sublists declared, and RSKIP-144 active. The
+last is not redundant with the second. Running the sublists separately is
+sound *because the fees are postponed*: credited per transaction, every
+sublist would add its own fees to REMASC's balance as read from the state
+they all start from, and committing them in order would keep the last rather
+than the sum. A unit test found this by setting edges on a configuration
+where RSKIP-144 was off, and the block quietly lost a sublist's fees.
+
+When a block does split:
+
+1. The block-level precompile maintenance runs first, alone, and its result
+   is the state every parallel sublist reads. rskj runs it on the block's own
+   repository before any sublist starts; giving it to one sublist instead
+   would hide it from the others.
+2. Each parallel sublist runs on its own thread, against that state.
+3. Their changes go into the trie as each sublist's own commit, in sublist
+   order -- which is what rskj does, and what makes the sequential sublist's
+   starting state well defined. **The trie is the merge**: there is no
+   reconciliation of several journals into one, which is where this would
+   otherwise have become delicate.
+4. The sequential sublist runs on what they left, carrying their fees so that
+   the settlement at the REMASC transaction covers the whole block.
+
+`BlockExecutionResult::applied_root` carries the result, so the caller applies
+nothing. It is `None` for a block that ran as one, where the caller applies
+the state changes as it always has.
+
 ## What is deliberately still serial
 
 - **The sequential sublist**, by RSKIP-144: it runs after the parallel ones,
@@ -154,12 +189,24 @@ count.
 
 ## How this is verified
 
-Thread-safety is not something a passing test proves. What the tests do prove:
+Thread-safety is not something a passing test proves. What is checked:
 
 - the compile-time assertions above;
-- that a block replayed with one thread and with several produces the same
-  state root, receipts root and gas — run over the testnet range where blocks
-  actually split, which is the only range where any of this is reachable;
-- that the per-sublist diagnostics come back from the worker threads rather
-  than coming back empty, which is the failure mode a result-only comparison
-  would not catch.
+- **3,812 block verifications on testnet**: six ranges spanning the chain
+  from the reed810 activation to the head, each replayed at one thread and at
+  two, every block compared against rskj's own state. Zero divergences. Both
+  thread counts are compared against the reference rather than against each
+  other, because a shared mistake would agree with itself;
+- a block with two parallel sublists executed at one thread and at two,
+  asserting the same state root, gas, fees, per-transaction results and
+  per-account balances;
+- a block whose sublists share a sender -- the race RSKIP-144 exists to
+  forbid -- caught as a write-write collision on the account cell when the
+  sublists really do run apart. Both transactions succeed, each seeing nonce
+  0 against the state the block starts from, which is why the rule has to be
+  a condition on the block rather than something execution would notice;
+- a block with no sublists running as one whatever the thread count.
+
+A sublist that fails still hands back what it recorded before the failure
+propagates. A diagnostic dropped on the error path is one missing exactly
+when it is wanted.
