@@ -664,13 +664,16 @@ fn driver_awaiting_a_chunk(
     blocks: &[Block],
     tds: &[U256],
     peers: &[B512],
-) -> (SnapDriver, u64, u64) {
+) -> (SnapDriver, u64, u64, B512) {
     let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
 
     let mut out = driver.poll(peers);
     let (status_id, kind) = asked(&out[0]);
     assert_eq!(kind, "status");
-    out = driver.on_status(status_id, peers[0], blocks, tds, 8_000, 0, peers);
+    // Answer from the peer each request was addressed to: the driver only
+    // accepts an answer from the peer it asked.
+    let to = out[0].peer;
+    out = driver.on_status(status_id, to, blocks, tds, 8_000, 0, peers);
 
     // Walk the headers down to genesis, answering from the offered chain.
     let mut guard = 0;
@@ -681,6 +684,7 @@ fn driver_awaiting_a_chunk(
         if kind == "chunk" {
             break;
         }
+        let to = out[0].peer;
         let P2pMessage::RskMessage(m) = &out[0].message else { unreachable!() };
         out = match m.sub_message.clone() {
             RskSubMessage::BlockHeadersRequest(req) => {
@@ -690,15 +694,10 @@ fn driver_awaiting_a_chunk(
                     .iter()
                     .find(|b| b.header.hash() == req.query.hash)
                     .map_or(0, |b| b.header.number);
-                driver.on_headers(
-                    id,
-                    peers[0],
-                    &headers_for(blocks, point, req.query.count),
-                    peers,
-                )
+                driver.on_headers(id, to, &headers_for(blocks, point, req.query.count), peers)
             }
             RskSubMessage::SkeletonRequest(_) => {
-                driver.on_skeleton(id, peers[0], &[], peers)
+                driver.on_skeleton(id, to, &[], peers)
             }
             other => panic!("unexpected request {other:?}"),
         };
@@ -707,7 +706,7 @@ fn driver_awaiting_a_chunk(
 
     let P2pMessage::RskMessage(m) = &out[0].message else { unreachable!() };
     let RskSubMessage::SnapChunkRequest(req) = &m.sub_message else { unreachable!() };
-    (driver, req.id, req.from)
+    (driver, req.id, req.from, out[0].peer)
 }
 
 /// **The point of the whole exercise.** A peer whose chunk fails its proof is
@@ -720,11 +719,11 @@ fn a_peer_whose_chunk_fails_its_proof_is_charged() {
     let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
     let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
 
-    let (mut driver, id, from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
     assert!(driver.take_blame().is_empty(), "nobody should owe anything yet");
 
     // A genuine chunk with one byte flipped, from a peer we can name.
-    let liar = B512::repeat_byte(9);
+    let liar = server;
     let mut payload = served_chunk(&f, from);
     tamper(&mut payload);
     driver.on_chunk(id, liar, &payload, Refusal::None, &peers);
@@ -735,29 +734,38 @@ fn a_peer_whose_chunk_fails_its_proof_is_charged() {
     assert_eq!(blame[0].event, EventType::InvalidMessage);
 }
 
-/// And the charge lands on whoever *sent* it, not on whoever was asked. Taking
-/// a chunk from any peer is deliberate -- a valid chunk is valid whatever its
-/// route -- but that only works if blame follows the sender.
+/// A chunk from a peer that was never asked is not taken, however well it is
+/// formed. Accepting it would consume the request and leave the genuine
+/// answer, when it came, to be dropped as unknown.
 #[test]
-fn the_charge_follows_the_sender_not_the_peer_that_was_asked() {
+fn a_chunk_from_a_peer_that_was_not_asked_is_ignored() {
     let f = fixture(250);
     let genesis = f.with_genesis();
     let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
-    let asked_peer = B512::repeat_byte(1);
-    let peers = vec![asked_peer, B512::repeat_byte(2)];
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
 
-    let (mut driver, id, from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
     driver.take_blame();
 
     let interloper = B512::repeat_byte(77);
+    assert_ne!(interloper, server);
     let mut payload = served_chunk(&f, from);
     tamper(&mut payload);
-    driver.on_chunk(id, interloper, &payload, Refusal::None, &peers);
 
+    // Tampered, so if it were taken at all the sender would be charged.
+    driver.on_chunk(id, interloper, &payload, Refusal::None, &peers);
+    assert!(
+        driver.take_blame().is_empty(),
+        "a chunk from a peer that was not asked should be ignored, not judged"
+    );
+
+    // And the request is still outstanding: the same tampered payload from
+    // the peer that *was* asked is taken, and charged. Only a live request
+    // can produce that.
+    driver.on_chunk(id, server, &payload, Refusal::None, &peers);
     let blame = driver.take_blame();
-    assert_eq!(blame.len(), 1);
-    assert_eq!(blame[0].peer, interloper, "blamed the peer we asked, not the one that answered");
-    assert_ne!(blame[0].peer, asked_peer);
+    assert_eq!(blame.len(), 1, "the request should still have been in flight");
+    assert_eq!(blame[0].peer, server);
 }
 
 /// A peer that serves honestly owes nothing. An implementation that charged on
@@ -769,10 +777,10 @@ fn an_honest_peer_is_never_charged() {
     let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
     let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
 
-    let (mut driver, id, from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
     driver.take_blame();
 
-    driver.on_chunk(id, peers[0], &served_chunk(&f, from), Refusal::None, &peers);
+    driver.on_chunk(id, server, &served_chunk(&f, from), Refusal::None, &peers);
     assert!(driver.take_blame().is_empty(), "charged an honest peer");
 }
 
@@ -786,10 +794,10 @@ fn a_peer_that_declines_is_dropped_not_punished() {
     let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
     let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
 
-    let (mut driver, id, _from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    let (mut driver, id, _from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
     driver.take_blame();
 
-    let pruned = B512::repeat_byte(5);
+    let pruned = server;
     let declined = ChunkPayload::Proved { entries: Vec::new(), witness: Vec::new() };
     driver.on_chunk(id, pruned, &declined, Refusal::None, &peers);
 
@@ -806,12 +814,12 @@ fn an_rskj_chunk_that_does_not_rebuild_is_charged() {
     let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
     let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
 
-    let (mut driver, id, _from) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    let (mut driver, id, _from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
     driver.take_blame();
 
     // A well-formed but empty rskj blob: it decodes and rebuilds to nothing
     // like the state root.
-    let liar = B512::repeat_byte(6);
+    let liar = server;
     let blob = rustock_trie::snapshot_legacy::encode_blob(&Default::default());
     driver.on_chunk(id, liar, &ChunkPayload::Legacy(blob.into()), Refusal::None, &peers);
 
@@ -834,7 +842,7 @@ fn a_peer_offering_a_broken_chain_is_charged() {
     let out = driver.poll(&peers);
     let (id, _) = asked(&out[0]);
 
-    let liar = B512::repeat_byte(3);
+    let liar = out[0].peer;
     driver.on_status(id, liar, &blocks, &tds, 5_000, 0, &peers);
 
     let blame = driver.take_blame();
@@ -862,7 +870,7 @@ fn a_peer_serving_an_unmined_header_is_charged_for_the_header() {
 
     let (headers_id, kind) = asked(&out[0]);
     assert_eq!(kind, "headers");
-    let liar = B512::repeat_byte(4);
+    let liar = out[0].peer;
     driver.on_headers(headers_id, liar, &[blocks[blocks.len() - 2].header.clone()], &peers);
 
     let blame = driver.take_blame();

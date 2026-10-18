@@ -1158,3 +1158,13 @@ mod tests {
         assert_eq!(decoded.compute_hash(&store), root.compute_hash(&store));
     }
 }
+
+#[cfg(test)]
+mod thread_safety_assertions {
+    /// Parallel sublist execution shares the parent root across worker
+    /// threads, so this has to hold. It is asserted rather than assumed
+    /// because adding an `Rc` anywhere in the node would break it silently.
+    const fn assert_send_sync<T: Send + Sync>() {}
+    const _: () = assert_send_sync::<super::TrieNode>();
+    const _: () = assert_send_sync::<super::NodeRef>();
+}

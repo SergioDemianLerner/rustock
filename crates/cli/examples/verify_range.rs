@@ -37,6 +37,8 @@
 //!                      root each block computed. Needed below wasabi100,
 //!                      where the header's own stateRoot is an orchid root and
 //!                      cannot address a unitrie node.
+//!   --execution-threads N
+//!                      threads for RSKIP-144 parallel sublists (default 1)
 //!   --sequential       execute the range in order, carrying each block's
 //!                      post-state forward instead of resolving every block's
 //!                      parent root from the source. The only way to reach
@@ -96,7 +98,7 @@ const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <t
 /// read as a positional -- a mistyped `--max-failures` that became a block
 /// number would be worse than no option at all.
 fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)>)> {
-    const WITH_VALUE: [&str; 9] = [
+    const WITH_VALUE: [&str; 10] = [
         "--network-id",
         "--scratch",
         "--max-failures",
@@ -106,6 +108,7 @@ fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)
         "--state-format",
         "--parent-roots",
         "--state-roots",
+        "--execution-threads",
     ];
     const SEED: [&str; 2] = ["--seed-genesis", "--sequential"];
     const FLAGS: [&str; 1] = ["--explain"];
@@ -463,7 +466,18 @@ fn main() -> Result<()> {
     eprintln!("  blocks  {data_dir} (read-only)");
     eprintln!("  state   {unitrie_dir} (read-only, {state_format} format)");
     eprintln!("  scratch {}", scratch_path.display());
-    let processor = BlockProcessor::new(hardfork_cfg.clone(), store.clone());
+    // RSKIP-144 parallel sublists. 1 runs every block as one; above 1, a
+    // block that declares at least two parallel sublists runs them on their
+    // own threads. Replaying the same range at 1 and at 2 is the check that
+    // matters, because both must agree with the reference chain.
+    let execution_threads: usize = options
+        .iter()
+        .find(|(k, _)| k == "--execution-threads")
+        .map(|(_, v)| v.parse())
+        .transpose()?
+        .unwrap_or(1);
+    let processor = BlockProcessor::new(hardfork_cfg.clone(), store.clone())
+        .with_execution_threads(execution_threads);
 
     let silent = match &record_silent {
         Some(dir) => {

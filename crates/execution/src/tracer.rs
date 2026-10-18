@@ -270,6 +270,21 @@ impl RskTracer {
         Self { record_steps: false, ..Self::new(0) }
     }
 
+    /// A new tracer configured like this one, with nothing recorded yet.
+    ///
+    /// Each parallel sublist runs with its own tracer, on its own thread.
+    /// Cloning would copy the accumulated frames and logs along with the
+    /// configuration, which is not what a second sublist should start from --
+    /// a tracer accumulates per transaction and is drained per transaction,
+    /// so starting empty is the only correct state.
+    pub fn fresh_like(&self) -> Self {
+        if self.record_steps {
+            Self::new(self.max_logs)
+        } else {
+            Self::call_tree_only()
+        }
+    }
+
     /// The recorded steps and the storage view they ended with.
     pub fn finish(self) -> (Vec<StructLog>, BTreeMap<String, String>, bool) {
         (self.logs, self.current_storage, self.truncated)

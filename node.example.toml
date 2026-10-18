@@ -42,6 +42,12 @@
 # supply_check = "both"             # default
 # rskj_multisig_senders = "on"      # default — on | off — emulate rskj multisig peg-in senders
 
+# Threads for RSKIP-144 parallel sublists. 1 runs every transaction in order on
+# one thread. A block only splits if its header says so, so on a chain where
+# RSKIP-144 is unscheduled this setting changes nothing. The cap is 2, because
+# that is the most parallel sublists a block may declare.
+# execution_threads = 1             # default
+
 # Serving a frozen chain, for timed comparisons between clients. A server that
 # is still following is not the same fixture twice: it grows between runs and
 # the second client has more to do than the first.

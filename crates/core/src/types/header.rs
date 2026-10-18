@@ -155,6 +155,13 @@ impl Header {
     /// False for a version-0 header whatever is offered: a header with a
     /// literal bloom commits to no extension, and accepting one would let a
     /// peer attach edges or a base event to a block that never had them.
+    ///
+    /// Nothing calls this today, deliberately. An extension that arrives
+    /// separately from its header -- in a body response, say -- is discarded
+    /// rather than checked, because the fields are bound to the block only
+    /// while they travel inside the header. This is the gate any future code
+    /// that does accept one must pass through; see the body decoder in
+    /// `rustock-networking` for the other end of the rule.
     pub fn accepts_extension(
         &self,
         extension: &crate::types::header_extension::BlockHeaderExtension,

@@ -42,6 +42,84 @@ pub struct BlockExecutionResult {
     /// Contract storage-prefix marker writes accumulated during execution
     /// (rskj `setupContract`), applied to the trie with the state changes.
     pub markers: crate::state::ContractMarkers,
+    /// The state the block left, when execution applied it itself.
+    ///
+    /// `None` for a block that ran as one, where the caller applies
+    /// `state_changes` and `markers` as it always has. `Some` for a block
+    /// whose sublists ran separately: each one's changes are committed to the
+    /// trie in sublist order, because that is what makes the sequential
+    /// sublist's starting state well defined, and re-applying the merged
+    /// result on top would not reproduce it.
+    ///
+    /// `state_changes` is still the whole block's, and still carries each
+    /// account's final values -- the supply check reads it.
+    pub applied_root: Option<TrieNode>,
+}
+
+/// One sublist's run, with everything it collected on its own thread.
+struct SublistRun {
+    result: BlockExecutionResult,
+    traces: std::collections::BTreeMap<usize, crate::tracer::ProgramTrace>,
+    /// The sublist's read and write key sets. The worker's thread-local
+    /// recorder is not the coordinator's, so they travel back by hand.
+    keys: Option<crate::collision::CollisionTracker>,
+    /// Likewise for the silent bridge-decision records.
+    records: Vec<crate::silent::SilentRecord>,
+}
+
+/// Fold one sublist's marker writes into the block's.
+///
+/// The trie already has them -- each sublist's markers were applied with its
+/// own state changes -- so this is for the reported result.
+fn merge_markers(into: &mut crate::state::ContractMarkers, from: crate::state::ContractMarkers) {
+    into.skip_created.extend(from.skip_created);
+    for addr in from.precompiles {
+        if !into.precompiles.contains(&addr) {
+            into.precompiles.push(addr);
+        }
+    }
+    into.bump_remasc_sender |= from.bump_remasc_sender;
+    into.raw_storage.extend(from.raw_storage);
+}
+
+/// Fold one sublist's state into the block's reported state.
+///
+/// Later sublists win on what they changed, which is what the trie commits
+/// already did. Among the *parallel* sublists nothing can conflict: the
+/// collision rule makes a block invalid when two of them write the same cell,
+/// so their write sets are disjoint by the time this runs. The sequential
+/// sublist is the one that genuinely writes over them, and it comes last.
+///
+/// An account the later sublist only read keeps the earlier values. Reading
+/// does not make a sublist the authority on anything.
+fn merge_reported_state(into: &mut revm::state::EvmState, from: revm::state::EvmState) {
+    use revm::state::AccountStatus;
+    use std::collections::hash_map::Entry;
+    for (addr, account) in from {
+        let wrote_account = account.info != *account.original_info
+            || account.status.intersects(
+                AccountStatus::SelfDestructed | AccountStatus::Created | AccountStatus::Touched,
+            );
+        match into.entry(addr) {
+            Entry::Vacant(slot) => {
+                slot.insert(account);
+            }
+            Entry::Occupied(mut slot) => {
+                let held = slot.get_mut();
+                for (key, cell) in account.storage {
+                    if cell.present_value != cell.original_value
+                        || !held.storage.contains_key(&key)
+                    {
+                        held.storage.insert(key, cell);
+                    }
+                }
+                if wrote_account {
+                    held.info = account.info;
+                    held.status |= account.status;
+                }
+            }
+        }
+    }
 }
 
 /// Executes RSK blocks and transactions using revm.
@@ -57,6 +135,13 @@ pub struct RskExecutor {
     /// executor runs. `None` disables it, which is the default so that tools
     /// and tests get unchanged behaviour without opting out.
     btc_block_cache: Option<Arc<crate::bridge::btc_block_cache::BtcBlockCache>>,
+    /// How many threads may run a block's parallel sublists (RSKIP-144).
+    ///
+    /// 1 means every transaction runs in order on the calling thread, which
+    /// is also what happens at any setting for a block that declares no
+    /// sublists -- which is every block on a chain where RSKIP-144 is
+    /// unscheduled.
+    execution_threads: usize,
 }
 
 impl RskExecutor {
@@ -72,6 +157,22 @@ impl RskExecutor {
     ) -> Self {
         self.btc_block_cache = Some(cache);
         self
+    }
+
+    /// How many threads a block's parallel sublists may use.
+    ///
+    /// Clamped to at least 1, and to at most the number of parallel sublists
+    /// a block may declare (`TX_EXECUTION_THREADS`): asking for more buys
+    /// nothing, because the partition the header declares is the only source
+    /// of work to divide.
+    pub fn with_execution_threads(mut self, threads: usize) -> Self {
+        self.execution_threads =
+            threads.clamp(1, rustock_core::validation::block_rules::TX_EXECUTION_THREADS);
+        self
+    }
+
+    pub fn execution_threads(&self) -> usize {
+        self.execution_threads
     }
 
     /// The cache in use, if any -- for the periodic report.
@@ -114,6 +215,9 @@ impl RskExecutor {
             bridge_constants,
             free_bridge_senders,
             btc_block_cache: None,
+            // Sequential unless a caller asks otherwise, so an executor built
+            // by a tool or a test behaves as it always has.
+            execution_threads: 1,
         }
     }
 
@@ -438,8 +542,11 @@ impl RskExecutor {
         transaction_id: usize,
         number: u64,
         index: usize,
+        fees_withheld: U256,
+        fees_settled: U256,
     ) -> Result<(), ExecutionError> {
-        let report = crate::supply::transaction_supply_change(state, transaction_id);
+        let report = crate::supply::transaction_supply_change(state, transaction_id)
+            .with_fees_in_transit(fees_withheld, fees_settled);
         if report.is_balanced() {
             return Ok(());
         }
@@ -546,6 +653,22 @@ impl RskExecutor {
     /// consensus block loop would drift -- which is the failure this codebase
     /// has already had twice, in the two orphan-recovery paths that were meant
     /// to stay identical and did not.
+    /// Execute a block, as one run or as its declared sublists.
+    ///
+    /// A block declares its partition in `txExecutionSublistsEdges`. With no
+    /// edges there is nothing to divide and the block is one run, which is
+    /// every block on a chain where RSKIP-144 is unscheduled. With edges and
+    /// more than one execution thread, each parallel sublist is its own run
+    /// against the parent state and the sequential sublist follows on what
+    /// they left.
+    ///
+    /// With edges but one execution thread the block is still one run. That
+    /// is not a lesser approximation: where the sublists are independent --
+    /// which the collision check establishes, and which is a condition of the
+    /// block's validity -- running them in order against a shared state and
+    /// running them separately against the parent reach the same state. Where
+    /// they are not independent the block is invalid either way.
+    #[allow(clippy::too_many_arguments)]
     fn execute_block_with(
         &self,
         header: &Header,
@@ -554,6 +677,281 @@ impl RskExecutor {
         trie_store: Arc<dyn TrieStore>,
         inspector: crate::tracer::RskTracer,
         traced: TracedTxs,
+    ) -> Result<
+        (BlockExecutionResult, std::collections::BTreeMap<usize, crate::tracer::ProgramTrace>),
+        ExecutionError,
+    > {
+        let edges: &[i16] = header
+            .version_fields
+            .as_ref()
+            .and_then(|v| v.edges.as_deref())
+            .unwrap_or(&[]);
+        let (parallel, sequential) =
+            crate::collision::sublist_ranges(edges, transactions.len());
+
+        // One run unless there are at least two parallel sublists to divide.
+        // With one there is nothing to run concurrently *with*, and a single
+        // run over the whole block reaches the same state for less.
+        //
+        // RSKIP-144 is also required, and not only because a header cannot
+        // carry edges without it. Running the sublists separately is sound
+        // *because* the fees are postponed: credited per transaction, every
+        // sublist would add its own fees to REMASC's balance as read from
+        // the state they all start from, and committing them in order keeps
+        // the last one rather than the sum. The block would silently lose a
+        // sublist's fees.
+        if self.execution_threads <= 1
+            || parallel.len() < 2
+            || !self.hardfork_cfg.has_rskip144(header.number)
+        {
+            return self.run_sublist(
+                header,
+                transactions,
+                0..transactions.len(),
+                state_root,
+                trie_store,
+                inspector,
+                traced,
+                U256::ZERO,
+                true,
+            );
+        }
+
+        self.execute_block_in_parallel(
+            header,
+            transactions,
+            parallel,
+            sequential,
+            state_root,
+            trie_store,
+            inspector,
+            traced,
+        )
+    }
+
+    /// The RSKIP-144 execution shape: the declared parallel sublists run
+    /// concurrently against the state the block starts from, then the
+    /// sequential sublist runs on what they left.
+    ///
+    /// Each sublist's changes go into the trie as that sublist's own commit,
+    /// in sublist order -- which is what rskj does (`tle.getRepository()
+    /// .commit()` in order) and what makes the sequential sublist's state
+    /// well defined. It also avoids reconciling several journals into one:
+    /// the trie is the merge.
+    ///
+    /// The block-level precompile maintenance runs first, alone, and its
+    /// result is the state every parallel sublist reads. rskj runs it on the
+    /// block's own repository before any sublist starts; giving it to one
+    /// sublist instead would hide it from the others.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_block_in_parallel(
+        &self,
+        header: &Header,
+        transactions: &[(rustock_core::Transaction, Address)],
+        parallel: Vec<std::ops::Range<usize>>,
+        sequential: std::ops::Range<usize>,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        inspector: crate::tracer::RskTracer,
+        traced: TracedTxs,
+    ) -> Result<
+        (BlockExecutionResult, std::collections::BTreeMap<usize, crate::tracer::ProgramTrace>),
+        ExecutionError,
+    > {
+        let store = trie_store.as_ref();
+
+        // 1. Block-level maintenance, on no sublist's account.
+        let (maintenance, _) = self.run_sublist(
+            header,
+            transactions,
+            0..0,
+            state_root,
+            trie_store.clone(),
+            inspector.fresh_like(),
+            TracedTxs::None,
+            U256::ZERO,
+            true,
+        )?;
+        let base_root = crate::state::apply_state_changes(
+            state_root,
+            store,
+            &maintenance.state_changes,
+            &maintenance.markers,
+        );
+
+        // 2. The parallel sublists, each against that state, each on its own
+        //    thread with its own everything.
+        let recorder = crate::collision::config();
+        let recording_silent = crate::silent::is_recording();
+        let base = &base_root;
+        let outcomes: Vec<Result<SublistRun, ExecutionError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = parallel
+                .iter()
+                .map(|range| {
+                    let range = range.clone();
+                    let store = trie_store.clone();
+                    let inspector = inspector.fresh_like();
+                    let recorder = recorder.clone();
+                    scope.spawn(move || {
+                        if let Some(cfg) = recorder {
+                            crate::collision::start_from(cfg);
+                        }
+                        if recording_silent {
+                            crate::silent::start();
+                        }
+                        let run = self.run_sublist(
+                            header,
+                            transactions,
+                            range,
+                            base,
+                            store,
+                            inspector,
+                            traced,
+                            U256::ZERO,
+                            false,
+                        );
+                        let keys = crate::collision::finish();
+                        let records = crate::silent::finish();
+                        run.map(|(result, traces)| SublistRun { result, traces, keys, records })
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(ExecutionError::Evm(
+                            "a parallel sublist thread panicked".to_string(),
+                        ))
+                    })
+                })
+                .collect()
+        });
+
+        // 3. Commit them in sublist order, and take back what the workers
+        //    collected on their own threads.
+        let mut root = base_root.clone();
+        let mut runs = Vec::with_capacity(outcomes.len());
+        let mut failure = None;
+        for outcome in outcomes {
+            // Taken before any early return. A sublist that failed still
+            // recorded what it touched on its own thread, and that is exactly
+            // what somebody diagnosing the failure will want -- including the
+            // collision that may be the reason it failed.
+            match outcome {
+                Ok(run) => {
+                    if let Some(keys) = run.keys {
+                        crate::collision::absorb(keys);
+                    }
+                    crate::silent::absorb(run.records);
+                    if failure.is_none() {
+                        root = crate::state::apply_state_changes(
+                            &root,
+                            store,
+                            &run.result.state_changes,
+                            &run.result.markers,
+                        );
+                        runs.push((run.result, run.traces));
+                    }
+                }
+                Err(e) => failure = failure.or(Some(e)),
+            }
+        }
+        if let Some(e) = failure {
+            return Err(e);
+        }
+
+        // 4. The sequential sublist, on what they left, carrying their fees
+        //    so that the settlement at the REMASC transaction covers the
+        //    whole block.
+        let fees_carried = runs
+            .iter()
+            .map(|(r, _)| r.paid_fees)
+            .fold(U256::ZERO, |a, b| a + b);
+        let (sequential_result, mut traces) = self.run_sublist(
+            header,
+            transactions,
+            sequential,
+            &root,
+            trie_store.clone(),
+            inspector,
+            traced,
+            fees_carried,
+            false,
+        )?;
+        let final_root = crate::state::apply_state_changes(
+            &root,
+            store,
+            &sequential_result.state_changes,
+            &sequential_result.markers,
+        );
+
+        // 5. Assemble, in the block's own transaction order.
+        let mut tx_results = Vec::with_capacity(transactions.len());
+        let mut gas_used = maintenance.gas_used;
+        let mut state_changes = maintenance.state_changes;
+        let mut markers = maintenance.markers;
+        for (run, run_traces) in runs {
+            gas_used += run.gas_used;
+            tx_results.extend(run.tx_results);
+            merge_markers(&mut markers, run.markers);
+            merge_reported_state(&mut state_changes, run.state_changes);
+            traces.extend(run_traces);
+        }
+        gas_used += sequential_result.gas_used;
+        tx_results.extend(sequential_result.tx_results);
+        merge_markers(&mut markers, sequential_result.markers);
+        merge_reported_state(&mut state_changes, sequential_result.state_changes);
+        Ok((
+            BlockExecutionResult {
+                tx_results,
+                gas_used,
+                paid_fees: sequential_result.paid_fees,
+                state_changes,
+                markers,
+                applied_root: Some(final_root),
+            },
+            traces,
+        ))
+    }
+
+    /// Execute one contiguous run of a block's transactions against a state.
+    ///
+    /// This is the whole block when it declares no sublists, which is every
+    /// block on a chain where RSKIP-144 is unscheduled. When it does declare
+    /// them, each sublist is one call: the parallel ones against the parent
+    /// state, the sequential one against the state the parallel ones left.
+    ///
+    /// `range` is in the block's own transaction indices and stays that way
+    /// throughout -- the Bridge reads the index, the tracer selects on it and
+    /// the collision tracker attributes by it, so a sublist-relative index
+    /// would be wrong in three places at once.
+    ///
+    /// Everything this builds -- the database handle, the journal, the
+    /// instruction table, the precompile provider, the overlay -- is built
+    /// here, which is to say on the thread that will run it. That is not
+    /// incidental: `rsk_instructions` keeps consensus configuration in
+    /// thread-local storage, and every unset value reads as a plausible
+    /// one. See `docs/parallel-execution-thread-safety.md`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_sublist(
+        &self,
+        header: &Header,
+        transactions: &[(rustock_core::Transaction, Address)],
+        range: std::ops::Range<usize>,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        inspector: crate::tracer::RskTracer,
+        traced: TracedTxs,
+        // `fees_carried`: fees paid by earlier sublists. rskj threads
+        // `totalPaidFees` into the sequential executor the same way, so that
+        // the settlement at the REMASC transaction covers the whole block.
+        fees_carried: U256,
+        // `run_maintenance`: run the block-level precompile maintenance
+        // first. True for the run that starts the block and false for every
+        // later sublist -- rskj's `maintainPrecompiledContractStorageRoots`
+        // runs once, on the block's own repository, before any sublist.
+        run_maintenance: bool,
     ) -> Result<
         (BlockExecutionResult, std::collections::BTreeMap<usize, crate::tracer::ProgramTrace>),
         ExecutionError,
@@ -619,9 +1017,33 @@ impl RskExecutor {
             header.beneficiary,
         );
 
+        // rskj builds every sublist executor with `postponeFeePayment = true`
+        // once RSKIP-144 is active (`TransactionListExecutor`), accumulates
+        // the fees, and credits the block's whole total to REMASC just before
+        // the REMASC transaction runs
+        // (`addFeesToRemascIfEnabled`). Before RSKIP-144 it credits per
+        // transaction, which is what this node did at every height.
+        //
+        // The end state is identical -- the same total reaches the same
+        // account before anything can observe it, REMASC being last. What
+        // differs is what an earlier transaction sees if it reads REMASC's
+        // balance, and that is consensus.
+        //
+        // It is also what makes parallel sublists mergeable at all: crediting
+        // per transaction has every sublist writing REMASC's account cell,
+        // and those writes would have to be summed rather than merged.
+        let postpone_fees = self.hardfork_cfg.has_rskip144(header.number);
+        let mut remasc_tx_seen = false;
+        // Whether this run ends the block. Only the run that does may settle
+        // fees nobody claimed; a parallel sublist ends without reaching the
+        // REMASC transaction by construction, and settling there would credit
+        // its fees once on its own account and again when the sequential
+        // sublist settles the block's total.
+        let ends_the_block = range.end == transactions.len();
+
         let mut total_gas = 0u64;
-        let mut total_fees = U256::ZERO;
-        let mut tx_results = Vec::with_capacity(transactions.len());
+        let mut total_fees = fees_carried;
+        let mut tx_results = Vec::with_capacity(range.len());
         // Harvested per transaction rather than once at the end, so that
         // `trace_block` can trace every transaction in a single block pass.
         let mut traces: std::collections::BTreeMap<usize, crate::tracer::ProgramTrace> =
@@ -633,7 +1055,7 @@ impl RskExecutor {
         // every genesis precompile is created (if absent) and marked; each
         // consensus-enabled precompile gets a fresh account (nonce/balance
         // reset) plus the marker exactly at its activation block.
-        {
+        if run_maintenance {
             use crate::hardfork::RskNetworkUpgrade;
             use revm::context_interface::{ContextTr, JournalTr};
             let mut ops: Vec<(Address, bool)> = Vec::new(); // (addr, reset_account)
@@ -660,10 +1082,14 @@ impl RskExecutor {
                 if !markers.precompiles.contains(&addr) {
                     markers.precompiles.push(addr);
                 }
+                // Written by the block, not by any sublist, so it must not
+                // be attributed to the first transaction's sublist.
+                crate::collision::exclude(addr);
             }
         }
 
-        for (i, (tx, sender)) in transactions.iter().enumerate() {
+        for i in range.clone() {
+            let (tx, sender) = &transactions[i];
             // The journal stamps each account with the transaction that last
             // touched it; capture the id in force for this one, before it is
             // incremented at commit.
@@ -675,6 +1101,9 @@ impl RskExecutor {
                 use revm::context_interface::ContextTr;
                 evm.ctx.chain_mut().raw_storage.begin_tx();
             }
+            // RSKIP-144: everything this transaction touches belongs to the
+            // sublist that runs it. Inert unless the block declares edges.
+            crate::collision::begin_transaction(i);
             if Self::is_remasc_tx(tx) {
                 debug!(tx_index = i, "executing REMASC system call");
                 if traced.includes(i) {
@@ -686,6 +1115,25 @@ impl RskExecutor {
                     // zero-gas, no-subtrace `call` rskj emits.
                     traces.insert(i, crate::tracer::ProgramTrace::default());
                 }
+                // rskj `TransactionListExecutor.addFeesToRemascIfEnabled`:
+                // with the fees postponed, the block's whole total is
+                // credited to REMASC immediately BEFORE the REMASC
+                // transaction executes, so REMASC's own distribution sees it.
+                remasc_tx_seen = true;
+                // What the settlement below takes out of the pending fee
+                // pool, for the per-transaction supply check: REMASC gains it
+                // without anybody losing it in this transaction.
+                let settled_now = if postpone_fees { total_fees } else { U256::ZERO };
+                if postpone_fees && !total_fees.is_zero() {
+                    use revm::context_interface::journaled_state::account::JournaledAccountTr;
+                    use revm::context_interface::{ContextTr, JournalTr};
+                    evm.ctx
+                        .journal_mut()
+                        .load_account_mut(REMASC_ADDR)
+                        .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?
+                        .incr_balance(total_fees);
+                }
+
                 // Warm the REMASC account: outside revm's transact flow the
                 // journal rejects storage ops on accounts it has not loaded.
                 // Touch it too: rskj transfers the (zero) endowment to the
@@ -743,11 +1191,22 @@ impl RskExecutor {
                     logs,
                     created_address: None,
                 });
-            if crate::supply::per_transaction_enabled() {
-                use revm::context_interface::ContextTr;
-                let st = &evm.ctx.journal_mut().inner.state;
-                Self::check_tx_supply(st, supply_tid, header.number, i)?;
-            }
+                if crate::supply::per_transaction_enabled() {
+                    use revm::context_interface::ContextTr;
+                    let st = &evm.ctx.journal_mut().inner.state;
+                    Self::check_tx_supply(st, supply_tid, header.number, i, U256::ZERO, settled_now)?;
+                }
+                // RSKIP-144: what this transaction read and wrote, attributed
+                // to its sublist. Inert unless the block declares sublist
+                // edges.
+                if crate::collision::is_recording() {
+                    use revm::context_interface::ContextTr;
+                    let j = &evm.ctx.journal_mut().inner;
+                    crate::collision::note_journal_entries(&j.journal, &j.state);
+                    crate::collision::record_transaction(supply_tid, &j.state);
+                    let raw = evm.ctx.chain_mut().raw_storage.tx_writes();
+                    crate::collision::record_raw_writes(raw);
+                }
                 continue;
             }
 
@@ -878,13 +1337,35 @@ impl RskExecutor {
                             // the spent gas, no logs, no endowment — but the
                             // sender is charged the FULL gas limit.
                             evm.ctx.chain_mut().raw_storage.discard_call();
+                            // RSKIP-144: the writes this call attempted are
+                            // about to be popped off the journal. The EVM's
+                            // own frames are covered in `rsk_handler`; a
+                            // direct bridge call never enters one.
+                            if crate::collision::records_attempted_writes() {
+                                let j = &evm.ctx.journal_mut().inner;
+                                crate::collision::note_journal_entries(&j.journal, &j.state);
+                            }
                             evm.ctx.journal_mut().checkpoint_revert(checkpoint);
+                            crate::collision::forget_entries_above(
+                                evm.ctx.journal_mut().inner.journal.len(),
+                            );
                             invisible_exception = true;
                             (true, Vec::new(), Vec::new())
                         }
                         Err(e) => {
                             evm.ctx.chain_mut().raw_storage.discard_call();
+                            // RSKIP-144: the writes this call attempted are
+                            // about to be popped off the journal. The EVM's
+                            // own frames are covered in `rsk_handler`; a
+                            // direct bridge call never enters one.
+                            if crate::collision::records_attempted_writes() {
+                                let j = &evm.ctx.journal_mut().inner;
+                                crate::collision::note_journal_entries(&j.journal, &j.state);
+                            }
                             evm.ctx.journal_mut().checkpoint_revert(checkpoint);
+                            crate::collision::forget_entries_above(
+                                evm.ctx.journal_mut().inner.journal.len(),
+                            );
                             debug!(tx_index = i, error = %e, "direct bridge call failed");
                             (false, Vec::new(), Vec::new())
                         }
@@ -909,6 +1390,9 @@ impl RskExecutor {
                         fee,
                     );
                 }
+                // What this transaction paid in that nobody was credited
+                // with, for the per-transaction supply check.
+                let withheld_now = if postpone_fees { fee } else { U256::ZERO };
                 total_fees += fee;
 
                 total_gas += gas_used;
@@ -922,7 +1406,17 @@ impl RskExecutor {
                 if crate::supply::per_transaction_enabled() {
                     use revm::context_interface::ContextTr;
                     let st = &evm.ctx.journal_mut().inner.state;
-                    Self::check_tx_supply(st, supply_tid, header.number, i)?;
+                    Self::check_tx_supply(st, supply_tid, header.number, i, withheld_now, U256::ZERO)?;
+                }
+                // RSKIP-144: what this transaction read and wrote, attributed to
+                // its sublist. Inert unless the block declares sublist edges.
+                if crate::collision::is_recording() {
+                    use revm::context_interface::ContextTr;
+                    let j = &evm.ctx.journal_mut().inner;
+                    crate::collision::note_journal_entries(&j.journal, &j.state);
+                    crate::collision::record_transaction(supply_tid, &j.state);
+                    let raw = evm.ctx.chain_mut().raw_storage.tx_writes();
+                    crate::collision::record_raw_writes(raw);
                 }
                 continue;
             }
@@ -994,7 +1488,8 @@ impl RskExecutor {
                 pre_rskip150_precompiles.clone(),
                 active_precompiles.clone(),
                 self.hardfork_cfg.has_rskip171(header.number),
-            );
+            )
+            .postponing_fees(postpone_fees);
                 // `inspect_run` for the one transaction being traced, `run`
                 // for every other -- and `run` is the same code path an EVM
                 // built without an inspector takes, because revm carries the
@@ -1056,7 +1551,9 @@ impl RskExecutor {
             } else {
                 gas_used
             };
-            total_fees += U256::from(fee_gas) * tx.gas_price;
+            let fee_paid = U256::from(fee_gas) * tx.gas_price;
+            let withheld_now = if postpone_fees { fee_paid } else { U256::ZERO };
+            total_fees += fee_paid;
 
             total_gas += gas_used;
             tx_results.push(TxExecutionResult {
@@ -1070,7 +1567,17 @@ impl RskExecutor {
             if crate::supply::per_transaction_enabled() {
                 use revm::context_interface::ContextTr;
                 let st = &evm.ctx.journal_mut().inner.state;
-                Self::check_tx_supply(st, supply_tid, header.number, i)?;
+                Self::check_tx_supply(st, supply_tid, header.number, i, withheld_now, U256::ZERO)?;
+            }
+            // RSKIP-144: what this transaction read and wrote, attributed to
+            // its sublist. Inert unless the block declares sublist edges.
+            if crate::collision::is_recording() {
+                use revm::context_interface::ContextTr;
+                let j = &evm.ctx.journal_mut().inner;
+                crate::collision::note_journal_entries(&j.journal, &j.state);
+                crate::collision::record_transaction(supply_tid, &j.state);
+                let raw = evm.ctx.chain_mut().raw_storage.tx_writes();
+                crate::collision::record_raw_writes(raw);
             }
             // rskj TransactionExecutor.finalization deletes suicided accounts
             // at the END of each transaction (track.delete), so a LATER tx in
@@ -1101,6 +1608,28 @@ impl RskExecutor {
             debug!(tx_index = i, gas_used, success, "executed transaction");
         }
 
+        // rskj `TransactionListExecutor.payToRemascWhenThereIsNoRemascTx`: a
+        // block without a REMASC transaction settles the postponed fees after
+        // its last one instead. rskj calls this case testing-only -- "the last
+        // tx should be always the REMASC" -- and it is reachable here for the
+        // same reason, from a hand-built block.
+        //
+        // Gated on this run ending the block. Without that gate every
+        // parallel sublist took itself for such a block and settled its own
+        // fees, which the sequential sublist then settled again: testnet
+        // #7,690,880 came out 640358944286 wei to the good, exactly the
+        // first sublist's fees.
+        if postpone_fees && ends_the_block && !remasc_tx_seen && !total_fees.is_zero() {
+            use revm::context_interface::journaled_state::account::JournaledAccountTr;
+            use revm::context_interface::{ContextTr, JournalTr};
+            evm.ctx
+                .journal_mut()
+                .load_account_mut(REMASC_ADDR)
+                .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?
+                .incr_balance(total_fees);
+            evm.ctx.journal_mut().touch_account(REMASC_ADDR);
+        }
+
         {
             use revm::context_interface::ContextTr;
             markers.raw_storage = evm.ctx.chain_mut().raw_storage.drain();
@@ -1114,6 +1643,7 @@ impl RskExecutor {
                 paid_fees: total_fees,
                 state_changes: state,
                 markers,
+                applied_root: None,
             },
             traces,
         ))
@@ -5228,6 +5758,226 @@ mod tests {
         assert!(result.success);
         // 21000 + 4*5 (zero) + 16*3 (non-zero at Istanbul) = 21000 + 20 + 48 = 21068
         assert_eq!(result.gas_used, 21_068, "21000 + 4*5 + 16*3 = 21068");
+    }
+
+    /// A block that declares two parallel sublists, executed both ways.
+    ///
+    /// Running the sublists on their own threads and running the whole block
+    /// as one must reach the same state. They are not the same computation:
+    /// one journal in transaction order against one journal per sublist
+    /// against the parent, merged in sublist order. They agree because the
+    /// sublists here are independent -- which is a condition of the block's
+    /// validity, not an accident of the fixture.
+    ///
+    /// The replay over testnet is the real evidence; this is here so that a
+    /// regression shows up without a 200 GB snapshot.
+    #[test]
+    fn a_split_block_executes_the_same_on_one_thread_and_on_two() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        // Three senders, so that no two transactions share a nonce and the
+        // sublists have nothing in common: same-sender transactions are
+        // connected by the nonce and would have to share a sublist.
+        let senders: Vec<Address> =
+            (1u8..=3).map(|n| Address::repeat_byte(0x10 + n)).collect();
+        let recipients: Vec<Address> =
+            (1u8..=3).map(|n| Address::repeat_byte(0xA0 + n)).collect();
+
+        let mut root = TrieNode::empty();
+        for s in &senders {
+            root = put_account(&root, store.as_ref(), s, 0, U256::from(10_000_000_000_000u64));
+        }
+
+        let mut header = dummy_header(8_000_000); // testnet reed810 is 7_139_600
+        // Two parallel sublists -- {tx0} and {tx1} -- and tx2 sequential.
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1, 2]),
+            base_event: None,
+        });
+
+        let transactions: Vec<(rustock_core::Transaction, Address)> = (0..3)
+            .map(|i| {
+                (
+                    rustock_core::Transaction {
+                        nonce: 0,
+                        gas_price: U256::from(1_000),
+                        gas_limit: U256::from(30_000),
+                        to: Bytes::copy_from_slice(recipients[i].as_slice()),
+                        value: U256::from(1_000),
+                        input: Bytes::new(),
+                        v: 0,
+                        r: U256::ZERO,
+                        s: U256::ZERO,
+                        cached_rlp: None,
+                    },
+                    senders[i],
+                )
+            })
+            .collect();
+
+        let run = |threads: usize| {
+            // Testnet, above reed810: a header cannot carry edges on a chain
+            // where RSKIP-144 is unscheduled, and the parallel path requires
+            // the postponed fee settlement that comes with it.
+            let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store.clone())
+                .with_execution_threads(threads);
+            let result = executor
+                .execute_block(&header, &transactions, &root, store.clone())
+                .expect("block executes");
+            let applied = result.applied_root.clone().unwrap_or_else(|| {
+                crate::state::apply_state_changes(
+                    &root,
+                    store.as_ref(),
+                    &result.state_changes,
+                    &result.markers,
+                )
+            });
+            let mut balances: Vec<(Address, U256, u64)> = result
+                .state_changes
+                .iter()
+                .map(|(a, acc)| (*a, acc.info.balance, acc.info.nonce))
+                .collect();
+            balances.sort_by_key(|(a, _, _)| *a);
+            (
+                applied.compute_hash(store.as_ref()),
+                result.gas_used,
+                result.paid_fees,
+                result.tx_results.iter().map(|r| (r.success, r.gas_used)).collect::<Vec<_>>(),
+                balances,
+            )
+        };
+
+        let one = run(1);
+        let two = run(2);
+        assert_eq!(one.3, two.3, "per-transaction results");
+        assert_eq!(one.1, two.1, "gas used");
+        assert_eq!(one.2, two.2, "paid fees");
+        assert_eq!(one.4, two.4, "account balances");
+        assert_eq!(one.0, two.0, "state root");
+        assert_eq!(one.3.len(), 3, "every transaction ran exactly once");
+    }
+
+    /// Two transactions from the same sender, placed in different parallel
+    /// sublists. This is the race RSKIP-144 exists to forbid, and it must be
+    /// caught when the sublists really do run apart.
+    ///
+    /// Each sublist runs against the state the block starts from, so both
+    /// transactions see nonce 0 and both succeed -- which is precisely the
+    /// problem, and why the rule is a condition on the block rather than
+    /// something sequential execution would have noticed.
+    #[test]
+    fn a_block_whose_sublists_share_a_sender_is_caught_in_parallel() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+        let sender = Address::repeat_byte(0x11);
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10_000_000_000_000u64),
+        );
+
+        let mut header = dummy_header(8_000_000);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1, 2]),
+            base_event: None,
+        });
+
+        let tx = |nonce: u64, to: u8| rustock_core::Transaction {
+            nonce,
+            gas_price: U256::from(1_000),
+            gas_limit: U256::from(30_000),
+            to: Bytes::copy_from_slice(Address::repeat_byte(to).as_slice()),
+            value: U256::from(1_000),
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        // tx0 in sublist 0 and tx1 in sublist 1, both from `sender`, both
+        // with nonce 0 -- which is what each of them sees, each running
+        // against the state the block starts from. A miner would never build
+        // this; the validator still has to refuse it.
+        let transactions = vec![
+            (tx(0, 0xA1), sender),
+            (tx(0, 0xA2), sender),
+            (tx(0, 0xA3), Address::repeat_byte(0x22)),
+        ];
+
+        let edges = [1i16, 2];
+        crate::collision::start(
+            &edges,
+            &[],
+            crate::collision::write_semantics(header.number),
+        );
+        let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store)
+            .with_execution_threads(2);
+        let _ = executor.execute_block(&header, &transactions, &root, store);
+        let collision = crate::collision::finish()
+            .expect("recording was started")
+            .first_collision()
+            .expect("both sublists write the sender's account cell");
+
+        assert_eq!(collision.kind, crate::collision::CollisionKind::WriteWrite);
+        assert_eq!(
+            collision.key,
+            rustock_trie::account_key(&sender),
+            "the nonce is what connects them, and it lives in the account cell"
+        );
+    }
+
+    /// The thread setting only decides *how*, never *whether*: a block with
+    /// no sublists runs as one however many threads are allowed.
+    #[test]
+    fn a_block_without_sublists_ignores_the_thread_count() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+        let sender = Address::repeat_byte(0x11);
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10_000_000_000_000u64),
+        );
+        let header = dummy_header(8_000_000); // version_fields: None
+        let transactions = vec![(
+            rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(1_000),
+                gas_limit: U256::from(30_000),
+                to: Bytes::copy_from_slice(Address::repeat_byte(0xA1).as_slice()),
+                value: U256::from(1_000),
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            },
+            sender,
+        )];
+        for threads in [1usize, 2] {
+            let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store.clone())
+                .with_execution_threads(threads);
+            let result = executor
+                .execute_block(&header, &transactions, &root, store.clone())
+                .expect("block executes");
+            assert!(
+                result.applied_root.is_none(),
+                "a block with no sublists is one run, so the caller applies it ({threads} threads)"
+            );
+        }
     }
 
     /// Verifies that the beneficiary (coinbase) receives gas fees in state changes.

@@ -43,6 +43,12 @@ pub enum ProcessError {
     /// this cannot be legitimate however the block was produced.
     #[error("supply increased by {created} wei in block #{number}: native BTC created from nothing")]
     SupplyCreated { number: u64, created: alloy_primitives::U256 },
+    /// RSKIP-144: two parallel sublists touched the same key, with at least
+    /// one of them writing it. The block's transactions cannot be split the
+    /// way its header says they were, so the block is invalid -- rskj's
+    /// `BlockExecutor.executeParallel` abandons it at the same point.
+    #[error("block #{number} is invalid under RSKIP-144: {collision}")]
+    SublistCollision { number: u64, collision: crate::collision::Collision },
     #[error("storage error: {0}")]
     Storage(#[from] anyhow::Error),
 }
@@ -156,6 +162,22 @@ impl BlockProcessor {
     /// Latency only: the cache is filled solely from reads consensus already
     /// performed and holds no negative entries, so a node with it and a node
     /// without it read the same trie nodes and reach the same answers.
+    /// How many threads a block's parallel sublists may use. See
+    /// [`crate::RskExecutor::with_execution_threads`].
+    pub fn with_execution_threads(mut self, threads: usize) -> Self {
+        self.executor = std::mem::replace(
+            &mut self.executor,
+            RskExecutor::new(self.hardfork_cfg.clone(), self.block_store.clone()),
+        )
+        .with_execution_threads(threads);
+        self
+    }
+
+    /// The thread count in force, after clamping.
+    pub fn execution_threads(&self) -> usize {
+        self.executor.execution_threads()
+    }
+
     pub fn with_btc_block_cache(
         mut self,
         cache: std::sync::Arc<crate::bridge::btc_block_cache::BtcBlockCache>,
@@ -223,17 +245,6 @@ impl BlockProcessor {
             .zip(tx_senders.iter().copied())
             .collect();
 
-        let exec_result = self.executor.execute_block(
-            header,
-            &transactions,
-            state_root,
-            trie_store.clone(),
-        )?;
-
-        let mut receipts = Vec::with_capacity(exec_result.tx_results.len());
-        let mut cumulative_gas = 0u64;
-        let mut block_bloom = Bloom::ZERO;
-
         // RSKIP-144: a block whose transactions are split across sublists
         // accumulates gas *per sublist*, not across the block. `edges` holds
         // the index each sublist after the first begins at, so the running
@@ -249,6 +260,56 @@ impl BlockProcessor {
             .as_ref()
             .and_then(|v| v.edges.as_deref())
             .unwrap_or(&[]);
+
+        // The sublists also have to be *independent*, and that is a rule the
+        // validator applies rather than a property it may assume. Recording
+        // is started only for a block that actually splits, so every block
+        // mainnet has produced -- reed810 is unscheduled there, and the field
+        // is absent or empty throughout -- pays nothing for it.
+        let check_collisions =
+            self.hardfork_cfg.has_rskip144(header.number) && !sublist_starts.is_empty();
+        if check_collisions {
+            // No address is excluded on account of fees any more. The fees
+            // are postponed whenever RSKIP-144 is active -- which is whenever
+            // this check runs -- and settled once at the REMASC transaction,
+            // which is in the sequential set. So no parallel sublist writes
+            // REMASC's account cell on their account, and excluding it would
+            // only hide a genuine transfer to the Bridge's counterpart that
+            // rskj does record.
+            //
+            // Before the fees were postponed this exclusion was mandatory:
+            // every sublist credited REMASC per transaction, and every
+            // testnet block that splits was rejected write-write, starting at
+            // #7,690,880.
+            crate::collision::start(
+                sublist_starts,
+                &[],
+                crate::collision::write_semantics(header.number),
+            );
+        }
+
+        let exec_result = self.executor.execute_block(
+            header,
+            &transactions,
+            state_root,
+            trie_store.clone(),
+        );
+        // Taken whether or not execution succeeded, so a failure cannot leave
+        // this block's keys behind for the next one to trip over.
+        let collisions = crate::collision::finish();
+        let mut exec_result = exec_result?;
+        if let Some(collision) = collisions.as_ref().and_then(|t| t.first_collision()) {
+            tracing::warn!(
+                target: "rustock::execution",
+                number = header.number, hash = %header.hash(),
+                "RSKIP-144 collision: {collision}; block rejected"
+            );
+            return Err(ProcessError::SublistCollision { number: header.number, collision });
+        }
+
+        let mut receipts = Vec::with_capacity(exec_result.tx_results.len());
+        let mut cumulative_gas = 0u64;
+        let mut block_bloom = Bloom::ZERO;
 
         for (i, tx_result) in exec_result.tx_results.iter().enumerate() {
             cumulative_gas = next_cumulative_gas(cumulative_gas, i, tx_result.gas_used, sublist_starts);
@@ -296,12 +357,19 @@ impl BlockProcessor {
             return Err(ProcessError::SupplyCreated { number: header.number, created });
         }
 
-        let mut new_state_root = apply_state_changes(
-            state_root,
-            trie_store.as_ref(),
-            &exec_result.state_changes,
-            &exec_result.markers,
-        );
+        // A block whose sublists ran separately applied itself: each
+        // sublist's changes are committed in sublist order, because that
+        // ordering is what gives the sequential sublist a state to start
+        // from. Re-applying the merged result here would not reproduce it.
+        let mut new_state_root = match exec_result.applied_root.take() {
+            Some(root) => root,
+            None => apply_state_changes(
+                state_root,
+                trie_store.as_ref(),
+                &exec_result.state_changes,
+                &exec_result.markers,
+            ),
+        };
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
         new_state_root.save(trie_store.as_ref(), true);
         // Reload the root lazily: children become hash references resolved on

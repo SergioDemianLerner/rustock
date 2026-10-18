@@ -44,6 +44,7 @@ use revm::interpreter::interpreter_action::FrameInit;
 use revm::interpreter::{CallOutcome, CreateOutcome, InstructionResult, InterpreterAction};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, Bytes, U256};
+use revm::inspector::JournalExt;
 use revm::state::EvmState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -66,7 +67,21 @@ pub struct RskHandler<CTX, ERROR, FRAME> {
     /// leftover refund and REMASC receives gasLimit * gasPrice — while the
     /// receipt stays SUCCESS with only the spent gas (mainnet #764,123:
     /// receipt 47,408 gas, fee charged for the full 1,000,000 limit).
-    invisible_exception: Arc<AtomicBool>,
+invisible_exception: Arc<AtomicBool>,
+    /// Accumulate the fee instead of crediting it to the beneficiary.
+    ///
+    /// rskj builds every sublist executor with `postponeFeePayment = true`
+    /// once RSKIP-144 is active, and settles the block's whole fee total into
+    /// REMASC just before the REMASC transaction
+    /// (`TransactionListExecutor.addFeesToRemascIfEnabled`). Before RSKIP-144
+    /// it credits per transaction (`postponeFeePayment = false`), which is
+    /// what this node always did.
+    ///
+    /// The end state is the same either way -- the same total reaches the
+    /// same account before anything can observe it, since REMASC is the last
+    /// transaction. What differs is what a transaction *earlier* in the block
+    /// sees if it reads REMASC's balance.
+    postpone_fees: bool,
     /// Pre-RSKIP150 (twoToThree, mainnet 2_018_000): rskj's
     /// `Program.callToPrecompiledAddress` saves a successful precompile's
     /// FULL output to the caller's memory at outOffs (`memorySave`, NOT
@@ -112,6 +127,13 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         )
     }
 
+    /// Hold the block's fees back from the beneficiary, to be settled at the
+    /// REMASC transaction. See the field.
+    pub fn postponing_fees(mut self, postpone: bool) -> Self {
+        self.postpone_fees = postpone;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn with_rskip125(
         empty_create_on_unpayable_deposit: bool,
@@ -128,6 +150,8 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             pre_rskip150_precompiles,
             active_precompiles,
             rskip171_active,
+            // Per-transaction, as before RSKIP-144; `postponing_fees` opts in.
+            postpone_fees: false,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -142,7 +166,11 @@ impl<CTX, ERROR, FRAME> Default for RskHandler<CTX, ERROR, FRAME> {
 impl<EVM, ERROR> Handler for RskHandler<EVM, ERROR, EthFrame<EthInterpreter>>
 where
     EVM: EvmTr<
-        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        // `JournalExt` is what exposes the entry log, and it is the bound
+        // revm's own inspectors carry. RSKIP-144 collision tracking needs it
+        // for the same reason: a write is only visible while it still stands,
+        // and a revert pops the entry that recorded it.
+        Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
         Frame = EthFrame<EthInterpreter>,
         Instructions: InstructionProvider<
             Context = <EVM as EvmTr>::Context,
@@ -195,6 +223,11 @@ where
     ) -> Result<(), Self::Error> {
         use revm::context_interface::journaled_state::account::JournaledAccountTr;
         use revm::context_interface::{Block, Transaction};
+        if self.postpone_fees {
+            // The executor accumulates the same total and settles it at the
+            // REMASC transaction, as rskj does once RSKIP-144 is active.
+            return Ok(());
+        }
         if !self.invisible_exception.load(Ordering::Relaxed) {
             // rskj routes the WHOLE tx fee (gasUsed * gasPrice) to REMASC (the
             // block beneficiary) — RSK never adopted EIP-1559, so no base fee is
@@ -316,7 +349,10 @@ where
                                     init.depth
                                 );
                             }
-                            if let Some(result) = evm.frame_return_result(synth)? {
+                            note_attempted_writes(evm);
+                            let returned = evm.frame_return_result(synth)?;
+                            forget_reverted_entries(evm);
+                            if let Some(result) = returned {
                                 return Ok(result);
                             }
                             if let Some(buffer) = preserved_return_buffer {
@@ -419,7 +455,13 @@ where
                     outcome.result.gas.set_refund(0);
                 }
             }
-            if let Some(result) = evm.frame_return_result(result)? {
+            // RSKIP-144: a frame that fails is about to have its journal
+            // entries popped, so the writes it attempted are read off here
+            // while they still stand.
+            note_attempted_writes(evm);
+            let returned = evm.frame_return_result(result)?;
+            forget_reverted_entries(evm);
+            if let Some(result) = returned {
                 return Ok(result);
             }
             if let Some((mem_start, output)) = unbounded_output {
@@ -432,6 +474,40 @@ where
             }
         }
     }
+}
+
+/// Hands the journal's entries to the RSKIP-144 collision tracker.
+///
+/// Called immediately before every point that can revert a checkpoint. Under
+/// the deployed write semantics a reverted write still counts, and revm
+/// records a write by pushing an entry and undoes it by popping that entry,
+/// so this is the last moment the write exists.
+///
+/// Inert unless a block declared sublist edges *and* attempted writes are
+/// being collected, which is a thread-local load on a path that is otherwise
+/// untouched.
+fn note_attempted_writes<EVM>(evm: &mut EVM)
+where
+    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>>,
+{
+    if !crate::collision::records_attempted_writes() {
+        return;
+    }
+    let journal = evm.ctx().journal_mut();
+    crate::collision::note_journal_entries(journal.journal(), journal.evm_state());
+}
+
+/// Pulls the tracker's entry mark back down to what survived the revert, so
+/// entries appended afterwards are read exactly once.
+fn forget_reverted_entries<EVM>(evm: &mut EVM)
+where
+    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>>,
+{
+    if !crate::collision::records_attempted_writes() {
+        return;
+    }
+    let len = evm.ctx().journal_mut().journal().len();
+    crate::collision::forget_entries_above(len);
 }
 
 /// `EvmTr::frame_run` with the create-return path replaced by

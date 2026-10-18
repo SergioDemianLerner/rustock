@@ -874,7 +874,28 @@ impl Decodable for RskMessage {
                     uncles.push(Header::decode_with_hash(&mut uncles_body)?);
                 }
 
-                // Skip optional BlockHeaderExtension (we don't need it for body storage)
+                // The optional BlockHeaderExtension is skipped, and that is a
+                // rule rather than a convenience.
+                //
+                // From RSKIP-351 a header can carry its bloom, execution
+                // edges and base event as a commitment -- `RLP[version,
+                // keccak(extension)]` -- instead of the literal fields. The
+                // block hash covers that commitment, so those fields are
+                // bound to the block only while they travel *inside* the
+                // header, which is the form this decoder receives and the
+                // form `Header::encode_base_fields` hashes.
+                //
+                // An extension delivered here arrives beside the header with
+                // nothing tying it to that commitment. Attaching it would
+                // leave the block holding fields no miner committed to while
+                // its hash still matched, and a block stored that way would
+                // re-decode to a different hash than it was filed under.
+                //
+                // So: this is discarded because it is unbound, not because it
+                // is unneeded. If a later change does need it -- serving
+                // light clients, or filling a bloom without executing -- it
+                // must first pass `Header::accepts_extension`, which exists
+                // for this and is otherwise unused.
 
                 RskSubMessage::BodyResponse(BodyResponse { id, transactions, uncles })
             }

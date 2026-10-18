@@ -79,8 +79,29 @@ impl PeerChunkTracker {
     }
 
     /// Buffers a response for the given chunk index, remembering its source.
-    pub fn buffer_response(&mut self, peer: B512, chunk_idx: usize, headers: Vec<Header>) {
-        self.buffered.insert(chunk_idx, (peer, headers));
+    /// Returns false if the slot was already filled, leaving it untouched.
+    ///
+    /// First answer wins. Overwriting would let a later response displace an
+    /// earlier one for the same chunk, which is how one peer's work replaces
+    /// another's after both were asked.
+    pub fn buffer_response(&mut self, peer: B512, chunk_idx: usize, headers: Vec<Header>) -> bool {
+        match self.buffered.entry(chunk_idx) {
+            std::collections::btree_map::Entry::Occupied(_) => false,
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert((peer, headers));
+                true
+            }
+        }
+    }
+
+    /// Whether this peer has any chunk request outstanding.
+    ///
+    /// Header responses are matched to skeleton entries by content rather
+    /// than by a request id, so without this a peer that was never asked can
+    /// supply a chunk simply by sending headers that end on a skeleton
+    /// boundary -- which every peer can compute.
+    pub fn has_outstanding(&self, peer: &B512) -> bool {
+        self.in_flight.get(peer).is_some_and(|q| !q.is_empty())
     }
 
     /// Drains all consecutive ready chunks starting from `next_to_process`.
@@ -130,5 +151,55 @@ impl PeerChunkTracker {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod peer_binding_tests {
+    use super::*;
+
+    /// Header responses are matched to skeleton entries by content, which
+    /// says *which* chunk a response is for but nothing about who was
+    /// entitled to answer. Every peer can work out where the skeleton
+    /// boundaries fall, so without an explicit test of outstanding requests
+    /// any connected peer could supply a chunk.
+    #[test]
+    fn a_peer_with_no_request_outstanding_is_not_owed_a_chunk() {
+        let mut t = PeerChunkTracker::new(4);
+        let asked = B512::repeat_byte(1);
+        let stranger = B512::repeat_byte(2);
+
+        t.in_flight.entry(asked).or_default().push_back(1);
+
+        assert!(t.has_outstanding(&asked));
+        assert!(!t.has_outstanding(&stranger), "nothing was asked of this peer");
+    }
+
+    /// A peer whose queue has drained is in the same position as one never
+    /// asked: its earlier request has already been answered.
+    #[test]
+    fn a_drained_queue_leaves_nothing_outstanding() {
+        let mut t = PeerChunkTracker::new(4);
+        let peer = B512::repeat_byte(1);
+        t.in_flight.entry(peer).or_default().push_back(1);
+
+        assert_eq!(t.identify_response(&peer), Some(1));
+        assert!(!t.has_outstanding(&peer));
+    }
+
+    /// First answer wins. Two peers can hold a request for the same chunk --
+    /// after a retry -- and the later answer must not displace the stored one.
+    #[test]
+    fn a_filled_chunk_slot_is_not_overwritten() {
+        let mut t = PeerChunkTracker::new(4);
+        let first = B512::repeat_byte(1);
+        let second = B512::repeat_byte(2);
+
+        assert!(t.buffer_response(first, 1, Vec::new()));
+        assert!(!t.buffer_response(second, 1, Vec::new()), "slot already filled");
+
+        let ready = t.drain_ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].1, first, "the first answer is the one kept");
     }
 }

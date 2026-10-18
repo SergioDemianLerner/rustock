@@ -380,7 +380,7 @@ impl SnapDriver {
         grid: u64,
         peers: &[B512],
     ) -> Vec<Outbound> {
-        if !self.answers(id, |p| matches!(p, Pending::Status)) {
+        if !self.answers(id, sender, |p| matches!(p, Pending::Status)) {
             return Vec::new();
         }
         self.session.note_in_flight(self.in_flight.len());
@@ -396,9 +396,10 @@ impl SnapDriver {
         headers: &[Header],
         peers: &[B512],
     ) -> Vec<Outbound> {
-        let Some(Pending::Headers { point, .. }) =
-            self.in_flight.get(&id).map(|r| r.what)
-        else {
+        let Some(point) = self.in_flight.get(&id).and_then(|r| match r.what {
+            Pending::Headers { point, .. } if r.peer == sender => Some(point),
+            _ => None,
+        }) else {
             return Vec::new();
         };
         self.in_flight.remove(&id);
@@ -422,9 +423,10 @@ impl SnapDriver {
         entries: &[rustock_networking::protocol::HeaderWithUncles],
         peers: &[B512],
     ) -> Vec<Outbound> {
-        let Some(Pending::Headers { point, .. }) =
-            self.in_flight.get(&id).map(|r| r.what)
-        else {
+        let Some(point) = self.in_flight.get(&id).and_then(|r| match r.what {
+            Pending::Headers { point, .. } if r.peer == sender => Some(point),
+            _ => None,
+        }) else {
             return Vec::new();
         };
         self.in_flight.remove(&id);
@@ -443,7 +445,7 @@ impl SnapDriver {
         identifiers: &[BlockIdentifier],
         peers: &[B512],
     ) -> Vec<Outbound> {
-        if !self.answers(id, |p| matches!(p, Pending::Skeleton { .. })) {
+        if !self.answers(id, sender, |p| matches!(p, Pending::Skeleton { .. })) {
             return Vec::new();
         }
         self.session.note_in_flight(self.in_flight.len());
@@ -464,6 +466,13 @@ impl SnapDriver {
         refusal: Refusal,
         peers: &[B512],
     ) -> Vec<Outbound> {
+        if self.in_flight.get(&id).is_some_and(|r| r.peer != sender) {
+            debug!(
+                target: "rustock::snap",
+                "chunk {id} answered by {:?}, which was not asked", &sender.0[..4]
+            );
+            return Vec::new();
+        }
         let Some(request) = self.in_flight.remove(&id) else {
             debug!(target: "rustock::snap", "chunk answer to unknown request {id}");
             return Vec::new();
@@ -474,9 +483,10 @@ impl SnapDriver {
             return Vec::new();
         };
 
-        // Taken from whoever sent it, not only from the peer it was asked of:
-        // a valid chunk is valid whatever its route, and the download would
-        // rather have it. The sender is what matters for what follows.
+        // Taken only from the peer it was asked of. A chunk is verified
+        // before it is used, so a stray one cannot corrupt the download --
+        // but accepting it would still let an unasked peer consume the
+        // request and leave the genuine answer to be dropped as unknown.
         self.session.note_in_flight(self.in_flight.len());
 
         // The chunk that completes the download also verifies it, and that
@@ -506,7 +516,7 @@ impl SnapDriver {
         difficulties: &[U256],
         peers: &[B512],
     ) -> Vec<Outbound> {
-        if !self.answers(id, |p| matches!(p, Pending::Blocks)) {
+        if !self.answers(id, sender, |p| matches!(p, Pending::Blocks)) {
             return Vec::new();
         }
         self.session.note_in_flight(self.in_flight.len());
@@ -516,8 +526,24 @@ impl SnapDriver {
     }
 
     /// Consumes an outstanding request if it is the kind expected.
-    fn answers(&mut self, id: u64, want: impl Fn(Pending) -> bool) -> bool {
+    /// Whether `id` is an outstanding request of the wanted kind that
+    /// `sender` was actually asked. Consumes it when so.
+    ///
+    /// The sender is part of the match, not a detail: a request is addressed
+    /// to one peer, and an answer from anyone else is unsolicited however
+    /// well-formed it looks. Request ids are random, so a third party cannot
+    /// realistically land on one -- but then the binding rests on a property
+    /// of the id generator rather than on this code, and would fall silently
+    /// if that generator ever changed.
+    fn answers(&mut self, id: u64, sender: B512, want: impl Fn(Pending) -> bool) -> bool {
         match self.in_flight.get(&id) {
+            Some(request) if request.peer != sender => {
+                debug!(
+                    target: "rustock::snap",
+                    "request {id} answered by {:?}, which was not asked", &sender.0[..4]
+                );
+                false
+            }
             Some(request) if want(request.what) => {
                 self.in_flight.remove(&id);
                 true

@@ -275,6 +275,19 @@ struct Args {
     #[arg(long, value_name = "MODE", default_value = "both")]
     supply_check: String,
 
+    /// How many threads may execute a block's parallel sublists (RSKIP-144).
+    ///
+    /// 1 runs every transaction in order on one thread, which is what every
+    /// block on a chain without RSKIP-144 does regardless of this setting --
+    /// a block only splits if its header says so. Above 1, the sublists a
+    /// block declares run concurrently and are merged in sublist order; the
+    /// sequential sublist always runs last, on the merged state.
+    ///
+    /// RSKIP-144 caps a block at two parallel sublists, so values above 2
+    /// buy nothing and are clamped.
+    #[arg(long, value_name = "N", default_value = "1")]
+    execution_threads: usize,
+
     /// Build the Bridge event index from stored receipts and exit.
     ///
     /// Indexes every log the Bridge emitted, keyed by event signature, so
@@ -1112,6 +1125,8 @@ fn apply_file_config(
     apply_opt(matches, "secret_key", f.node.secret_key.as_ref(), &mut a.secret_key);
     apply_opt(matches, "external_ip", f.node.external_ip.as_ref(), &mut a.external_ip);
     apply(matches, "supply_check", f.node.supply_check.as_ref(), &mut a.supply_check);
+    apply(matches, "execution_threads", f.node.execution_threads.as_ref(),
+        &mut a.execution_threads);
     apply(matches, "read_only", f.node.read_only.as_ref(), &mut a.read_only);
     apply(matches, "follow_up", f.node.follow_up.as_ref(), &mut a.follow_up);
     apply_opt(matches, "simulate_height", f.node.simulate_height.as_ref(), &mut a.simulate_height);
@@ -2200,7 +2215,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     if let Some(cache) = &btc_block_cache {
         block_processor = block_processor.with_btc_block_cache(cache.clone());
     }
-    info!("Block processor wired (hardfork config: {:?})", hardfork_cfg);
+    block_processor = block_processor.with_execution_threads(args.execution_threads);
+    info!(
+        "Block processor wired (hardfork config: {:?}, execution threads: {})",
+        hardfork_cfg,
+        block_processor.execution_threads()
+    );
 
     if let Some(count) = args.measure_block_reads {
         // Re-execute recent blocks and record what each one had to be given.

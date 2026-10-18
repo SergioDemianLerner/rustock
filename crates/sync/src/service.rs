@@ -538,7 +538,10 @@ pub struct SyncService {
     /// it left, and execution stopped for good. Worse, two separate recovery
     /// paths check this map for in-flight work and stand down when it is
     /// non-empty, so a single stuck entry disabled both of them.
-    pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header, Instant)>,
+    ///
+    /// Carries the peer each request was sent to, so the answer can be
+    /// matched against it.
+    pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header, Instant, B512)>,
     /// Blocks whose body was derived from the header rather than requested.
     /// Counted so the saving can be checked against an offline prediction.
     pub(crate) derived_bodies: u64,
@@ -1765,7 +1768,7 @@ impl SyncService {
     fn expire_stale_follow_bodies(&mut self) {
         let before = self.pending_follow_bodies.len();
         self.pending_follow_bodies
-            .retain(|_, (_, _, sent)| sent.elapsed() < FOLLOW_BODY_TIMEOUT);
+            .retain(|_, (_, _, sent, _)| sent.elapsed() < FOLLOW_BODY_TIMEOUT);
         let expired = before - self.pending_follow_bodies.len();
         if expired > 0 {
             warn!(
@@ -2314,7 +2317,7 @@ impl SyncService {
 
         // Follow-mode body requests are outstanding work in any state.
         count += self.pending_follow_bodies.len();
-        for (_, _, sent) in self.pending_follow_bodies.values() {
+        for (_, _, sent, _) in self.pending_follow_bodies.values() {
             note(*sent);
         }
 
@@ -3542,12 +3545,31 @@ impl SyncService {
                 // The highest block number in the response should match a skeleton entry.
                 let chunk_idx = identify_chunk_by_content(&headers, &skeleton);
 
+                // A chunk is only taken from a peer that was actually asked
+                // for one. Content matching alone identifies *which* chunk a
+                // response belongs to, not *who* was entitled to answer: any
+                // connected peer can compute where the skeleton boundaries
+                // fall and send headers ending on one.
+                let solicited = tracker.has_outstanding(&peer);
                 // Consume the FIFO entry for this peer regardless (keeps queue aligned)
                 let _ = tracker.identify_response(&peer);
 
                 match chunk_idx {
-                    Some(idx) if idx < tracker.total_chunks => {
-                        tracker.buffer_response(peer, idx, headers);
+                    Some(idx) if idx < tracker.total_chunks && solicited => {
+                        if !tracker.buffer_response(peer, idx, headers) {
+                            debug!(
+                                target: "rustock::sync",
+                                "Chunk {} already answered; ignoring the copy from {:?}",
+                                idx, &peer.0[..4]
+                            );
+                        }
+                    }
+                    Some(_) if !solicited => {
+                        debug!(
+                            target: "rustock::sync",
+                            "Headers from {:?}, which has no chunk request outstanding; ignoring",
+                            &peer.0[..4]
+                        );
                     }
                     _ => {
                         // Response doesn't match any skeleton entry. This happens when
@@ -4142,7 +4164,7 @@ impl SyncService {
                 let peer = &peers[0];
                 self.peer_store.send_to_peer(peer, msg).await;
                 self.pending_follow_bodies
-                    .insert(req_id, (hash, header.clone(), Instant::now()));
+                    .insert(req_id, (hash, header.clone(), Instant::now(), *peer));
             }
         }
     }
@@ -4258,7 +4280,7 @@ impl SyncService {
             // disconnected): the reclaim timeout re-sends it. Dropping it here
             // would orphan the block and the batch could never finish.
             in_flight.insert(idx, InFlightBody { req_id, sent: Instant::now(), peer });
-            id_index.insert(req_id, idx);
+            id_index.insert(req_id, (idx, peer));
             // Counted here rather than on a successful send, because the
             // request is tracked here either way: a send that failed is
             // still outstanding and still waiting on the reclaim timeout.
@@ -4340,7 +4362,7 @@ impl SyncService {
             // Point this block at the new request, but keep the old id in
             // `id_index` so a late response to it still lands.
             in_flight.insert(idx, InFlightBody { req_id, sent: Instant::now(), peer });
-            id_index.insert(req_id, idx);
+            id_index.insert(req_id, (idx, peer));
             *load.entry(peer).or_default() += 1;
         }
         info!(
@@ -4421,8 +4443,31 @@ impl SyncService {
             } => {
                 // Route via id_index, which keeps superseded request ids mapped
                 // so a late response to a retried request still applies.
-                let idx = match id_index.remove(&request_id) {
-                    Some(i) => i,
+                // A body is taken only from the peer the request was sent to.
+                // The id is unguessable, so this is belt-and-braces -- but it
+                // is the check that keeps the binding true if the id ever
+                // stops being random.
+                let idx = match id_index.get(&request_id) {
+                    Some((i, asked)) if *asked == peer => {
+                        let i = *i;
+                        id_index.remove(&request_id);
+                        i
+                    }
+                    Some(_) => {
+                        debug!(
+                            target: "rustock::sync",
+                            "Body for request {} came from {:?}, which was not asked; ignoring",
+                            request_id, &peer.0[..4]
+                        );
+                        self.state = SyncState::DownloadingBodies {
+                            peer_best,
+                            pending_headers,
+                            next_request,
+                            in_flight,
+                            id_index,
+                        };
+                        return;
+                    }
                     None => {
                         debug!(
                             target: "rustock::sync",
@@ -4444,8 +4489,10 @@ impl SyncService {
                 // it. Otherwise it's a duplicate of an already-stored block (an
                 // earlier retry already landed) → drop silently, no re-fetch.
                 if let Some(req) = in_flight.remove(&idx) {
-                    // The peer answered → it's responsive, clear its strikes.
-                    self.body_peer_strikes.remove(&req.peer);
+                    // The peer that answered is responsive, so its strikes go.
+                    // Crediting the peer the request was sent to would clear
+                    // strikes it has not earned.
+                    self.body_peer_strikes.remove(&peer);
                     let (hash, header) = &pending_headers[idx];
 
                     // Does this body belong to that header? Receipt is the one
@@ -4457,7 +4504,7 @@ impl SyncService {
                     {
                         self.charge_bad_body(peer, header.number, what);
                         in_flight.insert(idx, req);
-                        id_index.insert(request_id, idx);
+                        id_index.insert(request_id, (idx, peer));
                         self.state = SyncState::DownloadingBodies {
                             peer_best,
                             pending_headers,
@@ -4521,7 +4568,18 @@ impl SyncService {
             }
             SyncState::Following => {
                 self.state = SyncState::Following;
-                if let Some((hash, header, sent)) = self.pending_follow_bodies.remove(&request_id) {
+                let asked = self.pending_follow_bodies.get(&request_id).map(|e| e.3);
+                if asked.is_some_and(|a| a != peer) {
+                    debug!(
+                        target: "rustock::sync",
+                        "Follow body for request {} came from {:?}, which was not asked; ignoring",
+                        request_id, &peer.0[..4]
+                    );
+                    return;
+                }
+                if let Some((hash, header, sent, _asked)) =
+                    self.pending_follow_bodies.remove(&request_id)
+                {
                     // Same check as the batch path, same reason.
                     if let Some(what) =
                         crate::body_check::body_mismatch(&header, &transactions, &uncles)
@@ -4530,7 +4588,7 @@ impl SyncService {
                         // Put it back so the follow-mode retry re-requests it;
                         // dropping the entry would strand the block instead.
                         self.pending_follow_bodies
-                            .insert(request_id, (hash, header, sent));
+                            .insert(request_id, (hash, header, sent, peer));
                         return;
                     }
                     self.body_providers.insert(header.number, peer);
