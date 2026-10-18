@@ -158,6 +158,22 @@ pub fn drain() -> Vec<SilentRecord> {
     })
 }
 
+/// Append records collected on another thread.
+///
+/// A sublist executing on a worker records into that thread's sink, and the
+/// coordinator's sink is where the tool is looking. Without this a parallel
+/// block would quietly record nothing.
+pub fn absorb(records: Vec<SilentRecord>) {
+    if records.is_empty() {
+        return;
+    }
+    SINK.with(|s| {
+        if let Some(v) = s.borrow_mut().as_mut() {
+            v.extend(records);
+        }
+    });
+}
+
 pub fn is_recording() -> bool {
     SINK.with(|s| s.borrow().is_some())
 }

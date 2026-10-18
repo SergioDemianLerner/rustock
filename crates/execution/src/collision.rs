@@ -86,6 +86,15 @@ impl CollisionTracker {
         }
     }
 
+    /// Union another tracker's sublists into this one, sublist by sublist.
+    pub fn absorb(&mut self, other: CollisionTracker) {
+        for (id, keys) in other.sublists.into_iter().enumerate() {
+            self.ensure(id);
+            self.sublists[id].read.extend(keys.read);
+            self.sublists[id].written.extend(keys.written);
+        }
+    }
+
     pub fn clear(&mut self) {
         self.sublists.clear();
         self.current = 0;
@@ -258,6 +267,70 @@ pub fn write_semantics(_block_number: u64) -> WriteSemantics {
 pub fn sublist_of(index: usize, edges: &[i16]) -> Option<SublistId> {
     let id = edges.iter().filter(|&&e| (e as usize) <= index).count();
     (id < edges.len()).then_some(id)
+}
+
+/// The block's transactions partitioned as its header declares: the parallel
+/// sublists in order, then the sequential set.
+///
+/// Kept beside [`sublist_of`] because the two must agree about where the
+/// boundaries are -- one decides what executes together, the other decides
+/// what is checked against what, and a disagreement would check the wrong
+/// pairs.
+pub fn sublist_ranges(
+    edges: &[i16],
+    tx_count: usize,
+) -> (Vec<std::ops::Range<usize>>, std::ops::Range<usize>) {
+    let mut parallel = Vec::with_capacity(edges.len());
+    let mut start = 0usize;
+    for &edge in edges {
+        let end = (edge.max(0) as usize).min(tx_count);
+        if end > start {
+            parallel.push(start..end);
+        }
+        start = start.max(end);
+    }
+    (parallel, start..tx_count)
+}
+
+/// How a recorder was configured, so a worker thread can be given the same.
+///
+/// The thread-local is per thread by design -- it is how rskj keys its own
+/// tracker -- which means a worker starts with nothing and the coordinator
+/// has to hand it the block's configuration.
+#[derive(Debug, Clone)]
+pub struct RecorderConfig {
+    edges: Vec<i16>,
+    excluded: Vec<Address>,
+    semantics: WriteSemantics,
+}
+
+/// This thread's recorder configuration, if it has one.
+pub fn config() -> Option<RecorderConfig> {
+    RECORDER.with(|r| {
+        r.borrow().as_ref().map(|rec| RecorderConfig {
+            edges: rec.edges.clone(),
+            excluded: rec.excluded.clone(),
+            semantics: rec.semantics,
+        })
+    })
+}
+
+/// Start recording on this thread with a configuration taken from another.
+pub fn start_from(config: RecorderConfig) {
+    start(&config.edges, &config.excluded, config.semantics);
+}
+
+/// Fold a worker's key sets into this thread's recorder.
+///
+/// Each worker only ever writes the sublist it ran, so the fold is a union
+/// over disjoint sublists. It is written as a union anyway, because a fold
+/// that silently depended on that would be a bad thing to be wrong about.
+pub fn absorb(other: CollisionTracker) {
+    RECORDER.with(|r| {
+        if let Some(rec) = r.borrow_mut().as_mut() {
+            rec.tracker.absorb(other);
+        }
+    });
 }
 
 /// Per-thread recorder, off unless a block asks for it.
