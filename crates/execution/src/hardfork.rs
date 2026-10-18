@@ -127,6 +127,13 @@ impl RskHardforkConfig {
     }
 
     /// First block at which `upgrade` activates, if it activates on this network.
+    ///
+    /// `None` is rskj's activation height of `-1`: the upgrade is not
+    /// scheduled here at all. The distinction matters for any upgrade a
+    /// network skips, because an ordinal `active_upgrade() >= X` reads a
+    /// *later* upgrade as implying `X` -- right for a chain that passed
+    /// through `X`, wrong for one that never scheduled it. See
+    /// `has_rskip144`.
     pub fn activation_height(&self, upgrade: RskNetworkUpgrade) -> Option<u64> {
         self.activations.iter().find(|(_, u)| *u == upgrade).map(|(h, _)| *h)
     }
@@ -568,22 +575,6 @@ impl RskHardforkConfig {
         block_number >= height
     }
 
-    /// The height at which `upgrade` is scheduled on this network, or `None`
-    /// when it is not scheduled at all.
-    ///
-    /// rskj spells "not scheduled" as an activation height of `-1`, which the
-    /// activation tables here spell as an absent entry. The distinction
-    /// matters for any upgrade a network skips: an ordinal
-    /// `active_upgrade() >= X` reads a *later* upgrade as implying `X`, which
-    /// is right for a chain that passed through `X` and wrong for one that
-    /// never scheduled it.
-    pub fn upgrade_height(&self, upgrade: RskNetworkUpgrade) -> Option<u64> {
-        self.activations
-            .iter()
-            .find(|(_, u)| *u == upgrade)
-            .map(|(h, _)| *h)
-    }
-
     /// RSKIP144: parallel transaction execution, and the
     /// `txExecutionSublistsEdges` header field that carries the sublist
     /// boundaries.
@@ -601,7 +592,7 @@ impl RskHardforkConfig {
     /// carry no sublist edges. The first thing to depend on it would have
     /// forked the node.
     pub fn has_rskip144(&self, block_number: u64) -> bool {
-        self.upgrade_height(RskNetworkUpgrade::Reed810)
+        self.activation_height(RskNetworkUpgrade::Reed810)
             .is_some_and(|h| block_number >= h)
     }
 
@@ -613,7 +604,7 @@ impl RskHardforkConfig {
     /// before it validates anything, so they are kept as two predicates even
     /// though they coincide.
     pub fn has_rskip351(&self, block_number: u64) -> bool {
-        self.upgrade_height(RskNetworkUpgrade::Reed810)
+        self.activation_height(RskNetworkUpgrade::Reed810)
             .is_some_and(|h| block_number >= h)
     }
 
@@ -734,10 +725,10 @@ mod fee_settlement_tests {
     fn a_later_mainnet_upgrade_does_not_imply_an_unscheduled_one() {
         let cfg = RskHardforkConfig::mainnet();
         let vetiver900 = cfg
-            .upgrade_height(RskNetworkUpgrade::Vetiver900)
+            .activation_height(RskNetworkUpgrade::Vetiver900)
             .expect("mainnet schedules vetiver900");
         assert_eq!(
-            cfg.upgrade_height(RskNetworkUpgrade::Reed810),
+            cfg.activation_height(RskNetworkUpgrade::Reed810),
             None,
             "mainnet must never schedule reed810"
         );
