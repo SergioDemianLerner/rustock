@@ -18,6 +18,7 @@
 
 pub mod dev;
 pub mod coinbase;
+pub mod partition;
 pub mod fork_detection;
 pub mod merkle;
 pub mod server;
