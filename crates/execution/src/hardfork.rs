@@ -119,9 +119,29 @@ impl RskHardforkConfig {
     }
 
     /// Creates a config where all upgrades are active from genesis (useful for testing).
+    ///
+    /// Note what this does **not** turn on: RSKIP-144 and RSKIP-351 are
+    /// gated on `reed810` being *scheduled*, and naming Vetiver900 alone
+    /// does not schedule it -- see `has_rskip144`. A test that wants
+    /// parallel sublists wants [`RskHardforkConfig::all_active_parallel`].
     pub fn all_active(chain_id: u64) -> Self {
         Self {
             activations: vec![(0, RskNetworkUpgrade::Vetiver900)],
+            chain_id,
+        }
+    }
+
+    /// `all_active`, and RSKIP-144 with it.
+    ///
+    /// Scheduling reed810 at zero is what mainnet does not do, so this is
+    /// the shape of a chain that partitions its blocks: everything on, and
+    /// the parallel sublists among it.
+    pub fn all_active_parallel(chain_id: u64) -> Self {
+        Self {
+            activations: vec![
+                (0, RskNetworkUpgrade::Reed810),
+                (0, RskNetworkUpgrade::Vetiver900),
+            ],
             chain_id,
         }
     }

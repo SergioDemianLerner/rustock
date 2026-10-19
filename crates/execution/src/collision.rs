@@ -49,6 +49,16 @@ pub struct SublistKeys {
     written: HashSet<Vec<u8>>,
 }
 
+impl SublistKeys {
+    pub fn read(&self) -> &HashSet<Vec<u8>> {
+        &self.read
+    }
+
+    pub fn written(&self) -> &HashSet<Vec<u8>> {
+        &self.written
+    }
+}
+
 /// Per-sublist key sets for one block.
 #[derive(Debug, Default, Clone)]
 pub struct CollisionTracker {
@@ -102,6 +112,11 @@ impl CollisionTracker {
 
     pub fn sublist_count(&self) -> usize {
         self.sublists.len()
+    }
+
+    /// What bucket `id` read and wrote, if it exists.
+    pub fn keys(&self, id: SublistId) -> Option<&SublistKeys> {
+        self.sublists.get(id)
     }
 
     /// The first collision between two sublists, if there is one.
@@ -307,10 +322,15 @@ pub struct RecorderConfig {
 /// This thread's recorder configuration, if it has one.
 pub fn config() -> Option<RecorderConfig> {
     RECORDER.with(|r| {
-        r.borrow().as_ref().map(|rec| RecorderConfig {
-            edges: rec.edges.clone(),
-            excluded: rec.excluded.clone(),
-            semantics: rec.semantics,
+        r.borrow().as_ref().and_then(|rec| match &rec.attribution {
+            Attribution::Sublists(edges) => Some(RecorderConfig {
+                edges: edges.clone(),
+                excluded: rec.excluded.clone(),
+                semantics: rec.semantics,
+            }),
+            // Per-transaction recording belongs to the thread building the
+            // block; there is nothing for a worker to inherit.
+            Attribution::PerTransaction => None,
         })
     })
 }
@@ -339,9 +359,21 @@ pub fn absorb(other: CollisionTracker) {
 /// threaded through `execute_block`, the handler and every precompile, and
 /// the consensus path is the code least worth disturbing for the sake of a
 /// check that is inert on every block mainnet has ever produced.
+/// What a recorded key is attributed to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Attribution {
+    /// The sublist running the transaction, as the header declares them.
+    /// This is validation: the question is whether two sublists collide.
+    Sublists(Vec<i16>),
+    /// One bucket per transaction. This is mining: the question is what each
+    /// transaction touched, because that is what decides where it goes, and
+    /// the partition does not exist yet to attribute to.
+    PerTransaction,
+}
+
 struct Recorder {
     tracker: CollisionTracker,
-    edges: Vec<i16>,
+    attribution: Attribution,
     semantics: WriteSemantics,
     /// Addresses whose account cell is written outside any sublist, so
     /// attributing it to one would invent a collision. See [`start`].
@@ -387,7 +419,7 @@ pub fn start(edges: &[i16], excluded: &[Address], semantics: WriteSemantics) {
     RECORDER.with(|r| {
         *r.borrow_mut() = Some(Recorder {
             tracker: CollisionTracker::new(),
-            edges: edges.to_vec(),
+            attribution: Attribution::Sublists(edges.to_vec()),
             semantics,
             excluded: excluded.to_vec(),
             sublist: None,
@@ -435,12 +467,33 @@ pub fn finish() -> Option<CollisionTracker> {
 pub fn begin_transaction(index: usize) {
     RECORDER.with(|r| {
         if let Some(rec) = r.borrow_mut().as_mut() {
-            rec.sublist = sublist_of(index, &rec.edges);
+            rec.sublist = match &rec.attribution {
+                Attribution::Sublists(edges) => sublist_of(index, edges),
+                Attribution::PerTransaction => Some(index),
+            };
             rec.entries_seen = 0;
             if let Some(id) = rec.sublist {
                 rec.tracker.set_sublist(id);
             }
         }
+    });
+}
+
+/// Start recording with one bucket per transaction, for the miner.
+///
+/// The partition is what the miner is about to decide, so there is nothing
+/// to attribute to yet. [`CollisionTracker::keys`] then reads back what each
+/// transaction touched, indexed by its position in the block.
+pub fn start_per_transaction(semantics: WriteSemantics) {
+    RECORDER.with(|r| {
+        *r.borrow_mut() = Some(Recorder {
+            tracker: CollisionTracker::new(),
+            attribution: Attribution::PerTransaction,
+            semantics,
+            excluded: Vec::new(),
+            sublist: None,
+            entries_seen: 0,
+        })
     });
 }
 

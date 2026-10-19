@@ -184,6 +184,13 @@ impl BlockProcessor {
         self
     }
 
+    /// The executor underneath, for a caller that needs a raw execution
+    /// rather than a validated block -- the miner's partition probe, which
+    /// wants each transaction's own result and none of the roots.
+    pub fn executor(&self) -> &RskExecutor {
+        &self.executor
+    }
+
     /// The thread count in force, after clamping.
     pub fn execution_threads(&self) -> usize {
         self.executor.execution_threads()
