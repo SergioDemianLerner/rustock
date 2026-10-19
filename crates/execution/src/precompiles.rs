@@ -974,6 +974,9 @@ pub struct RskPrecompileProvider {
     /// successful precompile call; the executor drains this after each tx and
     /// applies the markers to the trie if the tx committed.
     called_precompiles: std::sync::Arc<std::sync::Mutex<Vec<Address>>>,
+    /// Set when this transaction reaches REMASC or the Bridge. See
+    /// [`RskPrecompileProvider::reached_sequential_only_slot`].
+    reached_sequential_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for RskPrecompileProvider {
@@ -1003,6 +1006,21 @@ impl RskPrecompileProvider {
         std::sync::Arc::clone(&self.called_precompiles)
     }
 
+    /// Whether this transaction has reached a precompile that bars it from a
+    /// parallel sublist.
+    ///
+    /// Deliberately **not** the same question as `called_precompiles_slot`,
+    /// which records a precompile that returned successfully because that is
+    /// when rskj writes its storage-prefix marker. This one records reaching
+    /// the precompile at all, whatever came of it, because that is what rskj
+    /// records: `Program.callToPrecompiledAddress` adds the address before
+    /// doing anything, and a child frame's set merges into its parent's
+    /// before the parent checks whether the child succeeded. A Bridge call
+    /// that reverts still bars the transaction.
+    pub fn reached_sequential_only_slot(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.reached_sequential_only)
+    }
+
     fn record_called(&self, addr: Address) {
         if let Ok(mut called) = self.called_precompiles.lock() {
             if !called.contains(&addr) {
@@ -1021,6 +1039,19 @@ impl RskPrecompileProvider {
 
 /// Addresses handled via the stateful dispatch path (have access to &mut CTX).
 const STATEFUL_PRECOMPILES: [Address; 4] = [ENVIRONMENT_ADDR, BLOCK_HEADER_ADDR, REMASC_ADDR, BRIDGE_ADDR];
+
+/// Precompiles a transaction may not reach from a parallel sublist.
+///
+/// rskj's `concurrentContractsDisallowed` (`RskSystemProperties`), and it is
+/// consensus rather than a miner's preference: the parallel sublist
+/// executors are built with this set and
+/// `TransactionListExecutor.call` fails the sublist -- and so the block --
+/// for a transaction that reached one of them. The sequential sublist is
+/// built with an empty set, "as there's no concurrency in it".
+///
+/// Both are stateful, which is why reaching them is recorded in
+/// `run_stateful` and nowhere else.
+pub const SEQUENTIAL_ONLY_PRECOMPILES: [Address; 2] = [REMASC_ADDR, BRIDGE_ADDR];
 
 /// Maximum ancestor depth supported by BlockHeaderContract (REMASC maturity).
 const MAX_BLOCK_DEPTH: i16 = 4000;
@@ -1048,6 +1079,9 @@ impl RskPrecompileProvider {
             bridge_tx_context: std::sync::Arc::new(std::sync::Mutex::new(BridgeTxContext::default())),
             invisible_exception: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             called_precompiles: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            reached_sequential_only: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
         }
     }
 
@@ -1071,6 +1105,15 @@ impl RskPrecompileProvider {
 
         if !STATEFUL_PRECOMPILES.contains(addr) {
             return Ok(None);
+        }
+
+        // Before dispatch, so the outcome cannot change the answer: under
+        // RSKIP-144 a transaction that reaches REMASC or the Bridge may only
+        // sit in the sequential sublist, and rskj records the address on the
+        // way in (`Program.callToPrecompiledAddress`).
+        if SEQUENTIAL_ONLY_PRECOMPILES.contains(addr) {
+            self.reached_sequential_only
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Copy input to owned bytes so we can pass &mut CTX to the handler
@@ -1509,6 +1552,7 @@ impl Clone for RskPrecompileProvider {
             bridge_tx_context: std::sync::Arc::clone(&self.bridge_tx_context),
             invisible_exception: std::sync::Arc::clone(&self.invisible_exception),
             called_precompiles: std::sync::Arc::clone(&self.called_precompiles),
+            reached_sequential_only: std::sync::Arc::clone(&self.reached_sequential_only),
         }
     }
 }

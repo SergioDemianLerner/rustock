@@ -49,6 +49,17 @@ pub enum ProcessError {
     /// `BlockExecutor.executeParallel` abandons it at the same point.
     #[error("block #{number} is invalid under RSKIP-144: {collision}")]
     SublistCollision { number: u64, collision: crate::collision::Collision },
+    /// RSKIP-144: a transaction in a parallel sublist reached REMASC or the
+    /// Bridge. rskj builds the parallel sublist executors with those two in
+    /// `concurrentContractsDisallowed` and fails the sublist -- and so the
+    /// block -- for a transaction that reaches one
+    /// (`TransactionListExecutor.call`). Only the sequential sublist may
+    /// hold them, "as there's no concurrency in it".
+    #[error(
+        "block #{number} is invalid under RSKIP-144: transaction {index} is in parallel \
+         sublist {sublist} and reaches a precompile only the sequential sublist may hold"
+    )]
+    SequentialOnlyPrecompileInParallelSublist { number: u64, index: usize, sublist: usize },
     #[error("storage error: {0}")]
     Storage(#[from] anyhow::Error),
 }
@@ -305,6 +316,32 @@ impl BlockProcessor {
                 "RSKIP-144 collision: {collision}; block rejected"
             );
             return Err(ProcessError::SublistCollision { number: header.number, collision });
+        }
+
+        // RSKIP-144: REMASC and the Bridge are barred from a parallel sublist,
+        // whatever the call returned. Checked for every block that declares a
+        // partition, not only one this node ran in parallel: it is a property
+        // of the block, and running it on one thread does not make it true.
+        if !sublist_starts.is_empty() && self.hardfork_cfg.has_rskip144(header.number) {
+            for (index, tx_result) in exec_result.tx_results.iter().enumerate() {
+                if !tx_result.reached_sequential_only {
+                    continue;
+                }
+                let Some(sublist) = crate::collision::sublist_of(index, sublist_starts) else {
+                    continue; // the sequential set, where they belong
+                };
+                tracing::warn!(
+                    target: "rustock::execution",
+                    number = header.number, hash = %header.hash(),
+                    "RSKIP-144: transaction {index} in parallel sublist {sublist} reaches \
+                     REMASC or the Bridge; block rejected"
+                );
+                return Err(ProcessError::SequentialOnlyPrecompileInParallelSublist {
+                    number: header.number,
+                    index,
+                    sublist,
+                });
+            }
         }
 
         let mut receipts = Vec::with_capacity(exec_result.tx_results.len());
@@ -1073,6 +1110,148 @@ mod tests {
         assert_eq!(result.receipts.len(), 1);
         assert!(result.receipts[0].status);
         assert_eq!(result.receipts[0].cumulative_gas_used, 21_000);
+    }
+
+    /// A transaction that reaches the Bridge may only sit in the sequential
+    /// sublist. rskj builds the parallel sublist executors with REMASC and
+    /// the Bridge in `concurrentContractsDisallowed` and fails the sublist --
+    /// and so the block -- for a transaction that reaches one. It is
+    /// consensus, not a miner's preference.
+    #[test]
+    fn a_bridge_call_in_a_parallel_sublist_invalidates_the_block() {
+        let (block, root, store, block_store) = bridge_calling_block(Some(vec![1, 2]));
+        let processor = BlockProcessor::new(
+            RskHardforkConfig::testnet(), // reed810 is scheduled there
+            block_store,
+        );
+        let err = processor
+            .execute_block(&block, &root, store)
+            .expect_err("a Bridge call in a parallel sublist is invalid");
+        assert!(
+            matches!(
+                err,
+                ProcessError::SequentialOnlyPrecompileInParallelSublist { index: 0, sublist: 0, .. }
+            ),
+            "got {err}"
+        );
+    }
+
+    /// The same transaction in the sequential set is fine -- that is where it
+    /// belongs, and where rskj puts it.
+    #[test]
+    fn a_bridge_call_in_the_sequential_sublist_is_allowed() {
+        // Edges [1, 2] make tx 0 parallel; [2, 3] leaves tx 0 in sublist 0
+        // too, so put the Bridge call where the sequential set starts by
+        // declaring a single transaction's worth of parallel sublists above
+        // it: with no edges at all there is no partition and no rule.
+        let (block, root, store, block_store) = bridge_calling_block(None);
+        let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store);
+        let out = processor.execute_block(&block, &root, store);
+        assert!(
+            !matches!(
+                out,
+                Err(ProcessError::SequentialOnlyPrecompileInParallelSublist { .. })
+            ),
+            "a block with no partition cannot break the partition rule"
+        );
+    }
+
+    /// A block whose transactions reach nothing of the sort is unaffected,
+    /// partition or no partition.
+    #[test]
+    fn an_ordinary_transaction_is_not_barred_from_a_parallel_sublist() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let chain_id = 31u64;
+        let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let sender = sender_address(&key);
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+
+        let mut tx = Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(21_000),
+            to: Bytes::copy_from_slice(Address::repeat_byte(0xBB).as_slice()),
+            value: U256::from(100),
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign_tx(&mut tx, &key, chain_id);
+
+        let mut header = dummy_header(8_000_000);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1, 2]),
+            base_event: None,
+        });
+        let block = Block { header, transactions: vec![tx], ommers: vec![] };
+
+        let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store);
+        let out = processor.execute_block(&block, &root, store);
+        assert!(
+            !matches!(
+                out,
+                Err(ProcessError::SequentialOnlyPrecompileInParallelSublist { .. })
+            ),
+            "a plain transfer reaches no precompile"
+        );
+    }
+
+    /// A block whose first transaction calls the Bridge, with `edges` as
+    /// given. Returns everything `execute_block` needs.
+    #[allow(clippy::type_complexity)]
+    fn bridge_calling_block(
+        edges: Option<Vec<i16>>,
+    ) -> (Block, TrieNode, Arc<dyn TrieStore>, Arc<BlockStore>) {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let chain_id = 31u64;
+        let key = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let sender = sender_address(&key);
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+
+        // Any call to the Bridge address reaches it. What the call returns is
+        // beside the point: rskj records the address on the way in.
+        let mut tx = Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(500_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(vec![0x00, 0x00, 0x00, 0x00]),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign_tx(&mut tx, &key, chain_id);
+
+        let mut header = dummy_header(8_000_000);
+        if let Some(edges) = edges {
+            header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+                version: 1,
+                edges: Some(edges),
+                base_event: None,
+            });
+        }
+        (Block { header, transactions: vec![tx], ommers: vec![] }, root, store, block_store)
     }
 
     #[test]

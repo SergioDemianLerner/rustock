@@ -28,6 +28,11 @@ pub struct TxExecutionResult {
     pub output: Vec<u8>,
     pub logs: Vec<revm::primitives::Log>,
     pub created_address: Option<Address>,
+    /// The transaction reached REMASC or the Bridge, so under RSKIP-144 it
+    /// may only sit in the sequential sublist
+    /// (`SEQUENTIAL_ONLY_PRECOMPILES`). True whatever the call returned --
+    /// reaching the precompile is what counts.
+    pub reached_sequential_only: bool,
 }
 
 /// Result of executing an entire block.
@@ -321,6 +326,7 @@ impl RskExecutor {
             }
         }
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
             rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
         let extcodesize_max_precompiles: Vec<Address> = if self.hardfork_cfg.has_rskip90(header.number) {
@@ -387,6 +393,8 @@ impl RskExecutor {
         let created_address = Self::extract_created_address(tx, sender, &success);
 
         Ok(TxExecutionResult {
+            reached_sequential_only: reached_sequential_only
+                .load(std::sync::atomic::Ordering::Relaxed),
             gas_used,
             success,
             output,
@@ -449,6 +457,7 @@ impl RskExecutor {
             }
         }
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
             rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
         let extcodesize_max_precompiles: Vec<Address> = if self.hardfork_cfg.has_rskip90(header.number) {
@@ -524,7 +533,15 @@ impl RskExecutor {
         outcome.apply_to(&mut trace);
 
         Ok((
-            TxExecutionResult { gas_used, success, output, logs, created_address },
+            TxExecutionResult {
+                gas_used,
+                success,
+                output,
+                logs,
+                created_address,
+                reached_sequential_only: reached_sequential_only
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
             trace,
         ))
     }
@@ -983,6 +1000,7 @@ impl RskExecutor {
         let bridge_ctx_slot = precompile_provider.bridge_tx_context_slot();
         let invisible_flag = precompile_provider.invisible_exception_flag();
         let called_precompiles = precompile_provider.called_precompiles_slot();
+        let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
             rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
         let extcodesize_max_precompiles: Vec<Address> = if self.hardfork_cfg.has_rskip90(header.number) {
@@ -1185,6 +1203,10 @@ impl RskExecutor {
                 markers.bump_remasc_sender = true;
 
                 tx_results.push(TxExecutionResult {
+                    // The REMASC system transaction is REMASC. It is always the
+                    // block's last and so always sequential, but say so rather
+                    // than leave it to that coincidence.
+                    reached_sequential_only: true,
                     gas_used: 0,
                     success: true,
                     output: Vec::new(),
@@ -1397,6 +1419,8 @@ impl RskExecutor {
 
                 total_gas += gas_used;
                 tx_results.push(TxExecutionResult {
+                    // This branch exists only to call the Bridge.
+                    reached_sequential_only: true,
                     gas_used,
                     success,
                     output,
@@ -1428,6 +1452,7 @@ impl RskExecutor {
             if let Ok(mut called) = called_precompiles.lock() {
                 called.clear();
             }
+            reached_sequential_only.store(false, std::sync::atomic::Ordering::Relaxed);
 
             // rskj `TransactionExecutor.create`:
             //
@@ -1557,6 +1582,8 @@ impl RskExecutor {
 
             total_gas += gas_used;
             tx_results.push(TxExecutionResult {
+                reached_sequential_only: reached_sequential_only
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 gas_used,
                 success,
                 output,
