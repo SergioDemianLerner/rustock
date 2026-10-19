@@ -53,6 +53,12 @@ impl Default for MiningConfig {
 
 /// A block ready to be mined, plus everything a submission needs to be matched
 /// back to it.
+/// A block's transactions in sublist order, with the edges that describe it.
+struct Partitioned {
+    transactions: Vec<Transaction>,
+    edges: Vec<i16>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BlockTemplate {
     /// The block itself, with every field filled except the three
@@ -86,6 +92,10 @@ pub enum TemplateError {
     ParentStateMissing { root: B256 },
     #[error("executing the template failed: {0}")]
     Execution(#[from] ProcessError),
+    /// The partition probe runs the executor directly rather than the
+    /// processor, so its failures arrive unwrapped.
+    #[error("partitioning the template failed: {0}")]
+    Partition(#[from] crate::executor::ExecutionError),
     #[error("storage error: {0}")]
     Storage(#[from] anyhow::Error),
 }
@@ -198,6 +208,7 @@ impl BlockTemplateBuilder {
             None
         };
 
+        #[allow(unused_mut)]
         let mut header = Header {
             parent_hash: parent.hash(),
             ommers_hash: compute_ommers_hash(&ommers),
@@ -227,6 +238,31 @@ impl BlockTemplateBuilder {
             cached_hash_for_merged_mining: None,
         };
 
+        // RSKIP-144: decide the partition, which also decides the order.
+        //
+        // The transactions are executed once in selection order to learn what
+        // each one touches, the partitioner places them from that, and the
+        // block is then rebuilt in sublist order and executed again. rskj
+        // does the first pass and reorders its receipts rather than
+        // re-executing, relying on a collision-free partition reaching the
+        // same state either way -- which is true, and is the theorem the
+        // validator exists to check rather than assume. Executing the block
+        // that will actually be published is the cheaper thing to be sure of,
+        // and the receipts have to be rebuilt regardless: `cumulativeGasUsed`
+        // restarts at each sublist.
+        let partitioned = self.partition(number, gas_limit, &transactions, &header, &state_root)?;
+        if let Some(partitioned) = partitioned {
+            transactions = partitioned.transactions;
+            header.transactions_root = ordered_tx_trie_root(&transactions, rskip126);
+            header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+                // RSKIP-351 travels with RSKIP-144; the extension is what
+                // carries the edges.
+                version: 1,
+                edges: Some(partitioned.edges),
+                base_event: None,
+            });
+        }
+
         let block = Block { header: header.clone(), transactions, ommers };
         let executed =
             self.processor.execute_block(&block, &state_root, self.trie_store.clone())?;
@@ -248,6 +284,110 @@ impl BlockTemplateBuilder {
             fees_paid_to_miner: executed.paid_fees,
             parent_state_root,
         })
+    }
+
+    /// Place the block's transactions in sublists, as rskj's miner does.
+    ///
+    /// `None` when the block declares no partition: RSKIP-144 inactive, or
+    /// the partition came out all-sequential, which rskj spells as an empty
+    /// edges array and we spell as no extension at all.
+    ///
+    /// The transactions are executed once here, in selection order, only to
+    /// learn what each one touches. That is also how rskj learns it, and it
+    /// is an approximation on purpose: a transaction is placed from an
+    /// execution against the accumulating sequential state, while its
+    /// sublist will run against the parent state. Where the two differ the
+    /// partition is wrong, and the validator is what catches it -- which is
+    /// why the validator re-checks instead of trusting the header.
+    fn partition(
+        &self,
+        number: u64,
+        gas_limit: U256,
+        transactions: &[Transaction],
+        header: &Header,
+        state_root: &TrieNode,
+    ) -> Result<Option<Partitioned>, TemplateError> {
+        if !self.hardfork_cfg.has_rskip144(number) {
+            return Ok(None);
+        }
+
+        let chain_id = self.hardfork_cfg.chain_id;
+        let with_senders: Vec<(Transaction, Address)> = transactions
+            .iter()
+            .map(|tx| {
+                let sender = tx.recover_sender(chain_id).unwrap_or_default();
+                (tx.clone(), sender)
+            })
+            .collect();
+
+        crate::collision::start_per_transaction(crate::collision::write_semantics(number));
+        let executed = self.processor.executor().execute_block(
+            header,
+            &with_senders,
+            state_root,
+            self.trie_store.clone(),
+        );
+        // Taken whether or not execution succeeded, so a failure cannot leave
+        // this probe's keys behind for the next template.
+        let touched = crate::collision::finish().unwrap_or_default();
+        let executed = executed?;
+
+        let mut partitioner = crate::mining::partition::SublistPartitioner::new(
+            rustock_core::validation::block_rules::TX_EXECUTION_THREADS,
+            gas_limit.saturating_to::<u64>(),
+            self.chain_config.min_sequential_set_gas_limit,
+        );
+
+        let mut placed: Vec<usize> = Vec::with_capacity(transactions.len());
+        for (index, tx) in transactions.iter().enumerate() {
+            let Some(result) = executed.tx_results.get(index) else {
+                continue;
+            };
+
+            // REMASC closes the sequential sublist and is not placed by the
+            // ordinary rule -- it is the block's last transaction by
+            // definition.
+            if index + 1 == transactions.len() && crate::mining::template::is_remasc(tx) {
+                partitioner.add_remasc(index, result.gas_used);
+                placed.push(index);
+                continue;
+            }
+
+            let keys = touched.keys(index);
+            let footprint = crate::mining::partition::TxFootprint {
+                sender: with_senders[index].1,
+                gas_limit: tx.gas_limit.saturating_to::<u64>(),
+                gas_used: result.gas_used,
+                reads: keys.map(|k| k.read().iter().cloned().collect()).unwrap_or_default(),
+                writes: keys.map(|k| k.written().iter().cloned().collect()).unwrap_or_default(),
+            };
+
+            // A transaction that reached REMASC or the Bridge may go nowhere
+            // but the sequential sublist: a parallel one makes the block
+            // invalid (`SEQUENTIAL_ONLY_PRECOMPILES`).
+            let seat = if result.reached_sequential_only {
+                partitioner.add_to_sequential(index, &footprint)
+            } else {
+                partitioner.add(index, &footprint)
+            };
+            // `None` is "it fits nowhere"; the transaction is dropped from
+            // the block rather than overflowing a sublist.
+            if seat.is_some() {
+                placed.push(index);
+            }
+        }
+
+        let edges = partitioner.edges();
+        if edges.is_empty() {
+            return Ok(None);
+        }
+
+        let order = partitioner.transactions_in_order();
+        debug_assert_eq!(order.len(), placed.len(), "every placed transaction is ordered");
+        Ok(Some(Partitioned {
+            transactions: order.iter().map(|&i| transactions[i].clone()).collect(),
+            edges,
+        }))
     }
 
     /// Reload the parent's state root from the trie store.
@@ -381,6 +521,13 @@ fn account_nonce(state_root: &TrieNode, store: &dyn TrieStore, addr: &Address) -
 /// transaction would give it a different hash and put a different
 /// transactions root in the header. rskj `RemascTransaction(long blockNumber)`
 /// with `Transaction.encode`.
+/// Whether `tx` is the REMASC system transaction, by shape.
+pub fn is_remasc(tx: &Transaction) -> bool {
+    tx.to.as_ref() == crate::precompiles::REMASC_ADDR.as_slice()
+        && tx.r.is_zero()
+        && tx.s.is_zero()
+}
+
 pub fn remasc_transaction(block_number: u64) -> Transaction {
     let nonce = block_number.saturating_sub(1);
     let to = Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice());

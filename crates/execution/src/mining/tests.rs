@@ -36,6 +36,8 @@ fn test_chain_config() -> Arc<ChainConfig> {
         gas_limit_bound_divisor: 1024,
         min_gas_limit: 1,
         max_gas_limit: 10_000_000,
+        // regtest's, as rskj's own partitioner tests use.
+        min_sequential_set_gas_limit: 6_800_000,
         activation_heights: ActivationHeights {
             orchid: 0,
             wasabi100: 0,
@@ -1209,5 +1211,283 @@ mod uncle_tests {
         // After the upgrade it can.
         store.build_height_index(0, |_| {}).unwrap();
         assert_eq!(select_uncles(&store, 11, headers[10].hash()).len(), 1);
+    }
+}
+
+// ── RSKIP-144: the miner's partition ──────────────────────────────────
+
+mod partitioned_templates {
+    use super::*;
+    use crate::mining::template::{PendingTransaction, PendingTransactionSource};
+    use k256::ecdsa::SigningKey;
+    use rustock_core::Transaction;
+    use sha3::Digest;
+
+    /// A pool that hands out exactly what it was given.
+    struct Pool(Vec<PendingTransaction>);
+
+    impl PendingTransactionSource for Pool {
+        fn pending(&self) -> Vec<PendingTransaction> {
+            self.0.clone()
+        }
+    }
+
+    fn signing_key(n: u8) -> SigningKey {
+        SigningKey::from_slice(&[n; 32]).unwrap()
+    }
+
+    fn address_of(key: &SigningKey) -> Address {
+        let pubkey = key.verifying_key().to_encoded_point(false);
+        let hash: [u8; 32] = sha3::Keccak256::digest(&pubkey.as_bytes()[1..]).into();
+        Address::from_slice(&hash[12..])
+    }
+
+    /// A plain transfer from `from` to `to`, signed.
+    fn transfer(from: &SigningKey, to: Address, nonce: u64, chain_id: u64) -> PendingTransaction {
+        let mut tx = Transaction {
+            nonce,
+            gas_price: U256::from(1),
+            gas_limit: U256::from(21_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value: U256::from(1_000),
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign(&mut tx, from, chain_id);
+        let sender = address_of(from);
+        let hash = B256::from_slice(&sha3::Keccak256::digest(tx.rlp_for_trie()));
+        PendingTransaction { tx, sender, hash }
+    }
+
+    fn sign(tx: &mut Transaction, key: &SigningKey, chain_id: u64) {
+        let hash = tx.signing_hash_eip155(chain_id);
+        let (signature, recid): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
+            key.sign_prehash_recoverable(hash.as_slice()).unwrap();
+        let sig_bytes = signature.to_bytes();
+        tx.r = U256::from_be_slice(&sig_bytes[..32]);
+        tx.s = U256::from_be_slice(&sig_bytes[32..]);
+        tx.v = chain_id * 2 + 35 + recid.to_byte() as u64;
+        tx.cached_rlp = None;
+    }
+
+    /// A builder on a chain where RSKIP-144 is active from genesis, with
+    /// `senders` funded accounts.
+    ///
+    /// Not testnet at its real reed810 height: REMASC reaches back
+    /// `maturity` blocks and the fixture would have to store seven million
+    /// headers to satisfy it. Scheduling Reed810 at zero asks the same
+    /// question of the miner for the price of a twenty-block chain.
+    #[allow(clippy::type_complexity)]
+    fn partitioning_fixture(
+        senders: u8,
+    ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
+        fixture_with_forks(senders, RskHardforkConfig::all_active_parallel(33))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn fixture_with_forks(
+        senders: u8,
+        hardfork_cfg: RskHardforkConfig,
+    ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+
+        let keys: Vec<SigningKey> = (1..=senders).map(signing_key).collect();
+        let mut root = TrieNode::empty();
+        for key in &keys {
+            let addr = address_of(key);
+            let acct = rustock_trie::AccountState::new(
+                U256::ZERO,
+                U256::from(10u64).pow(U256::from(18)),
+            );
+            let k = rustock_trie::TrieKeySlice::from_key(&rustock_trie::account_key(&addr));
+            root = root.put(&k, &acct.encode(), trie_store.as_ref());
+        }
+        let state_root = root.compute_hash(trie_store.as_ref());
+        root.save(trie_store.as_ref(), true);
+        // The seeding is the fixture's whole premise; a silent failure here
+        // shows up much later as "balance: 0" from the EVM.
+        for key in &keys {
+            let addr = address_of(key);
+            let probe = rustock_trie::TrieKeySlice::from_key(&rustock_trie::account_key(&addr));
+            assert!(root.get(&probe, trie_store.as_ref()).is_some(), "{addr} not seeded");
+        }
+
+        let height = 20u64;
+        let mut parent_hash = B256::ZERO;
+        let mut parent = header_at(0, parent_hash, state_root);
+        for number in 0..=height {
+            let mut header = header_at(number, parent_hash, state_root);
+            header.difficulty = U256::from(2);
+            header.gas_limit = U256::from(10_000_000u64);
+            let hash = header.hash();
+            store.put_header_with_hash(hash, &header).unwrap();
+            store.put_canonical_hash(number, hash).unwrap();
+            store.put_total_difficulty(hash, U256::from(number + 1)).unwrap();
+            parent_hash = hash;
+            parent = header;
+        }
+        store.set_head(parent_hash).unwrap();
+        store.set_exec_head(parent_hash, state_root).unwrap();
+
+        let builder = BlockTemplateBuilder::new(
+            Arc::new(BlockProcessor::new(hardfork_cfg.clone(), store.clone())),
+            trie_store.clone(),
+            test_chain_config(),
+            hardfork_cfg,
+            MiningConfig {
+                coinbase_address: address!("00000000000000000000000000000000c0117b45"),
+                ..Default::default()
+            },
+        );
+        (builder, parent, keys, trie_store, store)
+    }
+
+    /// Four transfers between eight distinct accounts: nothing touches
+    /// anything else, so the miner should split them across the parallel
+    /// sublists and the block should declare it.
+    #[test]
+    fn independent_transfers_are_split_across_parallel_sublists() {
+        let (builder, parent, keys, trie_store, store) = partitioning_fixture(4);
+        let chain_id = 33;
+        let pool = Pool(
+            keys.iter()
+                .enumerate()
+                .map(|(i, k)| transfer(k, Address::repeat_byte(0xA0 + i as u8), 0, chain_id))
+                .collect(),
+        );
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+
+        let edges = template
+            .block
+            .header
+            .version_fields
+            .as_ref()
+            .and_then(|v| v.edges.clone())
+            .expect("a block of independent transfers declares a partition");
+        assert!(!edges.is_empty(), "and the partition is not empty");
+        assert_eq!(
+            edges.len(),
+            2,
+            "four independent transfers fill both parallel sublists: {edges:?}"
+        );
+
+        // The partition has to survive the validator, which is the only
+        // opinion that counts.
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("a block this miner built must be one this node would accept");
+    }
+
+    /// Every transfer from one sender. They are connected by the nonce, so
+    /// they must all land in one sublist -- and with only one parallel
+    /// sublist used, the block still declares a partition naming it.
+    #[test]
+    fn transfers_from_a_single_sender_share_one_sublist() {
+        let (builder, parent, keys, trie_store, store) = partitioning_fixture(1);
+        let chain_id = 33;
+        let pool = Pool(
+            (0..3)
+                .map(|n| transfer(&keys[0], Address::repeat_byte(0xB0 + n as u8), n, chain_id))
+                .collect(),
+        );
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+
+        let edges = template
+            .block
+            .header
+            .version_fields
+            .as_ref()
+            .and_then(|v| v.edges.clone())
+            .expect("a partition is declared");
+        assert_eq!(edges, vec![3], "all three in the first parallel sublist");
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("the block validates");
+    }
+
+    /// A chain of transfers -- a pays b, b pays c -- is connected all the way
+    /// down, so it collapses into one sublist rather than being split.
+    #[test]
+    fn a_chain_of_transfers_does_not_split() {
+        let (builder, parent, keys, trie_store, store) = partitioning_fixture(3);
+        let chain_id = 33;
+        // a -> b, b -> c: the recipient of each is the sender of the next.
+        let pool = Pool(vec![
+            transfer(&keys[0], address_of(&keys[1]), 0, chain_id),
+            transfer(&keys[1], address_of(&keys[2]), 0, chain_id),
+        ]);
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+
+        let edges = template
+            .block
+            .header
+            .version_fields
+            .as_ref()
+            .and_then(|v| v.edges.clone())
+            .unwrap_or_default();
+        assert!(
+            edges.len() <= 1,
+            "connected transfers cannot be split into two parallel sublists: {edges:?}"
+        );
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("the block validates");
+    }
+
+    /// A chain that does not schedule reed810 declares no partition,
+    /// whatever the pool looks like. This is mainnet's shape: `all_active`
+    /// names Vetiver900, which outranks Reed810 in the enum and schedules
+    /// neither RSKIP-144 nor RSKIP-351.
+    #[test]
+    fn a_chain_without_reed810_declares_no_partition() {
+        let (builder, parent, keys, trie_store, store) =
+            fixture_with_forks(2, RskHardforkConfig::all_active(33));
+        let chain_id = 33;
+        let pool = Pool(
+            keys.iter()
+                .enumerate()
+                .map(|(i, k)| transfer(k, Address::repeat_byte(0xC0 + i as u8), 0, chain_id))
+                .collect(),
+        );
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+        assert!(
+            template.block.header.version_fields.is_none(),
+            "RSKIP-144 is not scheduled, so the header carries no extension"
+        );
+        assert_eq!(
+            template.block.transactions.len(),
+            3,
+            "and the transactions are all there, just unpartitioned"
+        );
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active(33), store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("the block validates");
     }
 }

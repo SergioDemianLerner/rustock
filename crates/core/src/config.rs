@@ -115,6 +115,12 @@ pub struct ChainConfig {
     pub gas_limit_bound_divisor: u64,
     pub min_gas_limit: u64,
     pub max_gas_limit: u64,
+    /// The gas the sequential sublist is guaranteed under RSKIP-144
+    /// (rskj `Constants.getMinSequentialSetGasLimit`). Absent from the
+    /// RSKIP, which says every sublist gets `block gas limit / (N + 1)`;
+    /// the real formula has three branches around this constant, and below
+    /// it the parallel sublists get no gas at all.
+    pub min_sequential_set_gas_limit: u64,
     pub activation_heights: ActivationHeights,
 }
 
@@ -130,6 +136,7 @@ impl ChainConfig {
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 5000,
             max_gas_limit: 1_000_000_000,
+            min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::mainnet(),
         }
     }
@@ -145,6 +152,7 @@ impl ChainConfig {
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 5000,
             max_gas_limit: 1_000_000_000,
+            min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::testnet(),
         }
     }
@@ -160,6 +168,7 @@ impl ChainConfig {
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 1,
             max_gas_limit: 10_000_000,
+            min_sequential_set_gas_limit: 6_800_000,
             activation_heights: ActivationHeights::regtest(),
         }
     }
