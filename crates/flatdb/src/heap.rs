@@ -381,6 +381,26 @@ impl Heap {
         seen
     }
 
+    /// Ask the kernel to fetch the pages these offsets point at.
+    ///
+    /// The second half of a batched read: once the index has said where
+    /// the records are, the records themselves can be faulted in together
+    /// rather than one blocking fault at a time.
+    pub fn prefetch(&self, offsets: &[Option<u64>], span: usize) {
+        let size = self.size.load(Ordering::Acquire);
+        let segments = self.segments.read().expect("heap segments");
+        for offset in offsets.iter().flatten() {
+            if *offset >= size {
+                continue;
+            }
+            let index = (*offset / self.segment_size) as usize;
+            let Some(segment) = segments.get(index) else { continue };
+            let within = (*offset % self.segment_size) as usize;
+            let len = span.min(self.segment_size as usize - within);
+            let _ = segment.advise_range(memmap2::Advice::WillNeed, within, len);
+        }
+    }
+
     /// Forces every segment written since the previous call.
     pub fn force(&self) -> io::Result<()> {
         if self.read_only {

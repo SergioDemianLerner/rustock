@@ -31,6 +31,17 @@ pub const CF_TRIE: &str = "trie_nodes";
 pub trait EpochBackend: Send + Sync {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
 
+    /// Read many independent keys, overlapping the work where the backend
+    /// can.
+    ///
+    /// The sweep's marking phase walks the trie level by level, and keys
+    /// at one level are independent of each other: this is the one place
+    /// the store is handed enough work to keep a device busy. The default
+    /// is serial, so a backend with nothing to add stays correct.
+    fn get_many(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        keys.iter().map(|k| self.get(k)).collect()
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
 
     /// Insert many entries at once. Used by the sweep, which copies live
@@ -268,6 +279,31 @@ impl EpochBackend for RocksEpoch {
         self.db.get_cf(cf, key).ok().flatten()
     }
 
+    /// Independent point lookups on their own threads.
+    ///
+    /// Each one blocks on the device, so the useful width tracks how many
+    /// concurrent requests the storage can serve rather than how many
+    /// cores exist -- the same reasoning `RocksDbTrieStore::get_many`
+    /// records.
+    fn get_many(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        let threads = crate::read_threads();
+        if keys.len() < threads * 2 {
+            return keys.iter().map(|k| self.get(k)).collect();
+        }
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+        let chunk = keys.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (key_chunk, out_chunk) in keys.chunks(chunk).zip(out.chunks_mut(chunk)) {
+                scope.spawn(|| {
+                    for (key, slot) in key_chunk.iter().zip(out_chunk.iter_mut()) {
+                        *slot = self.get(key);
+                    }
+                });
+            }
+        });
+        out
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let cf = self.cf()?;
         self.db.put_cf(cf, key, value).context("epoch write")
@@ -415,6 +451,16 @@ pub struct FlatEpoch {
 impl EpochBackend for FlatEpoch {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.db.get(key)
+    }
+
+    /// Prefetch rather than fan out across threads.
+    ///
+    /// A mapped lookup is a page fault, not a syscall, so a thread pool
+    /// would be paying thread-handoff cost to overlap faults. Telling the
+    /// kernel about the whole batch first expresses the same intent with
+    /// no threads at all.
+    fn get_many(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        self.db.get_many(keys)
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -716,5 +762,85 @@ mod tests {
         }
         assert!(store.newest_bytes() > 0, "the rotation trigger sees the data");
         assert!(store.total_bytes() >= store.newest_bytes());
+    }
+
+    /// A batch read has to give the same answers as the same number of
+    /// single reads, for either backend, including for keys that are not
+    /// there.
+    #[test]
+    fn a_batch_read_matches_reading_one_at_a_time() {
+        for factory in [rocks(), flat()] {
+            let name = factory.name();
+            let dir = tempfile::tempdir().unwrap();
+            let epoch = factory.open(dir.path()).unwrap();
+
+            let stored: Vec<(Vec<u8>, Vec<u8>)> = (0u8..120).map(|i| entry(i, 70)).collect();
+            epoch.put_many(&stored).unwrap();
+            epoch.flush().unwrap();
+
+            // Half present, half absent, interleaved, so position matters.
+            let mut asked: Vec<Vec<u8>> = Vec::new();
+            let mut expected: Vec<Option<Vec<u8>>> = Vec::new();
+            for (i, (k, v)) in stored.iter().enumerate() {
+                asked.push(k.clone());
+                expected.push(Some(v.clone()));
+                let absent = entry(200 + (i % 50) as u8, 70).0;
+                asked.push(absent);
+                expected.push(None);
+            }
+
+            assert_eq!(epoch.get_many(&asked), expected, "{name}");
+            let one_at_a_time: Vec<Option<Vec<u8>>> =
+                asked.iter().map(|k| epoch.get(k)).collect();
+            assert_eq!(one_at_a_time, expected, "{name}: single reads disagree");
+        }
+    }
+
+    /// Small batches take the serial path in both backends; it still has
+    /// to answer correctly and in order.
+    #[test]
+    fn a_batch_too_small_to_overlap_still_answers() {
+        for factory in [rocks(), flat()] {
+            let dir = tempfile::tempdir().unwrap();
+            let epoch = factory.open(dir.path()).unwrap();
+            let (k, v) = entry(1, 60);
+            epoch.put(&k, &v).unwrap();
+            let asked = vec![entry(9, 60).0, k.clone()];
+            assert_eq!(epoch.get_many(&asked), vec![None, Some(v)], "{}", factory.name());
+        }
+    }
+
+    /// The epoch store answers from whichever epoch holds the key, and a
+    /// batch must resolve across all of them exactly as single reads do.
+    #[test]
+    fn a_batch_resolves_across_epochs() {
+        use crate::epoch_store::{EpochConfig, EpochTrieStore};
+        use rustock_trie::TrieStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpochTrieStore::open_with(
+            dir.path(),
+            // Tiny, so writing forces rotations and the entries spread
+            // over several epochs.
+            EpochConfig { epochs: 4, burial_depth: 5, rotate_bytes: 8 * 1024 },
+            None,
+            Arc::new(FlatFactory::new(4096).with_segment_size(1 << 20)),
+        )
+        .unwrap();
+
+        let stored: Vec<(Vec<u8>, Vec<u8>)> = (0u8..150).map(|i| entry(i, 100)).collect();
+        for (k, v) in &stored {
+            store.put(k, v);
+        }
+        store.flush().unwrap();
+
+        let asked: Vec<Vec<u8>> = stored.iter().map(|(k, _)| k.clone()).collect();
+        let batched = store.get_many(&asked);
+        let singly: Vec<Option<Vec<u8>>> = asked.iter().map(|k| store.get(k)).collect();
+        assert_eq!(batched, singly, "the batch disagreed with single reads");
+        assert!(
+            batched.iter().filter(|v| v.is_some()).count() > 0,
+            "the test proved nothing: no key resolved"
+        );
     }
 }

@@ -303,6 +303,56 @@ rather than an unexamined one.
 every record is short and the benchmark cannot see this cost. Measuring
 it needs state with contract code in it.
 
+## Batched reads
+
+`get_many` exists because a trie traversal issues *dependent* reads — each
+address known only once the previous one returns — so the device sees one
+request at a time. Keys at the same level are independent, and the sweep's
+marking phase is the one place in the store that holds a whole level at
+once.
+
+Walking the top 13 levels of the 1 GB fixture (8,191 nodes), each mode in
+its own process with the page cache evicted first:
+
+| | serial | batched | |
+|---|---|---|---|
+| RocksDB | 18,150 ms | **2,283 ms** | 7.9× |
+| FlatDB | 54 ms | 42 ms | 1.3× |
+
+Two separate findings, and the first is not about FlatDB at all.
+
+**`EpochTrieStore::get_many` was throwing the batch away.** It mapped
+`get` over the keys, discarding the parallel implementation
+`RocksDbTrieStore` already had — so the expensive half of a collection
+ran at queue depth 1 against a device that wanted sixteen. That is a
+production path on the current backend, and 7.9× is what it was leaving
+behind. Fixed by batching per epoch, newest first, carrying forward only
+what is still unresolved.
+
+**FlatDB gains little from batching because it is already fast here, and
+some of that is the fixture.** A prefetch pass (`MADV_WILLNEED` over the
+index slots, then over the records they point at) is the right shape for
+a mapped store — a fault is one thread on one page, and a thread pool
+would pay handoff cost to overlap faults the kernel can overlap itself —
+but 1.3× is a modest return.
+
+The 336× gap between the two serial columns is **not** a fair claim about
+the engines. The fixture was built bottom-up by `bulk.rs`, so the top of
+the trie sits contiguously at the end of the heap and the first 13 levels
+of a walk are very nearly a sequential read. A node writing in traversal
+order per block would not have that layout. It is an accidental
+demonstration of the path-locality idea in
+`FlatDB-StateOfTheArt.md` rather than a measurement of normal operation.
+
+### How not to measure this
+
+Both of the first two attempts were wrong in the same way, from opposite
+ends. Serving each level serially *and* batched inside one process made
+whichever pass ran first pay for the cold cache: serial-first reported
+419× for batching, batch-first reported 0.05×. Neither number was about
+batching. The tool now takes `--mode serial|batch` and refuses to run
+without it.
+
 ## Crash consistency
 
 Tested against torn writes, not only simulated (#315).

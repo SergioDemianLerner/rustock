@@ -319,6 +319,32 @@ impl FlatDb {
         })
     }
 
+    /// Read many independent keys, telling the kernel about them first.
+    ///
+    /// A mapped lookup is a page fault, and a fault blocks one thread on
+    /// one page: queue depth 1, which the porting notes flag as the
+    /// number that bounds every other optimisation. Rather than a thread
+    /// pool, this hands the kernel the whole batch up front — the index
+    /// slots, then the records those slots point at — so the readaheads
+    /// can overlap, and then reads them in order with the pages already
+    /// on their way.
+    ///
+    /// Falls back to plain lookups for a batch too small to be worth two
+    /// extra passes.
+    pub fn get_many(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        const WORTH_PREFETCHING: usize = 8;
+        if keys.len() < WORTH_PREFETCHING {
+            return keys.iter().map(|k| self.get(k)).collect();
+        }
+        self.index.prefetch(&self.keys, keys);
+        let offsets = self.index.first_offsets(&self.keys, keys);
+        // A trie node is a few hundred bytes; one page covers it and its
+        // neighbours, and asking for more would evict what the batch
+        // actually needs.
+        self.heap.prefetch(&offsets, 4096);
+        keys.iter().map(|k| self.get(k)).collect()
+    }
+
     /// Bytes actually occupied: the heap frontier plus the live index.
     ///
     /// Deliberately not the size of the directory. Heap segments are

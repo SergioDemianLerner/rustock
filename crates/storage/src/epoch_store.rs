@@ -1106,8 +1106,41 @@ impl TrieStore for EpochTrieStore {
         }
     }
 
+    /// One batch per epoch, newest first, carrying forward only what is
+    /// still unresolved.
+    ///
+    /// This used to map `get` over the keys, which threw away whatever
+    /// the backend could do with a batch -- and the caller is the sweep's
+    /// marking phase, the one place in the store that has independent
+    /// reads to give. On RocksDB that meant the expensive half of a
+    /// collection ran at queue depth 1 against a device that wanted
+    /// sixteen.
     fn get_many(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
-        keys.iter().map(|k| self.get(k)).collect()
+        self.reads.fetch_add(keys.len() as u64, Ordering::Relaxed);
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+        // Positions still looking for an answer.
+        let mut outstanding: Vec<usize> = (0..keys.len()).collect();
+
+        let epochs = self.epochs.read().unwrap();
+        for epoch in epochs.iter().rev() {
+            if outstanding.is_empty() {
+                break;
+            }
+            self.read_probes.fetch_add(outstanding.len() as u64, Ordering::Relaxed);
+            let wanted: Vec<Vec<u8>> =
+                outstanding.iter().map(|&i| keys[i].clone()).collect();
+            let found = epoch.backend.get_many(&wanted);
+
+            let mut still_missing = Vec::new();
+            for (&index, value) in outstanding.iter().zip(found) {
+                match value {
+                    Some(bytes) => out[index] = Some(bytes),
+                    None => still_missing.push(index),
+                }
+            }
+            outstanding = still_missing;
+        }
+        out
     }
 }
 
