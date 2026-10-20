@@ -809,6 +809,26 @@ struct Args {
     #[arg(long, default_value = "single")]
     trie_backend: String,
 
+    /// Storage engine behind the trie: rocksdb or flatdb.
+    ///
+    /// Orthogonal to --trie-backend, which chooses retention. This chooses
+    /// what holds the nodes. flatdb is measurably faster on reads and far
+    /// steadier (docs/flatdb.md), and it is **experimental**: it has not run
+    /// on a real chain, so the default stays rocksdb until it has.
+    ///
+    /// The node refuses to start if the directory on disk was written by the
+    /// other engine, rather than opening an empty store beside the data.
+    #[arg(long, default_value = "rocksdb")]
+    trie_engine: String,
+
+    /// Keys to size a flatdb epoch's index for. Ignored by rocksdb.
+    ///
+    /// A hint rather than a limit, but exceeding it costs a stop-the-world
+    /// rehash, so set it from the expected peak. Costs 16 bytes of resident
+    /// memory per key at the default load factor.
+    #[arg(long, default_value_t = 16_000_000)]
+    trie_expected_keys: u64,
+
     /// Epochs to keep with --trie-backend epoch. Minimum 3.
     ///
     /// More epochs means smaller, more frequent sweeps and less duplication,
@@ -1198,6 +1218,9 @@ fn apply_file_config(
         &mut a.no_peer_punishment);
 
     apply(matches, "trie_backend", f.trie.backend.as_ref(), &mut a.trie_backend);
+    apply(matches, "trie_engine", f.trie.engine.as_ref(), &mut a.trie_engine);
+    apply(matches, "trie_expected_keys", f.trie.expected_keys.as_ref(),
+        &mut a.trie_expected_keys);
     apply(
         matches,
         "btc_block_cache_entries",
@@ -1875,6 +1898,16 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         rotate_bytes: args.gc_rotate_mb * (1 << 20),
     };
     let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
+    let engine = rustock_storage::TrieEngine::parse(&args.trie_engine)?;
+    if matches!(backend, rustock_storage::epoch_store::TrieBackend::Single)
+        && engine == rustock_storage::TrieEngine::FlatDb
+    {
+        anyhow::bail!(
+            "--trie-backend single keeps nodes in a column family of the node's main \
+             database, which only rocksdb can provide; use --trie-backend external or \
+             epoch to run flatdb"
+        );
+    }
 
     // The node only ever holds an `Arc<dyn TrieStore>`, so this is the entire
     // extent of the choice: nothing downstream knows which store it got.
@@ -1967,19 +2000,36 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     Some((hash, _)) => store.header(hash)?.map(|h| h.number),
                     None => None,
                 };
-                rustock_storage::epoch_store::EpochTrieStore::open(
+                engine.check_matches(std::path::Path::new(&trie_dir))?;
+                rustock_storage::epoch_store::EpochTrieStore::open_with(
                     &trie_dir,
                     cfg.clone(),
                     resume_at,
+                    engine.factory(args.trie_expected_keys),
                 )?
             }))
         }
         _ => None,
     };
     let external_store: Option<Arc<dyn rustock_trie::TrieStore>> = match &backend {
-        rustock_storage::epoch_store::TrieBackend::External => Some(Arc::new(
-            rustock_storage::RocksDbTrieStore::open(std::path::Path::new(&trie_dir))?,
-        )),
+        rustock_storage::epoch_store::TrieBackend::External => {
+            let dir = std::path::Path::new(&trie_dir);
+            engine.check_matches(dir)?;
+            Some(match engine {
+                rustock_storage::TrieEngine::RocksDb => {
+                    Arc::new(rustock_storage::RocksDbTrieStore::open(dir)?)
+                }
+                rustock_storage::TrieEngine::FlatDb => {
+                    Arc::new(rustock_storage::FlatTrieStore::open(
+                        dir,
+                        rustock_flatdb::Options {
+                            expected_keys: args.trie_expected_keys,
+                            ..rustock_flatdb::Options::default()
+                        },
+                    )?)
+                }
+            })
+        }
         _ => None,
     };
     let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> = match &epoch_store {

@@ -57,6 +57,9 @@ pub struct Record<'a> {
     /// the key is `H(data)` and the caller recomputes it.
     pub key: Option<&'a [u8]>,
     pub data: &'a [u8],
+    /// Bytes this record occupies, header included. What a sequential scan
+    /// adds to reach the next one.
+    pub total: usize,
 }
 
 pub struct Heap {
@@ -334,8 +337,48 @@ impl Heap {
                 None
             };
             let data = std::slice::from_raw_parts(base.add(p), data_length);
-            Some(f(Record { key, data }))
+            Some(f(Record { key, data, total }))
         }
+    }
+
+    /// Walks every record from the start of the heap to the frontier.
+    ///
+    /// For an append-only store this is the natural iteration and it beats
+    /// going through the index: it is sequential, it reads each page once,
+    /// and it needs no probe. The sweep wants exactly this — a scan of the
+    /// oldest epoch, filtered against the live set.
+    ///
+    /// A record never straddles a segment, so the frontier skips to the
+    /// next segment rather than splitting one. Those gaps hold no magic
+    /// and the scan jumps over them.
+    ///
+    /// The scan may yield records the index can no longer reach: a batch
+    /// whose slots were rolled back leaves its bytes behind. For a
+    /// content-addressed store that is harmless to a consumer that filters
+    /// by key, which is why this is the iteration the sweep uses.
+    pub fn scan(
+        &self,
+        key_length: usize,
+        visit: &mut dyn FnMut(Option<&[u8]>, &[u8]),
+    ) -> usize {
+        let size = self.size.load(Ordering::Acquire);
+        let mut offset = 0u64;
+        let mut seen = 0usize;
+        while offset < size {
+            match self.with_record(offset, key_length, |record| {
+                visit(record.key, record.data);
+                record.total
+            }) {
+                Some(total) if total > 0 => {
+                    seen += 1;
+                    offset += total as u64;
+                }
+                // No record here: the tail of a segment the frontier
+                // skipped over. The next one starts at the segment base.
+                _ => offset = (offset / self.segment_size + 1) * self.segment_size,
+            }
+        }
+        seen
     }
 
     /// Forces every segment written since the previous call.

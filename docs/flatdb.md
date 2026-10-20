@@ -188,16 +188,15 @@ index must be sized for the peak, not the present.
 Honest list, because the gap between this and a production store is where
 the risk lives.
 
-- **Not wired into the node.** `FlatTrieStore` implements `TrieStore` and
-  the benchmark can select it, but nothing in `main.rs` can.
-- **No `get_many`.** The trait's concurrent-read path falls back to serial
-  gets. For a mapped store the right implementation is probably different
-  from RocksDB's thread pool — page faults, not syscalls — and it is
-  unmeasured.
-- **The epoch store is RocksDB-shaped.** Pruning is whole-database
-  rotation, which suits FlatDB exactly, but `epoch_store.rs` opens RocksDB
-  column families directly and would need a storage abstraction it does
-  not currently have.
+Tracked as issues #310–#318.
+
+- **Not wired into the node** (#311). `FlatTrieStore` implements
+  `TrieStore`, `FlatEpoch` implements `EpochBackend`, and the benchmark can
+  select either, but nothing in `main.rs` can.
+- **No `get_many`** (#314). The trait's concurrent-read path falls back to
+  serial gets. For a mapped store the right implementation is probably
+  different from RocksDB's thread pool — page faults, not syscalls — and it
+  is unmeasured.
 - **No crash testing under real power loss.** The crash tests simulate by
   rewinding the checkpoint and dropping mappings. The porting notes
   suggest a torn-write harness that drops a configurable subset of
@@ -215,6 +214,34 @@ the risk lives.
   original. Closing it would cost one hash per long read and is worth
   measuring — contract code is exactly the data it applies to.
 - **The 1,024-byte threshold was never measured**, in Java or here.
+
+## As an epoch backend
+
+Done (#310). `epoch_backend.rs` defines what the epoch store needs from one
+epoch's storage — get, put, put_many, delete, flush, is_empty, for_each,
+size_bytes — with `RocksFactory`/`RocksEpoch` and `FlatFactory`/`FlatEpoch`
+behind it. `epoch_store.rs` no longer mentions RocksDB.
+
+Three things the seam had to get right, and each is a test:
+
+**Iteration is a heap scan, not an index walk.** The sweep reads the oldest
+epoch end to end, and for an append-only store the heap *is* the sequential
+order: one pass, each page read once, no probing. It can yield records the
+index no longer reaches — a rolled-back batch leaves its bytes behind —
+which is harmless to a consumer that filters by key, and the sweep does.
+
+**The rotation size comes from the backend.** FlatDB reserves heap segments
+whole and sizes its index for a key count it has not reached, so its
+directory is over a gigabyte before a single node is stored. A policy
+reading the filesystem would rotate an empty epoch. `size_bytes` reports
+the heap frontier plus the live index; `flatdb_reports_what_it_holds_rather_than_what_it_reserved`
+asserts the directory overstates it by more than 4×.
+
+**`delete` fails loudly.** An append-only heap has nowhere to put a
+tombstone, and the probe chains assume no slot is ever vacated. Nothing in
+the production path deletes — reclamation is discarding a whole epoch — but
+a backend that appeared to delete would let the epoch store believe it had
+reclaimed something.
 
 ## Running it
 

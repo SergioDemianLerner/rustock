@@ -35,7 +35,10 @@
 
 use alloy_primitives::B256;
 use anyhow::{bail, Context, Result};
-use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use crate::epoch_backend::{
+    EpochBackend, EpochBackendFactory, RocksFactory, TrieEngine, BLOCK_CACHE_BYTES,
+};
+use rocksdb::DB;
 use rustock_trie::{NodeRef, TrieNode, TrieStore};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -43,11 +46,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tracing::{debug, info, warn};
-
-const CF_TRIE: &str = "trie_nodes";
-
-/// Block cache shared by every epoch.
-const BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Directory name for epoch `seq`.
 fn epoch_dir(root: &Path, seq: u64) -> PathBuf {
@@ -87,7 +85,7 @@ impl EpochConfig {
 
 struct Epoch {
     seq: u64,
-    db: Arc<DB>,
+    backend: Arc<dyn EpochBackend>,
     dir: PathBuf,
     /// Highest block whose writes went into this epoch, once it has stopped
     /// receiving them. `None` while it is the newest epoch, or when the record
@@ -223,8 +221,9 @@ pub struct EpochTrieStore {
     /// held off for the brief moment it takes.
     epochs: RwLock<Vec<Epoch>>,
     next_seq: AtomicU64,
-    /// One block cache for every epoch. See `cf_options`.
-    cache: rocksdb::Cache,
+    /// Opens epochs, and owns whatever they share -- for RocksDB, one
+    /// block cache across all of them. See `epoch_backend`.
+    factory: Arc<dyn EpochBackendFactory>,
     /// Bytes written to the newest epoch since it was created.
     ///
     /// Tracked incrementally because the rotation trigger is tested once per
@@ -255,94 +254,16 @@ pub struct EpochTrieStore {
 /// to compact than a single unbounded database would.
 const BG_JOBS_PER_EPOCH: i32 = 1;
 
-fn db_options() -> Options {
-    let mut o = Options::default();
-    o.create_if_missing(true);
-    o.create_missing_column_families(true);
-    o.set_write_buffer_size(64 * 1024 * 1024);
-    o.set_max_write_buffer_number(3);
-    o.set_max_background_jobs(BG_JOBS_PER_EPOCH);
-    o
-}
 
-/// Table options for one epoch, sharing `cache` with every other epoch.
-///
-/// The cache is shared on purpose. Giving each epoch its own divides a fixed
-/// memory budget `N` ways instead of pooling it, and the split is arbitrary --
-/// reads concentrate on the newest epoch, so most of the memory would sit in
-/// caches serving the epochs that are read least.
-///
-/// `cache_index_and_filter_blocks` is left off. Turning it on puts index and
-/// filter blocks into the same cache as data blocks, where they are evicted and
-/// re-read; an earlier version of this file enabled it against a default-sized
-/// cache, which is a known way to make reads slower rather than faster.
-fn cf_options(cache: &rocksdb::Cache) -> Options {
-    let mut o = Options::default();
-    let mut block = rocksdb::BlockBasedOptions::default();
-    // A read miss must be answered by every epoch above the one holding the
-    // key, so a miss costs N lookups. Bloom filters keep that from becoming N
-    // disk reads.
-    block.set_bloom_filter(10.0, false);
-    block.set_block_cache(cache);
-    o.set_block_based_table_factory(&block);
-    o
-}
+/// Entries copied per batch while draining the oldest epoch.
+const DRAIN_BATCH: usize = 10_000;
 
-fn open_epoch(dir: &Path, cache: &rocksdb::Cache) -> Result<Arc<DB>> {
-    let db = DB::open_cf_descriptors(
-        &db_options(),
-        dir,
-        vec![ColumnFamilyDescriptor::new(CF_TRIE, cf_options(cache))],
-    )
-    .with_context(|| format!("opening epoch at {}", dir.display()))?;
-    Ok(Arc::new(db))
-}
-
-/// Open one epoch's database **read-only**.
-///
-/// RocksDB's read-only mode takes no LOCK and writes nothing -- not even the
-/// WAL replay a normal open performs -- so it cannot modify or damage the
-/// database it is pointed at. That is the whole reason it exists here: a
-/// benchmark or a diagnostic must never be able to hurt a 130 GB store it is
-/// only measuring.
-fn open_epoch_read_only(dir: &Path, cache: &rocksdb::Cache) -> Result<Arc<DB>> {
-    let db = DB::open_cf_descriptors_read_only(
-        &db_options(),
-        dir,
-        vec![ColumnFamilyDescriptor::new(CF_TRIE, cf_options(cache))],
-        false,
-    )
-    .with_context(|| format!("opening epoch read-only at {}", dir.display()))?;
-    Ok(Arc::new(db))
-}
-
-fn dir_size(p: &Path) -> u64 {
-    let mut total = 0;
-    if let Ok(rd) = std::fs::read_dir(p) {
-        for e in rd.flatten() {
-            match e.metadata() {
-                Ok(m) if m.is_file() => total += m.len(),
-                Ok(m) if m.is_dir() => total += dir_size(&e.path()),
-                _ => {}
-            }
-        }
-    }
-    total
+/// True when an epoch holds no entries.
+fn epoch_is_empty(e: &Epoch) -> bool {
+    e.backend.is_empty()
 }
 
 impl EpochTrieStore {
-    /// True when an epoch holds no entries.
-    fn epoch_is_empty(e: &Epoch) -> bool {
-        match e.db.cf_handle(CF_TRIE) {
-            Some(cf) => {
-                let mut it = e.db.raw_iterator_cf(cf);
-                it.seek_to_first();
-                !it.valid()
-            }
-            None => true,
-        }
-    }
-
     /// Opens (or creates) an epoch store rooted at `dir`.
     ///
     /// Existing epochs are discovered from the directory names, so the store
@@ -364,6 +285,18 @@ impl EpochTrieStore {
     /// a live database that means the most recent blocks may be missing; point
     /// this at a cleanly stopped node, which flushes on shutdown.
     pub fn open_read_only(dir: impl AsRef<Path>, config: EpochConfig) -> Result<Self> {
+        Self::open_read_only_with(
+            dir,
+            config,
+            Arc::new(RocksFactory::new(BLOCK_CACHE_BYTES)),
+        )
+    }
+
+    pub fn open_read_only_with(
+        dir: impl AsRef<Path>,
+        config: EpochConfig,
+        factory: Arc<dyn EpochBackendFactory>,
+    ) -> Result<Self> {
         let root = dir.as_ref().to_path_buf();
         if !root.exists() {
             anyhow::bail!("{} does not exist", root.display());
@@ -381,14 +314,13 @@ impl EpochTrieStore {
             anyhow::bail!("no epochs under {}", root.display());
         }
 
-        let cache = rocksdb::Cache::new_lru_cache(BLOCK_CACHE_BYTES);
         let mut epochs = Vec::with_capacity(seqs.len());
         for seq in &seqs {
             let d = epoch_dir(&root, *seq);
             let last_block = read_last_block(&d);
             epochs.push(Epoch {
                 seq: *seq,
-                db: open_epoch_read_only(&d, &cache)?,
+                backend: factory.open_read_only(&d)?,
                 dir: d,
                 last_block,
             });
@@ -406,7 +338,7 @@ impl EpochTrieStore {
             config,
             next_seq: AtomicU64::new(seqs.last().copied().unwrap_or(0) + 1),
             epochs: RwLock::new(epochs),
-            cache,
+            factory,
             newest_written: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             read_probes: AtomicU64::new(0),
@@ -428,6 +360,19 @@ impl EpochTrieStore {
         config: EpochConfig,
         resume_at: Option<u64>,
     ) -> Result<Self> {
+        Self::open_with(dir, config, resume_at, Arc::new(RocksFactory::new(BLOCK_CACHE_BYTES)))
+    }
+
+    /// Open with a chosen storage engine behind each epoch.
+    ///
+    /// The engine is orthogonal to the epoch policy: rotation, burial and
+    /// the sweep are the same whichever one holds the nodes.
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        config: EpochConfig,
+        resume_at: Option<u64>,
+        factory: Arc<dyn EpochBackendFactory>,
+    ) -> Result<Self> {
         config.validate()?;
         let root = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)
@@ -448,12 +393,16 @@ impl EpochTrieStore {
             seqs.push(0);
         }
 
-        let cache = rocksdb::Cache::new_lru_cache(BLOCK_CACHE_BYTES);
         let mut epochs = Vec::with_capacity(seqs.len());
         for seq in &seqs {
             let d = epoch_dir(&root, *seq);
             let last_block = read_last_block(&d);
-            epochs.push(Epoch { seq: *seq, db: open_epoch(&d, &cache)?, dir: d, last_block });
+            epochs.push(Epoch {
+                seq: *seq,
+                backend: factory.open(&d)?,
+                dir: d,
+                last_block,
+            });
         }
         let mut next = seqs.last().copied().unwrap_or(0) + 1;
 
@@ -464,7 +413,7 @@ impl EpochTrieStore {
         // write into it makes it both the newest epoch and the first
         // candidate for sweeping -- the two roles the design requires to stay
         // separate.
-        if epochs.len() == 1 && !Self::epoch_is_empty(&epochs[0]) {
+        if epochs.len() == 1 && !epoch_is_empty(&epochs[0]) {
             info!(
                 target: "rustock::gc",
                 "Epoch store opened with a single written epoch (highest block {:?}); \
@@ -473,7 +422,12 @@ impl EpochTrieStore {
             let seq = next;
             next += 1;
             let d = epoch_dir(&root, seq);
-            epochs.push(Epoch { seq, db: open_epoch(&d, &cache)?, dir: d, last_block: None });
+            epochs.push(Epoch {
+                seq,
+                backend: factory.open(&d)?,
+                dir: d,
+                last_block: None,
+            });
         }
 
         // Close any epoch that stopped receiving writes without being
@@ -525,14 +479,19 @@ impl EpochTrieStore {
             config.epochs, config.burial_depth, config.rotate_bytes / (1 << 20)
         );
 
-        let newest_written = AtomicU64::new(dir_size(&epoch_dir(&root, seqs[seqs.len() - 1])));
+        // From the backend, not from the directory: a backend that
+        // preallocates reports a size that has nothing to do with how much
+        // state it holds, and `rotate_bytes` would fire on an empty epoch.
+        let newest_written = AtomicU64::new(
+            epochs.last().map(|e| e.backend.size_bytes()).unwrap_or(0),
+        );
 
         Ok(Self {
             root,
             config,
             epochs: RwLock::new(epochs),
             next_seq: AtomicU64::new(next),
-            cache,
+            factory,
             newest_written,
             reads: AtomicU64::new(0),
             read_probes: AtomicU64::new(0),
@@ -546,13 +505,13 @@ impl EpochTrieStore {
     /// Bytes held by the newest epoch, which is what the rotation trigger watches.
     pub fn newest_bytes(&self) -> u64 {
         let e = self.epochs.read().unwrap();
-        e.last().map(|e| dir_size(&e.dir)).unwrap_or(0)
+        e.last().map(|e| e.backend.size_bytes()).unwrap_or(0)
     }
 
     /// Bytes held by the whole store.
     pub fn total_bytes(&self) -> u64 {
         let e = self.epochs.read().unwrap();
-        e.iter().map(|e| dir_size(&e.dir)).sum()
+        e.iter().map(|e| e.backend.size_bytes()).sum()
     }
 
     pub fn epoch_count(&self) -> usize {
@@ -923,42 +882,46 @@ impl EpochTrieStore {
     fn drain(&self, live: &HashSet<B256>) -> Result<(u64, u64, u64)> {
         let (oldest, newest) = {
             let e = self.epochs.read().unwrap();
-            (e.first().map(|e| e.db.clone()), e.last().map(|e| e.db.clone()))
+            (e.first().map(|e| e.backend.clone()), e.last().map(|e| e.backend.clone()))
         };
         let (Some(oldest), Some(newest)) = (oldest, newest) else {
             return Ok((0, 0, 0));
         };
 
-        let cf_src = oldest.cf_handle(CF_TRIE).context("oldest epoch has no trie cf")?;
-        let cf_dst = newest.cf_handle(CF_TRIE).context("newest epoch has no trie cf")?;
-
         let mut scanned = 0u64;
         let mut drained = 0u64;
         let mut bytes = 0u64;
-        let mut batch = WriteBatch::default();
-        let mut pending = 0usize;
+        let mut pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(DRAIN_BATCH);
+        // The visitor cannot return a failure, so the first one is carried
+        // out and the rest of the scan runs without writing. Stopping early
+        // would leave the sweep half-applied, which is worse: the entries
+        // already copied are live in two epochs, which is harmless, but a
+        // partial copy that is then reported as complete is not.
+        let mut failure: Option<anyhow::Error> = None;
 
-        let mut iter = oldest.raw_iterator_cf(cf_src);
-        iter.seek_to_first();
-        while iter.valid() {
-            if let (Some(k), Some(v)) = (iter.key(), iter.value()) {
-                scanned += 1;
-                if k.len() == 32 && live.contains(&B256::from_slice(k)) {
-                    batch.put_cf(cf_dst, k, v);
-                    drained += 1;
-                    bytes += v.len() as u64;
-                    pending += 1;
-                    if pending >= 10_000 {
-                        newest.write(std::mem::take(&mut batch)).context("drain batch")?;
-                        pending = 0;
-                    }
-                }
+        oldest.for_each(&mut |k, v| {
+            scanned += 1;
+            if k.len() != 32 || !live.contains(&B256::from_slice(k)) {
+                return;
             }
-            iter.next();
+            drained += 1;
+            bytes += v.len() as u64;
+            if failure.is_some() {
+                return;
+            }
+            pending.push((k.to_vec(), v.to_vec()));
+            if pending.len() >= DRAIN_BATCH {
+                if let Err(e) = newest.put_many(&pending) {
+                    failure = Some(e);
+                }
+                pending.clear();
+            }
+        })?;
+
+        if let Some(e) = failure {
+            return Err(e);
         }
-        if pending > 0 {
-            newest.write(batch).context("drain batch")?;
-        }
+        newest.put_many(&pending).context("drain batch")?;
         newest.flush().context("flush after drain")?;
         Ok((scanned, drained, bytes))
     }
@@ -1012,7 +975,7 @@ impl EpochTrieStore {
         let mut epochs = self.epochs.write().unwrap();
         let reclaimed = if epochs.len() >= self.config.epochs {
             let old = epochs.remove(0);
-            let size = dir_size(&old.dir);
+            let size = old.backend.size_bytes();
             let dir = old.dir.clone();
             // Taken before the handle goes. This epoch's `last_block` is the
             // floor below which state may now be absent, and once the directory
@@ -1045,7 +1008,12 @@ impl EpochTrieStore {
         self.close_newest(&mut epochs, current_block);
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let dir = epoch_dir(&self.root, seq);
-        epochs.push(Epoch { seq, db: open_epoch(&dir, &self.cache)?, dir, last_block: None });
+        epochs.push(Epoch {
+            seq,
+            backend: self.factory.open(&dir)?,
+            dir,
+            last_block: None,
+        });
         self.newest_written.store(0, Ordering::Relaxed);
         Ok(reclaimed)
     }
@@ -1068,7 +1036,12 @@ impl EpochTrieStore {
         self.close_newest(&mut epochs, current_block);
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let dir = epoch_dir(&self.root, seq);
-        epochs.push(Epoch { seq, db: open_epoch(&dir, &self.cache)?, dir, last_block: None });
+        epochs.push(Epoch {
+            seq,
+            backend: self.factory.open(&dir)?,
+            dir,
+            last_block: None,
+        });
         self.newest_written.store(0, Ordering::Relaxed);
         Ok(())
     }
@@ -1084,10 +1057,7 @@ impl EpochTrieStore {
     /// replay the WAL, came back one entry short.
     pub fn flush(&self) -> Result<()> {
         for e in self.epochs.read().unwrap().iter() {
-            if let Some(cf) = e.db.cf_handle(CF_TRIE) {
-                e.db.flush_cf(cf).ok();
-            }
-            e.db.flush().ok();
+            e.backend.flush().ok();
         }
         Ok(())
     }
@@ -1106,8 +1076,7 @@ impl TrieStore for EpochTrieStore {
         let epochs = self.epochs.read().unwrap();
         for e in epochs.iter().rev() {
             self.read_probes.fetch_add(1, Ordering::Relaxed);
-            let cf = e.db.cf_handle(CF_TRIE)?;
-            if let Ok(Some(v)) = e.db.get_cf(cf, key) {
+            if let Some(v) = e.backend.get(key) {
                 return Some(v);
             }
         }
@@ -1131,10 +1100,8 @@ impl TrieStore for EpochTrieStore {
             .fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
         let epochs = self.epochs.read().unwrap();
         if let Some(e) = epochs.last() {
-            if let Some(cf) = e.db.cf_handle(CF_TRIE) {
-                if let Err(err) = e.db.put_cf(cf, key, value) {
-                    warn!(target: "rustock::gc", "Epoch write failed: {err}");
-                }
+            if let Err(err) = e.backend.put(key, value) {
+                warn!(target: "rustock::gc", "Epoch write failed: {err}");
             }
         }
     }
@@ -1199,13 +1166,57 @@ pub fn open_backend(
     epoch_root: &Path,
     resume_at: Option<u64>,
 ) -> Result<Arc<dyn TrieStore>> {
-    match backend {
-        TrieBackend::Single => Ok(Arc::new(crate::RocksDbTrieStore::from_db(single_db))),
-        TrieBackend::External => {
+    open_backend_with(backend, single_db, epoch_root, resume_at, TrieEngine::RocksDb, 0)
+}
+
+/// As [`open_backend`], with the storage engine chosen.
+///
+/// `expected_keys` sizes a FlatDB epoch's index at open and is ignored by
+/// RocksDB. It is a hint rather than a limit, but exceeding it costs a
+/// stop-the-world rehash, so it should come from the expected peak.
+pub fn open_backend_with(
+    backend: &TrieBackend,
+    single_db: Arc<DB>,
+    epoch_root: &Path,
+    resume_at: Option<u64>,
+    engine: TrieEngine,
+    expected_keys: u64,
+) -> Result<Arc<dyn TrieStore>> {
+    match (backend, engine) {
+        // `Single` means the `trie_nodes` column family inside the node's
+        // own database. There is no such thing as a FlatDB column family,
+        // so this is a configuration error rather than something to
+        // silently downgrade.
+        (TrieBackend::Single, TrieEngine::FlatDb) => bail!(
+            "the single trie backend keeps nodes in a column family of the node's \
+             main database, which only rocksdb can provide; use the external or \
+             epoch backend to run flatdb"
+        ),
+        (TrieBackend::Single, _) => Ok(Arc::new(crate::RocksDbTrieStore::from_db(single_db))),
+
+        (TrieBackend::External, TrieEngine::RocksDb) => {
+            engine.check_matches(epoch_root)?;
             Ok(Arc::new(crate::RocksDbTrieStore::open(epoch_root)?))
         }
-        TrieBackend::Epochs(cfg) => {
-            Ok(Arc::new(EpochTrieStore::open(epoch_root, cfg.clone(), resume_at)?))
+        (TrieBackend::External, TrieEngine::FlatDb) => {
+            engine.check_matches(epoch_root)?;
+            Ok(Arc::new(crate::FlatTrieStore::open(
+                epoch_root,
+                rustock_flatdb::Options {
+                    expected_keys,
+                    ..rustock_flatdb::Options::default()
+                },
+            )?))
+        }
+
+        (TrieBackend::Epochs(cfg), _) => {
+            engine.check_matches(epoch_root)?;
+            Ok(Arc::new(EpochTrieStore::open_with(
+                epoch_root,
+                cfg.clone(),
+                resume_at,
+                engine.factory(expected_keys),
+            )?))
         }
     }
 }
@@ -1491,8 +1502,7 @@ mod tests {
         {
             let epochs = s.epochs.read().unwrap();
             for e in epochs.iter() {
-                let cf = e.db.cf_handle(CF_TRIE).unwrap();
-                e.db.delete_cf(cf, child.as_slice()).unwrap();
+                e.backend.delete(child.as_slice()).unwrap();
             }
         }
 

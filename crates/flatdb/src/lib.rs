@@ -285,6 +285,35 @@ impl FlatDb {
         out
     }
 
+    /// Hands every stored record to `visit` as `(key, value)`, walking the
+    /// heap rather than the index.
+    ///
+    /// Sequential and allocation-free per record. Short records have their
+    /// key recomputed, which also verifies them; long records carry theirs.
+    ///
+    /// Yields records the index can no longer reach — a batch whose slots
+    /// were rolled back leaves its bytes behind the frontier until the
+    /// frontier passes them again. A consumer that filters by key is
+    /// unaffected, which is what the epoch sweep does.
+    pub fn for_each_record(&self, visit: &mut dyn FnMut(&[u8], &[u8])) -> usize {
+        let key_length = self.keys.length();
+        self.heap.scan(key_length, &mut |key, data| match key {
+            Some(stored) => visit(stored, data),
+            None => visit(&self.keys.compute_key(data), data),
+        })
+    }
+
+    /// Bytes actually occupied: the heap frontier plus the live index.
+    ///
+    /// Deliberately not the size of the directory. Heap segments are
+    /// reserved whole and the index is sized for a key count that has not
+    /// been reached, so the directory overstates — by a gigabyte on a
+    /// freshly created store — and a rotation policy reading it would fire
+    /// on an epoch holding nothing.
+    pub fn size_bytes(&self) -> u64 {
+        self.heap.size() + self.index.capacity() * index::SLOT_SIZE
+    }
+
     pub fn exists(dir: impl AsRef<Path>) -> bool {
         dir.as_ref().join(checkpoint::FILE_NAME).exists()
     }

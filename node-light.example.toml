@@ -123,6 +123,20 @@ backend = "epoch"                   # light: bounds state size. This setting ALO
                                     # window stops being queryable. Default "single".
 # dir = "/var/lib/rustock/trie-epochs"# default: unset
 # node = "…"                        # default: unset — diagnostic: start from this state root
+
+# rocksdb | flatdb. Orthogonal to `backend`, which chooses retention: this
+# chooses what holds the nodes. flatdb is measurably faster on reads and far
+# steadier (docs/flatdb.md) and is EXPERIMENTAL — it has not run on a real
+# chain, so the default stays rocksdb. The single backend cannot use it: that
+# one keeps nodes in a column family of the main database, which only rocksdb
+# provides. The node refuses to start if the directory on disk was written by
+# the other engine, rather than opening an empty store beside the data.
+# engine = "rocksdb"                # default
+
+# Keys to size a flatdb index for; ignored by rocksdb. A hint, not a limit,
+# but exceeding it costs a stop-the-world rehash, so set it from the expected
+# peak rather than the present. Costs ~16 bytes of resident memory per key.
+# expected_keys = 16000000          # default
 # BTC stored-block cache. Answering "which BTC block is at height H?" costs one
 # trie read per block of depth whenever the RSKIP199 height index cannot answer.
 # The cache holds blocks already read for consensus -- it never pre-loads and
