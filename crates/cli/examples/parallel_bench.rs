@@ -1,0 +1,390 @@
+//! Measure block execution against a realistic trie, at a chosen number of
+//! threads.
+//!
+//! The method, the fixture and the caveats are in
+//! `docs/parallel-execution-benchmark.md`. In short: a synthetic trie of
+//! about a gigabyte, blocks of transfers between accounts that already
+//! exist in it so the trie's depth never changes, writes persisted so the
+//! I/O is paid, and a per-block time series so a cold start or a drift is
+//! visible rather than averaged away.
+//!
+//! ```text
+//! parallel_bench <fixture-dir> [options]
+//!
+//!   --threads N        execution threads (default 1)
+//!   --sublists N       parallel sublists each block declares (default 2)
+//!   --txs N            transactions per block (default 200)
+//!   --blocks N         blocks to execute (default 300)
+//!   --seconds N        stop after about this long, whatever the block count
+//!   --csv FILE         write the per-block series here
+//!   --label TEXT       a name for the run, carried into the CSV
+//!   --cache-mb N       RocksDB block cache (default 256, the node's)
+//! ```
+//!
+//! `--sublists` above `TX_EXECUTION_THREADS` produces blocks that **are not
+//! valid on the network**. That is deliberate and is the point of the
+//! option: RSKIP-144 specifies four where rskj implements two, and the
+//! difference is worth measuring without editing a consensus constant.
+
+use anyhow::{Context, Result};
+use alloy_primitives::{Address, B256, U256};
+use rustock_core::{Block, Header, Transaction};
+use rustock_execution::hardfork::RskHardforkConfig;
+use rustock_execution::mining::workload::{account_key, address_of, filler_address, sign};
+use rustock_execution::{BlockProcessor, RskExecutor};
+use rustock_storage::{BlockStore, RocksDbTrieStore};
+use rustock_trie::{TrieNode, TrieStore};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const CHAIN_ID: u64 = 33;
+
+fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let fixture = args.next().context("usage: parallel_bench <fixture-dir> [options]")?;
+    let mut threads = 1usize;
+    let mut sublists = 2usize;
+    let mut txs = 200usize;
+    let mut blocks = 300usize;
+    let mut seconds: Option<u64> = None;
+    let mut csv: Option<String> = None;
+    let mut label = String::new();
+    let mut cache_mb = 256usize;
+
+    while let Some(flag) = args.next() {
+        let value = args.next().with_context(|| format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--threads" => threads = value.parse()?,
+            "--sublists" => sublists = value.parse()?,
+            "--txs" => txs = value.parse()?,
+            "--blocks" => blocks = value.parse()?,
+            "--seconds" => seconds = Some(value.parse()?),
+            "--csv" => csv = Some(value),
+            "--label" => label = value,
+            "--cache-mb" => cache_mb = value.parse()?,
+            other => anyhow::bail!("unknown option {other}"),
+        }
+    }
+
+    let manifest = Manifest::read(&fixture)?;
+    println!(
+        "fixture {fixture}\n  {} accounts, {} with keys, root {}",
+        manifest.accounts, manifest.signers, manifest.root
+    );
+    println!("run  threads {threads}  sublists {sublists}  {txs} tx/block");
+    if manifest.signers < txs as u64 {
+        anyhow::bail!(
+            "{txs} transactions a block needs {txs} distinct senders, and the fixture has \
+             {} accounts with keys. Every transaction from a different sender is what keeps \
+             them independent; reusing one would connect them through its nonce.",
+            manifest.signers
+        );
+    }
+
+    // The same block cache and bloom filters the node's epoch store runs
+    // with. Without them a plain `RocksDbTrieStore` answers every level of
+    // every path from disk: the first attempt measured 4.5 seconds a block
+    // and a sixfold ramp from start to finish, which is a measurement of
+    // uncached RocksDB rather than of execution, and of a configuration no
+    // node uses.
+    let trie_store: Arc<dyn TrieStore> = Arc::new(open_cached_store(&fixture, cache_mb)?);
+    let root = trie_store
+        .get(manifest.root.as_slice())
+        .map(|data| TrieNode::from_message(&data, trie_store.as_ref()))
+        .context("the fixture's root is not in its own store")?;
+
+    // A throwaway block store: the chain the blocks hang off, not the state.
+    let chain_dir = tempfile::tempdir().context("a temporary chain directory")?;
+    let block_store = Arc::new(BlockStore::open(chain_dir.path())?);
+    let hardfork_cfg = RskHardforkConfig::all_active_parallel(CHAIN_ID);
+    let processor = BlockProcessor::new(hardfork_cfg.clone(), block_store.clone())
+        .with_execution_threads(threads);
+
+    let mut state = root;
+    let mut parent_hash = B256::ZERO;
+    let mut nonces = vec![0u64; manifest.signers as usize];
+    let mut rows: Vec<Row> = Vec::with_capacity(blocks);
+    let deadline = seconds.map(|s| Instant::now() + Duration::from_secs(s));
+    let started = Instant::now();
+
+    for number in 1..=blocks as u64 {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            println!("  stopping at block {} on the time limit", number - 1);
+            break;
+        }
+
+        let (transactions, senders) =
+            build_transactions(number, txs, &manifest, &mut nonces);
+        let header = bench_header(number, parent_hash, state.compute_hash(trie_store.as_ref()),
+                                  edges_for(sublists, transactions.len()));
+        let block = Block { header, transactions, ommers: Vec::new() };
+
+        let at = Instant::now();
+        let executed = RskExecutor::new(hardfork_cfg.clone(), block_store.clone())
+            .with_execution_threads(threads)
+            .execute_block(
+                &block.header,
+                &senders,
+                &state,
+                trie_store.clone(),
+            )
+            .with_context(|| format!("executing block {number}"))?;
+        let execution = at.elapsed();
+
+        // Persist, so the I/O a real node pays is paid here too.
+        let writing = Instant::now();
+        let mut next = match executed.applied_root {
+            Some(root) => root,
+            None => rustock_execution::apply_state_changes(
+                &state,
+                trie_store.as_ref(),
+                &executed.state_changes,
+                &executed.markers,
+            ),
+        };
+        let hash = next.compute_hash(trie_store.as_ref());
+        next.save(trie_store.as_ref(), true);
+        trie_store.flush();
+        let write = writing.elapsed();
+
+        // Reload lazily, as the node does: children become hash references
+        // resolved on demand, so the next block walks only its own paths
+        // instead of carrying the whole accumulated tree in memory.
+        state = trie_store
+            .get(hash.as_slice())
+            .map(|data| TrieNode::from_message(&data, trie_store.as_ref()))
+            .unwrap_or(next);
+        parent_hash = block.header.hash();
+
+        rows.push(Row {
+            number,
+            transactions: executed.tx_results.len(),
+            gas: executed.gas_used,
+            execution_us: execution.as_micros() as u64,
+            write_us: write.as_micros() as u64,
+            elapsed_s: started.elapsed().as_secs_f64(),
+        });
+
+        if number % 50 == 0 || number == blocks as u64 {
+            let recent = &rows[rows.len().saturating_sub(50)..];
+            println!(
+                "  block {number}  {:.0} tx/s  exec {:.1} ms  write {:.1} ms",
+                rate(recent),
+                mean(recent, |r| r.execution_us) / 1000.0,
+                mean(recent, |r| r.write_us) / 1000.0
+            );
+        }
+        let _ = &processor; // built to validate the configuration early
+    }
+
+    report(&rows, &label, threads, sublists);
+    if let Some(path) = csv {
+        write_csv(&path, &rows, &label, threads, sublists)?;
+        println!("\nseries written to {path}");
+    }
+    Ok(())
+}
+
+/// A read-write trie store configured like the node's epoch store: a block
+/// cache of the same size and bloom filters on the same terms.
+fn open_cached_store(dir: &str, cache_mb: usize) -> Result<RocksDbTrieStore> {
+    RocksDbTrieStore::open_with_cache(dir, cache_mb * 1024 * 1024)
+        .with_context(|| format!("opening {dir}"))
+}
+
+struct Row {
+    number: u64,
+    transactions: usize,
+    gas: u64,
+    execution_us: u64,
+    write_us: u64,
+    elapsed_s: f64,
+}
+
+fn rate(rows: &[Row]) -> f64 {
+    let us: u64 = rows.iter().map(|r| r.execution_us + r.write_us).sum();
+    let txs: usize = rows.iter().map(|r| r.transactions).sum();
+    if us == 0 { 0.0 } else { txs as f64 * 1_000_000.0 / us as f64 }
+}
+
+fn mean(rows: &[Row], of: impl Fn(&Row) -> u64) -> f64 {
+    if rows.is_empty() {
+        return 0.0;
+    }
+    rows.iter().map(|r| of(r) as f64).sum::<f64>() / rows.len() as f64
+}
+
+/// The shape of the question: is the start faster than the end?
+fn report(rows: &[Row], label: &str, threads: usize, sublists: usize) {
+    if rows.is_empty() {
+        println!("no blocks executed");
+        return;
+    }
+    let tenth = (rows.len() / 10).max(1);
+    let first = &rows[..tenth];
+    let last = &rows[rows.len() - tenth..];
+    let total_tx: usize = rows.iter().map(|r| r.transactions).sum();
+    let total_us: u64 = rows.iter().map(|r| r.execution_us + r.write_us).sum();
+
+    println!();
+    println!("=== {label}  threads {threads}  sublists {sublists} ===");
+    println!("  blocks          {}", rows.len());
+    println!("  transactions    {total_tx}");
+    println!("  wall            {:.1}s", rows.last().map(|r| r.elapsed_s).unwrap_or(0.0));
+    println!("  overall         {:.0} tx/s", total_tx as f64 * 1e6 / total_us.max(1) as f64);
+    println!("  first 10%       {:.0} tx/s", rate(first));
+    println!("  last 10%        {:.0} tx/s", rate(last));
+    let drift = if rate(first) > 0.0 { rate(last) / rate(first) } else { 0.0 };
+    println!("  last/first      {drift:.2}");
+    println!(
+        "  execution       {:.1} ms/block   write {:.1} ms/block",
+        mean(rows, |r| r.execution_us) / 1000.0,
+        mean(rows, |r| r.write_us) / 1000.0
+    );
+    println!("  gas             {}", rows.iter().map(|r| r.gas).sum::<u64>());
+}
+
+fn write_csv(path: &str, rows: &[Row], label: &str, threads: usize, sublists: usize) -> Result<()> {
+    let mut out = String::from(
+        "label,threads,sublists,block,transactions,gas,execution_us,write_us,elapsed_s\n",
+    );
+    for r in rows {
+        out.push_str(&format!(
+            "{label},{threads},{sublists},{},{},{},{},{},{:.3}\n",
+            r.number, r.transactions, r.gas, r.execution_us, r.write_us, r.elapsed_s
+        ));
+    }
+    std::fs::write(path, out).with_context(|| format!("writing {path}"))?;
+    Ok(())
+}
+
+/// Transfers from keyed accounts to accounts drawn from the whole fixture.
+///
+/// Every transaction has a different sender, because two from one sender
+/// are connected by its nonce and would land in the same sublist whatever
+/// else they touch. Recipients are scattered over all nine million so the
+/// reads do not settle into a working set.
+fn build_transactions(
+    block: u64,
+    count: usize,
+    manifest: &Manifest,
+    nonces: &mut [u64],
+) -> (Vec<Transaction>, Vec<(Transaction, Address)>) {
+    let mut transactions = Vec::with_capacity(count);
+    let mut with_senders = Vec::with_capacity(count);
+    for i in 0..count {
+        // A different slice of senders each block, so no small set stays
+        // warm across the run.
+        let s = ((block as usize * count + i) % manifest.signers as usize) as u64;
+        let key = account_key(manifest.seed, s as usize);
+        let from = address_of(&key);
+        let to = recipient(manifest, block, i);
+
+        let mut tx = Transaction {
+            nonce: nonces[s as usize],
+            gas_price: U256::from(1),
+            gas_limit: U256::from(21_000),
+            to: alloy_primitives::Bytes::copy_from_slice(to.as_slice()),
+            value: U256::from(1u64),
+            input: alloy_primitives::Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign(&mut tx, &key, CHAIN_ID);
+        nonces[s as usize] += 1;
+        transactions.push(tx.clone());
+        with_senders.push((tx, from));
+    }
+    (transactions, with_senders)
+}
+
+/// An account somewhere in the fixture, chosen so the reads scatter.
+fn recipient(manifest: &Manifest, block: u64, i: usize) -> Address {
+    // A multiplicative step coprime with the account count walks the whole
+    // range without repeating, which a modulo of a counter would not.
+    let index = (block.wrapping_mul(2_654_435_761).wrapping_add(i as u64 * 40_503))
+        % manifest.accounts;
+    if index < manifest.signers {
+        address_of(&account_key(manifest.seed, index as usize))
+    } else {
+        filler_address(manifest.seed, index)
+    }
+}
+
+/// Edges that split `count` transactions into `sublists` parallel parts,
+/// leaving the last one sequential.
+fn edges_for(sublists: usize, count: usize) -> Vec<i16> {
+    if sublists == 0 || count < sublists + 1 {
+        return Vec::new();
+    }
+    // One slot is kept for the sequential set, as a block must have.
+    let per = count / (sublists + 1);
+    (1..=sublists).map(|i| (i * per) as i16).collect()
+}
+
+fn bench_header(number: u64, parent_hash: B256, state_root: B256, edges: Vec<i16>) -> Header {
+    Header {
+        parent_hash,
+        ommers_hash: B256::ZERO,
+        beneficiary: Address::repeat_byte(0x11),
+        state_root,
+        transactions_root: B256::ZERO,
+        receipts_root: B256::ZERO,
+        logs_bloom: Default::default(),
+        extension_data: None,
+        version_fields: (!edges.is_empty()).then(|| {
+            rustock_core::types::header::HeaderVersionFields {
+                version: 1,
+                edges: Some(edges),
+                base_event: None,
+            }
+        }),
+        difficulty: U256::from(1),
+        number,
+        gas_limit: U256::from(100_000_000u64),
+        gas_used: 0,
+        timestamp: 1_700_000_000 + number * 14,
+        extra_data: Default::default(),
+        paid_fees: U256::ZERO,
+        minimum_gas_price: U256::ZERO,
+        uncle_count: 0,
+        umm_root: None,
+        bitcoin_merged_mining_header: None,
+        bitcoin_merged_mining_merkle_proof: None,
+        bitcoin_merged_mining_coinbase_transaction: None,
+        cached_hash: None,
+        cached_hash_for_merged_mining: None,
+    }
+}
+
+struct Manifest {
+    seed: u64,
+    accounts: u64,
+    signers: u64,
+    root: B256,
+}
+
+impl Manifest {
+    fn read(dir: &str) -> Result<Self> {
+        let text = std::fs::read_to_string(format!("{dir}/MANIFEST"))
+            .with_context(|| format!("{dir}/MANIFEST -- is this a synthetic_state fixture?"))?;
+        let mut seed = 0;
+        let mut accounts = 0;
+        let mut signers = 0;
+        let mut root = B256::ZERO;
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("seed"), Some(v)) => seed = v.parse()?,
+                (Some("accounts"), Some(v)) => accounts = v.parse()?,
+                (Some("signers"), Some(v)) => signers = v.parse()?,
+                (Some("root"), Some(v)) => root = v.parse()?,
+                _ => {}
+            }
+        }
+        anyhow::ensure!(accounts > 0 && signers > 0, "the manifest is incomplete");
+        Ok(Self { seed, accounts, signers, root })
+    }
+}

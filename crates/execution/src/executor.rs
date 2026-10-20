@@ -166,13 +166,20 @@ impl RskExecutor {
 
     /// How many threads a block's parallel sublists may use.
     ///
-    /// Clamped to at least 1, and to at most the number of parallel sublists
-    /// a block may declare (`TX_EXECUTION_THREADS`): asking for more buys
-    /// nothing, because the partition the header declares is the only source
-    /// of work to divide.
+    /// At least 1. Not clamped from above against
+    /// `TX_EXECUTION_THREADS`, because that constant bounds what a *header*
+    /// may declare and the real bound is what a given block actually
+    /// declared: a block with one parallel sublist gains nothing from four
+    /// threads however high the consensus cap goes. That bound is applied
+    /// where it is known, at execution.
+    ///
+    /// Keeping the two apart also lets a benchmark ask what a wider
+    /// partition would be worth. RSKIP-144 specifies
+    /// `maxTransactionExecutionThreads = 4` where rskj implements 2, and a
+    /// measurement of the difference should not require editing a consensus
+    /// constant to take it.
     pub fn with_execution_threads(mut self, threads: usize) -> Self {
-        self.execution_threads =
-            threads.clamp(1, rustock_core::validation::block_rules::TX_EXECUTION_THREADS);
+        self.execution_threads = threads.max(1);
         self
     }
 
@@ -801,8 +808,17 @@ impl RskExecutor {
         let recorder = crate::collision::config();
         let recording_silent = crate::silent::is_recording();
         let base = &base_root;
-        let outcomes: Vec<Result<SublistRun, ExecutionError>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = parallel
+        // At most `execution_threads` sublists at a time. With the consensus
+        // cap of two parallel sublists a wave is the whole partition and
+        // this is one pass, but the two are not the same quantity and
+        // conflating them would silently run four sublists on four threads
+        // when two were asked for.
+        let width = self.execution_threads.max(1);
+        let mut outcomes: Vec<Result<SublistRun, ExecutionError>> =
+            Vec::with_capacity(parallel.len());
+        for wave in parallel.chunks(width) {
+        let wave_outcomes: Vec<Result<SublistRun, ExecutionError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = wave
                 .iter()
                 .map(|range| {
                     let range = range.clone();
@@ -844,6 +860,8 @@ impl RskExecutor {
                 })
                 .collect()
         });
+        outcomes.extend(wave_outcomes);
+        }
 
         // 3. Commit them in sublist order, and take back what the workers
         //    collected on their own threads.

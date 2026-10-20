@@ -169,8 +169,12 @@ const KEY_LEN: usize = 31;
 /// and the trie would be smaller than the account count claims.
 fn account_value(key: &[u8]) -> Vec<u8> {
     let tail = u64::from_be_bytes(key[23..31].try_into().expect("31-byte key"));
-    AccountState::new(U256::from(tail % 7), U256::from(1_000_000_000u64 + tail % 1_000_000_007))
-        .encode()
+    // Nonce zero for every account: a benchmark sending from them has to
+    // know where their nonces start, and reading 93,000 of them back out of
+    // the trie first would warm exactly the paths the fixture exists to
+    // keep cold. The balances still differ, which is what keeps the leaves
+    // from deduplicating into one node.
+    AccountState::new(U256::ZERO, U256::from(1_000_000_000u64 + tail % 1_000_000_007)).encode()
 }
 
 /// A trie store for building a fixture, and for nothing else.
