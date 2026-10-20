@@ -179,6 +179,8 @@ pub struct TrieSection {
     pub engine: Option<String>,
     /// Sizes a flatdb index at open. Ignored by rocksdb.
     pub expected_keys: Option<u64>,
+    /// Blocks executed per trie durability point while catching up.
+    pub flush_every: Option<u64>,
     pub dir: Option<String>,
     pub node: Option<String>,
     /// Entries in the BTC stored-block cache; 0 disables it.
@@ -400,6 +402,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "trie_backend",
     "trie_engine",
     "trie_expected_keys",
+    "trie_flush_every",
     "trie_dir",
     "trie_node",
     "gc_epochs",

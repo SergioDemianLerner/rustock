@@ -821,6 +821,19 @@ struct Args {
     #[arg(long, default_value = "rocksdb")]
     trie_engine: String,
 
+    /// Blocks executed per trie durability point while catching up.
+    ///
+    /// Trie nodes are derivable — lose them and re-executing the block
+    /// recomputes them — so the store may flush less often than the node
+    /// executes. What it may not do is advance the executed head past what a
+    /// crash would keep, and it does not: the head moves only at a flush.
+    ///
+    /// The cost of raising this is that many blocks of re-execution after an
+    /// unclean stop. Follow mode ignores it and makes every block durable,
+    /// because one block every thirty seconds can afford a flush.
+    #[arg(long, default_value_t = 100)]
+    trie_flush_every: u64,
+
     /// Keys to size a flatdb epoch's index for. Ignored by rocksdb.
     ///
     /// A hint rather than a limit, but exceeding it costs a stop-the-world
@@ -1221,6 +1234,8 @@ fn apply_file_config(
     apply(matches, "trie_engine", f.trie.engine.as_ref(), &mut a.trie_engine);
     apply(matches, "trie_expected_keys", f.trie.expected_keys.as_ref(),
         &mut a.trie_expected_keys);
+    apply(matches, "trie_flush_every", f.trie.flush_every.as_ref(),
+        &mut a.trie_flush_every);
     apply(
         matches,
         "btc_block_cache_entries",
@@ -2709,6 +2724,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         .with_scoring(Some(scoring.clone()))
         .with_events(events.clone())
         .with_follow_up(args.follow_up)
+        .with_trie_flush_every(args.trie_flush_every)
         .with_serve_ceiling(args.simulate_height)
         .with_exit_when_synced(args.exit_when_synced);
 

@@ -137,6 +137,13 @@ backend = "epoch"                   # light: bounds state size. This setting ALO
 # but exceeding it costs a stop-the-world rehash, so set it from the expected
 # peak rather than the present. Costs ~16 bytes of resident memory per key.
 # expected_keys = 16000000          # default
+
+# Blocks executed per trie durability point while catching up. Trie nodes are
+# derivable, so the store may flush less often than the node executes; the
+# executed head never advances past what a crash would keep, so the only cost
+# of raising this is that many blocks of re-execution after an unclean stop.
+# Follow mode ignores it and makes every block durable.
+# flush_every = 100                 # default
 # BTC stored-block cache. Answering "which BTC block is at height H?" costs one
 # trie read per block of depth whenever the RSKIP199 height index cannot answer.
 # The cache holds blocks already read for consensus -- it never pre-loads and
