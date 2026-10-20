@@ -243,6 +243,54 @@ the production path deletes — reclamation is discarding a whole epoch — but
 a backend that appeared to delete would let the epoch store believe it had
 reclaimed something.
 
+## Crash consistency
+
+Tested against torn writes, not only simulated (#315).
+`tests/torn_writes.rs` snapshots a database at a committed point, writes
+more, kills the process before the checkpoint, and then rebuilds the
+directory with an arbitrary subset of 512-byte sectors reverted to their
+earlier contents. For any such subset: the store opens, every key durable
+at the old checkpoint reads back, nothing uncommitted appears, and the
+store is still writable.
+
+The reason that can hold is the argument for sector granularity: **a slot
+write never modifies another slot.** Eight-byte slots divide a 512-byte
+sector exactly, so reverting a sector loses precisely the slots written
+into it since the snapshot and never damages one already there — and
+those lost slots point at or beyond the old frontier, so they read as a
+miss anyway.
+
+One control test asserts the harness destroys more than twenty sectors,
+because a tear that silently reverted nothing would make every other test
+in the file pass for the wrong reason.
+
+The harness's first run reported a lost key, and the defect was in the
+harness. It staged the crash by completing the flush and *then* reverting
+the checkpoint — but a completed flush also removes the index file the
+old capacity names, so that pairing is one no crash can reach. Staging it
+faithfully means never writing the second checkpoint at all.
+
+### Why `loom` is not here
+
+The porting notes suggest model-checking the lock-free read path, and it
+was tried and rejected rather than skipped.
+
+`loom` replaces `std` atomics with instrumented ones that own their
+storage. The index's slots live inside a memory mapping, so they cannot
+be loom atomics without abstracting the slot array over its backing — and
+even then, loom would verify the slot protocol while the part that is
+actually subtle stays outside its view: whether a reader that acquires a
+slot sees the heap bytes the writer wrote through a raw pointer. That
+rests on the release/acquire pair plus append-only immutability, which is
+an argument, not something loom checks.
+
+A loom harness over a `Vec`-backed slot array would therefore model the
+easy half and produce confidence about the hard half that it had not
+earned. The concurrent tests that are here —
+`readers_and_a_writer_can_run_at_once`,
+`a_grow_under_concurrent_readers_loses_nothing` — exercise the real
+mapping under real threads, which is weaker as proof and honest about it.
+
 ## Running it
 
 ```sh
