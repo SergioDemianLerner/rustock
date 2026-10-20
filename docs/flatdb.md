@@ -303,6 +303,55 @@ rather than an unexamined one.
 every record is short and the benchmark cannot see this cost. Measuring
 it needs state with contract code in it.
 
+## Parallel execution: the bottleneck moved, it did not go away
+
+The parallel execution benchmark found the workload I/O bound — four
+threads reaching 86% CPU on four cores, buying 1.33×. The obvious
+follow-up was whether FlatDB, by making reads cheaper, would let the
+threads finally show something. Run against both engines with the same
+binary, 100 blocks, 200 tx/block, 4 sublists:
+
+| engine | threads | wall | CPU | total ms/block |
+|---|---|---|---|---|
+| RocksDB | 1 | 220.9 s | 46% | 2,179 |
+| RocksDB | 4 | 159.9 s | 80% | 1,566 |
+| FlatDB | 1 | **64.1 s** | 67% | **611** |
+| FlatDB | 4 | 58.7 s | **99%** | 558 |
+
+All eight runs end on the same state root.
+
+**FlatDB is 3.6× faster on a single thread** — which is the number that
+matters, because block execution issues dependent reads and cannot batch
+them. **And it scales 1.09×**, against RocksDB's 1.39×.
+
+99% CPU on four cores is one core busy. The bottleneck stopped being the
+disk and became a lock.
+
+### Write volume governs it (#319)
+
+60 blocks on FlatDB, varying only the transactions:
+
+| tx/block | 1 thread | 4 threads | scaling | CPU at 4 |
+|---|---|---|---|---|
+| 200 | 43.4 s | 38.0 s | 1.14× | 93% |
+| 40 | 18.2 s | 13.9 s | 1.31× | 41% |
+
+Cutting writes five-fold raises the scaling. By Amdahl the parallel
+fraction is 16% at 200 tx and 32% at 40: it **shrinks as writes grow**,
+which is what a lock inside the parallel region looks like. That lock is
+`FlatDb`'s writer mutex, held across the probe, the key comparison, the
+heap append and the slot store, some 6,900 times a block.
+
+The append does not need it — the frontier can be reserved with a
+`fetch_add` and written outside any lock, since no other thread can be
+handed the same range, and publication is already a release-store.
+
+But 41% CPU at four threads with *few* writes says the lock is not the
+only limit. A third of a block's work is parallel at best; the
+maintenance run, the ordered commit, the root hashing and the lazy
+reload are all sequential. Removing the mutex should recover what writes
+are stealing and no more.
+
 ## Memory
 
 The worry was that 8 bytes a slot at load factor 0.5 is 16 bytes of
