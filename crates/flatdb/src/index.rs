@@ -380,8 +380,27 @@ impl Index {
     }
 
     /// Doubles the table into a new file and rehashes every live entry.
+    ///
+    /// Stop-the-world: it holds the write lock, and it reads every record
+    /// out of the heap to recover its key, because the index stores none.
+    /// At sixteen million entries that is minutes during which no read
+    /// proceeds.
+    ///
+    /// It is a safety net rather than an expected event — an epoch's key
+    /// count is bounded by its rotation threshold, so
+    /// `epoch_backend::keys_for_rotation` sizes the table past it. Reaching
+    /// here means that sizing was wrong, which an operator needs to know,
+    /// so it says so at both ends with how long it took.
     fn grow(&self, heap: &Heap, keys: &dyn Keys) -> io::Result<()> {
+        let started = std::time::Instant::now();
         let mut table = self.table.write().expect("index table");
+        tracing::warn!(
+            target: "rustock::flatdb",
+            "index full at {} of {} slots: rehashing, which stops every read until \
+             it finishes. The store was sized for too few keys; see expected_keys.",
+            self.size.load(Ordering::Relaxed),
+            table.capacity
+        );
         let new_capacity = if table.capacity == 0 { 16 } else { table.capacity * 2 };
         if new_capacity > MAX_CAPACITY {
             return Err(io::Error::other(format!(
@@ -440,6 +459,12 @@ impl Index {
         self.size.store(moved, Ordering::Release);
         self.dirty.store(true, Ordering::Release);
         drop(previous);
+        tracing::warn!(
+            target: "rustock::flatdb",
+            "index rehashed to {} slots, {moved} entries carried over, {:.1}s stopped",
+            new_capacity,
+            started.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 

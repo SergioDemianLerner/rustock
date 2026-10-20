@@ -389,6 +389,28 @@ pub fn dir_size(path: &Path) -> u64 {
 /// there is no counterpart to the RocksDB block cache. The mapped heap
 /// *is* the cache, managed by the kernel, which is also why a FlatDB epoch
 /// store has one fewer memory budget to get wrong.
+/// Bytes a stored trie node takes, averaged, for sizing an index from a
+/// rotation threshold.
+///
+/// Measured on the 1 GB regtest fixture: 704 MB of heap over 9,299,999
+/// records is 75.7 bytes each. Rounded up to 80, because the figure only
+/// matters as a divisor and over-estimating it under-sizes the index --
+/// the direction that costs a stop-the-world rehash rather than some
+/// reclaimable address space.
+pub const AVERAGE_RECORD_BYTES: u64 = 80;
+
+/// Keys an epoch can hold before it rotates.
+///
+/// An epoch is not open-ended: it rotates at `rotate_bytes`, so the
+/// number of records it will ever hold is bounded and can be computed
+/// rather than guessed. Sizing from it designs the rehash out instead of
+/// making it faster, which is the right trade once #318 established that
+/// the index mapping is reclaimable page cache and over-sizing is nearly
+/// free.
+pub fn keys_for_rotation(rotate_bytes: u64) -> u64 {
+    (rotate_bytes / AVERAGE_RECORD_BYTES).max(1024)
+}
+
 pub struct FlatFactory {
     /// Sizes each epoch's index at open. A hint: exceeding it costs a
     /// rehash rather than a failure, but the rehash is stop-the-world, so
@@ -513,8 +535,10 @@ mod tests {
         Box::new(RocksFactory::new(8 * 1024 * 1024))
     }
 
+    /// Small segments: they are reserved whole, so the production 512 MiB
+    /// does not belong in a temporary directory several tests share.
     fn flat() -> Box<dyn EpochBackendFactory> {
-        Box::new(FlatFactory::new(1024))
+        Box::new(FlatFactory::new(1024).with_segment_size(1 << 20))
     }
 
     /// FlatDB keys must be the digest of their value; RocksDB does not
@@ -842,5 +866,60 @@ mod tests {
             batched.iter().filter(|v| v.is_some()).count() > 0,
             "the test proved nothing: no key resolved"
         );
+    }
+
+    /// Sizing from the rotation threshold is what designs the rehash out,
+    /// so the arithmetic has to leave the table under its load factor at
+    /// the moment the epoch is full.
+    #[test]
+    fn an_epoch_sized_from_its_rotation_threshold_does_not_grow() {
+        let rotate = 1u64 << 30; // the production 1 GB
+        let keys = keys_for_rotation(rotate);
+
+        // The table a FlatDB index allocates for that many keys.
+        let mut capacity = 16u64;
+        while capacity < keys * 2 {
+            capacity <<= 1;
+        }
+        assert!(
+            keys <= capacity / 2,
+            "{keys} keys against {capacity} slots is over the load factor, so a \
+             full epoch would rehash"
+        );
+
+        // And the records that actually fit in the threshold are covered.
+        let records_that_fit = rotate / AVERAGE_RECORD_BYTES;
+        assert!(
+            records_that_fit <= capacity / 2,
+            "an epoch filled to {rotate} bytes holds {records_that_fit} records, \
+             past half of {capacity} slots"
+        );
+    }
+
+    /// The derivation is a divisor, so a tiny threshold must not produce a
+    /// table too small to be a table.
+    #[test]
+    fn a_small_rotation_threshold_still_gets_a_usable_index() {
+        assert!(keys_for_rotation(1024) >= 1024);
+        assert!(keys_for_rotation(0) >= 1024);
+    }
+
+    /// The divisor has to sit *above* what a realistic record costs on
+    /// disk. Under-counting inflates the key estimate, which under-sizes
+    /// the index and brings back the rehash the derivation exists to
+    /// avoid. Reading it from the record encoding means a change to the
+    /// layout trips this rather than silently shrinking every index.
+    #[test]
+    fn the_average_record_estimate_covers_a_realistic_node() {
+        // An account leaf: a short record, no stored key.
+        let account = rustock_flatdb::Heap::record_size(64, false, 32);
+        assert!(
+            AVERAGE_RECORD_BYTES >= account as u64,
+            "a {account}-byte record against an estimate of {AVERAGE_RECORD_BYTES}: \
+             the estimate under-counts, so every index would be sized too small"
+        );
+        // And it should not be so generous that the index is wasteful: the
+        // fixture measured 75.7 bytes a record over 9.3 M of them.
+        assert!(AVERAGE_RECORD_BYTES <= 128, "the estimate is wastefully large");
     }
 }

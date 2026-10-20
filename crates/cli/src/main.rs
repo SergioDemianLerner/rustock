@@ -836,10 +836,16 @@ struct Args {
 
     /// Keys to size a flatdb epoch's index for. Ignored by rocksdb.
     ///
-    /// A hint rather than a limit, but exceeding it costs a stop-the-world
-    /// rehash, so set it from the expected peak. Costs 16 bytes of resident
-    /// memory per key at the default load factor.
-    #[arg(long, default_value_t = 16_000_000)]
+    /// Zero, the default, derives it from the rotation threshold: an epoch
+    /// rotates at --gc-rotate-mb, so the number of records it will ever hold
+    /// is bounded and can be computed rather than guessed. Set it only to
+    /// override that.
+    ///
+    /// Exceeding it costs a stop-the-world rehash. Over-sizing costs
+    /// reclaimable address space and nothing else -- the index is a file
+    /// mapping, not committed memory -- so the two errors are not
+    /// symmetric and the derived figure errs large.
+    #[arg(long, default_value_t = 0)]
     trie_expected_keys: u64,
 
     /// Epochs to keep with --trie-backend epoch. Minimum 3.
@@ -1912,8 +1918,16 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         burial_depth: args.gc_burial,
         rotate_bytes: args.gc_rotate_mb * (1 << 20),
     };
+    let rotate_bytes = gc_config.rotate_bytes;
     let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
     let engine = rustock_storage::TrieEngine::parse(&args.trie_engine)?;
+    // An epoch's key count is bounded by when it rotates, so the default
+    // is computed rather than configured.
+    let expected_keys = if args.trie_expected_keys > 0 {
+        args.trie_expected_keys
+    } else {
+        rustock_storage::epoch_backend::keys_for_rotation(rotate_bytes)
+    };
     if matches!(backend, rustock_storage::epoch_store::TrieBackend::Single)
         && engine == rustock_storage::TrieEngine::FlatDb
     {
@@ -2020,7 +2034,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     &trie_dir,
                     cfg.clone(),
                     resume_at,
-                    engine.factory(args.trie_expected_keys),
+                    engine.factory(expected_keys),
                 )?
             }))
         }
@@ -2038,7 +2052,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     Arc::new(rustock_storage::FlatTrieStore::open(
                         dir,
                         rustock_flatdb::Options {
-                            expected_keys: args.trie_expected_keys,
+                            expected_keys,
                             ..rustock_flatdb::Options::default()
                         },
                     )?)

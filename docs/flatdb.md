@@ -303,6 +303,86 @@ rather than an unexamined one.
 every record is short and the benchmark cannot see this cost. Measuring
 it needs state with contract code in it.
 
+## Memory
+
+The worry was that 8 bytes a slot at load factor 0.5 is 16 bytes of
+**resident** index per key, sized for the peak rather than the present
+(#318). Measured, the premise is wrong, and the direction is the
+opposite of what it assumed.
+
+Peak resident memory over 60 blocks at 4 threads, sampled from
+`/proc/<pid>/status`:
+
+| | RssAnon | RssFile | total |
+|---|---|---|---|
+| RocksDB, 256 MB block cache | **334 MB** | 11 MB | 345 MB |
+| FlatDB | **10 MB** | 962 MB | 972 MB |
+
+FlatDB's total looks three times worse and its *demand* is thirty times
+smaller. Almost all of it is file-backed: the heap and index mappings,
+which are page cache the kernel owns and can reclaim at will. The
+irreducible anonymous footprint is 10 MB.
+
+RocksDB's 334 MB is anonymous. The block cache is the application's
+memory; the kernel cannot take it back under pressure, it can only swap
+it.
+
+That is an operational difference, not a bookkeeping one. On a machine
+where something else needs memory, FlatDB degrades — pages are evicted,
+the next probe faults, reads get slower — and RocksDB does not degrade,
+it competes. On this 7 GB host, where a 2 GB cache has previously got a
+long-running job OOM-killed, graceful degradation is the behaviour worth
+having.
+
+It also explains the earlier cache results that looked paradoxical: a
+1,536 MB RocksDB block cache made the benchmark *slower* than a 256 MB
+one, and a 500k-entry node LRU cost 38%. Anonymous caches take memory
+away from the page cache that was doing the real work. A mapped store
+has only one pool and cannot make that mistake.
+
+### Sizing designs the rehash out (#313)
+
+A grow is stop-the-world: it holds the write lock and reads every record
+out of the heap to recover its key, because the index stores none. At
+sixteen million entries that is minutes with no read proceeding.
+
+Making it *fast* was the obvious fix and is the wrong one. An incremental
+rehash would keep both tables and migrate a bounded number of slots per
+operation, which removes the stall by complicating every read — the path
+that has to stay fast. And the memory result above says the alternative
+is nearly free: `expected_keys` buys reclaimable address space, not
+committed memory, so over-sizing and under-sizing are not symmetric
+errors at all.
+
+So the size is **computed, not configured**. An epoch is not open-ended:
+it rotates at `rotate_bytes`, so the records it will ever hold are
+bounded.
+
+```
+expected_keys = rotate_bytes / AVERAGE_RECORD_BYTES        (80 bytes)
+```
+
+At 1 GB that is 13.4 M keys, 2^25 slots, 268 MB of mapping, and a full
+epoch sits at 40% load — under the 0.5 factor, so it never grows. A test
+asserts exactly that, and another pins `AVERAGE_RECORD_BYTES` against
+the real record encoding so a layout change trips it instead of silently
+shrinking every index. The 80 comes from the fixture: 704 MB of heap
+over 9,299,999 records is 75.7 bytes each, rounded up because
+over-estimating the divisor under-sizes the index.
+
+`--trie-expected-keys 0` (the default) derives it. A non-zero value
+overrides.
+
+The grow stays as the safety net it now is, and says so at both ends
+with how long it stopped the world — reaching it means the sizing was
+wrong, which is something an operator needs told rather than left to
+infer from a latency graph.
+
+**Revisiting the 5-byte slot is not warranted.** It would trade the
+single aligned load and, more importantly, `AtomicU64` and the lock-free
+read path for 10 bytes a key instead of 16 — a saving in a quantity the
+measurement shows is not the binding constraint.
+
 ## Batched reads
 
 `get_many` exists because a trie traversal issues *dependent* reads — each

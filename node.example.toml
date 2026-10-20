@@ -114,10 +114,13 @@
 # the other engine, rather than opening an empty store beside the data.
 # engine = "rocksdb"                # default
 
-# Keys to size a flatdb index for; ignored by rocksdb. A hint, not a limit,
-# but exceeding it costs a stop-the-world rehash, so set it from the expected
-# peak rather than the present. Costs ~16 bytes of resident memory per key.
-# expected_keys = 16000000          # default
+# Keys to size a flatdb index for; ignored by rocksdb. Zero derives it from
+# the rotation threshold below: an epoch rotates at a known size, so the
+# records it will ever hold are bounded and can be computed rather than
+# guessed. Exceeding it costs a stop-the-world rehash; over-sizing costs
+# reclaimable address space and nothing else, because the index is a file
+# mapping and not committed memory. Set it only to override the derivation.
+# expected_keys = 0                 # default
 
 # Blocks executed per trie durability point while catching up. Trie nodes are
 # derivable, so the store may flush less often than the node executes; the
