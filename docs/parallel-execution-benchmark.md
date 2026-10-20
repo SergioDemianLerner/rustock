@@ -427,6 +427,91 @@ applies the changes; with two or more the sublists commit inside
 `execute_block`. **Only the total is comparable**, which is what the wall
 clock and the tx/s column use.
 
+## Where the time actually goes, and what moved it
+
+The result above says the work waits on the disk. The obvious next question
+is *which* disk traffic, and the answer decided what was worth changing.
+
+### Reads, not writes
+
+Device bytes over 30 blocks, from `/proc/<pid>/io`:
+
+| | per 30 blocks | per block |
+|---|---|---|
+| read | **963 MB** | 32 MB |
+| written | 566 MB | 18.9 MB |
+
+The writes are ~24× the ~795 KB of trie nodes a block actually produces,
+which is RocksDB compaction, not the write path — `write_bytes` came back
+within 1% of 566 MB in *every* configuration tried, including one with the
+WAL switched off. In absolute terms it is about 9 MB/s, which this SSD does
+not notice.
+
+The reads are the cost, and the mechanism is amplification: ~32 MB fetched
+to serve ~6,000 useful nodes of ~115 bytes each. **Trie keys are hashes, so
+there is no locality at all** — a 4 KB SST block holds ~35 unrelated nodes
+and a lookup wants one of them. This is also why a *bigger* RocksDB block
+cache made things worse: at 1536 MB it took memory from the OS page cache,
+which was serving those reads better, and the run went from 2,129 to 2,512
+ms/block.
+
+### Five changes, measured one at a time
+
+30 blocks, 4 threads, fresh fixture and evicted page cache before each run.
+`n` is how many times each was run; the spread on this machine is wide
+enough that single runs decide nothing.
+
+| | change | n | mean | vs baseline |
+|---|---|---|---|---|
+| A | no cache (`RocksDbTrieStore`) | 3 | 73.0 s | — |
+| B | `CachedTrieStore` as it was | 3 | 123.8 s | **0.59×** |
+| C | B, lock released before the read | 6 | **54.5 s** | **1.34×** |
+| D | C + cache sharded 16 ways | 6 | 57.2 s | 1.28× |
+| D2 | *control*: D on a recompacted fixture | 2 | 65.7 s | — |
+| E | D2 + 1 KB SST blocks | 2 | 64.4 s | 1.02× vs D2 |
+| F | E + no WAL | 3 | 63.6 s | 1.01× vs E |
+
+All five produce the same final state root,
+`0xfea7e236…97efdc`, so these are differences in speed and in nothing else.
+
+**B is the finding.** The store the node runs was **1.7× slower than no
+cache at all** under four threads, at 45% CPU and in one run 33%. Its `get`
+held the single `Mutex` across the RocksDB lookup, so every cache miss — a
+disk read, the thing this workload is made of — queued all four sublists
+behind it. Adding a cache made the node slower, and parallel execution gave
+back the concurrency it had just arranged.
+
+**C is the fix and it is the whole win.** Releasing the lock before the
+read: 2.27× over B, 1.34× over having no cache. Concurrent misses on the
+same key now duplicate the fetch, which is waste and never a wrong answer —
+a node is immutable and keyed by its own hash.
+
+**D, E and F bought nothing.** Sharding the cache was aimed at lock
+contention that no longer existed once the disk read was outside the lock;
+what remains inside is a hash lookup, too short for four threads to collide
+on. 1 KB SST blocks did not pay either, which refutes the prediction that
+followed from the amplification figure above. The WAL result is the direct
+test of "maybe it is writes": 1%.
+
+Recompacting the fixture made it *slower* (D2 at 65.7 s against D at 52.8
+s, CPU falling from 77% to 58%), which is unexplained. The control earns
+its place: without it that loss would have been charged to the block size.
+
+### Cache size matters more than expected, and not monotonically
+
+With the lock fixed, 40 blocks, four interleaved repetitions each:
+
+| LRU entries | mean | spread |
+|---|---|---|
+| 50,000 (the node's default) | 78.3 s | 54.6 – 105.7 |
+| 200,000 | **70.8 s** | 62.7 – 74.6 |
+| 500,000 | 97.3 s | 83.2 – 111.9 |
+
+200,000 is both faster and far steadier. 500,000 is clearly worse, for the
+same reason the 1536 MB block cache was: on a 7 GB machine it competes with
+the page cache that is doing the real work. The right size is a property of
+the machine, not of the trie, and 50,000 looks low for a gigabyte of state.
+
 ## What this says
 
 The workload is **I/O bound**. Four threads reach 86% of one core on a
@@ -438,7 +523,13 @@ exists — a bare value transfer, 21,000 gas, two account cells — against
 state that does not fit in cache. Both halves of that push the result the
 same way.
 
-What would move it:
+It also turned up something the question did not ask for and that matters
+more than the answer: **the node's own trie store was holding a lock across
+its disk reads**, which made it slower than no cache at all as soon as more
+than one thread was executing. That is fixed, and the fix is worth 1.34×
+against the unchanged baseline — more than the thread count buys.
+
+What would move the parallel number itself:
 
 - **Transactions that compute.** ERC-20 transfers, which the workload
   generator already builds, touch storage cells and do real work per
@@ -449,7 +540,21 @@ What would move it:
   design should be judged on.
 - **Longer runs.** Eighty blocks to warm up and a visible upturn after
   means 100 blocks sees the bottom of the curve and little else.
+- **Attacking read amplification directly.** 32 MB read to serve 6,000
+  nodes is the real tax. Smaller SST blocks did not touch it; what might is
+  storing the trie with keys that preserve locality rather than hashes, or
+  caching decoded nodes rather than the blocks they arrive in.
 
 Four sublists is above what the network allows; the two-thread row — 1.13×
 over the run — is what is reachable today, and it is within the run-to-run
 variance of this setup.
+
+### A caution about this machine
+
+Repeated runs of the same configuration vary by 20% and occasionally more
+(50,000 entries at 40 blocks ranged from 54.6 s to 105.7 s). Four cores and
+7 GB, with the state a seventh of RAM, is a setup where the page cache
+decides a lot and the eviction between runs does not control it perfectly.
+Every claim above rests on repeated interleaved runs, and the ones that
+rest on two are labelled as such. Differences under about 10% on this host
+should be treated as unproven.

@@ -50,6 +50,10 @@ fn main() -> Result<()> {
     let mut csv: Option<String> = None;
     let mut label = String::new();
     let mut cache_mb = 256usize;
+    let mut node_lru: usize = 0;
+    let mut no_wal: bool = false;
+    let mut sst_kb: usize = 0;
+    let mut compact_only: bool = false;
 
     while let Some(flag) = args.next() {
         let value = args.next().with_context(|| format!("{flag} needs a value"))?;
@@ -62,6 +66,10 @@ fn main() -> Result<()> {
             "--csv" => csv = Some(value),
             "--label" => label = value,
             "--cache-mb" => cache_mb = value.parse()?,
+            "--node-lru" => node_lru = value.parse()?,
+            "--no-wal" => no_wal = value.parse()?,
+            "--sst-kb" => sst_kb = value.parse()?,
+            "--compact-only" => compact_only = value.parse()?,
             other => anyhow::bail!("unknown option {other}"),
         }
     }
@@ -87,7 +95,40 @@ fn main() -> Result<()> {
     // and a sixfold ramp from start to finish, which is a measurement of
     // uncached RocksDB rather than of execution, and of a configuration no
     // node uses.
-    let trie_store: Arc<dyn TrieStore> = Arc::new(open_cached_store(&fixture, cache_mb)?);
+    // Rewrite every SST with the configured block size and stop. Changing
+    // `block_size` only affects files written afterwards, so measuring a
+    // smaller block against a fixture built with the default measures
+    // nothing until the fixture is rebuilt.
+    if compact_only {
+        let started = std::time::Instant::now();
+        let store = open_node_cached_store(
+            &fixture,
+            cache_mb,
+            sst_kb,
+            rustock_storage::cached_trie_store::Config::default(),
+        )?;
+        store.compact_all();
+        println!("compacted {fixture} at {sst_kb} KB blocks in {:.0}s",
+                 started.elapsed().as_secs_f64());
+        return Ok(());
+    }
+
+    let trie_store: Arc<dyn TrieStore> = if node_lru > 0 {
+        Arc::new(open_node_cached_store(
+            &fixture,
+            cache_mb,
+            sst_kb,
+            rustock_storage::cached_trie_store::Config {
+                lru_capacity: node_lru,
+                // A block writes about 6,900 nodes; flushing once a block
+                // rather than four times is what "batch the block" means.
+                auto_flush_threshold: 100_000,
+                disable_wal: no_wal,
+            },
+        )?)
+    } else {
+        Arc::new(open_cached_store(&fixture, cache_mb)?)
+    };
     let root = trie_store
         .get(manifest.root.as_slice())
         .map(|data| TrieNode::from_message(&data, trie_store.as_ref()))
@@ -177,6 +218,11 @@ fn main() -> Result<()> {
         let _ = &processor; // built to validate the configuration early
     }
 
+    // The state root after the last block. Every configuration of the store
+    // must end here: a cache, a lock discipline or a table option that
+    // changes this has changed the chain, not its speed.
+    println!("\nfinal root     {}", state.compute_hash(trie_store.as_ref()));
+
     report(&rows, &label, threads, sublists);
     if let Some(path) = csv {
         write_csv(&path, &rows, &label, threads, sublists)?;
@@ -190,6 +236,40 @@ fn main() -> Result<()> {
 fn open_cached_store(dir: &str, cache_mb: usize) -> Result<RocksDbTrieStore> {
     RocksDbTrieStore::open_with_cache(dir, cache_mb * 1024 * 1024)
         .with_context(|| format!("opening {dir}"))
+}
+
+/// The store the node itself runs: a `CachedTrieStore` over the same RocksDB,
+/// adding an LRU of **decoded nodes keyed by hash** and a `WriteBatch`.
+///
+/// The distinction from `--cache-mb` is the point of the option. A RocksDB
+/// block cache caches 4 KB SST blocks, and trie keys are hashes, so a block
+/// holds ~35 unrelated nodes of which a lookup wants one. An LRU keyed by the
+/// node's own hash caches the node itself.
+fn open_node_cached_store(
+    dir: &str,
+    cache_mb: usize,
+    sst_kb: usize,
+    config: rustock_storage::cached_trie_store::Config,
+) -> Result<rustock_storage::CachedTrieStore> {
+    use rocksdb::{ColumnFamilyDescriptor, Options};
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    opts.create_missing_column_families(true);
+    let cache = rocksdb::Cache::new_lru_cache(cache_mb * 1024 * 1024);
+    let mut block = rocksdb::BlockBasedOptions::default();
+    block.set_bloom_filter(10.0, false);
+    block.set_block_cache(&cache);
+    // Only affects SSTs written from here on, so measuring a smaller block
+    // means compacting the fixture with it first.
+    if sst_kb > 0 {
+        block.set_block_size(sst_kb * 1024);
+    }
+    let mut cf_opts = Options::default();
+    cf_opts.set_block_based_table_factory(&block);
+    let cfs = vec![ColumnFamilyDescriptor::new("trie_nodes", cf_opts)];
+    let db = rocksdb::DB::open_cf_descriptors(&opts, dir, cfs)
+        .with_context(|| format!("opening {dir}"))?;
+    Ok(rustock_storage::CachedTrieStore::with_config(Arc::new(db), config))
 }
 
 struct Row {
