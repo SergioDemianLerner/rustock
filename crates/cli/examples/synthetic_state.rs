@@ -22,7 +22,7 @@
 //! generated separately and are the only ones that need to sign anything.
 //!
 //! ```text
-//! synthetic_state build <dir> --accounts N [--seed S] [--batch N]
+//! synthetic_state build <dir> --accounts N [--signers M] [--seed S]
 //! synthetic_state measure <dir>
 //! ```
 //!
@@ -33,7 +33,7 @@
 
 use anyhow::{Context, Result};
 use alloy_primitives::U256;
-use rustock_execution::mining::workload::filler_address;
+use rustock_execution::mining::workload::{account_key, address_of, filler_address};
 use rustock_trie::{AccountState, TrieStore};
 use std::time::Instant;
 
@@ -46,17 +46,17 @@ fn main() -> Result<()> {
         "build" => {
             let mut accounts = 1_000_000u64;
             let mut seed = 1u64;
-            let mut batch = 20_000u64;
+            let mut signers = 0u64;
             while let Some(flag) = args.next() {
                 let value = args.next().with_context(|| format!("{flag} needs a value"))?;
                 match flag.as_str() {
                     "--accounts" => accounts = parse_count(&value)?,
                     "--seed" => seed = value.parse()?,
-                    "--batch" => batch = parse_count(&value)?,
+                    "--signers" => signers = parse_count(&value)?,
                     other => anyhow::bail!("unknown option {other}"),
                 }
             }
-            build(&dir, accounts, seed, batch)
+            build(&dir, accounts, seed, signers)
         }
         "measure" => {
             let bytes = directory_bytes(&dir)?;
@@ -81,7 +81,7 @@ fn parse_count(s: &str) -> Result<u64> {
     Ok(digits.trim().parse::<u64>()? * scale)
 }
 
-fn build(dir: &str, accounts: u64, seed: u64, _batch: u64) -> Result<()> {
+fn build(dir: &str, accounts: u64, seed: u64, signers: u64) -> Result<()> {
     if std::path::Path::new(dir).exists() {
         anyhow::bail!(
             "{dir} already exists. Building into an existing trie would mix two states; \
@@ -90,7 +90,10 @@ fn build(dir: &str, accounts: u64, seed: u64, _batch: u64) -> Result<()> {
     }
     std::fs::create_dir_all(dir)?;
 
-    println!("building {accounts} accounts into {dir} (seed {seed})");
+    if signers > accounts {
+        anyhow::bail!("--signers {signers} exceeds --accounts {accounts}");
+    }
+    println!("building {accounts} accounts into {dir} (seed {seed}, {signers} with keys)");
     let started = Instant::now();
 
     // Keys first, in one flat buffer. Thirty-one bytes each, so five
@@ -101,7 +104,15 @@ fn build(dir: &str, accounts: u64, seed: u64, _batch: u64) -> Result<()> {
     std::io::stdout().flush().ok();
     let mut flat = vec![0u8; accounts as usize * KEY_LEN];
     for i in 0..accounts {
-        let address = filler_address(seed, i);
+        // The first `signers` accounts are derived from real keys so the
+        // benchmark can sign as them; the rest are hashes, because nothing
+        // ever signs for those and nine million curve multiplications to
+        // produce addresses that will never spend is time for nothing.
+        let address = if i < signers {
+            address_of(&account_key(seed, i as usize))
+        } else {
+            filler_address(seed, i)
+        };
         let key = rustock_trie::account_key(&address);
         debug_assert_eq!(key.len(), KEY_LEN);
         flat[i as usize * KEY_LEN..(i as usize + 1) * KEY_LEN].copy_from_slice(&key);
@@ -135,8 +146,15 @@ fn build(dir: &str, accounts: u64, seed: u64, _batch: u64) -> Result<()> {
     println!("per account {:.1} bytes", bytes as f64 / keys.len() as f64);
     println!("took        {:.1}s", started.elapsed().as_secs_f64());
     std::fs::write(format!("{dir}/ROOT"), format!("{root}\n"))?;
+    // Everything needed to regenerate the same accounts, so a benchmark
+    // against this fixture does not have to be told the flags again -- and
+    // cannot be told the wrong ones.
+    std::fs::write(
+        format!("{dir}/MANIFEST"),
+        format!("seed {seed}\naccounts {}\nsigners {signers}\nroot {root}\n", keys.len()),
+    )?;
     println!();
-    println!("the root is also in {dir}/ROOT");
+    println!("the root is also in {dir}/ROOT, with the rest in {dir}/MANIFEST");
     Ok(())
 }
 
