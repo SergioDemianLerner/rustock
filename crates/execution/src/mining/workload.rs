@@ -290,6 +290,23 @@ pub fn account_key(seed: u64, index: usize) -> k256::ecdsa::SigningKey {
     k256::ecdsa::SigningKey::from_slice(&bytes).unwrap_or_else(|_| account_key(seed + 1, index))
 }
 
+/// A filler account's address: a hash, not a key.
+///
+/// These accounts exist to make a trie big and its reads cold. Nothing ever
+/// signs for them, so deriving them from a keypair would be both slower and
+/// a claim about them that is not true -- five million secp256k1 keys take
+/// longer to generate than the trie takes to build, to produce addresses
+/// nothing will ever spend.
+pub fn filler_address(seed: u64, index: u64) -> Address {
+    use sha3::{Digest, Keccak256};
+    let mut hasher = Keccak256::new();
+    hasher.update(b"rustock synthetic filler");
+    hasher.update(seed.to_be_bytes());
+    hasher.update(index.to_be_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    Address::from_slice(&digest[12..])
+}
+
 pub fn address_of(key: &k256::ecdsa::SigningKey) -> Address {
     use sha3::{Digest, Keccak256};
     let encoded = key.verifying_key().to_encoded_point(false);
