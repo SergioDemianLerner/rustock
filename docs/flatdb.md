@@ -351,6 +351,38 @@ earned. The concurrent tests that are here —
 `a_grow_under_concurrent_readers_loses_nothing` — exercise the real
 mapping under real threads, which is weaker as proof and honest about it.
 
+## Migrating a node
+
+Done (#317). `flat_migrate` converts an epoch store in place, with the
+node stopped:
+
+```sh
+cargo run --release --example flatdb_migrate -- \
+    /var/lib/rustock/trie-epochs --blocks /var/lib/rustock/blocks \
+    --expected-keys 24m --keep-original
+```
+
+Each epoch is converted into a sibling directory and marked done, so an
+interrupted run resumes where it stopped rather than starting over, and
+never half-writes the live store. A directory present without its marker
+is wreckage and is redone rather than trusted.
+
+**It verifies by the root, not by a count.** A node count can match the
+source while the trie is unwalkable. The migration resolves the executed
+head's state root through the converted epochs and descends the whole
+trie; only then are the originals moved aside. A node referenced but
+absent stops it with the originals untouched, and the message names
+issue #293 — an epoch store collected before `b0eff4b` may be missing
+long values, which is a precondition the migration cannot repair.
+
+`--segment-mb` is not a tuning knob. The segment size is recorded in each
+store's checkpoint and the node refuses to open one written with a
+different value, so a migration that guessed would convert cleanly and
+then fail to start. It defaults to the node's own 512 MB.
+
+Without `--blocks` nothing is verified and nothing is swapped, which is a
+legitimate way to do the slow half in advance.
+
 ## Running it
 
 ```sh

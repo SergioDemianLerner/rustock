@@ -358,11 +358,22 @@ pub struct FlatFactory {
     /// rehash rather than a failure, but the rehash is stop-the-world, so
     /// it should be set from the expected peak and not the present.
     pub expected_keys: u64,
+    /// Bytes per heap segment. Part of the on-disk format: a store records
+    /// what it was written with and refuses to open under anything else,
+    /// so everything that creates an epoch has to agree on this.
+    pub segment_size: u64,
 }
 
 impl FlatFactory {
     pub fn new(expected_keys: u64) -> Self {
-        Self { expected_keys }
+        Self { expected_keys, segment_size: rustock_flatdb::heap::DEFAULT_SEGMENT_SIZE }
+    }
+
+    /// A smaller segment, for tests. Segments are reserved whole, so the
+    /// production 512 MiB is more than a temporary directory wants.
+    pub fn with_segment_size(mut self, bytes: u64) -> Self {
+        self.segment_size = bytes;
+        self
     }
 
     fn options(&self, read_only: bool) -> rustock_flatdb::Options {
@@ -373,6 +384,7 @@ impl FlatFactory {
             // epoch that fsynced on every put would pay three syncs per
             // node written.
             sync_writes: false,
+            segment_size: self.segment_size,
             ..rustock_flatdb::Options::default()
         }
     }

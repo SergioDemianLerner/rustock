@@ -2,6 +2,7 @@ pub mod trie_store;
 pub mod cached_trie_store;
 pub mod epoch_backend;
 pub mod flat_trie_store;
+pub mod flat_migrate;
 pub mod counting_trie_store;
 pub mod rskj_import;
 pub use position::{
