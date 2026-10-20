@@ -245,15 +245,6 @@ pub struct EpochTrieStore {
     last_collect: RwLock<Option<CollectStats>>,
 }
 
-/// Background compaction jobs per epoch.
-///
-/// Deliberately low. Every epoch is an independent RocksDB instance, so this
-/// multiplies by `N`: the default of 2 across four epochs puts eight background
-/// threads on a machine that may have four cores, and they compete with block
-/// processing for them. One epoch is also small by construction, so it has less
-/// to compact than a single unbounded database would.
-const BG_JOBS_PER_EPOCH: i32 = 1;
-
 
 /// Entries copied per batch while draining the oldest epoch.
 const DRAIN_BATCH: usize = 10_000;

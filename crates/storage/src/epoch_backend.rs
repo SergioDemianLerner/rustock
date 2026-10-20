@@ -195,6 +195,20 @@ fn first_epoch_dir(root: &Path) -> Option<PathBuf> {
 /// would reserve memory for epochs that are read once a sweep.
 pub const BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
+/// Background compaction jobs **per epoch**.
+///
+/// Deliberately low, and the reason is the per-epoch part. Every epoch is
+/// an independent RocksDB instance, so this multiplies by `N`: the
+/// default of 2 across four epochs puts eight background threads on a
+/// machine that may have four cores, and they compete with block
+/// processing for them. An epoch is also small by construction, so it has
+/// less to compact than a single unbounded database would.
+const BG_JOBS_PER_EPOCH: i32 = 1;
+
+/// Memtable size and count per epoch.
+const WRITE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+const WRITE_BUFFERS: i32 = 3;
+
 pub struct RocksFactory {
     cache: rocksdb::Cache,
 }
@@ -208,6 +222,9 @@ impl RocksFactory {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+        opts.set_write_buffer_size(WRITE_BUFFER_BYTES);
+        opts.set_max_write_buffer_number(WRITE_BUFFERS);
+        opts.set_max_background_jobs(BG_JOBS_PER_EPOCH);
         opts
     }
 
