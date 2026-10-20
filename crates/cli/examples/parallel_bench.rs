@@ -54,6 +54,13 @@ fn main() -> Result<()> {
     let mut no_wal: bool = false;
     let mut sst_kb: usize = 0;
     let mut compact_only: bool = false;
+    let mut flatdb: bool = false;
+    let mut expected_keys: u64 = 24_000_000;
+    // How often the store is asked to make itself durable. 1 is once a
+    // block. Trie nodes are derivable -- lose them and re-executing the
+    // block recomputes them -- so a node may legitimately flush less often
+    // than it commits, provided its head pointer lags what is on disk.
+    let mut flush_every: u64 = 1;
 
     while let Some(flag) = args.next() {
         let value = args.next().with_context(|| format!("{flag} needs a value"))?;
@@ -70,6 +77,9 @@ fn main() -> Result<()> {
             "--no-wal" => no_wal = value.parse()?,
             "--sst-kb" => sst_kb = value.parse()?,
             "--compact-only" => compact_only = value.parse()?,
+            "--flatdb" => flatdb = value.parse()?,
+            "--expected-keys" => expected_keys = value.parse()?,
+            "--flush-every" => flush_every = value.parse()?,
             other => anyhow::bail!("unknown option {other}"),
         }
     }
@@ -113,7 +123,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let trie_store: Arc<dyn TrieStore> = if node_lru > 0 {
+    let trie_store: Arc<dyn TrieStore> = if flatdb {
+        // FlatDB caches nothing of its own: the heap *is* the page cache,
+        // so `--cache-mb` has no counterpart here and the comparison is
+        // between RocksDB with a 256 MB block cache and this with none.
+        Arc::new(rustock_storage::FlatTrieStore::open(
+            &fixture,
+            rustock_flatdb::Options {
+                expected_keys,
+                read_only: false,
+                sync_writes: false,
+                ..rustock_flatdb::Options::default()
+            },
+        )?)
+    } else if node_lru > 0 {
         Arc::new(open_node_cached_store(
             &fixture,
             cache_mb,
@@ -185,7 +208,9 @@ fn main() -> Result<()> {
         };
         let hash = next.compute_hash(trie_store.as_ref());
         next.save(trie_store.as_ref(), true);
-        trie_store.flush();
+        if number % flush_every == 0 {
+            trie_store.flush();
+        }
         let write = writing.elapsed();
 
         // Reload lazily, as the node does: children become hash references

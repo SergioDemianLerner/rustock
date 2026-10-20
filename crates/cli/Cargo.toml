@@ -19,6 +19,7 @@ rustock-core = { version = "0.1.0", path = "../core" }
 rustock-execution = { version = "0.1.0", path = "../execution" }
 rustock-networking = { version = "0.1.0", path = "../networking" }
 rustock-storage = { version = "0.1.0", path = "../storage" }
+rustock-flatdb = { version = "0.1.0", path = "../flatdb" }
 rustock-alerts = { version = "0.1.0", path = "../alerts" }
 rustock-rpc = { version = "0.1.0", path = "../rpc" }
 rustock-sync = { version = "0.1.0", path = "../sync" }

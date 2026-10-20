@@ -1,0 +1,16 @@
+[package]
+name = "rustock-flatdb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap2 = "0.9"
+crc32fast = "1"
+rustix = { version = "1", features = ["fs"] }
+sha3 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = "1"
