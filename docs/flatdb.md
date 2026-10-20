@@ -373,6 +373,15 @@ over-estimating the divisor under-sizes the index.
 `--trie-expected-keys 0` (the default) derives it. A non-zero value
 overrides.
 
+One consequence worth stating, because it was nearly a silent
+behavioural change. The rotation policy asks how much an epoch has
+*accumulated*, and FlatDB allocates its whole index up front — so
+reporting heap plus index would add a constant of 256 MB to every
+reading from the first, and an epoch configured to rotate at 1 GB would
+rotate after 768 MB of records, a quarter early, for the life of the
+store. `size_bytes` is the heap frontier alone; `disk_bytes` answers the
+other question.
+
 The grow stays as the safety net it now is, and says so at both ends
 with how long it stopped the world — reaching it means the sizing was
 wrong, which is something an operator needs told rather than left to

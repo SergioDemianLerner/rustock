@@ -71,14 +71,15 @@ pub trait EpochBackend: Send + Sync {
     /// stored but is scattered across it. Order is not relied upon.
     fn for_each(&self, visit: &mut dyn FnMut(&[u8], &[u8])) -> Result<()>;
 
-    /// Bytes this epoch occupies, for the rotation policy.
+    /// Bytes this epoch has **accumulated**, for the rotation policy.
     ///
-    /// Not necessarily the size of its directory. A backend that
-    /// preallocates — FlatDB reserves whole heap segments up front and
-    /// sizes its index for a key count it has not reached — would report a
-    /// figure that has nothing to do with how much state it holds, and
-    /// `rotate_bytes` would fire on an empty epoch. Each backend reports
-    /// the quantity the policy means.
+    /// Not the size of its directory, and not everything the backend holds
+    /// either. A backend that preallocates — FlatDB reserves whole heap
+    /// segments up front and sizes its index once from the epoch's
+    /// ceiling — would otherwise report a constant that has nothing to do
+    /// with how much state has arrived, and `rotate_bytes` would fire
+    /// early for the life of the store. Each backend reports the quantity
+    /// that grows.
     fn size_bytes(&self) -> u64;
 }
 
@@ -921,5 +922,26 @@ mod tests {
         // And it should not be so generous that the index is wasteful: the
         // fixture measured 75.7 bytes a record over 9.3 M of them.
         assert!(AVERAGE_RECORD_BYTES <= 128, "the estimate is wastefully large");
+    }
+
+    /// A rotation policy asks how much an epoch has accumulated. FlatDB
+    /// allocates its index up front, so counting it would add a constant
+    /// to every reading from the first -- 256 MB at the production
+    /// sizing -- and every epoch would rotate a quarter early for the
+    /// life of the store.
+    #[test]
+    fn an_empty_flatdb_epoch_has_accumulated_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let epoch = flat().open(dir.path()).unwrap();
+        assert_eq!(
+            epoch.size_bytes(),
+            0,
+            "an epoch holding nothing must not look like one that is filling up"
+        );
+
+        let (k, v) = entry(1, 100);
+        epoch.put(&k, &v).unwrap();
+        let after = epoch.size_bytes();
+        assert!(after > 0 && after < 1024, "one record moved it by about one record: {after}");
     }
 }

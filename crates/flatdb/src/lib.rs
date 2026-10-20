@@ -345,14 +345,34 @@ impl FlatDb {
         keys.iter().map(|k| self.get(k)).collect()
     }
 
-    /// Bytes actually occupied: the heap frontier plus the live index.
+    /// How much this store has **accumulated**: the heap frontier.
     ///
-    /// Deliberately not the size of the directory. Heap segments are
-    /// reserved whole and the index is sized for a key count that has not
-    /// been reached, so the directory overstates — by a gigabyte on a
-    /// freshly created store — and a rotation policy reading it would fire
-    /// on an epoch holding nothing.
+    /// This is the quantity a rotation policy means by "how big has this
+    /// epoch got", and getting it wrong is not a reporting error.
+    ///
+    /// Deliberately not the size of the directory: heap segments are
+    /// reserved whole, so a freshly created store occupies half a gigabyte
+    /// before holding anything and a policy reading the filesystem would
+    /// rotate an empty epoch.
+    ///
+    /// Deliberately not the index either, which is the subtler of the two.
+    /// Since the index is sized once from the epoch's own ceiling and never
+    /// grows, including it would add a constant — 256 MB at the production
+    /// sizing — to every reading, starting from the first. An epoch would
+    /// then rotate after 768 MB of records instead of the 1 GB it was
+    /// configured for, 25% early, for the whole life of the store.
+    ///
+    /// [`Self::disk_bytes`] answers the other question.
     pub fn size_bytes(&self) -> u64 {
+        self.heap.size()
+    }
+
+    /// Bytes this store is responsible for on disk: what it has
+    /// accumulated plus the index it holds to address it.
+    ///
+    /// Still not the directory size, which also counts segment space
+    /// reserved and not yet used.
+    pub fn disk_bytes(&self) -> u64 {
         self.heap.size() + self.index.capacity() * index::SLOT_SIZE
     }
 
