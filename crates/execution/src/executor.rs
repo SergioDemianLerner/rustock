@@ -808,25 +808,43 @@ impl RskExecutor {
         let recorder = crate::collision::config();
         let recording_silent = crate::silent::is_recording();
         let base = &base_root;
-        // At most `execution_threads` sublists at a time. With the consensus
-        // cap of two parallel sublists a wave is the whole partition and
-        // this is one pass, but the two are not the same quantity and
-        // conflating them would silently run four sublists on four threads
-        // when two were asked for.
-        let width = self.execution_threads.max(1);
-        let mut outcomes: Vec<Result<SublistRun, ExecutionError>> =
-            Vec::with_capacity(parallel.len());
-        for wave in parallel.chunks(width) {
-        let wave_outcomes: Vec<Result<SublistRun, ExecutionError>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = wave
-                .iter()
-                .map(|range| {
-                    let range = range.clone();
-                    let store = trie_store.clone();
-                    let inspector = inspector.fresh_like();
-                    let recorder = recorder.clone();
-                    scope.spawn(move || {
-                        if let Some(cfg) = recorder {
+        // Workers pull the next unclaimed sublist rather than being handed
+        // a fixed slice of them.
+        //
+        // Chunking into waves of `execution_threads` looked equivalent and
+        // is not: four sublists on three threads is a wave of three and
+        // then a wave of one, with two threads idle while the straggler
+        // finishes. The benchmark measured exactly that -- three threads
+        // came out *slower* than two on the cold blocks, 5,089 ms against
+        // 4,096, and identical once warm, which is the signature of a
+        // scheduling quantum rather than of anything about the work.
+        let width = self.execution_threads.max(1).min(parallel.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let slots: Vec<std::sync::Mutex<Option<Result<SublistRun, ExecutionError>>>> =
+            (0..parallel.len()).map(|_| std::sync::Mutex::new(None)).collect();
+        let parallel_ref = &parallel;
+        let slots_ref = &slots;
+        let next_ref = &next;
+
+        std::thread::scope(|scope| {
+            for _ in 0..width {
+                let store = trie_store.clone();
+                let recorder = recorder.clone();
+                // Borrowed, not cloned: a worker makes a fresh tracer per
+                // sublist it takes, so the second one it pulls is
+                // configured like the first rather than degraded to a
+                // call-tree-only default.
+                let template = &inspector;
+                scope.spawn(move || {
+                    loop {
+                        let index =
+                            next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(range) = parallel_ref.get(index) else { break };
+
+                        // Per sublist, not per thread: a worker that takes a
+                        // second sublist must not fold its keys in with the
+                        // first one's.
+                        if let Some(cfg) = recorder.clone() {
                             crate::collision::start_from(cfg);
                         }
                         if recording_silent {
@@ -835,33 +853,35 @@ impl RskExecutor {
                         let run = self.run_sublist(
                             header,
                             transactions,
-                            range,
+                            range.clone(),
                             base,
-                            store,
-                            inspector,
+                            store.clone(),
+                            template.fresh_like(),
                             traced,
                             U256::ZERO,
                             false,
                         );
                         let keys = crate::collision::finish();
                         let records = crate::silent::finish();
-                        run.map(|(result, traces)| SublistRun { result, traces, keys, records })
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        Err(ExecutionError::Evm(
-                            "a parallel sublist thread panicked".to_string(),
-                        ))
-                    })
-                })
-                .collect()
+                        let outcome = run
+                            .map(|(result, traces)| SublistRun { result, traces, keys, records });
+                        *slots_ref[index].lock().expect("sublist slot") = Some(outcome);
+                    }
+                });
+            }
         });
-        outcomes.extend(wave_outcomes);
-        }
+
+        let outcomes: Vec<Result<SublistRun, ExecutionError>> = slots
+            .into_iter()
+            .map(|slot| {
+                slot.into_inner().expect("sublist slot").unwrap_or_else(|| {
+                    Err(ExecutionError::Evm(
+                        "a parallel sublist thread panicked before recording its result"
+                            .to_string(),
+                    ))
+                })
+            })
+            .collect();
 
         // 3. Commit them in sublist order, and take back what the workers
         //    collected on their own threads.
