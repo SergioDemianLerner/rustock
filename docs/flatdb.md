@@ -522,6 +522,50 @@ then fail to start. It defaults to the node's own 512 MB.
 Without `--blocks` nothing is verified and nothing is swapped, which is a
 legitimate way to do the slow half in advance.
 
+## The mainnet trial
+
+October 2026, node stopped, working on a copy. The live store at
+`/var/lib/rustock/trie-epochs` was not touched and a backup was taken to
+a different physical disk first.
+
+```
+3 epochs, 25,371,307 nodes copied, 0 skipped, 120 s
+10,519,952 nodes resolved walking from the executed state root
+```
+
+**Nothing was skipped**, which settles on production data what the
+converter only checks: the trie store is content-addressed throughout.
+
+**No epoch grew.** All three came out at 2^25 slots, the figure derived
+from the rotation threshold, which is the first real evidence for #313's
+approach.
+
+### What it found
+
+| | |
+|---|---|
+| records | 11.2 M / 8.4 M / 5.7 M across the three epochs |
+| 32–63 bytes | 30.4% |
+| 64–127 bytes | 69.5% |
+| over 1,024 bytes | 0.05% — 5,589 in the oldest epoch |
+| longest | 24,573 bytes |
+| mean on disk | 73.8, 73.2, 73.4 bytes |
+
+**The fixture has no long records at all**, so until this ran, the
+stored-key path and the verification on top of it (#316) had never seen
+anything real. A trie walk does not reach them either — a long value
+hangs off a node's value hash rather than being one of its children — so
+they were read back explicitly: **5,589, 450 and 475, all verified, none
+failed.** Contract code, up to 24 KB, through the path that recomputes
+`H(value)` and compares.
+
+**And it corrected `AVERAGE_RECORD_BYTES`.** The 80 came from the
+synthetic fixture. The real mean is 73.5, so the real key count sat 9%
+above the estimate — the same capacity either way, but less margin than
+intended. It is now 72, rounded *down* because the figure is a divisor
+and under-estimating it over-sizes the index, which is the cheap error.
+A full 1 GB epoch is then 14.7 M records against a 2^25 table: 44% load.
+
 ## Running it
 
 ```sh

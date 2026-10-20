@@ -393,12 +393,23 @@ pub fn dir_size(path: &Path) -> u64 {
 /// Bytes a stored trie node takes, averaged, for sizing an index from a
 /// rotation threshold.
 ///
-/// Measured on the 1 GB regtest fixture: 704 MB of heap over 9,299,999
-/// records is 75.7 bytes each. Rounded up to 80, because the figure only
-/// matters as a divisor and over-estimating it under-sizes the index --
-/// the direction that costs a stop-the-world rehash rather than some
-/// reclaimable address space.
-pub const AVERAGE_RECORD_BYTES: u64 = 80;
+/// Measured on the **mainnet** epoch store, converted October 2026:
+/// 73.8, 73.2 and 73.4 bytes across its three epochs, over 25.4 million
+/// records. Thirty percent of them are 32-63 bytes and seventy percent
+/// are 64-127; the 0.05% over a kilobyte are contract code and barely
+/// move the mean.
+///
+/// Rounded **down** to 72, which is the conservative direction: the
+/// figure is a divisor, so under-estimating it over-estimates the key
+/// count and over-sizes the index. Over-sizing costs reclaimable address
+/// space; under-sizing costs a stop-the-world rehash (see #313 and
+/// #318). The first estimate here was 80, taken from the synthetic
+/// fixture, which put the real count 9% above the estimate and left
+/// thinner margin than intended.
+///
+/// At 1 GB this gives 14.9 M keys, a 2^25 table, and a full epoch at
+/// about 44% load -- under the 0.5 factor with room to spare.
+pub const AVERAGE_RECORD_BYTES: u64 = 72;
 
 /// Keys an epoch can hold before it rotates.
 ///
