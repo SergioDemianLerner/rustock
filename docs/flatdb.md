@@ -243,6 +243,66 @@ the production path deletes — reclamation is discarding a whole epoch — but
 a backend that appeared to delete would let the epoch store believe it had
 reclaimed something.
 
+## Verifying what comes back
+
+A short record stores no key: the probe recomputes `H(value)` to compare,
+so every successful read of one checks the bytes against their own
+address. A record over 1,024 bytes carries its key and was compared
+against what it *claims* rather than against what it *is* — and that is
+exactly the data contract code lives in. Closed (#316), and the shape of
+the fix came out of the measurement rather than the other way round.
+
+Keccak-256 on this machine, `sha3` 0.10:
+
+| bytes | ns/hash |
+|---|---|
+| 50 | 483 |
+| 1,024 | 3,623 |
+| 2,048 | 7,439 |
+| 4,096 | 14,101 |
+| 65,536 | 217,080 |
+
+About 283 MB/s, with ~480 ns of fixed cost.
+
+That rules out the obvious implementation. Verifying during the
+comparison would mean hashing a 24 KB contract body in order to
+**reject** it on a collision — some 80 µs to discover the record is not
+the one being looked for. The stored key exists precisely to make that
+rejection cost 32 bytes of memcmp.
+
+So verification runs **on the hit, never on a rejection**: once the
+stored key has matched, `H(data)` is recomputed once and compared. One
+hash per successful long read, zero on a miss. A record whose bytes no
+longer hash to their address is reported as absent rather than returned,
+because a missing trie node can be fetched from a peer and a wrong one
+cannot.
+
+`verify_long_records` defaults to on. `without_verification_a_corrupt_long_record_is_returned`
+exists to document what the other setting means.
+
+### And the threshold is no longer a correctness boundary
+
+That was the second half of #316, and the measurement reframes it. With
+verification on the hit, 1,024 bytes stops deciding which values are
+content-checked — all of them are — and becomes a pure space-versus-time
+knob:
+
+- below it, 32 bytes saved per record, and every probe step that touches
+  the record pays a hash (483 ns at 50 bytes);
+- above it, 32 bytes spent, rejections cost a memcmp, and one hash is
+  paid on the hit.
+
+At the threshold itself a hash is 3.6 µs and the key is 3% of the
+record, which makes storing it clearly right there. At 128 bytes a hash
+is 489 ns and the key is 25% overhead, which makes it clearly wrong. The
+crossover is somewhere in between and depends on the read-to-space
+tradeoff of the deployment, so 1,024 stays — now as a defensible default
+rather than an unexamined one.
+
+**Not measured end to end**: the 1 GB fixture is accounts, so almost
+every record is short and the benchmark cannot see this cost. Measuring
+it needs state with contract code in it.
+
 ## Crash consistency
 
 Tested against torn writes, not only simulated (#315).

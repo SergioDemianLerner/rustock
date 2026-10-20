@@ -19,6 +19,7 @@ fn options(expected_keys: u64) -> Options {
         expected_keys,
         read_only: false,
         sync_writes: false,
+        verify_long_records: true,
         segment_size: TEST_SEGMENT,
     }
 }

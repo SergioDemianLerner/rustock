@@ -40,6 +40,7 @@ fn options() -> Options {
         expected_keys: 4096,
         read_only: false,
         sync_writes: false,
+        verify_long_records: true,
         // Small, so a test covers several heap files without writing a
         // gigabyte. The size is recorded in the checkpoint, so this
         // exercises the same code a production segment would.

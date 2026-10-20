@@ -85,6 +85,7 @@ impl Table {
 pub struct Index {
     dir: PathBuf,
     read_only: bool,
+    verify_long_records: bool,
     table: RwLock<Table>,
     size: AtomicU64,
     dirty: AtomicBool,
@@ -93,12 +94,14 @@ pub struct Index {
 impl Index {
     /// Sizes the table from the checkpoint, or from an expectation when
     /// starting empty, and maps it.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         dir: &Path,
         read_only: bool,
         committed_capacity: u64,
         committed_size: u64,
         expected_keys: u64,
+        verify_long_records: bool,
     ) -> io::Result<Self> {
         let capacity = if committed_capacity > 0 {
             committed_capacity
@@ -109,6 +112,7 @@ impl Index {
         let index = Self {
             dir: dir.to_path_buf(),
             read_only,
+            verify_long_records,
             table: RwLock::new(table),
             size: AtomicU64::new(committed_size),
             // A table that no checkpoint describes yet has to be written
@@ -149,6 +153,36 @@ impl Index {
     /// Takes no exclusive lock, so any number of threads may be in here at
     /// once, and allocates only for the record that matches: probe steps
     /// that miss borrow straight out of the mapping.
+    /// Does this record's data still hash to the key it is filed under?
+    ///
+    /// Only asked of a **long** record, and only once its stored key has
+    /// already matched. A short record has no stored key, so the probe
+    /// recomputed `H(data)` to compare in the first place and is verified
+    /// by construction.
+    ///
+    /// Doing it on the hit rather than on every probe step is what makes
+    /// it affordable. Recomputing during the comparison would mean hashing
+    /// a 24 KB contract body to *reject* it on a collision -- about 80 µs
+    /// at the ~283 MB/s measured here -- which is why the key is stored at
+    /// all. One hash on the hit costs 3.6 µs at the 1 KiB threshold and
+    /// scales with the record; zero on a miss.
+    fn long_record_is_intact(&self, keys: &dyn Keys, record: &Record<'_>, key: &[u8]) -> bool {
+        if !self.verify_long_records || record.key.is_none() {
+            return true;
+        }
+        if keys.compute_key(record.data) == key {
+            return true;
+        }
+        // The bytes do not hash to their own address. Reporting a miss is
+        // recoverable -- a trie node that is absent can be fetched from a
+        // peer -- and returning the bytes is not.
+        tracing::error!(
+            target: "rustock::flatdb",
+            "a stored record no longer hashes to its key; reporting it as absent"
+        );
+        false
+    }
+
     pub fn get(&self, heap: &Heap, keys: &dyn Keys, key: &[u8]) -> Option<Vec<u8>> {
         let table = self.table.read().expect("index table");
         if table.capacity == 0 {
@@ -164,7 +198,9 @@ impl Index {
                 return None;
             }
             let found = heap.with_record(slot - 1, key_length, |record| {
-                if Self::key_of(keys, &record) == key {
+                if Self::key_of(keys, &record) == key
+                    && self.long_record_is_intact(keys, &record, key)
+                {
                     Some(record.data.to_vec())
                 } else {
                     None
@@ -478,7 +514,7 @@ mod tests {
     fn fixture(expected_keys: u64) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let heap = Heap::open(dir.path(), false, 0, 1 << 20).unwrap();
-        let index = Index::open(dir.path(), false, 0, 0, expected_keys).unwrap();
+        let index = Index::open(dir.path(), false, 0, 0, expected_keys, true).unwrap();
         Fixture { _dir: dir, heap, index }
     }
 
@@ -657,5 +693,74 @@ mod tests {
                 "slot {slot} straddles a sector"
             );
         }
+    }
+
+    /// A long record whose bytes no longer hash to its key must not be
+    /// returned. Short records cannot reach this state: the probe
+    /// recomputes their key to compare, so a corrupt one simply misses.
+    #[test]
+    fn a_corrupt_long_record_reads_as_absent() {
+        let f = fixture(64);
+        let data = value(4000, 7);
+        let key = key_of(&data);
+        f.index.put(&f.heap, &KeccakKeys, &key, &data).unwrap();
+        assert_eq!(f.index.get(&f.heap, &KeccakKeys, &key), Some(data.clone()));
+
+        // Corrupt one byte of the stored value, leaving the stored key
+        // intact -- which is precisely the case the stored key cannot
+        // catch by itself.
+        corrupt_one_data_byte(&f);
+
+        assert_eq!(
+            f.index.get(&f.heap, &KeccakKeys, &key),
+            None,
+            "the bytes no longer hash to their address, so they are not the record"
+        );
+    }
+
+    /// With verification off the same corruption is handed back, which is
+    /// the behaviour the option exists to describe -- and the reason it
+    /// defaults to on.
+    #[test]
+    fn without_verification_a_corrupt_long_record_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let heap = Heap::open(dir.path(), false, 0, 1 << 20).unwrap();
+        let index = Index::open(dir.path(), false, 0, 0, 64, false).unwrap();
+        let f = Fixture { _dir: dir, heap, index };
+
+        let data = value(4000, 7);
+        let key = key_of(&data);
+        f.index.put(&f.heap, &KeccakKeys, &key, &data).unwrap();
+        corrupt_one_data_byte(&f);
+
+        let got = f.index.get(&f.heap, &KeccakKeys, &key);
+        assert!(got.is_some(), "unverified, the damaged bytes come straight back");
+        assert_ne!(got.as_ref(), Some(&data), "and they are not what was stored");
+    }
+
+    /// Flip a byte well inside the record's data, past the magic, the
+    /// length field and the 32-byte stored key.
+    fn corrupt_one_data_byte(f: &Fixture) {
+        f.heap
+            .with_record(0, 32, |record| {
+                let at = record.data.as_ptr() as *mut u8;
+                // SAFETY: the mapping is writable and this is inside the
+                // record's own data, which the test owns exclusively.
+                unsafe { *at.add(100) ^= 0xFF };
+            })
+            .expect("the record is at offset zero");
+    }
+
+    /// Verification happens on the hit, never on a rejection: a probe that
+    /// walks over an unrelated long record must not hash it.
+    #[test]
+    fn verification_does_not_run_on_a_probe_that_misses() {
+        let f = fixture(64);
+        let stored = value(4000, 1);
+        f.index.put(&f.heap, &KeccakKeys, &key_of(&stored), &stored).unwrap();
+        // A key that is not present: every probe step rejects, and none of
+        // them may need the record's contents hashed to do it.
+        let absent = key_of(&value(4000, 2));
+        assert_eq!(f.index.get(&f.heap, &KeccakKeys, &absent), None);
     }
 }

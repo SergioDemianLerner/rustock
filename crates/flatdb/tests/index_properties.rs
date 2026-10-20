@@ -24,6 +24,7 @@ fn options() -> Options {
         expected_keys: 16,
         read_only: false,
         sync_writes: false,
+        verify_long_records: true,
         segment_size: 1 << 20,
     }
 }
