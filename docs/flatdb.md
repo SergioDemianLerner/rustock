@@ -392,6 +392,46 @@ single aligned load and, more importantly, `AtomicU64` and the lock-free
 read path for 10 bytes a key instead of 16 — a saving in a quantity the
 measurement shows is not the binding constraint.
 
+## What real data did to the headline
+
+The benchmark sections below were measured on the synthetic fixture.
+Re-run against the **real mainnet epoch store** — same data on both
+sides, same state root, same disk, page cache dropped by name with
+`posix_fadvise` before each run — the conclusion changes.
+
+65,535 nodes, walking the trie level by level as the sweep's marking
+phase does. Medians of three:
+
+| | serial | batched (16 threads) |
+|---|---|---|
+| RocksDB | 74,450 ms | **8,166 ms** |
+| FlatDB | **42,425 ms** | 8,372 ms |
+
+**Batched, they are a dead heat** — 2.5% apart, which is inside the
+run-to-run spread. The 3.5× that `parallel_bench` measured on the
+fixture does not survive contact with real state.
+
+The fixture flattered FlatDB and this document said so at the time
+without knowing how much: it was built bottom-up by `bulk.rs`, so the
+top of the trie sits contiguously at the end of the heap and a walk is
+nearly a sequential read. A real store is written in traversal order
+over months and spread across three epochs, and the locality is gone.
+
+**Serially, FlatDB is still 1.76× faster**, and that is not a
+consolation prize: block execution issues *dependent* reads and cannot
+batch them, so the serial column is the one execution lives in. But
+1.76× is the number to carry, not 3.5×.
+
+### How not to measure this, part two
+
+The first run of this comparison produced 376 ms and 66,870 ms for the
+same configuration — a 178× spread. The eviction was at fault: filling
+the page cache by reading 6 GB of unrelated data does not reliably evict
+anything, because Linux favours dropping pages it has seen once
+sequentially over pages recently touched, which is exactly backwards for
+a benchmark. `posix_fadvise(POSIX_FADV_DONTNEED)` on the store's own
+files names the pages to drop and takes a second.
+
 ## Batched reads
 
 `get_many` exists because a trie traversal issues *dependent* reads — each
@@ -418,12 +458,24 @@ production path on the current backend, and 7.9× is what it was leaving
 behind. Fixed by batching per epoch, newest first, carrying forward only
 what is still unresolved.
 
-**FlatDB gains little from batching because it is already fast here, and
-some of that is the fixture.** A prefetch pass (`MADV_WILLNEED` over the
-index slots, then over the records they point at) is the right shape for
-a mapped store — a fault is one thread on one page, and a thread pool
-would pay handoff cost to overlap faults the kernel can overlap itself —
-but 1.3× is a modest return.
+**FlatDB was prefetching, and that was wrong.** The first implementation
+used `MADV_WILLNEED` over the index slots and the records they point at,
+on the reasoning that a mapped read is a page fault rather than a
+syscall, so the kernel could overlap the batch with no threads at all.
+Measured on the real store over 65,535 nodes:
+
+| | ms |
+|---|---|
+| fan out over 16 threads | **8,342** |
+| prefetch only | 37,026 |
+| both | 26,309 |
+
+Prefetching alone is 4.5× slower than fanning out, and adding it *on top*
+of the threads is 3.2× slower than the threads alone — the advice
+competes with the threads' own faults and spends bandwidth fetching
+pages in an order nothing is waiting for. The reasoning was clean and the
+kernel does not behave that way. The prefetch path is gone; FlatDB fans
+out exactly as RocksDB does.
 
 The 336× gap between the two serial columns is **not** a fair claim about
 the engines. The fixture was built bottom-up by `bulk.rs`, so the top of

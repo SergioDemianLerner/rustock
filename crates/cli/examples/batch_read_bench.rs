@@ -18,7 +18,14 @@
 //!
 //! ```text
 //! batch_read_bench <dir> --mode serial|batch [--flatdb] [--levels N]
+//! batch_read_bench <epoch-root> --epochs --root <hex> --mode ... [--flatdb]
 //! ```
+//!
+//! `--epochs` opens the directory as an epoch store rather than a single
+//! trie, reading newest epoch first exactly as the node does, which is
+//! what makes a measurement against a real store represent the real read
+//! path. The state root then has to be given: an epoch store has no ROOT
+//! file, because which root is current is the block database's business.
 
 use anyhow::{Context, Result};
 use rustock_trie::{NodeRef, TrieNode, TrieStore};
@@ -35,6 +42,9 @@ fn main() -> Result<()> {
     let mut expected_keys = 10_000_000u64;
     let mut batch_mode = false;
     let mut mode_given = false;
+    let mut epochs = false;
+    let mut explicit_root: Option<String> = None;
+    let mut flat_threads = 16usize;
     let rest: Vec<String> = args.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -60,6 +70,18 @@ fn main() -> Result<()> {
                 mode_given = true;
                 i += 2;
             }
+            "--flat-threads" => {
+                flat_threads = rest[i + 1].parse()?;
+                i += 2;
+            }
+            "--epochs" => {
+                epochs = true;
+                i += 1;
+            }
+            "--root" => {
+                explicit_root = Some(rest[i + 1].clone());
+                i += 2;
+            }
             "--expected-keys" => {
                 expected_keys = rest[i + 1].parse()?;
                 i += 2;
@@ -74,7 +96,29 @@ fn main() -> Result<()> {
          the page cache rather than the batching"
     );
 
-    let store: Arc<dyn TrieStore> = if flatdb {
+    let store: Arc<dyn TrieStore> = if epochs {
+        // The node's own configuration, so the layering and the read order
+        // are the ones production uses.
+        let config = rustock_storage::epoch_store::EpochConfig {
+            epochs: 4,
+            burial_depth: 4000,
+            rotate_bytes: 1 << 30,
+        };
+        if flatdb {
+            Arc::new(rustock_storage::epoch_store::EpochTrieStore::open_read_only_with(
+                &dir,
+                config,
+                Arc::new(
+                    rustock_storage::epoch_backend::FlatFactory::new(expected_keys)
+                        .with_read_threads(flat_threads),
+                ),
+            )?)
+        } else {
+            Arc::new(rustock_storage::epoch_store::EpochTrieStore::open_read_only(
+                &dir, config,
+            )?)
+        }
+    } else if flatdb {
         Arc::new(rustock_storage::FlatTrieStore::open(
             &dir,
             rustock_flatdb::Options {
@@ -90,14 +134,35 @@ fn main() -> Result<()> {
         )?)
     };
 
-    let root_hex = std::fs::read_to_string(format!("{dir}/ROOT"))
-        .context("the fixture has no ROOT file")?;
-    let root: alloy_primitives::B256 = root_hex.trim().parse()?;
+    // When a single flatdb store is under test the batch can be served
+    // directly, which is what lets the two mechanisms be varied.
+    let flat_direct: Option<rustock_flatdb::FlatDb> = if flatdb && !epochs {
+        Some(rustock_flatdb::FlatDb::open(
+            &dir,
+            rustock_flatdb::Options {
+                expected_keys,
+                read_only: true,
+                ..rustock_flatdb::Options::default()
+            },
+        )?)
+    } else {
+        None
+    };
+
+    let root: alloy_primitives::B256 = match explicit_root {
+        Some(hex) => hex.trim().parse().context("--root is not a 32-byte hex hash")?,
+        None => std::fs::read_to_string(format!("{dir}/ROOT"))
+            .context("no --root given and the directory has no ROOT file")?
+            .trim()
+            .parse()?,
+    };
 
     println!(
-        "{} at {dir}",
-        if flatdb { "flatdb" } else { "rocksdb" }
+        "{} {} at {dir}",
+        if flatdb { "flatdb" } else { "rocksdb" },
+        if epochs { "epoch store" } else { "single trie" }
     );
+    println!("root {root:?}");
     println!("mode {}", if batch_mode { "batch" } else { "serial" });
     println!("{:>6}  {:>9}  {:>11}", "level", "nodes", "ms");
 
@@ -115,7 +180,10 @@ fn main() -> Result<()> {
 
         let t = Instant::now();
         let batched = if batch_mode {
-            store.get_many(&keys)
+            match &flat_direct {
+                Some(db) => db.get_many_on(&keys, flat_threads),
+                None => store.get_many(&keys),
+            }
         } else {
             keys.iter().map(|k| store.get(k)).collect()
         };

@@ -449,17 +449,28 @@ pub struct FlatFactory {
     /// what it was written with and refuses to open under anything else,
     /// so everything that creates an epoch has to agree on this.
     pub segment_size: u64,
+    /// Threads a batched read fans out over.
+    pub read_threads: usize,
 }
 
 impl FlatFactory {
     pub fn new(expected_keys: u64) -> Self {
-        Self { expected_keys, segment_size: rustock_flatdb::heap::DEFAULT_SEGMENT_SIZE }
+        Self {
+            expected_keys,
+            segment_size: rustock_flatdb::heap::DEFAULT_SEGMENT_SIZE,
+            read_threads: crate::read_threads(),
+        }
     }
 
     /// A smaller segment, for tests. Segments are reserved whole, so the
     /// production 512 MiB is more than a temporary directory wants.
     pub fn with_segment_size(mut self, bytes: u64) -> Self {
         self.segment_size = bytes;
+        self
+    }
+
+    pub fn with_read_threads(mut self, threads: usize) -> Self {
+        self.read_threads = threads;
         self
     }
 
@@ -481,13 +492,19 @@ impl EpochBackendFactory for FlatFactory {
     fn open(&self, dir: &Path) -> Result<Arc<dyn EpochBackend>> {
         let db = rustock_flatdb::FlatDb::open(dir, self.options(false))
             .with_context(|| format!("opening flatdb epoch at {}", dir.display()))?;
-        Ok(Arc::new(FlatEpoch { db }))
+        Ok(Arc::new(FlatEpoch {
+            db,
+            read_threads: self.read_threads,
+        }))
     }
 
     fn open_read_only(&self, dir: &Path) -> Result<Arc<dyn EpochBackend>> {
         let db = rustock_flatdb::FlatDb::open(dir, self.options(true))
             .with_context(|| format!("opening flatdb epoch read-only at {}", dir.display()))?;
-        Ok(Arc::new(FlatEpoch { db }))
+        Ok(Arc::new(FlatEpoch {
+            db,
+            read_threads: self.read_threads,
+        }))
     }
 
     fn name(&self) -> &'static str {
@@ -497,6 +514,7 @@ impl EpochBackendFactory for FlatFactory {
 
 pub struct FlatEpoch {
     db: rustock_flatdb::FlatDb,
+    read_threads: usize,
 }
 
 impl EpochBackend for FlatEpoch {
@@ -504,14 +522,16 @@ impl EpochBackend for FlatEpoch {
         self.db.get(key)
     }
 
-    /// Prefetch rather than fan out across threads.
+    /// Fan out, exactly as the RocksDB epoch does.
     ///
-    /// A mapped lookup is a page fault, not a syscall, so a thread pool
-    /// would be paying thread-handoff cost to overlap faults. Telling the
-    /// kernel about the whole batch first expresses the same intent with
-    /// no threads at all.
+    /// This first prefetched instead, on the reasoning that a mapped read
+    /// is a page fault rather than a syscall so the kernel could overlap
+    /// the batch with no threads. Measured on the real mainnet store it
+    /// was 4.5x slower than fanning out, and doing both was 3.2x slower
+    /// than fanning out alone -- the advice competes with the threads'
+    /// own faults. See `FlatDb::get_many`.
     fn get_many(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
-        self.db.get_many(keys)
+        self.db.get_many_on(keys, self.read_threads)
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -801,7 +821,9 @@ mod tests {
             dir.path(),
             EpochConfig { epochs: 3, burial_depth: 10, rotate_bytes: 64 * 1024 },
             None,
-            Arc::new(FlatFactory::new(4096)),
+            // Small segments: they are reserved whole, so a production
+            // 512 MiB one does not belong in a temporary directory.
+            Arc::new(FlatFactory::new(4096).with_segment_size(1 << 20)),
         )
         .unwrap();
 

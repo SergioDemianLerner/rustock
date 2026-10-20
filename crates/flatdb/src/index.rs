@@ -213,54 +213,6 @@ impl Index {
         }
     }
 
-    /// Ask the kernel to fetch the index pages these keys will probe.
-    ///
-    /// A mapped read is a page fault, and a fault is one thread blocked on
-    /// one page — queue depth 1, which is the worst thing to hand an SSD.
-    /// `MADV_WILLNEED` over the slots a batch is about to touch lets the
-    /// kernel issue them together instead.
-    ///
-    /// Only the first slot of each probe chain is advised. Chains are
-    /// short at load factor 0.5 and the rest of a chain is usually on the
-    /// same page anyway, so following them here would cost more than it
-    /// saves.
-    pub fn prefetch(&self, keys: &dyn Keys, wanted: &[Vec<u8>]) {
-        let table = self.table.read().expect("index table");
-        if table.capacity == 0 {
-            return;
-        }
-        let mask = table.capacity - 1;
-        for key in wanted {
-            let slot = keys.hash(key) as u64 & mask;
-            let _ = table.map.advise_range(
-                memmap2::Advice::WillNeed,
-                (slot * SLOT_SIZE) as usize,
-                SLOT_SIZE as usize,
-            );
-        }
-    }
-
-    /// The heap offsets these keys' first probe step points at, for
-    /// prefetching the records themselves. `None` where the slot is empty.
-    pub fn first_offsets(&self, keys: &dyn Keys, wanted: &[Vec<u8>]) -> Vec<Option<u64>> {
-        let table = self.table.read().expect("index table");
-        if table.capacity == 0 {
-            return vec![None; wanted.len()];
-        }
-        let mask = table.capacity - 1;
-        wanted
-            .iter()
-            .map(|key| {
-                let slot = keys.hash(key) as u64 & mask;
-                // SAFETY: masked into the table.
-                match unsafe { table.at(slot) }.load(Ordering::Acquire) {
-                    EMPTY => None,
-                    packed => Some(packed - 1),
-                }
-            })
-            .collect()
-    }
-
     /// Inserts `key -> data`, appending the value to the heap.
     ///
     /// Callers must serialise this against itself; readers need no
