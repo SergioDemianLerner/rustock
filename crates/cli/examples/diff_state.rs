@@ -88,8 +88,8 @@ fn main() -> Result<()> {
     let mut ours = Vec::new();
     let mut theirs = Vec::new();
     support::diff(
-        &NodeRef::Node(Box::new(root)),
-        &NodeRef::Node(Box::new(rskj_root)),
+        &NodeRef::Node(std::sync::Arc::new(root)),
+        &NodeRef::Node(std::sync::Arc::new(rskj_root)),
         &mut Vec::new(),
         &mut Vec::new(),
         replay.trie_store.as_ref(),

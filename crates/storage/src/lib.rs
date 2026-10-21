@@ -1,5 +1,8 @@
 pub mod trie_store;
 pub mod cached_trie_store;
+pub mod epoch_backend;
+pub mod flat_trie_store;
+pub mod flat_migrate;
 pub mod counting_trie_store;
 pub mod rskj_import;
 pub use position::{
@@ -16,6 +19,8 @@ pub mod pruner;
 pub mod freezer;
 pub mod silent_store;
 pub use cached_trie_store::CachedTrieStore;
+pub use flat_trie_store::FlatTrieStore;
+pub use epoch_backend::TrieEngine;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
 use rustock_core::{Block, Header, Receipt, Transaction};

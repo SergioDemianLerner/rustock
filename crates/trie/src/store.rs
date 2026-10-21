@@ -9,6 +9,23 @@ use std::sync::Mutex;
 pub trait TrieStore: Send + Sync {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
     fn put(&self, key: &[u8], value: &[u8]);
+
+    /// Write many entries at once.
+    ///
+    /// Saving a trie produces every node of a dirty subtree in one go --
+    /// a block rewrites some 6,900 of them -- and handing them over one
+    /// at a time forces a store to pay its per-write cost 6,900 times.
+    /// For an append-only store that cost includes reserving space in a
+    /// shared frontier, which is the one thing that has to be serialised;
+    /// a batch reserves once.
+    ///
+    /// The default writes them one at a time, so a store with nothing to
+    /// add stays correct.
+    fn put_many(&self, entries: &[(Vec<u8>, Vec<u8>)]) {
+        for (key, value) in entries {
+            self.put(key, value);
+        }
+    }
     /// Durably flush any buffered writes to the underlying storage.
     /// Default implementation is a no-op (suitable for stores that write synchronously).
     fn flush(&self) {}

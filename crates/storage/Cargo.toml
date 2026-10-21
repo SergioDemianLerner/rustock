@@ -11,6 +11,7 @@ workspace = true
 thiserror = { workspace = true }
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-trie = { version = "0.1.0", path = "../trie" }
+rustock-flatdb = { version = "0.1.0", path = "../flatdb" }
 rocksdb = { workspace = true }
 libc = { workspace = true }
 hex = { workspace = true }

@@ -50,6 +50,33 @@ impl RocksDbTrieStore {
         Ok(Self { db: Arc::new(db), write_failed: Arc::new(Default::default()) })
     }
 
+    /// Open read-write with a block cache and bloom filters, as the epoch
+    /// store does.
+    ///
+    /// `open` leaves RocksDB on its defaults, which for a trie means every
+    /// level of every path can be a disk read: a benchmark against a
+    /// gigabyte of state measured 4.5 seconds a block that way, almost all
+    /// of it I/O, against a configuration no node runs.
+    pub fn open_with_cache<P: AsRef<Path>>(path: P, cache_bytes: usize) -> anyhow::Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+
+        let cache = rocksdb::Cache::new_lru_cache(cache_bytes);
+        let mut block = rocksdb::BlockBasedOptions::default();
+        // Ten bits a key, and the filter blocks out of the data cache --
+        // `epoch_store` records what putting them in costs.
+        block.set_bloom_filter(10.0, false);
+        block.set_block_cache(&cache);
+        let mut cf_opts = Options::default();
+        cf_opts.set_block_based_table_factory(&block);
+
+        let cfs = vec![ColumnFamilyDescriptor::new(CF_TRIE, cf_opts)];
+        let db = DB::open_cf_descriptors(&opts, path, cfs)
+            .map_err(|e| anyhow::anyhow!("Failed to open trie RocksDB: {e}"))?;
+        Ok(Self { db: Arc::new(db), write_failed: Arc::new(Default::default()) })
+    }
+
     /// Open a trie store read-only, without taking the directory lock.
     ///
     /// RocksDB allows one writer per directory and that writer holds an

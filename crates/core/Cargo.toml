@@ -18,10 +18,16 @@ anyhow = { workspace = true }
 bitcoin = { workspace = true }
 hex = { workspace = true }
 hex-literal = "0.4.1"
-k256 = { workspace = true, features = ["ecdsa"] }
+secp256k1 = { workspace = true }
 serde = { workspace = true }
 ripemd = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
 rustock-trie = { version = "0.1.0", path = "../trie" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# The tests sign with k256 and recover with libsecp256k1, which makes them
+# a cross-check between two independent implementations rather than a
+# round trip through one. Production code no longer uses k256 at all.
+k256 = { workspace = true, features = ["ecdsa"] }

@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
 
     let (mut ao, mut bo) = (Vec::new(), Vec::new());
     let (mut ap, mut bp) = (Vec::new(), Vec::new());
-    diff(&NodeRef::Node(Box::new(na)), &NodeRef::Node(Box::new(nb)), &mut ap, &mut bp, us, &mut ao, &mut bo);
+    diff(&NodeRef::Node(std::sync::Arc::new(na)), &NodeRef::Node(std::sync::Arc::new(nb)), &mut ap, &mut bp, us, &mut ao, &mut bo);
 
     println!("A ({}): {} differing leaves", a[1], ao.len());
     for (k, v) in &ao {

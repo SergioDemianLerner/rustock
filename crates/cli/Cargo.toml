@@ -19,6 +19,7 @@ rustock-core = { version = "0.1.0", path = "../core" }
 rustock-execution = { version = "0.1.0", path = "../execution" }
 rustock-networking = { version = "0.1.0", path = "../networking" }
 rustock-storage = { version = "0.1.0", path = "../storage" }
+rustock-flatdb = { version = "0.1.0", path = "../flatdb" }
 rustock-alerts = { version = "0.1.0", path = "../alerts" }
 rustock-rpc = { version = "0.1.0", path = "../rpc" }
 rustock-sync = { version = "0.1.0", path = "../sync" }
@@ -42,5 +43,10 @@ smtp = ["rustock-alerts/smtp"]
 tempfile = { workspace = true }
 serde_json = "1"
 # For the examples that decode a peg-in's bitcoin transaction straight out of
-# the call data, without executing the block.
+# the call data, without executing the block. `validation_cost` also reaches
+# through it for `secp256k1`, the rust-bitcoin bindings to the C
+# libsecp256k1, to time sender recovery against the pure-Rust `k256` the
+# node uses today.
 bitcoin = { workspace = true }
+# `validation_cost` hashes a recovered public key the way the node does.
+sha3 = { workspace = true }

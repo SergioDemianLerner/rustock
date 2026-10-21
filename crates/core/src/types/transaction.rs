@@ -193,11 +193,31 @@ fn take_rlp_item<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(item)
 }
 
+/// The verification context libsecp256k1 wants, built once per process.
+///
+/// Creating one fills in precomputed multiplication tables, which costs far
+/// more than a recovery does -- so a per-call context would spend the whole
+/// advantage of using this library and then some. Verification-only because
+/// nothing here signs: the signing half of the tables is not built.
+fn secp_context() -> &'static secp256k1::Secp256k1<secp256k1::VerifyOnly> {
+    static CTX: std::sync::OnceLock<secp256k1::Secp256k1<secp256k1::VerifyOnly>> =
+        std::sync::OnceLock::new();
+    CTX.get_or_init(secp256k1::Secp256k1::verification_only)
+}
+
 impl Transaction {
 
     /// Recover the sender address from the transaction signature.
     ///
     /// RSK chain IDs: mainnet=30, testnet=31, regtest=33.
+    ///
+    /// Through libsecp256k1 rather than the pure-Rust `k256`, which is
+    /// 4.3x slower at exactly this: 248 us against 59 us, medians of five
+    /// rounds over three hundred real mainnet transactions, both backends
+    /// agreeing on every address. A node pays this once per transaction,
+    /// so at a full block it was the single largest cost outside execution
+    /// -- 50 ms of a 205 ms block. See `cargo run --release --example
+    /// validation_cost` and `docs/execution-performance.md`.
     pub fn recover_sender(&self, chain_id: u64) -> anyhow::Result<Address> {
         let hash = self.signing_hash(chain_id);
 
@@ -218,16 +238,21 @@ impl Transaction {
         sig_bytes[..32].copy_from_slice(&self.r.to_be_bytes::<32>());
         sig_bytes[32..].copy_from_slice(&self.s.to_be_bytes::<32>());
 
-        let signature = k256::ecdsa::Signature::from_slice(&sig_bytes)
+        // `from_u8_masked` takes the low two bits rather than rejecting an
+        // out-of-range id, which is safe only because the branches above
+        // have already confined `recovery_id` to 0 or 1.
+        let recid = secp256k1::ecdsa::RecoveryId::from_u8_masked(recovery_id);
+        let signature = secp256k1::ecdsa::RecoverableSignature::from_compact(&sig_bytes, recid)
             .map_err(|e| anyhow::anyhow!("invalid signature: {e}"))?;
-        let recid = k256::ecdsa::RecoveryId::from_byte(recovery_id)
-            .ok_or_else(|| anyhow::anyhow!("invalid recovery id: {recovery_id}"))?;
+        let message = secp256k1::Message::from_digest(hash.0);
 
-        let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(hash.as_slice(), &signature, recid)
+        let key = secp_context()
+            .recover_ecdsa(message, &signature)
             .map_err(|e| anyhow::anyhow!("ECDSA recovery failed: {e}"))?;
 
-        let pubkey_bytes = vk.to_encoded_point(false);
-        let pubkey_hash = Keccak256::digest(&pubkey_bytes.as_bytes()[1..]);
+        // The leading byte is the uncompressed-form marker and is not part
+        // of the key the address is taken from.
+        let pubkey_hash = Keccak256::digest(&key.serialize_uncompressed()[1..]);
         Ok(Address::from_slice(&pubkey_hash[12..]))
     }
 
@@ -257,19 +282,17 @@ impl Transaction {
         sig_bytes[..32].copy_from_slice(&self.r.to_be_bytes::<32>());
         sig_bytes[32..].copy_from_slice(&self.s.to_be_bytes::<32>());
 
-        let signature = k256::ecdsa::Signature::from_slice(&sig_bytes).ok()?;
-        let recid = k256::ecdsa::RecoveryId::from_byte(recovery_id)?;
+        // Confined to 0 or 1 above, so masking cannot turn a rejected id
+        // into an accepted one.
+        let recid = secp256k1::ecdsa::RecoveryId::from_u8_masked(recovery_id);
+        let signature =
+            secp256k1::ecdsa::RecoverableSignature::from_compact(&sig_bytes, recid).ok()?;
+        let message = secp256k1::Message::from_digest(hash.0);
 
-        let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(
-            hash.as_slice(),
-            &signature,
-            recid,
-        ).ok()?;
-
-        let compressed = vk.to_encoded_point(true);
-        let mut arr = [0u8; 33];
-        arr.copy_from_slice(compressed.as_bytes());
-        Some(arr)
+        // Same backend as `recover_sender`, for the same reason and so the
+        // two cannot drift apart on what a signature means.
+        let key = secp_context().recover_ecdsa(message, &signature).ok()?;
+        Some(key.serialize())
     }
 
     /// Compute the Keccak256 hash of this transaction's RLP bytes.

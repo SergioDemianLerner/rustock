@@ -557,6 +557,9 @@ pub struct SyncService {
     pub(crate) follow_buffer: BTreeMap<u64, (B256, Header, Vec<Transaction>, Vec<Header>)>,
     tx_pool: Option<Arc<crate::TransactionPool>>,
     blocks_since_flush: u64,
+    /// Blocks executed per durability point while catching up. See
+    /// `execution_commit`.
+    trie_flush_every: u64,
     /// Peers excluded from header-chunk assignment (stalled mid-round),
     /// mapped to the instant their sideline expires.
     pub(crate) sidelined: HashMap<B512, Instant>,
@@ -678,6 +681,7 @@ impl SyncService {
             follow_buffer: BTreeMap::new(),
             tx_pool: None,
             blocks_since_flush: 0,
+            trie_flush_every: crate::execution_commit::DEFAULT_FLUSH_EVERY,
             sidelined: HashMap::new(),
             events: None,
             body_providers: HashMap::new(),
@@ -765,6 +769,7 @@ impl SyncService {
         let tx_pool = self.tx_pool.clone();
         let activity = self.chain_activity.clone();
         let gas_price = self.gas_price.clone();
+        let flush_every = self.trie_flush_every;
         self.exec_fn = Some(Arc::new(move |state_root, blocks_since_flush, pending| {
             process_downloaded_blocks(
                 &processor,
@@ -773,6 +778,7 @@ impl SyncService {
                 &store,
                 tx_pool.as_deref(),
                 blocks_since_flush,
+                flush_every,
                 &pending,
                 &activity,
                 &gas_price,
@@ -892,6 +898,18 @@ impl SyncService {
     }
 
     /// Whether to catch up at all. `false` serves only.
+    /// Blocks executed per durability point while catching up.
+    ///
+    /// Trie nodes are derivable, so the store may flush less often than
+    /// the node executes; what it may not do is advance the executed head
+    /// past what a crash would keep. The cost of raising this is that many
+    /// blocks of re-execution after an unclean stop. Follow mode is
+    /// unaffected: it makes every block durable.
+    pub fn with_trie_flush_every(mut self, every: u64) -> Self {
+        self.trie_flush_every = every.max(1);
+        self
+    }
+
     pub fn with_follow_up(mut self, follow_up: bool) -> Self {
         self.follow_up = follow_up;
         self
@@ -4824,8 +4842,12 @@ impl SyncService {
                     crate::chain_activity::thread_cpu_time().saturating_sub(cpu_start),
                     wall_start.elapsed(),
                 );
-                trie_store.flush();
-                if !record_execution(&self.manager.store, hash, result.state_root_hash) {
+                let advanced = crate::execution_commit::ExecutionCommitter::new(1)
+                    .after_block(trie_store.as_ref(), true, || {
+                        record_execution(&self.manager.store, hash, result.state_root_hash)
+                    })
+                    .unwrap_or(false);
+                if !advanced {
                     // The work is done and the state is in the trie, but the
                     // marker did not move -- so neither does the in-memory
                     // root, which must keep matching the committed one. This
@@ -4924,11 +4946,17 @@ fn process_downloaded_blocks(
     state_root: TrieNode,
     store: &BlockStore,
     tx_pool: Option<&crate::TransactionPool>,
-    mut blocks_since_flush: u64,
+    blocks_since_flush: u64,
+    flush_every: u64,
     pending_headers: &[(B256, Header)],
     activity: &crate::chain_activity::ChainActivity,
     gas_price: &crate::gas_price::GasPriceTracker,
 ) -> ExecOutcome {
+    // Executed state becomes durable here and the head advances only
+    // through this, which is what keeps "flush before you claim it" from
+    // being a convention each call site has to remember.
+    let mut committer =
+        crate::execution_commit::ExecutionCommitter::resuming(flush_every, blocks_since_flush);
     let mut current_root = state_root;
     let mut processed = 0u64;
     // Of `processed`, how many were adopted without re-running the EVM.
@@ -5031,16 +5059,15 @@ fn process_downloaded_blocks(
                 current_root = result.new_state_root;
                 last_executed = Some((*hash, result.state_root_hash));
                 processed += 1;
-                blocks_since_flush += 1;
-                if blocks_since_flush >= 100 {
-                    trie_store.flush();
-                    blocks_since_flush = 0;
-                    if !record_execution(store, *hash, result.state_root_hash) {
-                        // Not canonical any more: executing further blocks on
-                        // top of it would build on a branch the node is not on.
-                        all_ok = false;
-                        break;
-                    }
+                if let Some(false) = committer.after_block(
+                    trie_store.as_ref(),
+                    false,
+                    || record_execution(store, *hash, result.state_root_hash),
+                ) {
+                    // Not canonical any more: executing further blocks on top
+                    // of it would build on a branch the node is not on.
+                    all_ok = false;
+                    break;
                 }
                 if processed.is_multiple_of(100) {
                     debug!(
@@ -5070,10 +5097,11 @@ fn process_downloaded_blocks(
     }
 
     if processed > 0 {
-        trie_store.flush();
-        blocks_since_flush = 0;
         if let Some((hash, root_hash)) = last_executed {
-            if !record_execution(store, hash, root_hash) {
+            if let Some(false) = committer.finish(
+                trie_store.as_ref(),
+                || record_execution(store, hash, root_hash),
+            ) {
                 // `halt_after_exec_failure` then reconciles the head, which is
                 // the only thing that can make this block canonical or replace
                 // it. Reporting the batch as clean would leave the executed
@@ -5099,7 +5127,7 @@ fn process_downloaded_blocks(
     ExecOutcome {
         all_ok,
         new_state_root: current_root,
-        blocks_since_flush,
+        blocks_since_flush: committer.pending(),
     }
 }
 

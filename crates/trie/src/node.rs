@@ -7,7 +7,8 @@
 /// - `value_hash`: keccak256 of the value
 /// - `children_size`: aggregate size of child sub-trees (VarInt-encoded in serialization)
 use alloy_primitives::B256;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use sha3::{Digest, Keccak256};
 use crate::path::TrieKeySlice;
 use crate::shared_path;
@@ -26,11 +27,31 @@ pub fn empty_trie_hash() -> B256 {
 }
 
 /// Reference to a child node — either in-memory, by hash, or empty.
+///
+/// The in-memory variant is an `Arc` and not a `Box` for one reason, and
+/// it is the difference between a block costing linear and quadratic time.
+/// A `Box` is a unique owner, so cloning one has to clone what it points
+/// at, and `TrieNode` holds two more `NodeRef`s -- so the copy recurses
+/// through the entire in-memory subtree. `internal_put` clones twice per
+/// level of its descent (the child it goes into, and the sibling it
+/// carries over), and a block's puts leave `Node` behind them where they
+/// found `Hash`. Put number k therefore copied everything puts 1..k-1 had
+/// built. Measured: per-put cost doubled with every doubling of the puts
+/// in a block.
+///
+/// `Arc::clone` is an atomic increment instead, and sharing is sound
+/// because a `TrieNode` is immutable once constructed -- `put` and
+/// `delete` return new nodes rather than modifying old ones, and the two
+/// fields that do change after construction (`saved` and `hash_cache`)
+/// are both interior-mutable and both monotonic, so two owners of the
+/// same node cannot disagree about them.
+///
+/// See `crates/trie/examples/put_scaling.rs`, which measures the shape.
 #[derive(Clone, Debug)]
 pub enum NodeRef {
     Empty,
     Hash(B256),
-    Node(Box<TrieNode>),
+    Node(Arc<TrieNode>),
 }
 
 /// What [`NodeRef::try_resolve`] found.
@@ -43,7 +64,7 @@ pub enum NodeRef {
 #[derive(Debug, Clone)]
 pub enum Resolution {
     /// The node is here.
-    Found(TrieNode),
+    Found(Arc<TrieNode>),
     /// The trie ends here. Nothing is wrong.
     Absent,
     /// The trie refers to this hash and the store cannot produce a node for
@@ -72,13 +93,13 @@ impl NodeRef {
     pub fn try_resolve(&self, store: &dyn TrieStore) -> Resolution {
         match self {
             NodeRef::Empty => Resolution::Absent,
-            NodeRef::Node(n) => Resolution::Found(*n.clone()),
+            NodeRef::Node(n) => Resolution::Found(Arc::clone(n)),
             NodeRef::Hash(h) => match store.get(h.as_slice()) {
                 // Unreadable bytes are as missing as absent ones: the store
                 // holds something under that hash, but nothing that can be
                 // walked, so the trie is incomplete either way.
                 Some(data) => match TrieNode::try_from_message(&data, store) {
-                    Some(node) => Resolution::Found(node),
+                    Some(node) => Resolution::Found(Arc::new(node)),
                     None => Resolution::Missing(*h),
                 },
                 None => Resolution::Missing(*h),
@@ -87,18 +108,51 @@ impl NodeRef {
     }
 
     /// Resolves the node, loading from store if only a hash is available.
-    pub fn resolve(&self, store: &dyn TrieStore) -> Option<TrieNode> {
+    pub fn resolve(&self, store: &dyn TrieStore) -> Option<Arc<TrieNode>> {
         match self {
             NodeRef::Empty => None,
-            NodeRef::Node(n) => Some(*n.clone()),
+            NodeRef::Node(n) => Some(Arc::clone(n)),
             NodeRef::Hash(h) => {
                 // Unresolvable and unparseable are the same answer here. A
                 // store can hold bytes a peer supplied, and a node nobody can
                 // read is a node that is not there.
                 let data = store.get(h.as_slice())?;
+                TrieNode::try_from_message(&data, store).map(Arc::new)
+            }
+        }
+    }
+
+    /// Resolve by consuming the reference.
+    ///
+    /// Unlike [`Self::resolve_owned`] this takes `self`, so when the
+    /// reference is the only owner of its `Arc` the node is moved out
+    /// rather than copied -- which is the case on the delete path, where
+    /// the node being unwrapped was built one call ago.
+    pub fn into_owned(self, store: &dyn TrieStore) -> Option<TrieNode> {
+        match self {
+            NodeRef::Empty => None,
+            NodeRef::Node(n) => {
+                Some(Arc::try_unwrap(n).unwrap_or_else(|shared| (*shared).clone()))
+            }
+            NodeRef::Hash(h) => {
+                let data = store.get(h.as_slice())?;
                 TrieNode::try_from_message(&data, store)
             }
         }
+    }
+
+    /// Like [`Self::resolve`], but hands back an owned node.
+    ///
+    /// Prefer `resolve`. This one has to copy when the child is already in
+    /// memory, and copying a `NodeRef::Node` copies its whole subtree --
+    /// which is the cost the `Arc` exists to avoid. It is here for the few
+    /// callers that put the node into a structure of their own and cannot
+    /// share it. Never use it on a put or get path.
+    ///
+    /// The copy is skipped when this reference is the only owner, which is
+    /// the common case of a node just read from the store.
+    pub fn resolve_owned(&self, store: &dyn TrieStore) -> Option<TrieNode> {
+        self.resolve(store).map(|n| Arc::try_unwrap(n).unwrap_or_else(|shared| (*shared).clone()))
     }
 
     pub fn get_hash(&self, store: &dyn TrieStore) -> Option<B256> {
@@ -145,7 +199,7 @@ impl NodeRef {
     }
 
     /// The sub-tree size as defined by RSKIP107: serialized node + children_size + external_value_length.
-    fn reference_size(&self, store: &dyn TrieStore) -> u64 {
+    pub(crate) fn reference_size(&self, store: &dyn TrieStore) -> u64 {
         match self {
             NodeRef::Empty => 0,
             NodeRef::Node(n) => {
@@ -223,7 +277,7 @@ impl Reader<'_> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TrieNode {
     pub shared_path: TrieKeySlice,
     pub value: Option<Vec<u8>>,
@@ -242,7 +296,14 @@ pub struct TrieNode {
     pub left: NodeRef,
     pub right: NodeRef,
     pub children_size: u64,
-    saved: bool,
+    /// Whether this node is already in the store.
+    ///
+    /// Interior-mutable because `collect_for_save` reaches children through
+    /// an `Arc`, which cannot hand out `&mut`. It is only ever set, never
+    /// cleared, so two owners of a shared node cannot disagree: the worst a
+    /// race does is let both walk the subtree, and writing the same
+    /// content-addressed bytes twice is harmless.
+    saved: AtomicBool,
     /// Memoised result of `compute_hash`.
     ///
     /// Safe to cache unconditionally: a TrieNode's content is immutable once
@@ -259,6 +320,28 @@ pub struct TrieNode {
     hash_cache: OnceLock<B256>,
 }
 
+/// Hand-written because `saved` is an `AtomicBool`, which is not `Clone`.
+///
+/// Both of the interior-mutable fields are carried over, and both are
+/// sound to carry: a clone has the same content as its original, so it
+/// hashes the same and -- the store being content-addressed -- is already
+/// in the store if the original was.
+impl Clone for TrieNode {
+    fn clone(&self) -> Self {
+        Self {
+            shared_path: self.shared_path.clone(),
+            value: self.value.clone(),
+            value_hash: self.value_hash,
+            long_value_len: self.long_value_len,
+            left: self.left.clone(),
+            right: self.right.clone(),
+            children_size: self.children_size,
+            saved: AtomicBool::new(self.saved.load(Ordering::Acquire)),
+            hash_cache: self.hash_cache.clone(),
+        }
+    }
+}
+
 impl TrieNode {
     pub fn empty() -> Self {
         Self {
@@ -268,7 +351,7 @@ impl TrieNode {
             left: NodeRef::Empty,
             right: NodeRef::Empty,
             children_size: 0,
-            saved: false,
+            saved: AtomicBool::new(false),
             long_value_len: None,
             hash_cache: OnceLock::new(),
         }
@@ -283,7 +366,7 @@ impl TrieNode {
         left: NodeRef,
         right: NodeRef,
     ) -> Self {
-        Self { shared_path, value, value_hash, left, right, children_size: 0, saved: false, long_value_len: None, hash_cache: OnceLock::new() }
+        Self { shared_path, value, value_hash, left, right, children_size: 0, saved: AtomicBool::new(false), long_value_len: None, hash_cache: OnceLock::new() }
     }
 
     pub fn new_leaf(shared_path: TrieKeySlice, value: Vec<u8>) -> Self {
@@ -295,7 +378,7 @@ impl TrieNode {
             left: NodeRef::Empty,
             right: NodeRef::Empty,
             children_size: 0,
-            saved: false,
+            saved: AtomicBool::new(false),
             long_value_len: None,
             hash_cache: OnceLock::new(),
         }
@@ -451,7 +534,7 @@ impl TrieNode {
             if embedded {
                 let len = r.byte()? as usize;
                 let body = r.take(len)?;
-                Some(NodeRef::Node(Box::new(TrieNode::try_from_message(body, store)?)))
+                Some(NodeRef::Node(Arc::new(TrieNode::try_from_message(body, store)?)))
             } else {
                 Some(NodeRef::Hash(B256::from_slice(r.take(32)?)))
             }
@@ -491,7 +574,7 @@ impl TrieNode {
             left,
             right,
             children_size,
-            saved: false,
+            saved: AtomicBool::new(false),
             long_value_len,
             hash_cache: OnceLock::new(),
         })
@@ -735,13 +818,14 @@ impl TrieNode {
             return Some(trie);
         }
 
+        let shared_path = trie.shared_path.clone();
         let (child, implicit_bit) = if !trie.left.is_empty() {
-            (trie.left.resolve(store)?, 0u8)
+            (trie.left.into_owned(store)?, 0u8)
         } else {
-            (trie.right.resolve(store)?, 1u8)
+            (trie.right.into_owned(store)?, 1u8)
         };
 
-        let new_path = trie.shared_path.rebuild_shared_path(implicit_bit, &child.shared_path);
+        let new_path = shared_path.rebuild_shared_path(implicit_bit, &child.shared_path);
         Some(TrieNode {
             shared_path: new_path,
             value: child.value,
@@ -749,7 +833,7 @@ impl TrieNode {
             left: child.left,
             right: child.right,
             children_size: child.children_size,
-            saved: false,
+            saved: AtomicBool::new(false),
             long_value_len: None,
             hash_cache: OnceLock::new(),
         })
@@ -797,7 +881,7 @@ impl TrieNode {
                     left: NodeRef::Empty,
                     right: NodeRef::Empty,
                     children_size: 0,
-                    saved: false,
+                    saved: AtomicBool::new(false),
                     long_value_len: None,
             hash_cache: OnceLock::new(),
                 });
@@ -815,7 +899,7 @@ impl TrieNode {
                 left: self.left.clone(),
                 right: self.right.clone(),
                 children_size: self.children_size,
-                saved: false,
+                saved: AtomicBool::new(false),
                 long_value_len: None,
             hash_cache: OnceLock::new(),
             });
@@ -831,7 +915,7 @@ impl TrieNode {
                 left: NodeRef::Empty,
                 right: NodeRef::Empty,
                 children_size: 0,
-                saved: false,
+                saved: AtomicBool::new(false),
                 long_value_len: None,
             hash_cache: OnceLock::new(),
             });
@@ -840,14 +924,14 @@ impl TrieNode {
         // Navigate to child
         let bit = key.get(self.shared_path.length());
         let child_ref = if bit == 0 { &self.left } else { &self.right };
-        let child = child_ref.resolve(store).unwrap_or_else(TrieNode::empty);
+        let child = child_ref.resolve(store).unwrap_or_else(|| Arc::new(TrieNode::empty()));
 
         let sub_key = key.slice(self.shared_path.length() + 1, key.length());
         let new_child_opt = child.put_impl(&sub_key, value, is_recursive_delete, store);
 
         // None means the child sub-tree was fully deleted
         let new_ref = match new_child_opt {
-            Some(c) => NodeRef::Node(Box::new(c)),
+            Some(c) => NodeRef::Node(Arc::new(c)),
             None => NodeRef::Empty,
         };
 
@@ -872,7 +956,7 @@ impl TrieNode {
             left: new_left,
             right: new_right,
             children_size: new_cs,
-            saved: false,
+            saved: AtomicBool::new(false),
             long_value_len: None,
             hash_cache: OnceLock::new(),
         })
@@ -888,12 +972,12 @@ impl TrieNode {
             left: self.left.clone(),
             right: self.right.clone(),
             children_size: self.children_size,
-            saved: false,
+            saved: AtomicBool::new(false),
             long_value_len: None,
             hash_cache: OnceLock::new(),
         };
 
-        let child_ref = NodeRef::Node(Box::new(new_child));
+        let child_ref = NodeRef::Node(Arc::new(new_child));
         let bit = self.shared_path.get(common_len);
 
         let cs = child_ref.reference_size(store);
@@ -910,7 +994,7 @@ impl TrieNode {
             left: new_left,
             right: new_right,
             children_size: cs,
-            saved: false,
+            saved: AtomicBool::new(false),
             long_value_len: None,
             hash_cache: OnceLock::new(),
         }
@@ -921,30 +1005,60 @@ impl TrieNode {
     }
 
     /// Recursively saves this node (and its children) to the store.
+    /// Persist this node and everything dirty beneath it.
+    ///
+    /// The whole subtree is collected first and written in **one** call.
+    /// A block rewrites roughly 6,900 nodes -- every node on the path
+    /// from each touched account up to the root -- and handing them over
+    /// singly makes the store pay its per-write cost that many times. For
+    /// an append-only store that cost includes reserving space in a
+    /// frontier shared between threads, which is the part that has to be
+    /// serialised; one batch reserves once.
     pub fn save(&mut self, store: &dyn TrieStore, is_root: bool) {
-        if self.saved {
+        let mut batch = Vec::new();
+        self.collect_for_save(store, is_root, &mut batch);
+        if !batch.is_empty() {
+            store.put_many(&batch);
+        }
+    }
+
+    /// The body of [`Self::save`], accumulating instead of writing.
+    ///
+    /// Reads still go to the store while this runs -- `to_message` and
+    /// `is_embeddable` consult it -- but only for nodes that are already
+    /// there. Everything this produces is in memory and is reachable
+    /// through the node graph, so nothing in the batch is needed to build
+    /// the rest of it.
+    fn collect_for_save(
+        &self,
+        store: &dyn TrieStore,
+        is_root: bool,
+        batch: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
+        if self.saved.load(Ordering::Acquire) {
             return;
         }
 
-        // Recursively save children if they are in-memory
-        if let NodeRef::Node(ref mut child) = self.left {
-            child.save(store, false);
+        // Children first, so a parent's message is built from children
+        // whose hashes are settled.
+        if let NodeRef::Node(child) = &self.left {
+            child.collect_for_save(store, false, batch);
         }
-        if let NodeRef::Node(ref mut child) = self.right {
-            child.save(store, false);
+        if let NodeRef::Node(child) = &self.right {
+            child.collect_for_save(store, false, batch);
         }
 
-        // Save long values separately
+        // A long value lives outside its node, under its own hash.
         if self.has_long_value() {
             if let Some(ref v) = self.value {
                 let vh = self.get_value_hash();
-                store.put(vh.as_slice(), v);
+                batch.push((vh.as_slice().to_vec(), v.clone()));
             }
         }
 
-        // Embeddable non-root nodes are not stored independently
+        // Embeddable non-root nodes are not stored independently.
         if self.is_embeddable(store) && !is_root {
-            self.saved = true;
+            self.saved.store(true, Ordering::Release);
             return;
         }
 
@@ -954,8 +1068,8 @@ impl TrieNode {
         // dirty subtree beneath this node, not merely this node.
         let msg = self.to_message(store);
         let hash = *self.hash_cache.get_or_init(|| keccak(&msg));
-        store.put(hash.as_slice(), &msg);
-        self.saved = true;
+        batch.push((hash.as_slice().to_vec(), msg));
+        self.saved.store(true, Ordering::Release);
     }
 }
 

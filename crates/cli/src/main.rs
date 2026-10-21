@@ -809,6 +809,45 @@ struct Args {
     #[arg(long, default_value = "single")]
     trie_backend: String,
 
+    /// Storage engine behind the trie: rocksdb or flatdb.
+    ///
+    /// Orthogonal to --trie-backend, which chooses retention. This chooses
+    /// what holds the nodes. flatdb is measurably faster on reads and far
+    /// steadier (docs/flatdb.md), and it is **experimental**: it has not run
+    /// on a real chain, so the default stays rocksdb until it has.
+    ///
+    /// The node refuses to start if the directory on disk was written by the
+    /// other engine, rather than opening an empty store beside the data.
+    #[arg(long, default_value = "rocksdb")]
+    trie_engine: String,
+
+    /// Blocks executed per trie durability point while catching up.
+    ///
+    /// Trie nodes are derivable — lose them and re-executing the block
+    /// recomputes them — so the store may flush less often than the node
+    /// executes. What it may not do is advance the executed head past what a
+    /// crash would keep, and it does not: the head moves only at a flush.
+    ///
+    /// The cost of raising this is that many blocks of re-execution after an
+    /// unclean stop. Follow mode ignores it and makes every block durable,
+    /// because one block every thirty seconds can afford a flush.
+    #[arg(long, default_value_t = 100)]
+    trie_flush_every: u64,
+
+    /// Keys to size a flatdb epoch's index for. Ignored by rocksdb.
+    ///
+    /// Zero, the default, derives it from the rotation threshold: an epoch
+    /// rotates at --gc-rotate-mb, so the number of records it will ever hold
+    /// is bounded and can be computed rather than guessed. Set it only to
+    /// override that.
+    ///
+    /// Exceeding it costs a stop-the-world rehash. Over-sizing costs
+    /// reclaimable address space and nothing else -- the index is a file
+    /// mapping, not committed memory -- so the two errors are not
+    /// symmetric and the derived figure errs large.
+    #[arg(long, default_value_t = 0)]
+    trie_expected_keys: u64,
+
     /// Epochs to keep with --trie-backend epoch. Minimum 3.
     ///
     /// More epochs means smaller, more frequent sweeps and less duplication,
@@ -1198,6 +1237,11 @@ fn apply_file_config(
         &mut a.no_peer_punishment);
 
     apply(matches, "trie_backend", f.trie.backend.as_ref(), &mut a.trie_backend);
+    apply(matches, "trie_engine", f.trie.engine.as_ref(), &mut a.trie_engine);
+    apply(matches, "trie_expected_keys", f.trie.expected_keys.as_ref(),
+        &mut a.trie_expected_keys);
+    apply(matches, "trie_flush_every", f.trie.flush_every.as_ref(),
+        &mut a.trie_flush_every);
     apply(
         matches,
         "btc_block_cache_entries",
@@ -1874,7 +1918,25 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         burial_depth: args.gc_burial,
         rotate_bytes: args.gc_rotate_mb * (1 << 20),
     };
+    let rotate_bytes = gc_config.rotate_bytes;
     let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
+    let engine = rustock_storage::TrieEngine::parse(&args.trie_engine)?;
+    // An epoch's key count is bounded by when it rotates, so the default
+    // is computed rather than configured.
+    let expected_keys = if args.trie_expected_keys > 0 {
+        args.trie_expected_keys
+    } else {
+        rustock_storage::epoch_backend::keys_for_rotation(rotate_bytes)
+    };
+    if matches!(backend, rustock_storage::epoch_store::TrieBackend::Single)
+        && engine == rustock_storage::TrieEngine::FlatDb
+    {
+        anyhow::bail!(
+            "--trie-backend single keeps nodes in a column family of the node's main \
+             database, which only rocksdb can provide; use --trie-backend external or \
+             epoch to run flatdb"
+        );
+    }
 
     // The node only ever holds an `Arc<dyn TrieStore>`, so this is the entire
     // extent of the choice: nothing downstream knows which store it got.
@@ -1967,19 +2029,36 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                     Some((hash, _)) => store.header(hash)?.map(|h| h.number),
                     None => None,
                 };
-                rustock_storage::epoch_store::EpochTrieStore::open(
+                engine.check_matches(std::path::Path::new(&trie_dir))?;
+                rustock_storage::epoch_store::EpochTrieStore::open_with(
                     &trie_dir,
                     cfg.clone(),
                     resume_at,
+                    engine.factory(expected_keys),
                 )?
             }))
         }
         _ => None,
     };
     let external_store: Option<Arc<dyn rustock_trie::TrieStore>> = match &backend {
-        rustock_storage::epoch_store::TrieBackend::External => Some(Arc::new(
-            rustock_storage::RocksDbTrieStore::open(std::path::Path::new(&trie_dir))?,
-        )),
+        rustock_storage::epoch_store::TrieBackend::External => {
+            let dir = std::path::Path::new(&trie_dir);
+            engine.check_matches(dir)?;
+            Some(match engine {
+                rustock_storage::TrieEngine::RocksDb => {
+                    Arc::new(rustock_storage::RocksDbTrieStore::open(dir)?)
+                }
+                rustock_storage::TrieEngine::FlatDb => {
+                    Arc::new(rustock_storage::FlatTrieStore::open(
+                        dir,
+                        rustock_flatdb::Options {
+                            expected_keys,
+                            ..rustock_flatdb::Options::default()
+                        },
+                    )?)
+                }
+            })
+        }
         _ => None,
     };
     let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> = match &epoch_store {
@@ -2659,6 +2738,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         .with_scoring(Some(scoring.clone()))
         .with_events(events.clone())
         .with_follow_up(args.follow_up)
+        .with_trie_flush_every(args.trie_flush_every)
         .with_serve_ceiling(args.simulate_height)
         .with_exit_when_synced(args.exit_when_synced);
 

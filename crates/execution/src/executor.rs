@@ -59,6 +59,45 @@ pub struct BlockExecutionResult {
     /// `state_changes` is still the whole block's, and still carries each
     /// account's final values -- the supply check reads it.
     pub applied_root: Option<TrieNode>,
+    /// Where the block's time went, split by phase.
+    pub phases: PhaseTimings,
+}
+
+/// Microseconds spent in each phase of executing one block.
+///
+/// Three of these are **sequential whatever the thread count**, which is
+/// why they are measured separately: the maintenance run has to finish
+/// before any sublist starts, and the commit has to apply the sublists
+/// in order because that is what makes the sequential sublist's starting
+/// state well defined. Only `sublists` is the part threads divide.
+///
+/// Amdahl says the sequential share bounds everything parallel execution
+/// can return, and until this existed that share was inferred from
+/// differences between whole runs rather than measured.
+///
+/// Collecting it costs a few `Instant::now()` a block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseTimings {
+    /// The block-level run that owns no sublist: REMASC, the bridge,
+    /// fork activations. Every sublist starts from the state it leaves.
+    pub maintenance_us: u64,
+    /// Executing the parallel sublists. The only part threads divide.
+    pub sublists_us: u64,
+    /// Applying each sublist's changes to the trie, in sublist order:
+    /// one `apply_state_changes` per sublist plus one for the sequential
+    /// set, each rebuilding the upper trie on the previous one's result.
+    ///
+    /// **This used to include the sequential sublist's execution**, which
+    /// is a fifth of a block's transactions and has nothing to do with
+    /// the trie. That made the commit look twice the size of the parallel
+    /// execution when a good part of the difference was simply more
+    /// transactions being run. `sequential_us` is that work, now counted
+    /// where it belongs.
+    pub commit_us: u64,
+    /// Running the sequential sublist -- the transactions that may touch
+    /// REMASC or the Bridge and so cannot share a sublist with anything.
+    /// Execution, not trie work, and no thread count divides it.
+    pub sequential_us: u64,
 }
 
 /// One sublist's run, with everything it collected on its own thread.
@@ -166,13 +205,20 @@ impl RskExecutor {
 
     /// How many threads a block's parallel sublists may use.
     ///
-    /// Clamped to at least 1, and to at most the number of parallel sublists
-    /// a block may declare (`TX_EXECUTION_THREADS`): asking for more buys
-    /// nothing, because the partition the header declares is the only source
-    /// of work to divide.
+    /// At least 1. Not clamped from above against
+    /// `TX_EXECUTION_THREADS`, because that constant bounds what a *header*
+    /// may declare and the real bound is what a given block actually
+    /// declared: a block with one parallel sublist gains nothing from four
+    /// threads however high the consensus cap goes. That bound is applied
+    /// where it is known, at execution.
+    ///
+    /// Keeping the two apart also lets a benchmark ask what a wider
+    /// partition would be worth. RSKIP-144 specifies
+    /// `maxTransactionExecutionThreads = 4` where rskj implements 2, and a
+    /// measurement of the difference should not require editing a consensus
+    /// constant to take it.
     pub fn with_execution_threads(mut self, threads: usize) -> Self {
-        self.execution_threads =
-            threads.clamp(1, rustock_core::validation::block_rules::TX_EXECUTION_THREADS);
+        self.execution_threads = threads.max(1);
         self
     }
 
@@ -777,6 +823,7 @@ impl RskExecutor {
     > {
         let store = trie_store.as_ref();
 
+        let at_maintenance = std::time::Instant::now();
         // 1. Block-level maintenance, on no sublist's account.
         let (maintenance, _) = self.run_sublist(
             header,
@@ -795,22 +842,51 @@ impl RskExecutor {
             &maintenance.state_changes,
             &maintenance.markers,
         );
+        let maintenance_us = at_maintenance.elapsed().as_micros() as u64;
 
         // 2. The parallel sublists, each against that state, each on its own
         //    thread with its own everything.
         let recorder = crate::collision::config();
         let recording_silent = crate::silent::is_recording();
         let base = &base_root;
-        let outcomes: Vec<Result<SublistRun, ExecutionError>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = parallel
-                .iter()
-                .map(|range| {
-                    let range = range.clone();
-                    let store = trie_store.clone();
-                    let inspector = inspector.fresh_like();
-                    let recorder = recorder.clone();
-                    scope.spawn(move || {
-                        if let Some(cfg) = recorder {
+        // Workers pull the next unclaimed sublist rather than being handed
+        // a fixed slice of them.
+        //
+        // Chunking into waves of `execution_threads` looked equivalent and
+        // is not: four sublists on three threads is a wave of three and
+        // then a wave of one, with two threads idle while the straggler
+        // finishes. The benchmark measured exactly that -- three threads
+        // came out *slower* than two on the cold blocks, 5,089 ms against
+        // 4,096, and identical once warm, which is the signature of a
+        // scheduling quantum rather than of anything about the work.
+        let at_sublists = std::time::Instant::now();
+        let width = self.execution_threads.max(1).min(parallel.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let slots: Vec<std::sync::Mutex<Option<Result<SublistRun, ExecutionError>>>> =
+            (0..parallel.len()).map(|_| std::sync::Mutex::new(None)).collect();
+        let parallel_ref = &parallel;
+        let slots_ref = &slots;
+        let next_ref = &next;
+
+        std::thread::scope(|scope| {
+            for _ in 0..width {
+                let store = trie_store.clone();
+                let recorder = recorder.clone();
+                // Borrowed, not cloned: a worker makes a fresh tracer per
+                // sublist it takes, so the second one it pulls is
+                // configured like the first rather than degraded to a
+                // call-tree-only default.
+                let template = &inspector;
+                scope.spawn(move || {
+                    loop {
+                        let index =
+                            next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(range) = parallel_ref.get(index) else { break };
+
+                        // Per sublist, not per thread: a worker that takes a
+                        // second sublist must not fold its keys in with the
+                        // first one's.
+                        if let Some(cfg) = recorder.clone() {
                             crate::collision::start_from(cfg);
                         }
                         if recording_silent {
@@ -819,32 +895,40 @@ impl RskExecutor {
                         let run = self.run_sublist(
                             header,
                             transactions,
-                            range,
+                            range.clone(),
                             base,
-                            store,
-                            inspector,
+                            store.clone(),
+                            template.fresh_like(),
                             traced,
                             U256::ZERO,
                             false,
                         );
                         let keys = crate::collision::finish();
                         let records = crate::silent::finish();
-                        run.map(|(result, traces)| SublistRun { result, traces, keys, records })
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        Err(ExecutionError::Evm(
-                            "a parallel sublist thread panicked".to_string(),
-                        ))
-                    })
-                })
-                .collect()
+                        let outcome = run
+                            .map(|(result, traces)| SublistRun { result, traces, keys, records });
+                        *slots_ref[index].lock().expect("sublist slot") = Some(outcome);
+                    }
+                });
+            }
         });
 
+        let outcomes: Vec<Result<SublistRun, ExecutionError>> = slots
+            .into_iter()
+            .map(|slot| {
+                slot.into_inner().expect("sublist slot").unwrap_or_else(|| {
+                    Err(ExecutionError::Evm(
+                        "a parallel sublist thread panicked before recording its result"
+                            .to_string(),
+                    ))
+                })
+            })
+            .collect();
+
+        let sublists_us = at_sublists.elapsed().as_micros() as u64;
+
+        let mut commit_us = 0u64;
+        let at_commit = std::time::Instant::now();
         // 3. Commit them in sublist order, and take back what the workers
         //    collected on their own threads.
         let mut root = base_root.clone();
@@ -877,6 +961,7 @@ impl RskExecutor {
         if let Some(e) = failure {
             return Err(e);
         }
+        commit_us += at_commit.elapsed().as_micros() as u64;
 
         // 4. The sequential sublist, on what they left, carrying their fees
         //    so that the settlement at the REMASC transaction covers the
@@ -885,6 +970,7 @@ impl RskExecutor {
             .iter()
             .map(|(r, _)| r.paid_fees)
             .fold(U256::ZERO, |a, b| a + b);
+        let at_sequential = std::time::Instant::now();
         let (sequential_result, mut traces) = self.run_sublist(
             header,
             transactions,
@@ -896,12 +982,18 @@ impl RskExecutor {
             fees_carried,
             false,
         )?;
+        let sequential_us = at_sequential.elapsed().as_micros() as u64;
+
+        let at_final = std::time::Instant::now();
         let final_root = crate::state::apply_state_changes(
             &root,
             store,
             &sequential_result.state_changes,
             &sequential_result.markers,
         );
+        commit_us += at_final.elapsed().as_micros() as u64;
+
+        let phases = PhaseTimings { maintenance_us, sublists_us, commit_us, sequential_us };
 
         // 5. Assemble, in the block's own transaction order.
         let mut tx_results = Vec::with_capacity(transactions.len());
@@ -927,6 +1019,7 @@ impl RskExecutor {
                 state_changes,
                 markers,
                 applied_root: Some(final_root),
+                phases,
             },
             traces,
         ))
@@ -1671,6 +1764,10 @@ impl RskExecutor {
                 state_changes: state,
                 markers,
                 applied_root: None,
+                // A run that is one sublist has no phases to split: the
+                // caller applies its changes, and there is no maintenance
+                // pass or ordered commit to attribute time to.
+                phases: PhaseTimings::default(),
             },
             traces,
         ))

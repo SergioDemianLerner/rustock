@@ -7,6 +7,7 @@ members = [
     "crates/sync",
     "crates/rpc",
     "crates/trie",
+    "crates/flatdb",
     "crates/execution",
     "crates/alerts",
 ]
@@ -47,6 +48,20 @@ sha3 = "0.10.8"
 sha2 = "0.10.9"
 hex = "0.4.3"
 k256 = "0.13.4"
+# Pieter Wuille's libsecp256k1, through the rust-bitcoin bindings, vendored
+# as C sources. Used for signature recovery, which it does 4.3x faster than
+# the pure-Rust k256 -- measured on real mainnet transactions by
+# `cargo run --release --example validation_cost`.
+#
+# Pinned to the version `revm-precompile` resolves to, deliberately and not
+# to the one `bitcoin` pulls in. Two copies of this library are in the
+# binary either way -- bitcoin wants 0.29, revm wants 0.31 -- so the choice
+# does not reduce the count. It decides something else: recovering a
+# transaction's sender and running the EVM's `ecrecover` precompile are two
+# places that judge the same question, which signatures are valid, and they
+# should not be able to answer it differently because they link different
+# versions of the same C library.
+secp256k1 = { version = "0.31.1", features = ["recovery"] }
 async-trait = "0.1"
 bitcoin = "0.32.8"
 ripemd = "0.1"
