@@ -156,7 +156,7 @@ fn finish(node: TrieNode, store: &dyn TrieStore) -> Written {
     }
 
     if node.is_embeddable(store) {
-        return Written { reference: NodeRef::Node(Box::new(node)), size };
+        return Written { reference: NodeRef::Node(std::sync::Arc::new(node)), size };
     }
 
     let hash = node.compute_hash(store);

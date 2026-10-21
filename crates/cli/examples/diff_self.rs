@@ -120,8 +120,8 @@ fn main() -> anyhow::Result<()> {
         root = processed.new_state_root;
     }
 
-    let a_ref = NodeRef::Node(Box::new(base_root.unwrap())); // before #number
-    let b_ref = NodeRef::Node(Box::new(root)); // after #number
+    let a_ref = NodeRef::Node(std::sync::Arc::new(base_root.unwrap())); // before #number
+    let b_ref = NodeRef::Node(std::sync::Arc::new(root)); // after #number
     let mut aout = Vec::new();
     let mut bout = Vec::new();
     diff(&a_ref, &b_ref, &mut Vec::new(), &mut Vec::new(), trie_store.as_ref(), &mut aout, &mut bout);

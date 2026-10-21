@@ -97,7 +97,7 @@ fn convert_account_node(
         Some(c0) => {
             let k = key.rebuild_shared_path(0, &c0.shared_path);
             convert_account_node(&k, c0, false, store, cache)
-                .map(|n| NodeRef::Node(Box::new(n)))
+                .map(|n| NodeRef::Node(std::sync::Arc::new(n)))
                 .unwrap_or(NodeRef::Empty)
         }
         None => NodeRef::Empty,
@@ -106,7 +106,7 @@ fn convert_account_node(
         Some(c1) => {
             let k = key.rebuild_shared_path(1, &c1.shared_path);
             convert_account_node(&k, c1, false, store, cache)
-                .map(|n| NodeRef::Node(Box::new(n)))
+                .map(|n| NodeRef::Node(std::sync::Arc::new(n)))
                 .unwrap_or(NodeRef::Empty)
         }
         None => NodeRef::Empty,
@@ -193,8 +193,8 @@ fn convert_storage_node(
         panic!("the unitrie storage doesn't share as much structure as we need to rebuild the Orchid trie");
     }
 
-    let left = converted0.map(|n| NodeRef::Node(Box::new(n))).unwrap_or(NodeRef::Empty);
-    let right = converted1.map(|n| NodeRef::Node(Box::new(n))).unwrap_or(NodeRef::Empty);
+    let left = converted0.map(|n| NodeRef::Node(std::sync::Arc::new(n))).unwrap_or(NodeRef::Empty);
+    let right = converted1.map(|n| NodeRef::Node(std::sync::Arc::new(n))).unwrap_or(NodeRef::Empty);
     let new_node = TrieNode::from_parts(shared_path, value, value_hash, left, right);
     if !only_child {
         cache.insert(src_hash, new_node.clone());

@@ -30,7 +30,7 @@
 use alloy_primitives::B256;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use crate::node::{NodeRef, TrieNode};
 use crate::store::TrieStore;
 
@@ -118,7 +118,7 @@ pub fn seek(root: &TrieNode, offset: u64, store: &dyn TrieStore) -> Option<Seek>
         if offset < left {
             // `branch_size` is zero for an embedded child, so reaching here
             // means the left child is a separate entry and resolvable.
-            let next = node.left.resolve(store)?;
+            let next = node.left.resolve_owned(store)?;
             path.push(Step { node, went_left: true });
             node = next;
             continue;
@@ -134,7 +134,7 @@ pub fn seek(root: &TrieNode, offset: u64, store: &dyn TrieStore) -> Option<Seek>
         if node.right.is_empty() || is_embedded(&node.right, store) {
             return None;
         }
-        let next = node.right.resolve(store)?;
+        let next = node.right.resolve_owned(store)?;
         offset -= left + here;
         path.push(Step { node, went_left: false });
         node = next;
@@ -273,14 +273,14 @@ fn collect(
 
     // The stack holds ancestors still owing their own entry and right
     // subtree, innermost last.
-    let mut stack: Vec<TrieNode> = start
+    let mut stack: Vec<Arc<TrieNode>> = start
         .path
         .iter()
         .filter(|s| s.went_left)
-        .map(|s| s.node.clone())
+        .map(|s| Arc::new(s.node.clone()))
         .collect();
 
-    let mut pending = Some(start.node);
+    let mut pending = Some(Arc::new(start.node));
     let mut descend_right: Option<NodeRef> = None;
 
     loop {
@@ -791,9 +791,9 @@ pub fn verify_complete(
     // into the whole walk done serially.
     let max_pieces = workers * 64;
 
-    let mut pieces: Vec<TrieNode> = Vec::new();
+    let mut pieces: Vec<Arc<TrieNode>> = Vec::new();
     let mut heap: BinaryHeap<(u64, usize)> = BinaryHeap::new();
-    pieces.push(root.clone());
+    pieces.push(Arc::new(root.clone()));
     heap.push((total, 0));
     let mut counted = 0u64;
 
@@ -812,7 +812,7 @@ pub fn verify_complete(
         for child in [&node.left, &node.right] {
             let resolved = match child {
                 NodeRef::Empty => None,
-                NodeRef::Node(n) => Some((**n).clone()),
+                NodeRef::Node(n) => Some(Arc::clone(n)),
                 NodeRef::Hash(h) => match child.resolve(store) {
                     Some(n) => Some(n),
                     None => return Err(Missing::Node(*h)),
@@ -827,7 +827,7 @@ pub fn verify_complete(
     }
 
     // Whatever is left in the heap is the work, in no particular order.
-    let frontier: Vec<TrieNode> =
+    let frontier: Vec<Arc<TrieNode>> =
         heap.into_iter().map(|(_, i)| pieces[i].clone()).collect();
 
     if frontier.is_empty() {
@@ -870,7 +870,7 @@ pub fn verify_complete(
                         for child in [&node.left, &node.right] {
                             match child {
                                 NodeRef::Empty => {}
-                                NodeRef::Node(n) => stack.push((**n).clone()),
+                                NodeRef::Node(n) => stack.push(Arc::clone(n)),
                                 NodeRef::Hash(h) => match child.resolve(store) {
                                     Some(n) => stack.push(n),
                                     None => {
@@ -930,7 +930,7 @@ mod verify_complete_tests {
     /// last.
     fn hash_referenced(root: &TrieNode, store: &MemoryTrieStore) -> Vec<B256> {
         let mut out = Vec::new();
-        let mut level = vec![root.clone()];
+        let mut level = vec![Arc::new(root.clone())];
         while !level.is_empty() {
             let mut next = Vec::new();
             for node in &level {
@@ -942,7 +942,7 @@ mod verify_complete_tests {
                                 next.push(n);
                             }
                         }
-                        NodeRef::Node(n) => next.push((**n).clone()),
+                        NodeRef::Node(n) => next.push(Arc::clone(n)),
                         NodeRef::Empty => {}
                     }
                 }
@@ -1103,7 +1103,7 @@ mod split_balance_tests {
         let total = total_size(root, store);
         let bound = (total / (workers as u64 * 4)).max(1);
         let max_pieces = workers * 64;
-        let mut pieces = vec![root.clone()];
+        let mut pieces = vec![Arc::new(root.clone())];
         let mut heap: BinaryHeap<(u64, usize)> = BinaryHeap::new();
         heap.push((total, 0));
 
@@ -1165,7 +1165,7 @@ impl TrieShape {
 /// between.
 pub fn measure_shape(root: &TrieNode, store: &dyn TrieStore) -> TrieShape {
     let mut shape = TrieShape::default();
-    let mut stack = vec![(root.clone(), 0u32)];
+    let mut stack = vec![(Arc::new(root.clone()), 0u32)];
 
     while let Some((node, depth)) = stack.pop() {
         shape.nodes += 1;
@@ -1186,7 +1186,7 @@ pub fn measure_shape(root: &TrieNode, store: &dyn TrieStore) -> TrieShape {
                 NodeRef::Empty => {}
                 NodeRef::Node(n) => {
                     shape.embedded_children += 1;
-                    stack.push(((**n).clone(), depth + 1));
+                    stack.push((Arc::clone(n), depth + 1));
                 }
                 NodeRef::Hash(_) => {
                     shape.hash_children += 1;

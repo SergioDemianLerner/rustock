@@ -61,7 +61,7 @@ impl<'a> Walk<'a> {
     /// Iterative, not recursive: this subtree is deep enough to be worth not
     /// trusting the stack with.
     fn run(&mut self, root: &TrieNode) {
-        let mut stack: Vec<TrieNode> = vec![root.clone()];
+        let mut stack: Vec<std::sync::Arc<TrieNode>> = vec![std::sync::Arc::new(root.clone())];
         while let Some(node) = stack.pop() {
             if self.seen.len() >= self.cap {
                 eprintln!("  stopped at the cap of {} nodes", self.cap);

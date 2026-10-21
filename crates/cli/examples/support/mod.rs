@@ -231,8 +231,8 @@ pub fn diff_roots(
 ) -> (Vec<Leaf>, Vec<Leaf>) {
     let (mut a, mut b) = (Vec::new(), Vec::new());
     diff(
-        &NodeRef::Node(Box::new(before.clone())),
-        &NodeRef::Node(Box::new(after.clone())),
+        &NodeRef::Node(std::sync::Arc::new(before.clone())),
+        &NodeRef::Node(std::sync::Arc::new(after.clone())),
         &mut Vec::new(),
         &mut Vec::new(),
         store,
