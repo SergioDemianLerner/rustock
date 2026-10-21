@@ -434,7 +434,9 @@ Amdahl, at most a third of a block is parallelisable; the rest is:
   writer mutex.
 
 That last one has a known fix and a known ceiling of about 10% of wall
-clock ([#319](https://github.com/SergioDemianLerner/rustock/issues/319)),
+clock — [`flatdb-writer-lock.md`](flatdb-writer-lock.md) explains it from
+scratch for someone who has not read the store's code, and
+[#319](https://github.com/SergioDemianLerner/rustock/issues/319) tracks it —
 with the naive version of it disproved — `size` is both the allocation
 cursor and the publication barrier, so reserving ahead of writing breaks
 the release/acquire pair that makes lock-free reads sound.

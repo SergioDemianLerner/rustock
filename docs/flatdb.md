@@ -347,6 +347,10 @@ which is what a lock inside the parallel region looks like. That lock is
 `FlatDb`'s writer mutex, held across the probe, the key comparison, the
 heap append and the slot store, some 6,900 times a block.
 
+[`flatdb-writer-lock.md`](flatdb-writer-lock.md) is a standalone
+explanation of this for someone picking it up cold, with the code
+quoted and the two fixes spelled out.
+
 ### Why the obvious fix is unsound
 
 The first proposal was to reserve the frontier with a `fetch_add` and
