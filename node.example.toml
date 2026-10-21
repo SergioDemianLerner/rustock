@@ -74,6 +74,21 @@
 # dev = false                       # default — evm_* namespace: snapshot/revert/mine — development chains only
 # ws = false                        # default — WebSocket JSON-RPC, for eth_subscribe
 # ws_port = 4445                    # default
+#
+# A file of private keys this node may sign with, one 32-byte hex key per
+# line; blank lines and `#` comments are skipped. Off by default, and the
+# only way the node ever holds a key for signing: without it eth_accounts
+# is empty and eth_sign, eth_signTransaction and eth_sendTransaction
+# report as unknown methods.
+#
+# Not a keystore -- no encryption, no passphrase, no personal_* namespace.
+# The keys are read once and held in memory. It exists so a load-testing
+# harness can drive eth_sendTransaction from funded senders.
+#
+# Anyone who can reach this RPC endpoint can spend from these accounts.
+# Give the file mode 0600 and do not set this on a node whose RPC is
+# reachable from anywhere you do not control.
+# wallet_file = "/etc/rustock/wallet.keys"   # default: unset — no wallet, no signing
 
 [metrics]
 # Prometheus metrics, served on their own listener. Absent port means no

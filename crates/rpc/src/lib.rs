@@ -12,12 +12,14 @@ pub mod net;
 pub mod rsk;
 pub mod sco;
 pub mod server;
+pub mod sign;
 pub mod state;
 pub mod subscribe;
 pub mod tx;
 pub mod trace;
 pub mod txpool;
 pub mod types;
+pub mod wallet;
 pub mod web3;
 pub mod ws;
 

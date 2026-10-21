@@ -22,7 +22,9 @@ futures = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+secp256k1 = { workspace = true }
 sha3 = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = { workspace = true }

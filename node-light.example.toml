@@ -90,6 +90,10 @@
 # dev = false                       # default — evm_* namespace: snapshot/revert/mine — development chains only
 # ws = false                        # default — WebSocket JSON-RPC, for eth_subscribe
 # ws_port = 4445                    # default
+# Private keys this node may sign with, one hex key per line. Off by
+# default; without it the node holds no keys and refuses eth_sign and
+# eth_sendTransaction. Anyone who can reach this RPC can spend from them.
+# wallet_file = "/etc/rustock/wallet.keys"   # default: unset — no wallet, no signing
 
 [metrics]
 # Prometheus metrics, served on their own listener. Absent port means no
