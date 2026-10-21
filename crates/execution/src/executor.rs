@@ -83,8 +83,21 @@ pub struct PhaseTimings {
     pub maintenance_us: u64,
     /// Executing the parallel sublists. The only part threads divide.
     pub sublists_us: u64,
-    /// Applying each sublist's changes to the trie, in sublist order.
+    /// Applying each sublist's changes to the trie, in sublist order:
+    /// one `apply_state_changes` per sublist plus one for the sequential
+    /// set, each rebuilding the upper trie on the previous one's result.
+    ///
+    /// **This used to include the sequential sublist's execution**, which
+    /// is a fifth of a block's transactions and has nothing to do with
+    /// the trie. That made the commit look twice the size of the parallel
+    /// execution when a good part of the difference was simply more
+    /// transactions being run. `sequential_us` is that work, now counted
+    /// where it belongs.
     pub commit_us: u64,
+    /// Running the sequential sublist -- the transactions that may touch
+    /// REMASC or the Bridge and so cannot share a sublist with anything.
+    /// Execution, not trie work, and no thread count divides it.
+    pub sequential_us: u64,
 }
 
 /// One sublist's run, with everything it collected on its own thread.
@@ -914,6 +927,7 @@ impl RskExecutor {
 
         let sublists_us = at_sublists.elapsed().as_micros() as u64;
 
+        let mut commit_us = 0u64;
         let at_commit = std::time::Instant::now();
         // 3. Commit them in sublist order, and take back what the workers
         //    collected on their own threads.
@@ -947,6 +961,7 @@ impl RskExecutor {
         if let Some(e) = failure {
             return Err(e);
         }
+        commit_us += at_commit.elapsed().as_micros() as u64;
 
         // 4. The sequential sublist, on what they left, carrying their fees
         //    so that the settlement at the REMASC transaction covers the
@@ -955,6 +970,7 @@ impl RskExecutor {
             .iter()
             .map(|(r, _)| r.paid_fees)
             .fold(U256::ZERO, |a, b| a + b);
+        let at_sequential = std::time::Instant::now();
         let (sequential_result, mut traces) = self.run_sublist(
             header,
             transactions,
@@ -966,18 +982,18 @@ impl RskExecutor {
             fees_carried,
             false,
         )?;
+        let sequential_us = at_sequential.elapsed().as_micros() as u64;
+
+        let at_final = std::time::Instant::now();
         let final_root = crate::state::apply_state_changes(
             &root,
             store,
             &sequential_result.state_changes,
             &sequential_result.markers,
         );
+        commit_us += at_final.elapsed().as_micros() as u64;
 
-        // Everything from the ordered commit to here is the sequential
-        // tail: applying each sublist in turn, then running the
-        // sequential sublist, then merging the reported state.
-        let commit_us = at_commit.elapsed().as_micros() as u64;
-        let phases = PhaseTimings { maintenance_us, sublists_us, commit_us };
+        let phases = PhaseTimings { maintenance_us, sublists_us, commit_us, sequential_us };
 
         // 5. Assemble, in the block's own transaction order.
         let mut tx_results = Vec::with_capacity(transactions.len());

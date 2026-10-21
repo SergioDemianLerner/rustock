@@ -453,6 +453,7 @@ fn main() -> Result<()> {
             maintenance_us: executed.phases.maintenance_us,
             sublists_us: executed.phases.sublists_us,
             commit_us: executed.phases.commit_us + committing.as_micros() as u64,
+            sequential_us: executed.phases.sequential_us,
             accounts: executed.state_changes.len() as u64,
             hash_us: hashed.as_micros() as u64,
             reload_us: reloaded.as_micros() as u64,
@@ -577,6 +578,9 @@ struct Row {
     maintenance_us: u64,
     sublists_us: u64,
     commit_us: u64,
+    /// Running the sequential sublist. Execution, not trie work, and it
+    /// used to be counted inside the commit.
+    sequential_us: u64,
     /// Accounts the block changed, so the commit's cost can be read
     /// against the work it was given rather than against the clock.
     accounts: u64,
@@ -636,9 +640,10 @@ fn report(rows: &[Row], label: &str, threads: usize, sublists: usize) {
     // What parallel execution can and cannot divide. Three of these four
     // run once a block on one thread whatever `--threads` says.
     println!(
-        "  maintenance     {:.1}   sublists {:.1}   commit {:.1}   root hash {:.1}   reload {:.1}  ms/block",
+        "  maintenance     {:.1}   sublists {:.1}   sequential {:.1}   commit {:.1}   root hash {:.1}   reload {:.1}  ms/block",
         mean(rows, |r| r.maintenance_us) / 1000.0,
         mean(rows, |r| r.sublists_us) / 1000.0,
+        mean(rows, |r| r.sequential_us) / 1000.0,
         mean(rows, |r| r.commit_us) / 1000.0,
         mean(rows, |r| r.hash_us) / 1000.0,
         mean(rows, |r| r.reload_us) / 1000.0,
@@ -664,6 +669,7 @@ fn report(rows: &[Row], label: &str, threads: usize, sublists: usize) {
         );
     }
     let sequential = mean(rows, |r| r.maintenance_us)
+        + mean(rows, |r| r.sequential_us)
         + mean(rows, |r| r.commit_us)
         + mean(rows, |r| r.hash_us)
         + mean(rows, |r| r.reload_us);

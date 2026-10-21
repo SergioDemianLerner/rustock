@@ -502,6 +502,13 @@ threads:
 | root hashing | 5.1 | no |
 | lazy reload | 0.4 | no |
 
+> The 431.7 includes the sequential sublist's *execution*, which the
+> phase timer wrongly folded into the commit; see "Splitting the commit
+> across sublists costs nothing" below. It does not change what this
+> section goes on to find — the commit was quadratic, and that is
+> measured directly rather than through this table — but a fifth of
+> that number is transactions being run, not trie work.
+
 **The commit cost 5.1× what executing the transactions cost**, and
 80–84% of the measured work was sequential whatever the thread count.
 
@@ -617,9 +624,17 @@ per block, three interleaved repetitions:
 | one thread | 303.8 / 320.2 / 308.6 | median **308.6** |
 | four threads | 459.3 / 479.0 / 614.8 | median **479.0** |
 
-**Four sublists cost 55% more to commit than one**, for the same
-changes. Per repetition: 1.51×, 1.50×, 1.99× — the third from a round
-where the machine slowed and both phases rose together.
+**The four-thread row is not comparable to the one-thread row.** It
+carries the sequential sublist's execution, which the phase timer
+included in the commit; the one-thread path does not go through that
+code at all. The comparison below was drawn before that was noticed.
+
+~~**Four sublists cost 55% more to commit than one**, for the same
+changes.~~ **Withdrawn.** The four-thread figure includes the
+sequential sublist's execution and the one-thread figure does not,
+because the phase timer spanned both. Measured again with them
+separated, five applies cost 1.04× one apply — nothing. See "Splitting
+the commit across sublists costs nothing".
 
 So the trade parallel execution appeared to make was to save about
 84 ms of execution and spend about 170 ms more on the commit. It lost,
@@ -783,6 +798,15 @@ prefetched access list and parallel libsecp256k1 recovery. Four
 threads, four sublists, medians of three interleaved rounds, mainnet
 node stopped. Each arm ended on one state root across its three runs.
 
+> **The 4-thread commit figures below and everywhere above are
+> overstated.** The phase timer started before the ordered commit and
+> stopped after the *sequential sublist had executed* — a fifth of the
+> block's transactions, which is not trie work. `sequential_us` now
+> counts that separately. Re-measured at 1,190 transactions, the commit
+> is 104.5 ms and the sequential sublist 35.3; the tables here still
+> show the two added together. The single-thread figures are unaffected:
+> that path does not go through `execute_block_in_parallel`.
+
 | | execution only | **whole block** |
 |---|---:|---:|
 | **sum of phases** | **388.0 ms** | **420.1 ms** |
@@ -808,10 +832,42 @@ that starts a node.
 | └ root hash | 30.3 | 29.9 |
 | lazy reload | 7.6 | 7.3 |
 
-**The commit is the largest phase again**: 141.8 ms against 70.8 to
-execute the transactions, a ratio of 2.0 where a 200-transaction block
-gives 1.0. It is linear now rather than quadratic, but it grows with
-the accounts a block touches — 2,381 here — and no sublist divides it.
+**The commit is the largest phase again**, though by less than this
+table first said. Separating the sequential sublist's execution out of
+it gives, medians of three at 1,190 transactions: sublists 79.1 ms for
+952 transactions across four threads, **sequential 35.3 ms** for the
+other 238 on one, and **commit 104.5 ms** for the five
+`apply_state_changes` calls. It is linear now rather than quadratic,
+but it grows with the accounts a block touches — 2,381 here — and no
+sublist divides it.
+
+### Splitting the commit across sublists costs nothing
+
+Worth recording, because the obvious fix for a large ordered commit is
+to merge the five `apply_state_changes` calls into one, and the
+measurement says there is nothing there. Medians of three interleaved
+rounds, 1,190 transactions, node stopped:
+
+| | commit, ms/block |
+|---|---:|
+| one thread — **one** apply over all 2,381 accounts | 100.4 |
+| four threads — **five** applies, chained | 104.5 |
+
+1.04×, against an 8% spread within the one-thread column. **The cost is
+per put, not per call.** The same 2,381 descents happen either way, and
+each rebuilds its own path; five calls add five root clones and five
+map iterations, which an `Arc` clone makes invisible.
+
+This also withdraws the "four sublists cost 55% more to commit than
+one" result recorded earlier in this document. That was the sequential
+sublist's execution being counted inside the commit timer, not applies.
+
+What *would* reduce it is algorithmic. Those 100 ms are 2,381 descents
+of about 23 levels, some 55,000 node allocations a block, and every
+shared ancestor is rebuilt once per descendant that passes through it.
+Sorting the keys and building the affected subtrees bottom-up touches
+each ancestor once. `crates/trie/src/bulk.rs` already does this — it is
+what made the fixture build linear — and the commit does not use it.
 
 **Validation is no longer the problem**: 40.7 ms of 420, under 10%.
 With serial `k256` it would have been 1,190 × 248 us = 295 ms, and the
