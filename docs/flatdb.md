@@ -352,6 +352,11 @@ block.
 was real and cost about 7 ms against a 611 ms block: visible in a
 profile, invisible in a wall clock.
 
+Every figure in this section is a single run, and single runs on this
+host have repeatedly failed to replicate — the spread reaches 5× for
+identical configurations. Treat them as indicative and see
+[`flatdb-writer-lock.md`](flatdb-writer-lock.md) §7.
+
 What the gap actually reflects is that more transactions mean more
 **sequential** work per block — more nodes to hash recomputing the root,
 more to walk in the ordered commit, more to write — and no thread count

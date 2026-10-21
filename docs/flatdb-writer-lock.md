@@ -3,12 +3,20 @@
 A guide to the concurrency of FlatDB's write path, for someone who did
 not write the code and wants to make it faster.
 
-It is also the record of a hypothesis that was wrong. An earlier version
-of this document argued that a writer mutex was holding back parallel
-execution, and said how to remove it. The mutex was removed. **Nothing
-got faster.** That result is kept here because the reasoning behind the
-hypothesis looked sound and was not, and the next person deserves to
-know which arguments already failed.
+It is also the record of three claims that did not survive being
+measured again, kept because each looked sound and the next person
+deserves to know which arguments already failed.
+
+1. That a writer mutex was holding back parallel execution. The mutex
+   was removed. **Nothing got faster.**
+2. That batching the writes was then worth 1.16–1.80× on a single
+   thread. **It is not measurable**, in either direction.
+3. That batching had made four threads slower than one. **It had not** —
+   and the fix written for that measured slightly worse and was
+   reverted.
+
+All three came from single runs on a machine whose spread is severe.
+See §7, which is the most useful section here.
 
 No prior knowledge of the store is assumed.
 
@@ -37,32 +45,30 @@ Scaling went from 1.09× to 1.12×, which is inside the run-to-run spread.
 **The mutex was not the bottleneck.** It existed, it did serialise
 writers, and removing it bought nothing measurable.
 
-### What the same change did buy
+### What the same change did buy: nothing measurable either
 
 The work that replaced the mutex also batched the writes — a block's
 whole dirty subtree is collected and written in one call instead of
-roughly 6,900 — and *that* paid, on a single thread:
+roughly 6,900. Single runs put that at 1.16× and 1.80×, and the commit
+that landed it says so. **Repeated three times, it does not replicate.**
 
-| 60 blocks, one thread | before | after | |
-|---|---|---|---|
-| 200 tx/block | 43.4 s | **37.3 s** | 1.16× |
-| 40 tx/block | 18.2 s | **10.1 s** | **1.80×** |
+Medians of three, 60 blocks:
 
-Which matters, because RSKIP-144 is unscheduled on mainnet and the node
-executes on one thread.
-
-### And what it broke
-
-| 60 blocks, 200 tx | before | after |
+| | without batching | with it |
 |---|---|---|
-| 1 thread | 43.4 s | 37.3 s |
-| 4 threads | 38.0 s | **42.2 s** |
+| 40 tx/block, 1 thread | 20.7 s | 20.1 s |
+| 40 tx/block, 4 threads | 18.1 s | 15.4 s |
+| 200 tx/block, 1 thread | 42.6 s | **46.6 s** |
+| 200 tx/block, 4 threads | 40.1 s | 37.3 s |
 
-With full blocks, four threads are now **slower than one**. That
-regression is the subject of section 4 and is the thing actually worth
-fixing.
+Three to fifteen per cent, in both directions, drawn from samples that
+include 28.2 s, 40.3 s and 189.5 s for identical configurations. Nothing
+here is resolvable.
 
----
+The change is kept: one reservation a block instead of 6,900 is better
+structure whatever the clock says, the tests are stronger for it, and it
+measures no worse. But **the performance claim in `8336b24` is
+withdrawn** — see §7 for why it was made.
 
 ## 2. How the write path works now
 
@@ -166,53 +172,47 @@ refuted the thing it was built to confirm.
 
 ---
 
-## 4. What is actually serialising now
+## 4. The regression that was not there either
+
+An earlier version of this section said that batching had made four
+threads slower than one on full blocks, blamed `publish`'s ordered wait,
+and specified a fix. The fix was written. **Neither held up.**
+
+Three runs each, 60 blocks:
+
+| 200 tx/block | 1 thread | 4 threads | median |
+|---|---|---|---|
+| as it stands | 189.5 / 43.2 / 46.6 | 39.8 / 37.3 / 36.7 | 46.6 / **37.3** |
+| with out-of-order publication | 40.9 / 43.2 / 46.2 | 38.8 / 42.5 / 41.9 | 43.2 / 41.9 |
+
+Four threads are 1.25× faster than one, as it stands. The 42.2 s that
+started it was a single run and does not reproduce. The fix measured
+slightly worse and was reverted.
+
+### Why the ordered wait costs less than it looks like it should
+
+`publish` does advance the frontier strictly in reservation order, and a
+writer does wait for every earlier reservation to complete:
 
 ```rust
 fn publish(&self, from: u64, to: u64) {
-    let mut spins = 0u32;
     while self.size.compare_exchange_weak(from, to, AcqRel, Acquire).is_err() {
-        spins += 1;
-        if spins < 64 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+        /* spin, then yield */
     }
 }
 ```
 
-That loop only succeeds once `size` has reached `from` — that is, once
-**every writer that reserved earlier has published**. Reservations
-complete out of order; publication may not, or `size` would run ahead of
-a range still being written and break the invariant in section 2.
+The reason it is affordable came out of instrumenting it. Over 20
+blocks, **27,879 puts were served by 20 reservations, and the
+publication queue never exceeded depth one.** Batching collapses a
+block's writes into a single reservation per writer, so in practice
+there is rarely anything outstanding to wait behind.
 
-Which was affordable when a reservation was one record. A writer waited
-for a predecessor to memcpy 115 bytes.
-
-It is not affordable now that a reservation is a whole batch. Each
-sublist reserves ~1,380 nodes, so the first to reserve blocks the other
-three for its entire copy. The batching that made one thread 1.16–1.80×
-faster is the same change that made four threads slower than one.
-
-### The fix ([#320](https://github.com/SergioDemianLerner/rustock/issues/320))
-
-Publish **out of order**. Keep a small record of in-flight ranges, and
-when a writer finishes, advance `size` to the start of the lowest range
-that is still incomplete rather than waiting for a turn.
-
-A sketch, not a prescription: with at most a handful of batches in
-flight — four sublists — a fixed-size array of `(start, end, done)`
-under a short lock, or a sorted small-vec, is enough. The writer marks
-its own range done, then advances `size` as far as the contiguous
-completed prefix allows.
-
-The invariant to preserve is unchanged and is the only hard
-requirement: **`size` must never exceed the lowest unwritten byte.**
-
-### What to expect from it
-
-It should recover the parallel path without giving back the serial gain,
-so roughly 42.2 s back to 38 s or better at 200 tx and four threads.
-It will not deliver 4×, because of section 5.
-
----
+The pathology is real in principle — a slow writer *would* hold up later
+publishers — and it does not arise at this workload's shape. If a future
+change puts many reservations in flight at once, revisit it; the
+out-of-order design is in the git history at the commit that closed
+#320.
 
 ## 5. The ceiling, before you start
 
@@ -265,3 +265,21 @@ symptom. If it does not move, the serialisation did not.
 **And the correctness gate, which costs nothing.** `parallel_bench`
 prints the final state root; it must not change. Every run quoted in
 this document ends on the same one.
+
+---
+
+## 7. Measure three times
+
+Every quantitative conclusion in this area was drawn from single runs,
+and repetition dissolved all of them. They shared a direction: each made
+the story more interesting than the truth.
+
+The spread is the reason. On this host the same configuration on the
+same binary has produced **189.5 s and 36.7 s**, and the mainnet node
+runs on the same four cores. A 10% difference between two single runs
+carries no information at all.
+
+So: three runs minimum, report medians rather than means, and make no
+claim about a difference smaller than the spread you just measured. If
+that sounds slow, it is faster than writing a fix for a problem that is
+not there.
