@@ -45,6 +45,11 @@ pub fn apply_state_changes(
 ) -> TrieNode {
     let mut new_root = root.clone();
 
+    // Writes are collected and applied in one descent at the end;
+    // deletions stay where they are. See `apply_batch` below for why that
+    // reordering is sound, and `rustock_trie::bulk_put` for what it buys.
+    let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(state.len() * 2);
+
     for (addr, account) in state {
         if account.status.contains(AccountStatus::SelfDestructed) {
             // rskj `MutableRepository.delete`: the whole account subtree
@@ -67,7 +72,7 @@ pub fn apply_state_changes(
             continue;
         }
 
-        new_root = put_account_info(&new_root, store, addr, account);
+        batch.push(account_info_entry(addr, account));
 
         if account.status.contains(AccountStatus::Created) {
             // rskj calls `setupContract` (which writes the storage-prefix
@@ -85,14 +90,11 @@ pub fn apply_state_changes(
             let code_bytes = account.info.code.as_ref().map(|c| c.original_bytes());
             let has_code = code_bytes.as_ref().is_some_and(|c| !c.is_empty());
             if !markers.skip_created.contains(addr) && (has_code || account.is_created_locally()) {
-                let key = TrieKeySlice::from_key(&storage_prefix_key(addr));
-                new_root = new_root.put(&key, &[1], store);
+                batch.push((storage_prefix_key(addr), vec![1]));
             }
             if let Some(code_bytes) = code_bytes {
                 if !code_bytes.is_empty() {
-                    let key_bytes = code_key(addr);
-                    let key = TrieKeySlice::from_key(&key_bytes);
-                    new_root = new_root.put(&key, &code_bytes, store);
+                    batch.push((code_key(addr), code_bytes.to_vec()));
                 }
             }
         }
@@ -106,14 +108,30 @@ pub fn apply_state_changes(
             // updateCollections re-read the cells). Writing the present
             // value unconditionally is always correct — a read-only slot
             // holds the same value the trie already has.
-            new_root = put_storage_value(&new_root, store, addr, *slot, storage_slot.present_value);
+            // A zero clears the slot, and a clear is a deletion, which
+            // coalesces nodes and so is a second shape of rewrite that
+            // the batched descent does not do. Those stay here.
+            match storage_entry(addr, *slot, storage_slot.present_value) {
+                Some(entry) => batch.push(entry),
+                None => {
+                    let key_bytes = storage_key(addr, &B256::from(*slot));
+                    new_root = new_root.delete(&TrieKeySlice::from_key(&key_bytes), store);
+                }
+            }
         }
     }
 
     for addr in &markers.precompiles {
-        let key = TrieKeySlice::from_key(&storage_prefix_key(addr));
-        new_root = new_root.put(&key, &[1], store);
+        batch.push((storage_prefix_key(addr), vec![1]));
     }
+
+    // Everything collected above lands here, in one descent.
+    //
+    // What follows must not be batched. `raw_storage` may clear a cell the
+    // loop above wrote, so its deletions have to see those writes; and
+    // `bump_remasc_sender` *reads* the account it is about to increment,
+    // which would read a stale balance if the writes were still pending.
+    new_root = apply_batch(&new_root, store, batch);
 
     for (addr, slot, value) in &markers.raw_storage {
         let slot_b256 = B256::from(*slot);
@@ -137,37 +155,70 @@ pub fn apply_state_changes(
     new_root
 }
 
-fn put_account_info(
+/// Apply a block's writes to the trie in one descent.
+///
+/// The per-key path rebuilds the route from the root for every key, so a
+/// block's two-odd thousand accounts rebuild every shared ancestor once
+/// each; one descent over the sorted batch builds each node once. See
+/// `rustock_trie::bulk_put`.
+///
+/// **Why reordering the writes is sound.** A radix trie with path
+/// compression has one shape for a given set of key/value pairs, so any
+/// order that ends with the same pairs ends with the same trie. The only
+/// place order can matter is a key touched by both a deletion and a
+/// write, and there is exactly one: an account that self-destructs and is
+/// then re-created in the same block. Its deletion runs in the loop above
+/// and its writes land here, so the deletion still comes first.
+///
+/// Duplicate keys keep the **last** value written, which is what the
+/// sequential path does: a later `put` to the same key overwrites.
+fn apply_batch(
     root: &TrieNode,
     store: &dyn TrieStore,
-    addr: &Address,
-    account: &revm::state::Account,
+    mut batch: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> TrieNode {
-    let key_bytes = account_key(addr);
-    let key = TrieKeySlice::from_key(&key_bytes);
-    let acct = AccountState::new(U256::from(account.info.nonce), account.info.balance);
-    root.put(&key, &acct.encode(), store)
-}
-
-fn put_storage_value(
-    root: &TrieNode,
-    store: &dyn TrieStore,
-    addr: &Address,
-    slot: U256,
-    value: U256,
-) -> TrieNode {
-    let slot_b256 = B256::from(slot);
-    let key_bytes = storage_key(addr, &slot_b256);
-    let key = TrieKeySlice::from_key(&key_bytes);
-
-    if value.is_zero() {
-        root.delete(&key, store)
-    } else {
-        let be = value.to_be_bytes::<32>();
-        let start = be.iter().position(|&b| b != 0).unwrap_or(32);
-        root.put(&key, &be[start..], store)
+    if batch.is_empty() {
+        return root.clone();
     }
+
+    // `from_key` expands bytes most-significant bit first, so ordering the
+    // key bytes lexicographically is ordering the trie's bits -- including
+    // putting a prefix before what extends it, which is what an account
+    // key is to its storage keys.
+    //
+    // The index breaks ties in reverse so that `dedup_by`, which keeps the
+    // first of a run, keeps the last write.
+    let mut indexed: Vec<(usize, (Vec<u8>, Vec<u8>))> = batch.drain(..).enumerate().collect();
+    indexed.sort_by(|a, b| a.1 .0.cmp(&b.1 .0).then(b.0.cmp(&a.0)));
+    indexed.dedup_by(|a, b| a.1 .0 == b.1 .0);
+
+    let keyed: Vec<(TrieKeySlice, Vec<u8>)> = indexed
+        .into_iter()
+        .map(|(_, (k, v))| (TrieKeySlice::from_key(&k), v))
+        .collect();
+    let entries: Vec<(&TrieKeySlice, &[u8])> =
+        keyed.iter().map(|(k, v)| (k, v.as_slice())).collect();
+
+    rustock_trie::bulk_put::put_bulk(root, &entries, store)
 }
+
+fn account_info_entry(addr: &Address, account: &revm::state::Account) -> (Vec<u8>, Vec<u8>) {
+    let acct = AccountState::new(U256::from(account.info.nonce), account.info.balance);
+    (account_key(addr), acct.encode())
+}
+
+/// The write a storage slot asks for, or `None` when it asks for a
+/// deletion instead -- which a zero does.
+fn storage_entry(addr: &Address, slot: U256, value: U256) -> Option<(Vec<u8>, Vec<u8>)> {
+    if value.is_zero() {
+        return None;
+    }
+    let be = value.to_be_bytes::<32>();
+    let start = be.iter().position(|&b| b != 0).unwrap_or(32);
+    Some((storage_key(addr, &B256::from(slot)), be[start..].to_vec()))
+}
+
+
 
 #[cfg(test)]
 mod tests {
