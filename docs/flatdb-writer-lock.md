@@ -226,14 +226,21 @@ any of this:
 - the root hashing, which walks every dirty node;
 - the lazy reload of the root between blocks.
 
-By Amdahl the parallel fraction is a third of a block at best. And there
-is a prior question: with a fast store and a prefetched access list, the
-best measured configuration **uses one thread**, and adding threads made
-it slower even before this regression existed. See
-[`execution-performance.md`](execution-performance.md).
+**Both of those claims have since been overtaken**, and the correction
+belongs here because it is the same kind of mistake this document is
+about. The ordered commit in that list was not merely sequential, it
+was *quadratic* in the accounts a block touched —
+`NodeRef::Node(Box<TrieNode>)` could not share a subtree, so every
+descent deep-copied the ones it passed. With an `Arc` the commit is 15×
+cheaper, the parallel fraction is about half a block rather than a
+third, and four threads went from 0.98× of one thread to 1.47×. The
+"best configuration uses one thread" result was an artefact of a cost
+four sublists paid four times.
 
-So fix the regression, because a change should not leave things worse
-than it found them. Do not expect throughput from thread count.
+So: the ceiling was real, it was mostly one defect, and the arithmetic
+above should not be reused. See
+[`execution-performance.md`](execution-performance.md) for the
+replacement.
 
 ---
 

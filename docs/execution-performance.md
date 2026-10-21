@@ -1,11 +1,19 @@
-# Three ways to make block execution faster, and what each is worth
+# Three ways to make block execution faster, and the defect that was worth more than all three
 
 October 2026. A synthesis of three lines of work that turned out to be
 the same line: parallel sublist execution (RSKIP-144), replacing the
 trie store with FlatDB, and prefetching a block's access list.
 
 Each was measured on its own and all three were measured together. They
-do not add up, and the reason they do not is the most useful thing here.
+do not add up, and the reason they do not is one of the two most useful
+things here.
+
+The other is that profiling the three of them eventually pointed at a
+line of code none of them was about. Applying a block's changes to the
+trie took time quadratic in the number of accounts the block touched,
+because the type holding a child node could not share one. Fixing that
+was worth more than the three levers put together, and it moved where
+the next bottleneck is. Sections written before it are marked.
 
 The detail lives in
 [`parallel-execution-benchmark.md`](parallel-execution-benchmark.md),
@@ -16,8 +24,29 @@ part you need to decide what to build.
 
 ## The short version
 
-Against one thread on RocksDB, executing 100 synthetic blocks of 200
-native transfers each against a 1 GB state:
+**Start with the fourth thing, which is not a lever and is worth more
+than the three that are.** Applying a block's changes to the trie cost
+quadratic time in the number of accounts the block touched, because
+`NodeRef::Node` held a `Box<TrieNode>` and a `Box` cannot share — so
+every descent deep-copied the subtrees it passed. One `Arc` later, the
+commit is 15× cheaper and a block is 3.4× faster end to end. See
+"Where a block's time actually goes".
+
+| 40 blocks, 200 transfers, FlatDB, medians of three | tx/s |
+|---|---|
+| one thread | 401 → **926** |
+| four threads | 392 → **1,357** |
+| one thread + access list | 471 → **1,530** |
+| four threads + access list | 411 → **1,582** |
+
+Left of the arrow is the code before the copying was removed, right of
+it after. Everything below the next heading that predates it is marked.
+
+---
+
+Of the three levers proper, measured against one thread on RocksDB,
+100 synthetic blocks of 200 native transfers against a 1 GB state
+**before the copying fix**:
 
 | | wall | speedup |
 |---|---|---|
@@ -28,17 +57,26 @@ native transfers each against a 1 GB state:
 | **FlatDB + access list, one thread** | **50.4 s** | **3.61×** |
 | FlatDB + access list + four threads | 58.0 s | 3.13× |
 
-Three things are worth reading twice.
+Three things were worth reading twice, and one of them did not survive.
 
 **Parallel execution is the weakest of the three levers.** It is also
-the only one that needs a consensus change.
+the only one that needs a consensus change. Still true.
 
-**The best configuration uses one thread.** Adding threads to the
-fastest setup makes it slower.
+**The best configuration uses one thread.** ~~Adding threads to the
+fastest setup makes it slower.~~ **Withdrawn.** That was an artefact of
+the quadratic commit, which four sublists paid four times. Re-measured
+after the fix, one thread and four are *indistinguishable* with the
+access list prefetched — 1,530 against 1,582 tx/s, medians of three,
+with 15% spread on each. Without the access list four threads now win
+1.47×. Adding threads is no longer a loss; it is still not a reason to
+add threads.
 
 **The levers do not compose.** All three are ways of not waiting on a
 read. Once one of them has removed the waiting, the others have nothing
-to remove — which is why the three together are worse than two of them.
+to remove. Still true, and sharper now: with the commit cheap, the
+access list is worth 1.65× on one thread (926 → 1,530) where it was
+worth 1.17× before (401 → 471) — acceleration that was being thrown
+away into a phase that dominated the block.
 
 ---
 
@@ -133,8 +171,20 @@ below measures the cost of *updating* a trie of fixed shape. A real chain
 creates accounts, contracts and storage slots continuously, and nothing
 here says what that costs.
 
-**This is close to a worst case for parallel execution and should be read
-that way.** A native transfer is the least compute-intensive transaction
+**The load test measures execution and commit, and nothing else.**
+Senders are passed to `execute_block` rather than recovered from
+signatures, so `ecrecover` never runs. The header carries
+`difficulty: 1`, no merged-mining fields, and zeroes for
+`transactions_root` and `receipts_root`. A `BlockProcessor` is built
+and deliberately not called (`let _ = &processor;`). So signature
+recovery, proof-of-work and header validation, the transaction and
+receipt tries, and persisting the block are outside every number in
+this document. All of them are per-transaction CPU work that divides
+cleanly across threads, so their absence makes parallel execution look
+*worse* than it is, not better.
+
+**This is also close to a worst case for parallel execution and should
+be read that way.** A native transfer is the least compute-intensive transaction
 there is: a balance check and two balance updates against two random
 paths. The ratio of I/O to arithmetic is as lopsided as it can be made.
 A block of contract calls does far more work per state access.
@@ -452,22 +502,97 @@ threads:
 | root hashing | 5.1 | no |
 | lazy reload | 0.4 | no |
 
-**The commit costs 5.1× what executing the transactions costs**, and
-80–84% of the measured work is sequential whatever the thread count.
+**The commit cost 5.1× what executing the transactions cost**, and
+80–84% of the measured work was sequential whatever the thread count.
 
-Running the 200 transfers takes 84 ms. Applying what they changed to the
-trie, one sublist after another, takes 432.
+That is what sent the next measurement at the commit, and the commit
+turned out to be quadratic. The rest of this section is the finding;
+the numbers above are what it looked like from outside.
 
-The mechanism is the one the design implies and nobody had priced. Each
-sublist computed its changes against the same `base_root`, so
-`apply_state_changes` runs once per sublist, each rewriting the top of
-the trie on top of the previous one's result. Four sublists means the
-upper trie is rebuilt four times, in sequence. That is the work parallel
-execution *adds*, and it is five times the work it divides.
+### The commit was quadratic in the accounts a block touched
 
-Three of the four phases that were listed as unprofiled turn out to be
-negligible — maintenance, root hashing and reload total 5.5 ms. The
-fourth is everything.
+`NodeRef::Node` held a `Box<TrieNode>`. A `Box` is a unique owner, so
+cloning one must clone what it points at — and a `TrieNode` holds two
+more `NodeRef`s, so the copy recursed through the whole in-memory
+subtree. `internal_put` paid that twice at every level of its descent:
+
+```rust
+let child_ref = if bit == 0 { &self.left } else { &self.right };
+let child = child_ref.resolve(store).unwrap_or_else(TrieNode::empty);
+...
+let (new_left, new_right) = if bit == 0 {
+    (new_ref, self.right.clone())      // the sibling
+} else {
+    (self.left.clone(), new_ref)
+};
+```
+
+and `resolve` was the worse of the two, because it copied even when
+there was nothing to read:
+
+```rust
+NodeRef::Node(n) => Some(*n.clone()),   // deep copy, no store access
+```
+
+A block begins with every child a `NodeRef::Hash` — 32 bytes, free to
+clone — and each put leaves a `NodeRef::Node` behind it. So put number
+*k* copied what puts 1..k-1 had built. Measured directly against a
+100,000-key trie reloaded from the store, three interleaved repetitions
+of the whole ladder per run, mainnet node stopped and the machine
+otherwise idle:
+
+| puts in the block | µs per put, `Box` | µs per put, `Arc` |
+|---:|---:|---:|
+| 50 | 72.1 | **14.7** |
+| 100 | 119.4 | **11.9** |
+| 200 | 210.7 | **12.2** |
+| 400 | 390.1 | **11.8** |
+| 800 | 663.0 | **11.3** |
+| 1600 | 1,215.8 | **11.8** |
+
+The left column doubles every time the block does. The right column
+does not move. `crates/trie/examples/put_scaling.rs` is that table; a
+second round reproduced both arms within 5%.
+
+The fix is `Arc<TrieNode>`, whose `clone` is an atomic increment.
+Sharing is sound because a `TrieNode` is immutable once constructed,
+which the code already depended on for `hash_cache`. The one obstacle
+was `saved`, set through `&mut self` by `collect_for_save`, which an
+`Arc` cannot hand out; it is an `AtomicBool` now, and since the flag is
+only ever set and never cleared, two owners of a shared node cannot
+disagree about it.
+
+### What it bought
+
+40 blocks of 200 transfers on FlatDB, 401 accounts changed per block,
+three rounds alternating the two arms, mainnet node stopped and no
+other load on the machine. Medians:
+
+| | wall | tx/s | commit, ms/block |
+|---|---:|---:|---:|
+| `Box`, one thread | 21.1 s | 401 | 302.4 |
+| `Box`, four threads | 21.6 s | 392 | 422.7 |
+| **`Arc`, one thread** | 9.8 s | 926 | **19.9** |
+| **`Arc`, four threads** | **7.1 s** | **1,357** | 46.6 |
+
+The commit is **15.2× cheaper** on one thread and 9.1× on four. A block
+is 2.15× faster on one thread and 3.04× on four.
+
+**All twenty-four runs across both experiments ended on the same state
+root**, `0x9efbc466…` — two representations of the node graph, two
+thread counts, with and without prefetch. That is a stronger check than
+the 2,383 unit tests, and it is the reason to believe the change is
+purely one of representation.
+
+**The sign of parallelism flipped.** With `Box`, four threads returned
+0.98× of one thread: the 55 ms they saved executing cost 120 ms more to
+commit. With `Arc` they return 1.47×. Parallel execution did not get
+better — it stopped being buried under a sequential phase that cost
+five times what it saved.
+
+Three of the four phases that were listed as unprofiled were negligible
+all along — maintenance, root hashing and reload total 5.5 ms. The
+fourth was a defect.
 
 ### Why these numbers are trustworthy where the wall clock is not
 
@@ -480,7 +605,7 @@ That is the expected split. Wall clock includes cold-start I/O, which is
 what varies wildly on this host. The phases measure CPU over structures
 already in memory.
 
-### The commit is where parallel execution loses its money
+### How it looked before the cause was found
 
 Instrumenting the single-threaded path too — it applies the changes in
 the caller rather than inside the executor, so it had been reporting
@@ -496,19 +621,28 @@ per block, three interleaved repetitions:
 changes. Per repetition: 1.51×, 1.50×, 1.99× — the third from a round
 where the machine slowed and both phases rose together.
 
-So the trade parallel execution actually makes, at this block size, is
-to save about 84 ms of execution and spend about 170 ms more on the
-commit. It loses, and that is why four threads barely beat one here and
-lost outright once the store was fast and the access list prefetched.
+So the trade parallel execution appeared to make was to save about
+84 ms of execution and spend about 170 ms more on the commit. It lost,
+and that is why four threads barely beat one and lost outright once the
+store was fast and the access list prefetched.
 
-The mechanism is the one the design implies: each sublist computes its
-changes against the same `base_root`, so `apply_state_changes` runs once
-per sublist and each rebuilds the upper trie on top of the previous
-one's result. One thread rebuilds it once.
+The explanation offered at the time was that each sublist computes its
+changes against the same `base_root`, so `apply_state_changes` runs
+once per sublist and each rebuilds the upper trie on top of the
+previous one's result, where one thread rebuilds it once. That is true
+and it is not the reason the penalty was large. Four rebuilds of a
+linear-cost structure would have cost four times very little. They were
+expensive because each rebuild was quadratic.
 
-### And the per-account cost grows with the block
+After the fix the same ratio is still there — 46.6 ms against 19.9, so
+four sublists cost 2.34× one — and it no longer matters, because it is
+26 ms. Worth knowing if someone raises the sublist count; not worth
+attacking at four.
 
-Four threads, medians of three:
+### And the per-account cost grew with the block
+
+This was the measurement that gave the cause away, and it was nearly
+dismissed. Four threads, medians of three:
 
 | accounts | commit | per account |
 |---|---|---|
@@ -516,51 +650,71 @@ Four threads, medians of three:
 | 201 | 174.9 ms | 870 µs |
 | 401 | 479.0 ms | 1,195 µs |
 
-Doubling 201 to 401 accounts multiplies the commit by 2.74. Doubling 101
-to 201 multiplies it by 1.77. **Suggestive of superlinearity and not
-established** — the 101-account point measured 80.1 / 98.8 / 121.7, a
-52% spread, because a small block amortises its fixed costs worst and
-the noise with them.
+Doubling 201 to 401 accounts multiplied the commit by 2.74; doubling
+101 to 201 multiplied it by 1.77. It was written down as **suggestive
+of superlinearity and not established**, because the 101-account point
+measured 80.1 / 98.8 / 121.7 — a 52% spread, on a machine that was
+sharing four cores with the mainnet node.
 
-A candidate worth testing: `TrieNode::put` returns a new root, and
-`NodeRef::Node` owns its subtree, so rebuilding a path deep-copies the
-siblings along it. That is exactly the O(n²) that made the fixture build
-take 63 s for 20,000 accounts and was fixed there by building bottom-up.
-The commit still inserts one account at a time.
+Refusing to claim it was right. **Three points with that much noise
+cannot establish a shape.** What they can do is justify building an
+instrument that measures the shape directly, over a wider range and
+without the rest of a block in the way, which is what
+`put_scaling.rs` does: six points across a 32× range, and the answer
+was unambiguous in the first run.
 
-Hashing is **not** a candidate: `hash_cache` is a `OnceLock` and
+The candidate named here at the time was the right one: *"`TrieNode::put`
+returns a new root, and `NodeRef::Node` owns its subtree, so rebuilding
+a path deep-copies the siblings along it."* It understated the problem
+by half — `resolve` copies the child on the descent path too, not only
+the sibling — but it pointed at the line.
+
+Hashing was correctly ruled out: `hash_cache` is a `OnceLock` and
 `put_impl` never touches `compute_hash` or `to_message`, so building the
 trie hashes nothing. The whole dirty subtree is hashed once at the end,
-for 5.1 ms.
+for 5.1 ms, which is now a third of the commit rather than a hundredth.
 
 ### What to attack
 
-Not the store, not prefetching, not the thread count — those make the
-84 ms smaller. The 432 ms is the commit, and the obvious question is
-whether four sequential `apply_state_changes` can become one: the
-sublists touch disjoint accounts by construction, so their changes could
-in principle be merged and applied in a single pass over the trie.
-Whether that preserves the ordering consensus depends on, and is
-constrained by, what the sequential sublist is allowed to observe.
+The commit is no longer it. At 19.9 ms against 5.5 ms of root hashing
+and 57 ms of execution, nothing in the block is dominant enough to be
+the obvious target.
 
-**Not yet measured:** the single-threaded path does not go through
-`execute_block_in_parallel`, so it reports no phases at all. Its
-breakdown is unknown, and it is the path the node runs on today.
+What the measurement cannot see is the next question, and it is a
+larger one than it sounds. **The load test executes transactions and
+commits state, and nothing else.** It passes senders in rather than
+recovering them from signatures, builds a header with `difficulty: 1`
+and no merged-mining fields, leaves `transactions_root` and
+`receipts_root` zero, and constructs a `BlockProcessor` it never calls
+(`let _ = &processor;`). So signature recovery, proof-of-work
+validation, the transaction and receipt tries and block persistence are
+all outside every figure here. Signature recovery alone is of the order
+of 10–20 ms a block at 200 transactions, against the ~170 ms a block
+the best configuration now takes.
+
+That omission biases *against* parallelism rather than for it:
+everything missing is per-transaction CPU work with no ordering
+constraint, which is the kind that divides cleanly. A block whose
+sequential fraction has shrunk this much deserves to be re-measured
+with the rest of validation in it before anyone concludes what the
+thread count should be.
 
 ## What is left
 
-With FlatDB and a perfect access list, execution sits at 92% CPU on one
-core and 50.4 s for 100 blocks. The remaining time is not I/O. By
-Amdahl, at most a third of a block is parallelisable; the rest is:
+Amdahl's arithmetic has to be redone. The old reasoning — at most a
+third of a block is parallelisable, because the maintenance run, the
+ordered commit, the root hashing and the lazy reload are all sequential
+— was correct about which phases are sequential and wrong about what
+they weigh. With the copying gone, on four threads with the access list
+prefetched, a block is about 39 ms of sublist execution against 39 ms
+of commit, 6 ms of root hashing and 1 ms of reload. The sequential
+share fell from 80–84% to roughly half, and most of what is left is a
+commit that now costs 26 ms more on four sublists than on one — an
+overhead of parallelism rather than a floor under it.
 
-- the block-level maintenance run,
-- the ordered commit of each sublist,
-- the root hashing, which walks every dirty node,
-- the lazy reload of the root between blocks.
-
-All four are sequential by construction. Three of them are now measured
-— see "Where a block's time actually goes" above; the ordered commit is
-the whole story and the other three round to nothing.
+That is why the one-thread recommendation is withdrawn rather than
+reversed. The structural ceiling moved; what is above it has not been
+measured on a workload that includes the rest of block validation.
 
 **The insertion path is the gap left.** Because every recipient
 pre-exists in the fixture, no run has ever split a trie path or
@@ -585,26 +739,41 @@ than a single record.
 
 ## Recommendations
 
+**Ship the `Arc` change first.** It is the largest single improvement
+measured in any of this work, it needs no consensus change, no wire
+format and no operational plan, and it is a strictly local change to
+how the trie holds its children. 3.4× end to end, 15× on the commit,
+and twenty-four runs on the same state root.
+
 **Deploy FlatDB.** 1.76× on the read pattern execution actually uses, a
 thirtyfold smaller memory demand, no compaction, and a simpler
-durability story. Running on the mainnet node now. The remaining work
-is the ordered-publication regression in
-[`flatdb-writer-lock.md`](flatdb-writer-lock.md) §4 and the operational
-items in [`flatdb-rollout.md`](flatdb-rollout.md).
+durability story. Running on the mainnet node now. The remaining
+operational items are in
+[`flatdb-rollout.md`](flatdb-rollout.md).
 
 **Pursue the access list, as a peer-supplied hint.** The cheapest
-intervention measured and the second largest, with no consensus
-exposure. Measure it against contract traffic before designing the wire
-format, because that is where its coverage assumption is weakest.
+intervention measured, with no consensus exposure, and worth more now
+than when it was measured: 1.65× on one thread where it used to be
+1.17×, because the acceleration is no longer swallowed by the commit.
+Measure it against contract traffic before designing the wire format,
+because that is where its coverage assumption is weakest.
 
-**Keep parallel execution; do not expect throughput from it.** It is
-consensus-capped at two threads today, Amdahl-capped well below that,
-and worth 1.09× once the store is fast. Its value is in being ready if
-the gas limit or the transaction mix changes, not in what it returns on
-the chain as it runs today.
+**Keep parallel execution; the case for it is open again, and still
+unproven.** It was worth 0.98× before the fix — a loss — and is worth
+1.47× after it without the access list, and nothing measurable with it
+(1,530 against 1,582 tx/s, medians of three, 15% spread on each). It
+remains consensus-capped at two threads today. Do not raise the thread
+count on the strength of these numbers; do re-measure once validation
+is in the workload, because that is all parallelisable work and all of
+it is currently missing.
 
-**Measure the sequential section next.** It is now the majority of a
-block's time and nobody has looked at it.
+**Measure a whole block next, not a whole execution.** The sequential
+section has been profiled and the one thing in it that mattered is
+fixed. The open question is no longer which phase of execution is
+slow — it is that the load test only measures execution. Signature
+recovery, the transaction and receipt tries, header and
+proof-of-work validation and block persistence are all absent, and
+together they are now a large fraction of what a real block costs.
 
 ---
 
@@ -618,6 +787,18 @@ conclusion before being caught.
 the faster one execute more blocks, sampling a different part of a decay
 curve that falls steeply for the first eighty blocks. Fixed by running a
 fixed block count.
+
+**And one thing that went right, recorded for the same reason.** The
+superlinear commit was visible in three noisy points long before it was
+established, and the honest reading at the time was "suggestive and not
+established" — the smallest point had a 52% spread. That refusal was
+correct: three points with that much noise cannot establish a shape. But
+declining to claim a result is not the same as dropping the question.
+What closed it was building an instrument that measured the shape
+directly — six points over a 32× range, in-memory store, no block around
+it — and getting an unambiguous answer in one run. **When a measurement
+is too noisy to support a claim, the move is a better measurement, not a
+weaker claim.**
 
 **Evicting the page cache by filling it.** Reading 6 GB of unrelated
 data does not reliably evict anything: Linux favours dropping pages it
