@@ -59,6 +59,32 @@ pub struct BlockExecutionResult {
     /// `state_changes` is still the whole block's, and still carries each
     /// account's final values -- the supply check reads it.
     pub applied_root: Option<TrieNode>,
+    /// Where the block's time went, split by phase.
+    pub phases: PhaseTimings,
+}
+
+/// Microseconds spent in each phase of executing one block.
+///
+/// Three of these are **sequential whatever the thread count**, which is
+/// why they are measured separately: the maintenance run has to finish
+/// before any sublist starts, and the commit has to apply the sublists
+/// in order because that is what makes the sequential sublist's starting
+/// state well defined. Only `sublists` is the part threads divide.
+///
+/// Amdahl says the sequential share bounds everything parallel execution
+/// can return, and until this existed that share was inferred from
+/// differences between whole runs rather than measured.
+///
+/// Collecting it costs a few `Instant::now()` a block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseTimings {
+    /// The block-level run that owns no sublist: REMASC, the bridge,
+    /// fork activations. Every sublist starts from the state it leaves.
+    pub maintenance_us: u64,
+    /// Executing the parallel sublists. The only part threads divide.
+    pub sublists_us: u64,
+    /// Applying each sublist's changes to the trie, in sublist order.
+    pub commit_us: u64,
 }
 
 /// One sublist's run, with everything it collected on its own thread.
@@ -784,6 +810,7 @@ impl RskExecutor {
     > {
         let store = trie_store.as_ref();
 
+        let at_maintenance = std::time::Instant::now();
         // 1. Block-level maintenance, on no sublist's account.
         let (maintenance, _) = self.run_sublist(
             header,
@@ -802,6 +829,7 @@ impl RskExecutor {
             &maintenance.state_changes,
             &maintenance.markers,
         );
+        let maintenance_us = at_maintenance.elapsed().as_micros() as u64;
 
         // 2. The parallel sublists, each against that state, each on its own
         //    thread with its own everything.
@@ -818,6 +846,7 @@ impl RskExecutor {
         // came out *slower* than two on the cold blocks, 5,089 ms against
         // 4,096, and identical once warm, which is the signature of a
         // scheduling quantum rather than of anything about the work.
+        let at_sublists = std::time::Instant::now();
         let width = self.execution_threads.max(1).min(parallel.len());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let slots: Vec<std::sync::Mutex<Option<Result<SublistRun, ExecutionError>>>> =
@@ -883,6 +912,9 @@ impl RskExecutor {
             })
             .collect();
 
+        let sublists_us = at_sublists.elapsed().as_micros() as u64;
+
+        let at_commit = std::time::Instant::now();
         // 3. Commit them in sublist order, and take back what the workers
         //    collected on their own threads.
         let mut root = base_root.clone();
@@ -941,6 +973,12 @@ impl RskExecutor {
             &sequential_result.markers,
         );
 
+        // Everything from the ordered commit to here is the sequential
+        // tail: applying each sublist in turn, then running the
+        // sequential sublist, then merging the reported state.
+        let commit_us = at_commit.elapsed().as_micros() as u64;
+        let phases = PhaseTimings { maintenance_us, sublists_us, commit_us };
+
         // 5. Assemble, in the block's own transaction order.
         let mut tx_results = Vec::with_capacity(transactions.len());
         let mut gas_used = maintenance.gas_used;
@@ -965,6 +1003,7 @@ impl RskExecutor {
                 state_changes,
                 markers,
                 applied_root: Some(final_root),
+                phases,
             },
             traces,
         ))
@@ -1709,6 +1748,10 @@ impl RskExecutor {
                 state_changes: state,
                 markers,
                 applied_root: None,
+                // A run that is one sublist has no phases to split: the
+                // caller applies its changes, and there is no maintenance
+                // pass or ordered commit to attribute time to.
+                phases: PhaseTimings::default(),
             },
             traces,
         ))

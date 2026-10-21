@@ -524,7 +524,7 @@ phase does. Medians of three:
 | FlatDB | **42,425 ms** | 8,372 ms |
 
 **Batched, they are a dead heat** — 2.5% apart, which is inside the
-run-to-run spread. The 3.5× that `parallel_bench` measured on the
+run-to-run spread. The 3.5× that `loadtest` measured on the
 fixture does not survive contact with real state.
 
 The fixture flattered FlatDB and this document said so at the time
@@ -742,7 +742,7 @@ cargo run --release --example flatdb_convert -- <rocksdb-dir> <flatdb-dir> \
     --expected-keys 10m
 
 # benchmark against it
-cargo run --release --example parallel_bench -- <flatdb-dir> \
+cargo run --release --example loadtest -- <flatdb-dir> \
     --flatdb true --threads 4 --sublists 4 --txs 200 --blocks 100 \
     --flush-every 25
 ```

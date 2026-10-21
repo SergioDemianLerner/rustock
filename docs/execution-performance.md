@@ -121,8 +121,17 @@ reproducible and the access list is knowable in advance.
 Senders are drawn from the 93,000 keyed accounts, a different slice each
 block so no small set stays warm; recipients from all 9.3 million by a
 multiplicative step coprime with the count, so reads scatter over the
-whole gigabyte. No new accounts are created, so the trie's depth never
-changes and a run measures a growing trie rather than a deepening one.
+whole gigabyte.
+
+**Every recipient already exists**, which is a sharper limitation than it
+sounds. `recipient` indexes modulo the fixture's account count, so no
+`put` ever inserts a key that is not already in the trie, so
+`TrieNode::split` is never called in a run. The insertion path — the one
+that deepens the trie, allocates the extra branch node and revises
+`children_size` up the spine — has never been on the clock. Everything
+below measures the cost of *updating* a trie of fixed shape. A real chain
+creates accounts, contracts and storage slots continuously, and nothing
+here says what that costs.
 
 **This is close to a worst case for parallel execution and should be read
 that way.** A native transfer is the least compute-intensive transaction
@@ -186,7 +195,7 @@ cargo run --release --example flatdb_convert -- <dir> <flat-dir> \
     --expected-keys 10m
 
 # one run; --flatdb and --prefetch select the levers
-cargo run --release --example parallel_bench -- <dir> \
+cargo run --release --example loadtest -- <dir> \
     --threads 4 --sublists 4 --txs 200 --blocks 100 \
     --flush-every 100 --prefetch 16 --csv run.csv
 ```
@@ -428,6 +437,116 @@ sound and free of protocol risk.
 
 ---
 
+## Where a block's time actually goes
+
+Until this was instrumented, the sequential share was inferred from
+differences between whole runs. Measured directly — node stopped, three
+interleaved repetitions, medians, 60 blocks of 200 transfers at four
+threads:
+
+| phase | ms/block | parallel? |
+|---|---|---|
+| maintenance run | 0.0 | no |
+| **sublist execution** | **84.2** | **yes** |
+| **ordered commit** | **431.7** | no |
+| root hashing | 5.1 | no |
+| lazy reload | 0.4 | no |
+
+**The commit costs 5.1× what executing the transactions costs**, and
+80–84% of the measured work is sequential whatever the thread count.
+
+Running the 200 transfers takes 84 ms. Applying what they changed to the
+trie, one sublist after another, takes 432.
+
+The mechanism is the one the design implies and nobody had priced. Each
+sublist computed its changes against the same `base_root`, so
+`apply_state_changes` runs once per sublist, each rewriting the top of
+the trie on top of the previous one's result. Four sublists means the
+upper trie is rebuilt four times, in sequence. That is the work parallel
+execution *adds*, and it is five times the work it divides.
+
+Three of the four phases that were listed as unprofiled turn out to be
+negligible — maintenance, root hashing and reload total 5.5 ms. The
+fourth is everything.
+
+### Why these numbers are trustworthy where the wall clock is not
+
+The wall clock for one thread came out 86.8 / 41.0 / 37.8 s across three
+runs of identical code: a 2.3× spread. The phase figures over the same
+runs repeated within 2% — sublists 83.9 / 84.2 / 108.8, commit 430.4 /
+439.3 / 431.7.
+
+That is the expected split. Wall clock includes cold-start I/O, which is
+what varies wildly on this host. The phases measure CPU over structures
+already in memory.
+
+### The commit is where parallel execution loses its money
+
+Instrumenting the single-threaded path too — it applies the changes in
+the caller rather than inside the executor, so it had been reporting
+nothing — makes the cost explicit. Identical work, 401 accounts changed
+per block, three interleaved repetitions:
+
+| | commit, ms/block | |
+|---|---|---|
+| one thread | 303.8 / 320.2 / 308.6 | median **308.6** |
+| four threads | 459.3 / 479.0 / 614.8 | median **479.0** |
+
+**Four sublists cost 55% more to commit than one**, for the same
+changes. Per repetition: 1.51×, 1.50×, 1.99× — the third from a round
+where the machine slowed and both phases rose together.
+
+So the trade parallel execution actually makes, at this block size, is
+to save about 84 ms of execution and spend about 170 ms more on the
+commit. It loses, and that is why four threads barely beat one here and
+lost outright once the store was fast and the access list prefetched.
+
+The mechanism is the one the design implies: each sublist computes its
+changes against the same `base_root`, so `apply_state_changes` runs once
+per sublist and each rebuilds the upper trie on top of the previous
+one's result. One thread rebuilds it once.
+
+### And the per-account cost grows with the block
+
+Four threads, medians of three:
+
+| accounts | commit | per account |
+|---|---|---|
+| 101 | 98.8 ms | 978 µs |
+| 201 | 174.9 ms | 870 µs |
+| 401 | 479.0 ms | 1,195 µs |
+
+Doubling 201 to 401 accounts multiplies the commit by 2.74. Doubling 101
+to 201 multiplies it by 1.77. **Suggestive of superlinearity and not
+established** — the 101-account point measured 80.1 / 98.8 / 121.7, a
+52% spread, because a small block amortises its fixed costs worst and
+the noise with them.
+
+A candidate worth testing: `TrieNode::put` returns a new root, and
+`NodeRef::Node` owns its subtree, so rebuilding a path deep-copies the
+siblings along it. That is exactly the O(n²) that made the fixture build
+take 63 s for 20,000 accounts and was fixed there by building bottom-up.
+The commit still inserts one account at a time.
+
+Hashing is **not** a candidate: `hash_cache` is a `OnceLock` and
+`put_impl` never touches `compute_hash` or `to_message`, so building the
+trie hashes nothing. The whole dirty subtree is hashed once at the end,
+for 5.1 ms.
+
+### What to attack
+
+Not the store, not prefetching, not the thread count — those make the
+84 ms smaller. The 432 ms is the commit, and the obvious question is
+whether four sequential `apply_state_changes` can become one: the
+sublists touch disjoint accounts by construction, so their changes could
+in principle be merged and applied in a single pass over the trie.
+Whether that preserves the ordering consensus depends on, and is
+constrained by, what the sequential sublist is allowed to observe.
+
+**Not yet measured:** the single-threaded path does not go through
+`execute_block_in_parallel`, so it reports no phases at all. Its
+breakdown is unknown, and it is the path the node runs on today.
+
 ## What is left
 
 With FlatDB and a perfect access list, execution sits at 92% CPU on one
@@ -439,9 +558,19 @@ Amdahl, at most a third of a block is parallelisable; the rest is:
 - the root hashing, which walks every dirty node,
 - the lazy reload of the root between blocks.
 
-All four are sequential by construction and **none of them has been
-profiled**. That is where the next measurement should go: it is the
-larger share, and it is the only one left that has not been ruled out.
+All four are sequential by construction. Three of them are now measured
+— see "Where a block's time actually goes" above; the ordered commit is
+the whole story and the other three round to nothing.
+
+**The insertion path is the gap left.** Because every recipient
+pre-exists in the fixture, no run has ever split a trie path or
+deepened the trie. The commit cost measured here is the cost of
+rewriting a spine that already has the right shape. Extending the
+workload to draw a share of recipients from beyond the fixture's account
+count is a small change to `recipient` in `loadtest.rs`, and it is the
+measurement that would tell us whether account creation is cheaper than
+an update (its descent stops at the divergence point, so it may be) or
+dearer (it allocates an extra node per insertion and grows the store).
 
 What has been ruled out is the store's writer mutex. It was the obvious
 suspect — scaling tracked write volume, which looks exactly like a lock

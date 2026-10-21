@@ -9,7 +9,7 @@
 //! visible rather than averaged away.
 //!
 //! ```text
-//! parallel_bench <fixture-dir> [options]
+//! loadtest <fixture-dir> [options]
 //!
 //!   --threads N        execution threads (default 1)
 //!   --sublists N       parallel sublists each block declares (default 2)
@@ -41,7 +41,7 @@ const CHAIN_ID: u64 = 33;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let fixture = args.next().context("usage: parallel_bench <fixture-dir> [options]")?;
+    let fixture = args.next().context("usage: loadtest <fixture-dir> [options]")?;
     let mut threads = 1usize;
     let mut sublists = 2usize;
     let mut txs = 200usize;
@@ -221,16 +221,32 @@ fn main() -> Result<()> {
 
         // Persist, so the I/O a real node pays is paid here too.
         let writing = Instant::now();
+        // With one thread the executor hands back the changes and the
+        // caller applies them, so the commit happens here instead of
+        // inside `execute_block_in_parallel`. Timed the same way, so the
+        // breakdown is comparable across thread counts.
+        let mut committing = std::time::Duration::ZERO;
         let mut next = match executed.applied_root {
             Some(root) => root,
-            None => rustock_execution::apply_state_changes(
-                &state,
-                trie_store.as_ref(),
-                &executed.state_changes,
-                &executed.markers,
-            ),
+            None => {
+                let at = Instant::now();
+                let root = rustock_execution::apply_state_changes(
+                    &state,
+                    trie_store.as_ref(),
+                    &executed.state_changes,
+                    &executed.markers,
+                );
+                committing = at.elapsed();
+                root
+            }
         };
+        // The root hash walks every dirty node of the block: `to_message`
+        // recurses into in-memory children to fold in their hashes. One
+        // pass, one thread, once a block.
+        let hashing = Instant::now();
         let hash = next.compute_hash(trie_store.as_ref());
+        let hashed = hashing.elapsed();
+
         next.save(trie_store.as_ref(), true);
         if number % flush_every == 0 {
             trie_store.flush();
@@ -240,10 +256,12 @@ fn main() -> Result<()> {
         // Reload lazily, as the node does: children become hash references
         // resolved on demand, so the next block walks only its own paths
         // instead of carrying the whole accumulated tree in memory.
+        let reloading = Instant::now();
         state = trie_store
             .get(hash.as_slice())
             .map(|data| TrieNode::from_message(&data, trie_store.as_ref()))
             .unwrap_or(next);
+        let reloaded = reloading.elapsed();
         parent_hash = block.header.hash();
 
         rows.push(Row {
@@ -253,6 +271,12 @@ fn main() -> Result<()> {
             execution_us: execution.as_micros() as u64,
             write_us: write.as_micros() as u64,
             prefetch_us: prefetched.as_micros() as u64,
+            maintenance_us: executed.phases.maintenance_us,
+            sublists_us: executed.phases.sublists_us,
+            commit_us: executed.phases.commit_us + committing.as_micros() as u64,
+            accounts: executed.state_changes.len() as u64,
+            hash_us: hashed.as_micros() as u64,
+            reload_us: reloaded.as_micros() as u64,
             elapsed_s: started.elapsed().as_secs_f64(),
         });
 
@@ -370,6 +394,14 @@ struct Row {
     execution_us: u64,
     write_us: u64,
     prefetch_us: u64,
+    maintenance_us: u64,
+    sublists_us: u64,
+    commit_us: u64,
+    /// Accounts the block changed, so the commit's cost can be read
+    /// against the work it was given rather than against the clock.
+    accounts: u64,
+    hash_us: u64,
+    reload_us: u64,
     elapsed_s: f64,
 }
 
@@ -412,6 +444,32 @@ fn report(rows: &[Row], label: &str, threads: usize, sublists: usize) {
         "  prefetch        {:.1} ms/block",
         mean(rows, |r| r.prefetch_us) / 1000.0
     );
+    // What parallel execution can and cannot divide. Three of these four
+    // run once a block on one thread whatever `--threads` says.
+    println!(
+        "  maintenance     {:.1}   sublists {:.1}   commit {:.1}   root hash {:.1}   reload {:.1}  ms/block",
+        mean(rows, |r| r.maintenance_us) / 1000.0,
+        mean(rows, |r| r.sublists_us) / 1000.0,
+        mean(rows, |r| r.commit_us) / 1000.0,
+        mean(rows, |r| r.hash_us) / 1000.0,
+        mean(rows, |r| r.reload_us) / 1000.0,
+    );
+    println!(
+        "  accounts/block  {:.0}   commit per account {:.0} us",
+        mean(rows, |r| r.accounts),
+        mean(rows, |r| r.commit_us) / mean(rows, |r| r.accounts).max(1.0),
+    );
+    let sequential = mean(rows, |r| r.maintenance_us)
+        + mean(rows, |r| r.commit_us)
+        + mean(rows, |r| r.hash_us)
+        + mean(rows, |r| r.reload_us);
+    let parallel = mean(rows, |r| r.sublists_us);
+    if sequential + parallel > 0.0 {
+        println!(
+            "  of the measured phases, {:.0}% is sequential whatever the thread count",
+            100.0 * sequential / (sequential + parallel)
+        );
+    }
     println!(
         "  execution       {:.1} ms/block   write {:.1} ms/block",
         mean(rows, |r| r.execution_us) / 1000.0,
@@ -422,13 +480,15 @@ fn report(rows: &[Row], label: &str, threads: usize, sublists: usize) {
 
 fn write_csv(path: &str, rows: &[Row], label: &str, threads: usize, sublists: usize) -> Result<()> {
     let mut out = String::from(
-        "label,threads,sublists,block,transactions,gas,prefetch_us,execution_us,write_us,elapsed_s\n",
+        "label,threads,sublists,block,transactions,gas,prefetch_us,maintenance_us,\
+sublists_us,commit_us,hash_us,reload_us,execution_us,write_us,elapsed_s\n",
     );
     for r in rows {
         out.push_str(&format!(
-            "{label},{threads},{sublists},{},{},{},{},{},{},{:.3}\n",
-            r.number, r.transactions, r.gas, r.prefetch_us, r.execution_us, r.write_us,
-            r.elapsed_s
+            "{label},{threads},{sublists},{},{},{},{},{},{},{},{},{},{},{},{:.3}\n",
+            r.number, r.transactions, r.gas, r.prefetch_us, r.maintenance_us,
+            r.sublists_us, r.commit_us, r.hash_us, r.reload_us, r.execution_us,
+            r.write_us, r.elapsed_s
         ));
     }
     std::fs::write(path, out).with_context(|| format!("writing {path}"))?;

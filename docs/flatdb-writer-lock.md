@@ -244,7 +244,7 @@ thread again.
 
 ```sh
 for t in 1 4; do
-  /usr/bin/time -f "%P %e" cargo run --release --example parallel_bench -- <fixture> \
+  /usr/bin/time -f "%P %e" cargo run --release --example loadtest -- <fixture> \
       --threads $t --sublists 4 --txs 200 --blocks 60 --flatdb true --flush-every 100
 done
 ```
@@ -262,7 +262,7 @@ depends on batch size:
 **The CPU figure.** Four threads at about one core on four cores is the
 symptom. If it does not move, the serialisation did not.
 
-**And the correctness gate, which costs nothing.** `parallel_bench`
+**And the correctness gate, which costs nothing.** `loadtest`
 prints the final state root; it must not change. Every run quoted in
 this document ends on the same one.
 
