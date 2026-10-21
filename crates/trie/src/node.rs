@@ -199,7 +199,7 @@ impl NodeRef {
     }
 
     /// The sub-tree size as defined by RSKIP107: serialized node + children_size + external_value_length.
-    fn reference_size(&self, store: &dyn TrieStore) -> u64 {
+    pub(crate) fn reference_size(&self, store: &dyn TrieStore) -> u64 {
         match self {
             NodeRef::Empty => 0,
             NodeRef::Node(n) => {

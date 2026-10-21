@@ -1,5 +1,6 @@
 pub mod account;
 pub mod bulk;
+pub mod bulk_put;
 pub mod key_mapper;
 pub mod node;
 pub mod orchid_converter;
