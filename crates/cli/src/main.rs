@@ -4527,6 +4527,27 @@ mod genesis_tests {
         );
     }
 
+    /// Regtest's header must commit to its allocation, or the ten funded
+    /// accounts cannot be reached.
+    ///
+    /// This is not a formality. The header is what a state lookup
+    /// resolves through, so a header carrying the empty root -- which
+    /// regtest's did, correctly, while it funded nobody -- makes
+    /// `eth_getBalance` answer "cannot resolve block" and every
+    /// transaction fail for insufficient funds, with the state sitting
+    /// in the trie the whole time.
+    #[test]
+    fn regtest_genesis_state_root_matches_the_header() {
+        let config = ChainConfig::regtest();
+        let store = MemoryTrieStore::new();
+        let root = build_genesis_state(&config, &store).unwrap();
+        assert_eq!(
+            root.compute_hash(&store),
+            config.genesis_header().state_root,
+            "the regtest header must carry the root of its own allocation"
+        );
+    }
+
     /// Mainnet must be untouched by that: RSKIP126 does not activate at its
     /// genesis (wasabi100 is #1,591,000), so no precompile is seeded and the
     /// state is the allocation alone. Its header carries the *orchid* root of
