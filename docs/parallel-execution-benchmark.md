@@ -84,7 +84,7 @@ have been 2.3 GB and more than double mainnet's live state.
 | on disk | 1,019 MB |
 | depth | ~23 levels of branching |
 | build time | 92 s |
-| root | `0x4622e441e12d77e832fa8b54f44801568bb7c08c57c37c9470b37e2b8f89a2e2` |
+| root | `0x5a428782bfde84201dedffaf67632df2d7886a5b2d9d41dddff62a4ad5535d57` |
 
 One per cent of the accounts are derived from real keys; the rest are
 hashes. Nine million curve multiplications to produce addresses that will

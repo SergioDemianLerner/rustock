@@ -42,6 +42,167 @@ to remove — which is why the three together are worse than two of them.
 
 ---
 
+## The method
+
+Every number above comes from one of two measurements, against two
+different states. Both are described here in full, because a performance
+claim that cannot be reproduced is an anecdote.
+
+### Why the workload is synthetic
+
+Two reasons, each disqualifying on its own.
+
+**Mainnet has no partitioned blocks.** RSKIP-144 is unscheduled there
+(`reed810 = -1`), so no mainnet header has ever carried a non-empty edges
+field. **Testnet's are too small to measure**: of 1,020,420 canonical
+headers above its activation height, 203,419 split, but their edges are
+`[1]`, `[1, 2]`, `[1, 3]` — one or two transactions per sublist at about
+45,000 gas. Dividing one transaction between two threads measures the
+cost of starting a thread.
+
+And on today's mainnet there is nothing to measure at all: blocks are
+running at roughly 1% of the gas limit, a node in follow mode executes
+one in 38 ms and then idles for thirty seconds.
+
+So the transactions are synthetic. That is the weakness, and it is the
+reason the *state* they run against is not.
+
+### The state: a 1 GB synthetic trie
+
+Starting from an empty trie measures the wrong thing — the first blocks
+run against a handful of cached nodes, the rate starts absurdly high and
+decays, and the average is an artifact of the ramp. The fixture is sized
+so its working set already exceeds anything a run adds.
+
+Sized against mainnet rather than guessed. From `trie-scan-baseline.md`,
+mainnet's **live** state extrapolates to ~600,000 accounts, 4.6 million
+storage cells, 10.8 million nodes, 0.7–0.9 GB. (The 131 GB archival trie
+is history, not what a node reads while following.) Measured at 115 bytes
+per account — stable at 116.2 at 200k, 115.5 at 2M, 114.9 at 9.3M — one
+gigabyte is 9.3 million accounts.
+
+| | |
+|---|---|
+| accounts | 9,300,000 |
+| of which can sign | 93,000 (1%) |
+| on disk | 1,019 MB |
+| depth | ~23 levels |
+| build time | 92 s |
+| root | `0x5a428782bfde84201dedffaf67632df2d7886a5b2d9d41dddff62a4ad5535d57` |
+| built by | `cargo run --release --example synthetic_state -- build <dir> --accounts 9300000 --signers 93000` |
+
+Only 1% carry real keys: nine million curve multiplications for addresses
+that will never spend is time for nothing, but senders must sign. 93,000
+is also enough that their paths do not all sit in cache after the first
+block.
+
+The build is bottom-up (`crates/trie/src/bulk.rs`), leaves first, each
+node written once. Inserting one at a time is O(n²) — `TrieNode::put`
+returns a new root and deep-copies the siblings along the path — and took
+63 s for 20,000 accounts. **This layout is also why the fixture flatters
+FlatDB**: writing bottom-up leaves the top of the trie contiguous at the
+end of the heap, which a real store, written in traversal order over
+months, does not have. Every FlatDB figure taken on the fixture is
+therefore optimistic, and the one taken on real state (1.76×) is not.
+
+### The blocks
+
+Generated deterministically from the fixture's seed, so a run is
+reproducible and the access list is knowable in advance.
+
+| | |
+|---|---|
+| per transaction | **native rBTC transfer**, 21,000 gas, value 1 wei, empty calldata |
+| per block | 200 transactions, **4,200,000 gas** |
+| partitioning | 4 parallel sublists of 40, plus 40 sequential |
+| blocks per run | **100** (20,000 transactions, 420M gas) |
+| state touched | two account cells per transaction |
+
+Senders are drawn from the 93,000 keyed accounts, a different slice each
+block so no small set stays warm; recipients from all 9.3 million by a
+multiplicative step coprime with the count, so reads scatter over the
+whole gigabyte. No new accounts are created, so the trie's depth never
+changes and a run measures a growing trie rather than a deepening one.
+
+**This is close to a worst case for parallel execution and should be read
+that way.** A native transfer is the least compute-intensive transaction
+there is: a balance check and two balance updates against two random
+paths. The ratio of I/O to arithmetic is as lopsided as it can be made.
+A block of contract calls does far more work per state access.
+`parallel_workload` already builds ERC-20 transfers for that comparison
+and it has not been run.
+
+### The second state: the real mainnet store
+
+The read comparison between the engines (1.76× serial, dead heat
+batched) was **not** measured on the fixture. It used the node's own
+epoch store, converted with the node stopped:
+
+- 3 epochs, 25,371,307 nodes copied, **none skipped** — which establishes
+  on production data that the trie store is content-addressed throughout;
+- 10,519,952 nodes resolved by descending from the executed state root;
+- every record over the 1,024-byte threshold read back and verified
+  (5,589 + 450 + 475, none failed) — contract code up to 24,573 bytes,
+  which the fixture contains none of;
+- mean record 73.5 bytes on disk across the three epochs.
+
+Both sides therefore hold identical data with identical roots, on the
+same physical disk.
+
+### Running conditions
+
+| | |
+|---|---|
+| machine | 4 cores, 7 GB, **mainnet node stopped for the duration** |
+| RocksDB block cache | 256 MB with bloom filters at 10 bits/key — the node's own `BLOCK_CACHE_BYTES` |
+| peak RSS | 375–411 MB (RocksDB), 972 MB of which 10 MB anonymous (FlatDB) |
+| flush cadence | every 100 blocks, the node's own, for both engines |
+| per run | fresh copy of the fixture, page cache evicted, fixed block count |
+
+**A fixed block count, not a fixed time.** Time-boxing lets the faster
+configuration execute more blocks and so sample a different part of a
+decay curve that falls steeply for the first eighty.
+
+**The page cache is evicted by name.** `posix_fadvise(POSIX_FADV_DONTNEED)`
+on the store's own files, not by reading unrelated data to flush them out
+— see the methodology section at the end for why that does not work.
+`drop_caches` is unavailable: `/proc` is read-only on this host.
+
+**The exec/write split in the CSV is not comparable across thread
+counts.** With one thread the caller applies the state changes and the
+time lands in `write`; with two or more the sublists commit inside
+`execute_block` and it lands in `execution`. Only the total is
+comparable, and the totals are what every figure above uses.
+
+### Reproducing it
+
+```sh
+# the fixture, once
+cargo run --release --example synthetic_state -- build <dir> \
+    --accounts 9300000 --signers 93000
+
+# optionally convert it to FlatDB
+cargo run --release --example flatdb_convert -- <dir> <flat-dir> \
+    --expected-keys 10m
+
+# one run; --flatdb and --prefetch select the levers
+cargo run --release --example parallel_bench -- <dir> \
+    --threads 4 --sublists 4 --txs 200 --blocks 100 \
+    --flush-every 100 --prefetch 16 --csv run.csv
+```
+
+Each run prints the final state root. **All eight runs of the thread
+sweep, and all four of the prefetch matrix, end on the same root** —
+these are differences in speed and in nothing else.
+
+The fixture and the runner live in
+`/mnt/import/tn-snapshot/regtest-parallel-bench/`. That path is
+misleading — it is regtest data, not testnet — and sits there only
+because `/mnt/import`'s root is not writable by the account that built
+it.
+
+---
+
 ## Why they do not compose
 
 Every one of these is an answer to the same question: *the CPU is idle,
