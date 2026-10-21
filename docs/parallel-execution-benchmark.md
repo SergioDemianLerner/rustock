@@ -512,6 +512,88 @@ same reason the 1536 MB block cache was: on a 7 GB machine it competes with
 the page cache that is doing the real work. The right size is a property of
 the machine, not of the trie, and 50,000 looks low for a gigabyte of state.
 
+## An access list is worth more than the threads
+
+100 blocks, 200 tx/block, the 1 GB fixture, `--prefetch 16`. The
+generator knows the sender and the recipient of every transfer, so the
+access list is **exact**: this simulates EIP-2930 at 100% coverage and
+is therefore an upper bound. If perfect foreknowledge buys little, no
+scheme that has to transmit, verify or guess the list can buy more.
+
+| engine | threads | prefetch | wall | CPU |
+|---|---|---|---|---|
+| RocksDB | 1 | — | 181.7 s | 53% |
+| RocksDB | 1 | 16 | **72.4 s** | 112% |
+| RocksDB | 4 | — | 125.6 s | 96% |
+| RocksDB | 4 | 16 | 72.7 s | 131% |
+| FlatDB | 1 | — | 58.2 s | 74% |
+| FlatDB | 1 | **16** | **50.4 s** | 92% |
+| FlatDB | 4 | — | 57.3 s | 103% |
+| FlatDB | 4 | 16 | 58.0 s | 106% |
+
+Against the 1-thread RocksDB baseline, each lever on its own:
+
+| | | |
+|---|---|---|
+| FlatDB alone | 58.2 s | **3.12×** |
+| access list alone | 72.4 s | **2.51×** |
+| four threads alone | 125.6 s | 1.45× |
+| FlatDB + access list, one thread | **50.4 s** | **3.61×** |
+| all three together | 58.0 s | 3.13× |
+
+### Three things worth saying plainly
+
+**Prefetching beats parallel execution, and it is not close.** One
+thread with the access list (72.4 s) beats four threads without it
+(125.6 s) by 1.73×. On RocksDB the list is worth 2.51× where the thread
+count is worth 1.45×.
+
+**The best configuration uses one thread.** FlatDB plus the access list
+on a single thread is the fastest of the eight, and adding threads to it
+makes it *slower* — 50.4 s against 58.0 s. Parallel sublist execution
+contributes nothing once reads stop being the constraint, and then costs
+something: each sublist rewrites the top of the trie independently
+against the same base, and the writes serialise on FlatDB's writer mutex
+(#319).
+
+**The levers do not add up, because they attack the same bottleneck.**
+All three — a faster store, a prefetched access list, more threads —
+are ways of not waiting on a read. Once one of them has removed the
+waiting, the others have nothing left to remove. That is why
+FlatDB + prefetch + threads (3.13×) is worse than FlatDB + prefetch
+alone (3.61×).
+
+### Why a single descent cannot be batched
+
+An access list gives *paths*, derived from addresses. A
+content-addressed store retrieves a node by its **hash**, and a child's
+hash is only learned by reading its parent — so knowing the destination
+does not let a descent skip to it. What the list does give is N
+descents that are independent *of each other*, and those can be in
+flight at once. That is the whole mechanism, and it is why the gain
+tracks how slow a single read is: RocksDB 2.51×, FlatDB 1.16×.
+
+A path-keyed store — Geth's pathdb, Erigon's flat state — could jump
+straight to the leaf. This one cannot, and that is a consequence of
+content addressing rather than an oversight.
+
+### What this does not establish
+
+- The fixture is accounts only and its bottom-up layout favours FlatDB;
+  against the real mainnet store the serial read advantage was 1.76×,
+  not 3.1×.
+- Native transfers touch two accounts each and the list is trivially
+  predictable. Contract calls reach storage slots that depend on
+  execution, which is exactly where a real access list is hardest to
+  produce and most likely to be incomplete.
+- 100% coverage is the ceiling, not a forecast.
+- RSK has no EIP-2930 and never adopted EIP-2929, so there is no gas
+  incentive for a sender to supply a list. It would have to come from a
+  peer that has already executed the block — which is sound, because a
+  prefetch hint that is wrong costs a wasted read and nothing else. It
+  needs no consensus change, unlike the witness scheme measured in
+  `profiling.md`.
+
 ## What this says
 
 The workload is **I/O bound**. Four threads reach 86% of one core on a

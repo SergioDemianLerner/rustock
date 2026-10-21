@@ -61,6 +61,9 @@ fn main() -> Result<()> {
     // block recomputes them -- so a node may legitimately flush less often
     // than it commits, provided its head pointer lags what is on disk.
     let mut flush_every: u64 = 1;
+    // Ways to descend the block's access list before executing it. 0 is
+    // off. See `prefetch_access_list`.
+    let mut prefetch: usize = 0;
 
     while let Some(flag) = args.next() {
         let value = args.next().with_context(|| format!("{flag} needs a value"))?;
@@ -80,6 +83,7 @@ fn main() -> Result<()> {
             "--flatdb" => flatdb = value.parse()?,
             "--expected-keys" => expected_keys = value.parse()?,
             "--flush-every" => flush_every = value.parse()?,
+            "--prefetch" => prefetch = value.parse()?,
             other => anyhow::bail!("unknown option {other}"),
         }
     }
@@ -183,6 +187,26 @@ fn main() -> Result<()> {
                                   edges_for(sublists, transactions.len()));
         let block = Block { header, transactions, ommers: Vec::new() };
 
+        // Simulate an EIP-2930 access list at 100% coverage.
+        //
+        // The generator knows every account a block touches -- the sender
+        // and the recipient of each transfer -- so the list is exact
+        // rather than a hint, and no protocol change is needed to measure
+        // what one would be worth. This is therefore an **upper bound**:
+        // if the gain is small with perfect coverage, no real scheme that
+        // has to transmit, verify or guess the list can do better.
+        //
+        // The descents are independent of each other even though each is
+        // internally dependent, which is the whole point: a
+        // content-addressed store cannot batch one descent, because a
+        // child's hash is only learned from its parent -- but N descents
+        // can be in flight at once.
+        let prefetching = Instant::now();
+        if prefetch > 0 {
+            prefetch_access_list(&state, trie_store.as_ref(), &senders, prefetch);
+        }
+        let prefetched = prefetching.elapsed();
+
         let at = Instant::now();
         let executed = RskExecutor::new(hardfork_cfg.clone(), block_store.clone())
             .with_execution_threads(threads)
@@ -228,6 +252,7 @@ fn main() -> Result<()> {
             gas: executed.gas_used,
             execution_us: execution.as_micros() as u64,
             write_us: write.as_micros() as u64,
+            prefetch_us: prefetched.as_micros() as u64,
             elapsed_s: started.elapsed().as_secs_f64(),
         });
 
@@ -254,6 +279,47 @@ fn main() -> Result<()> {
         println!("\nseries written to {path}");
     }
     Ok(())
+}
+
+/// Walk every account the block will touch, `ways` descents at a time.
+///
+/// Each descent resolves the path from the root to a leaf and throws the
+/// answer away: the point is the side effect, which is that the nodes are
+/// in the store's cache by the time execution asks for them.
+///
+/// Senders and recipients are the whole access list for a native
+/// transfer. Duplicates are dropped -- a block reuses accounts, and
+/// descending the same path twice would overstate the work a real list
+/// would cause.
+fn prefetch_access_list(
+    state: &TrieNode,
+    store: &dyn TrieStore,
+    senders: &[(rustock_core::Transaction, Address)],
+    ways: usize,
+) {
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(senders.len() * 2);
+    for (tx, from) in senders {
+        keys.push(rustock_trie::account_key(from));
+        if tx.to.len() == 20 {
+            keys.push(rustock_trie::account_key(&Address::from_slice(&tx.to)));
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+
+    let ways = ways.max(1).min(keys.len().max(1));
+    let chunk = keys.len().div_ceil(ways);
+    std::thread::scope(|scope| {
+        for part in keys.chunks(chunk) {
+            scope.spawn(move || {
+                for key in part {
+                    // The answer is discarded; the cache it populates is
+                    // the product.
+                    let _ = state.get(&rustock_trie::TrieKeySlice::from_key(key), store);
+                }
+            });
+        }
+    });
 }
 
 /// A read-write trie store configured like the node's epoch store: a block
@@ -303,11 +369,12 @@ struct Row {
     gas: u64,
     execution_us: u64,
     write_us: u64,
+    prefetch_us: u64,
     elapsed_s: f64,
 }
 
 fn rate(rows: &[Row]) -> f64 {
-    let us: u64 = rows.iter().map(|r| r.execution_us + r.write_us).sum();
+    let us: u64 = rows.iter().map(|r| r.execution_us + r.write_us + r.prefetch_us).sum();
     let txs: usize = rows.iter().map(|r| r.transactions).sum();
     if us == 0 { 0.0 } else { txs as f64 * 1_000_000.0 / us as f64 }
 }
@@ -342,6 +409,10 @@ fn report(rows: &[Row], label: &str, threads: usize, sublists: usize) {
     let drift = if rate(first) > 0.0 { rate(last) / rate(first) } else { 0.0 };
     println!("  last/first      {drift:.2}");
     println!(
+        "  prefetch        {:.1} ms/block",
+        mean(rows, |r| r.prefetch_us) / 1000.0
+    );
+    println!(
         "  execution       {:.1} ms/block   write {:.1} ms/block",
         mean(rows, |r| r.execution_us) / 1000.0,
         mean(rows, |r| r.write_us) / 1000.0
@@ -351,12 +422,13 @@ fn report(rows: &[Row], label: &str, threads: usize, sublists: usize) {
 
 fn write_csv(path: &str, rows: &[Row], label: &str, threads: usize, sublists: usize) -> Result<()> {
     let mut out = String::from(
-        "label,threads,sublists,block,transactions,gas,execution_us,write_us,elapsed_s\n",
+        "label,threads,sublists,block,transactions,gas,prefetch_us,execution_us,write_us,elapsed_s\n",
     );
     for r in rows {
         out.push_str(&format!(
-            "{label},{threads},{sublists},{},{},{},{},{},{:.3}\n",
-            r.number, r.transactions, r.gas, r.execution_us, r.write_us, r.elapsed_s
+            "{label},{threads},{sublists},{},{},{},{},{},{},{:.3}\n",
+            r.number, r.transactions, r.gas, r.prefetch_us, r.execution_us, r.write_us,
+            r.elapsed_s
         ));
     }
     std::fs::write(path, out).with_context(|| format!("writing {path}"))?;
