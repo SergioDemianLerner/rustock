@@ -1,5 +1,10 @@
 # Measuring what parallel sublist execution buys
 
+> For how this fits with the other two levers — the trie store and
+> prefetched access lists — and which of them is worth what, see
+> [`execution-performance.md`](execution-performance.md). This document
+> is the detail behind one of them.
+
 What RSKIP-144 parallel execution is worth, measured rather than argued.
 
 This records the method before the numbers, so that the numbers can be read

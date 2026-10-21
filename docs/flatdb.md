@@ -1,5 +1,10 @@
 # FlatDB in rustock
 
+> For how this fits with the other two levers — the trie store and
+> prefetched access lists — and which of them is worth what, see
+> [`execution-performance.md`](execution-performance.md). This document
+> is the detail behind one of them.
+
 A port of the `flatdb-simplified` branch of rskj (`co.rsk.flatdb`, commit
 `8b4f94a4c`) to Rust, written against `FlatDB-Rust-Port.md`, plus the
 measurements comparing it with RocksDB as a trie store.
