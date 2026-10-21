@@ -202,7 +202,7 @@ fn assert_recovers(staged: &Staged) -> Result<(), TestCaseError> {
         );
     }
     // Nothing from the uncommitted batch may be visible, torn or not.
-    for (k, _) in &staged.lost {
+    for k in staged.lost.keys() {
         if !staged.durable.contains_key(k) {
             prop_assert_eq!(db.get(k), None, "an uncommitted key survived");
         }

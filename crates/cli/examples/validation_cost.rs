@@ -44,7 +44,7 @@ const MAINNET_CHAIN_ID: u64 = 30;
 fn stats(mut us: Vec<f64>) -> (f64, f64, f64, f64) {
     us.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = us.len();
-    let median = if n % 2 == 0 { (us[n / 2 - 1] + us[n / 2]) / 2.0 } else { us[n / 2] };
+    let median = if n.is_multiple_of(2) { (us[n / 2 - 1] + us[n / 2]) / 2.0 } else { us[n / 2] };
     let mean = us.iter().sum::<f64>() / n as f64;
     (median, mean, us[0], us[n - 1])
 }

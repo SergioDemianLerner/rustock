@@ -124,7 +124,7 @@ mod tests {
 
         let mut root = TrieNode::empty();
         for (i, key) in keys.iter().enumerate() {
-            root = root.put(&TrieKeySlice::from_key(key), &vec![i as u8; 40], &store);
+            root = root.put(&TrieKeySlice::from_key(key), &[i as u8; 40], &store);
         }
         root.save(&store, true);
         let hash = root.compute_hash(&store);
@@ -133,7 +133,7 @@ mod tests {
         let memory = rustock_trie::MemoryTrieStore::new();
         let mut expected = TrieNode::empty();
         for (i, key) in keys.iter().enumerate() {
-            expected = expected.put(&TrieKeySlice::from_key(key), &vec![i as u8; 40], &memory);
+            expected = expected.put(&TrieKeySlice::from_key(key), &[i as u8; 40], &memory);
         }
         assert_eq!(hash, expected.compute_hash(&memory), "same trie, same root");
 
@@ -147,7 +147,7 @@ mod tests {
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(
                 loaded.get(&TrieKeySlice::from_key(key), &reopened).as_deref(),
-                Some(&vec![i as u8; 40][..]),
+                Some(&[i as u8; 40][..]),
                 "key {i}"
             );
         }

@@ -2,6 +2,12 @@
 name = "rustock-flatdb"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+
+# Without this the workspace's `allow`s do not reach this crate, and CI's
+# `clippy -D warnings` fails on a lint every sibling is excused from.
+[lints]
+workspace = true
 
 [dependencies]
 memmap2 = "0.9"

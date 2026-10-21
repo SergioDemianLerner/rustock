@@ -74,7 +74,7 @@ fn main() -> Result<()> {
         flat.put(&key, &value);
         copied += 1;
         bytes += value.len() as u64;
-        if copied % 1_000_000 == 0 {
+        if copied.is_multiple_of(1_000_000) {
             println!(
                 "  {copied} nodes, {:.1} GB, {:.0}s",
                 bytes as f64 / 1e9,

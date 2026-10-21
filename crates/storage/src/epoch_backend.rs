@@ -971,7 +971,11 @@ mod tests {
         );
         // And it should not be so generous that the index is wasteful: the
         // fixture measured 75.7 bytes a record over 9.3 M of them.
-        assert!(AVERAGE_RECORD_BYTES <= 128, "the estimate is wastefully large");
+        // `const` on both sides, so clippy sees a constant assertion and is
+        // right that it cannot fail at run time. It is here to fail at
+        // *review* time if someone raises the constant past what the
+        // fixture measured, which is what a compile-time check gives.
+        const _: () = assert!(AVERAGE_RECORD_BYTES <= 128);
     }
 
     /// A rotation policy asks how much an epoch has accumulated. FlatDB

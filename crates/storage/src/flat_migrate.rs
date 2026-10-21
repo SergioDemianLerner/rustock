@@ -316,7 +316,7 @@ mod tests {
         for i in 0..count {
             trie = trie.put(
                 &TrieKeySlice::from_key(&trie_key(i)),
-                &vec![(i % 251) as u8; 60],
+                &[(i % 251) as u8; 60],
                 backing.as_ref(),
             );
         }
@@ -344,7 +344,7 @@ mod tests {
         for i in 0..count {
             assert_eq!(
                 node.get(&TrieKeySlice::from_key(&trie_key(i)), backing.as_ref()).as_deref(),
-                Some(&vec![(i % 251) as u8; 60][..]),
+                Some(&[(i % 251) as u8; 60][..]),
                 "key {i} after migration"
             );
         }

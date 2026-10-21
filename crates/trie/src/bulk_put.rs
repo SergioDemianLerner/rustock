@@ -633,8 +633,8 @@ mod tests {
                 state ^= state << 17;
                 state
             };
-            let base_n = (next() % 400) as u64;
-            let batch_n = 1 + (next() % 120) as u64;
+            let base_n = next() % 400;
+            let batch_n = 1 + next() % 120;
 
             let mut base = Vec::new();
             for i in 0..base_n {
@@ -681,7 +681,7 @@ mod tests {
             // A handful of stems, each extended many ways, so most pairs
             // of keys agree for a long way and then diverge.
             let stems: Vec<Vec<u8>> = (0..4).map(|i| key(9, seed ^ i, 8)).collect();
-            let mut make = |n: u64, tag: u8, next: &mut dyn FnMut() -> u64| {
+            let make = |n: u64, tag: u8, next: &mut dyn FnMut() -> u64| {
                 let mut out = Vec::new();
                 for i in 0..n {
                     let mut k = stems[(next() % stems.len() as u64) as usize].clone();
@@ -697,8 +697,8 @@ mod tests {
             let mut batch = make(1 + next() % 40, 2, &mut next);
             // Half the time, also rewrite keys the base already holds.
             if !base.is_empty() && seed % 2 == 0 {
-                for i in 0..base.len().min(10) {
-                    batch.push((base[i].0.clone(), vec![0xEE; 1 + i]));
+                for (i, (k, _)) in base.iter().take(10).enumerate() {
+                    batch.push((k.clone(), vec![0xEE; 1 + i]));
                 }
             }
             batch.sort();

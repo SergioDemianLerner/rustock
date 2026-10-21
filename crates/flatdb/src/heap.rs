@@ -593,7 +593,7 @@ mod tests {
     fn an_offset_that_is_not_a_record_reads_as_a_miss() {
         let dir = tempfile::tempdir().unwrap();
         let heap = heap(dir.path());
-        let offset = heap.append(&[1u8; 32], &vec![7u8; 50], false).unwrap();
+        let offset = heap.append(&[1u8; 32], &[7u8; 50], false).unwrap();
         assert!(read_data(&heap, offset + 3).is_none(), "mid-record");
         assert!(read_data(&heap, heap.size()).is_none(), "at the frontier");
         assert!(read_data(&heap, heap.size() + 10_000).is_none(), "beyond it");
@@ -605,9 +605,9 @@ mod tests {
     fn records_beyond_the_frontier_are_invisible() {
         let dir = tempfile::tempdir().unwrap();
         let heap = heap(dir.path());
-        let first = heap.append(&[1u8; 32], &vec![1u8; 50], false).unwrap();
+        let first = heap.append(&[1u8; 32], &[1u8; 50], false).unwrap();
         let committed = heap.size();
-        let second = heap.append(&[2u8; 32], &vec![2u8; 50], false).unwrap();
+        let second = heap.append(&[2u8; 32], &[2u8; 50], false).unwrap();
         assert!(read_data(&heap, second).is_some());
 
         heap.truncate_to(committed);
@@ -642,7 +642,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (offset, committed) = {
             let heap = heap(dir.path());
-            let offset = heap.append(&[1u8; 32], &vec![42u8; 60], false).unwrap();
+            let offset = heap.append(&[1u8; 32], &[42u8; 60], false).unwrap();
             heap.force().unwrap();
             (offset, heap.size())
         };
@@ -692,7 +692,7 @@ mod tests {
         let segments: std::collections::BTreeSet<u64> =
             offsets.iter().map(|o| o / TEST_SEGMENT).collect();
         assert!(
-            segments.len() > 1 || offsets[0] % TEST_SEGMENT == 0,
+            segments.len() > 1 || offsets[0].is_multiple_of(TEST_SEGMENT),
             "no segment boundary was crossed: offsets {offsets:?}"
         );
         for offset in &offsets {

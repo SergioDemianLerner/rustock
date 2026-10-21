@@ -399,7 +399,7 @@ mod tests {
             let db = open_test_db(dir.path());
             let store = CachedTrieStore::with_config(db, config.clone());
 
-            let keys: Vec<Vec<u8>> = (0u16..600).map(|i| key_of(i)).collect();
+            let keys: Vec<Vec<u8>> = (0u16..600).map(key_of).collect();
             for (i, key) in keys.iter().enumerate() {
                 store.put(key, format!("value-{i}").as_bytes());
             }
@@ -467,7 +467,7 @@ mod tests {
                 ..Config::default()
             },
         ));
-        let keys: Vec<Vec<u8>> = (0u16..400).map(|i| key_of(i)).collect();
+        let keys: Vec<Vec<u8>> = (0u16..400).map(key_of).collect();
         for (i, key) in keys.iter().enumerate() {
             store.put(key, format!("v{i}").as_bytes());
         }
