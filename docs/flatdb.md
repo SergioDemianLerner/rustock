@@ -342,9 +342,49 @@ which is what a lock inside the parallel region looks like. That lock is
 `FlatDb`'s writer mutex, held across the probe, the key comparison, the
 heap append and the slot store, some 6,900 times a block.
 
-The append does not need it — the frontier can be reserved with a
-`fetch_add` and written outside any lock, since no other thread can be
-handed the same range, and publication is already a release-store.
+### Why the obvious fix is unsound
+
+The first proposal was to reserve the frontier with a `fetch_add` and
+write outside the lock, since no other thread can be handed the same
+range. **That is wrong**, and the reason is worth keeping.
+
+`size` has two jobs. It is the allocation cursor, and it is the
+publication barrier:
+
+```rust
+// append: bytes first, publication second
+std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+self.size.store(size + total, Ordering::Release);
+
+// with_record: acquire, then reject anything beyond
+let size = self.size.load(Ordering::Acquire);
+if offset >= size { return None; }
+```
+
+That pair is the *only* thing making the lock-free read path sound: a
+reader either sees the old `size` and rejects the offset, or sees the
+new one, and the edge guarantees the bytes are there. Reserving ahead of
+writing moves the barrier in front of the bytes, and a reader following
+a resurrected stale slot into the reserved range would read memory while
+it is being written. That is a data race and therefore undefined
+behaviour — the content-addressing argument does not rescue it, because
+that argument is about which *values* would come back and a race is
+undefined regardless.
+
+Two alternatives that do hold:
+
+**Narrow the lock.** The probe and the key comparison mutate nothing,
+and the comparison hashes every candidate record — 483 ns each, about
+1.5 times per put. Both can move outside, leaving the append and the
+slot publish inside. The pass under the lock has to resume from the
+probe's candidate rather than trust it, which is sound because an
+occupied slot never empties except under `grow`'s write lock.
+
+**Ordered publication.** Split the two roles: an `alloc` cursor reserved
+by CAS, and `size` advanced only in order. A writer reserves, writes its
+bytes with no lock held, then waits for `size` to reach its own start
+before storing its end. The invariant survives exactly, and the
+expensive part — the memcpy and its page faults — genuinely overlaps.
 
 But 41% CPU at four threads with *few* writes says the lock is not the
 only limit. A third of a block's work is parallel at best; the
