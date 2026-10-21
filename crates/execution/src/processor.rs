@@ -875,8 +875,44 @@ impl BlockProcessor {
         Ok(result)
     }
 
+    /// Below this many transactions, recovery stays on the calling thread.
+    ///
+    /// Spawning scoped threads costs tens of microseconds and a recovery
+    /// costs about sixty, so a handful of transactions -- which is every
+    /// block mainnet produces today, averaging under two -- would pay more
+    /// for the threads than the work is worth.
+    const RECOVERY_PARALLEL_THRESHOLD: usize = 16;
+
     /// Recover every transaction's sender.
     ///
+    /// This is the largest piece of per-block work outside execution, and
+    /// every item of it is independent: no ordering, no shared state, no
+    /// I/O, just elliptic-curve arithmetic over one signature. It used to
+    /// run as a plain sequential loop before any execution thread existed,
+    /// which put ~50 ms of a 205 ms full block squarely in the part of the
+    /// block that no thread count divides.
+    ///
+    /// The scheduler is the executor's: a shared cursor the workers pull
+    /// from, rather than a fixed slice each, so one slow signature does not
+    /// leave three threads idle.
+    ///
+    /// The error must not depend on the schedule. Whichever thread finds a
+    /// bad signature first, the one reported is the one at the lowest
+    /// index, because that is what a sequential pass would have reported
+    /// and a validity decision cannot vary with thread timing.
+    ///
+    /// **If a sender cache is ever added, it must not take a lock here.**
+    /// Nothing on this path locks today: `signing_hash` only *reads*
+    /// `cached_rlp`, and libsecp256k1's verification context is immutable
+    /// once built, which is why it can be a `&'static` shared across the
+    /// workers. A cache is the obvious next optimisation -- rskj keeps one,
+    /// and most of a block's transactions passed through our own pool,
+    /// which already recovered them at `txpool.rs` -- but a
+    /// `Mutex<HashMap>` consulted per transaction would serialise exactly
+    /// the region this function exists to parallelise, and would do it
+    /// invisibly: the work still happens, just one thread at a time. Shard
+    /// it, make it lock-free, or look the whole block up once before the
+    /// threads start.
     /// Public so a benchmark measures this function rather than a copy of
     /// it that drifts: `crates/cli/examples/loadtest.rs --validate`.
     pub fn recover_senders(
@@ -884,16 +920,44 @@ impl BlockProcessor {
         transactions: &[Transaction],
         chain_id: u64,
     ) -> Result<Vec<Address>, ProcessError> {
-        let mut senders = Vec::with_capacity(transactions.len());
-        for (i, tx) in transactions.iter().enumerate() {
+        let one = |i: usize, tx: &Transaction| -> Result<Address, ProcessError> {
             if Self::is_remasc_tx(tx) {
-                senders.push(Address::ZERO);
-                continue;
+                // REMASC carries no signature. rskj gives it the zero
+                // address too.
+                return Ok(Address::ZERO);
             }
-            let sender = tx.recover_sender(chain_id).map_err(|e| {
-                ProcessError::SenderRecovery { index: i, source: e }
-            })?;
-            senders.push(sender);
+            tx.recover_sender(chain_id)
+                .map_err(|e| ProcessError::SenderRecovery { index: i, source: e })
+        };
+
+        let width = self.execution_threads().max(1).min(transactions.len());
+        if width <= 1 || transactions.len() < Self::RECOVERY_PARALLEL_THRESHOLD {
+            return transactions.iter().enumerate().map(|(i, tx)| one(i, tx)).collect();
+        }
+
+        let slots: Vec<std::sync::Mutex<Option<Result<Address, ProcessError>>>> =
+            (0..transactions.len()).map(|_| std::sync::Mutex::new(None)).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (slots_ref, next_ref) = (&slots, &next);
+
+        std::thread::scope(|scope| {
+            for _ in 0..width {
+                scope.spawn(move || loop {
+                    let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(tx) = transactions.get(i) else { break };
+                    *slots_ref[i].lock().unwrap() = Some(one(i, tx));
+                });
+            }
+        });
+
+        let mut senders = Vec::with_capacity(transactions.len());
+        for slot in slots {
+            // Taken in index order, so the first error returned is the
+            // first error a sequential pass would have hit.
+            match slot.into_inner().unwrap().expect("every index is assigned exactly once") {
+                Ok(address) => senders.push(address),
+                Err(e) => return Err(e),
+            }
         }
         Ok(senders)
     }

@@ -680,24 +680,150 @@ The commit is no longer it. At 19.9 ms against 5.5 ms of root hashing
 and 57 ms of execution, nothing in the block is dominant enough to be
 the obvious target.
 
-What the measurement cannot see is the next question, and it is a
-larger one than it sounds. **The load test executes transactions and
-commits state, and nothing else.** It passes senders in rather than
-recovering them from signatures, builds a header with `difficulty: 1`
-and no merged-mining fields, leaves `transactions_root` and
-`receipts_root` zero, and constructs a `BlockProcessor` it never calls
-(`let _ = &processor;`). So signature recovery, proof-of-work
-validation, the transaction and receipt tries and block persistence are
-all outside every figure here. Signature recovery alone is of the order
-of 10–20 ms a block at 200 transactions, against the ~170 ms a block
-the best configuration now takes.
+What the measurement could not see was the next question, and it was a
+larger one than it sounded: **the load test executed transactions and
+committed state, and nothing else.** `--validate true` now adds the
+rest, and the answer is in the next section.
 
-That omission biases *against* parallelism rather than for it:
-everything missing is per-transaction CPU work with no ordering
-constraint, which is the kind that divides cleanly. A block whose
-sequential fraction has shrunk this much deserves to be re-measured
-with the rest of validation in it before anyone concludes what the
-thread count should be.
+## The rest of a block: what validation costs
+
+Adding `--validate true` — sender recovery, the full header rule set
+with merged-mining proof of work, the body rules, the transaction and
+receipt tries, the REMASC transaction every real block carries, and
+persisting the block — cost **28% of throughput**. Medians of three
+interleaved rounds, mainnet node stopped, 40 blocks of 200 transfers:
+
+| | wall | tx/s | validation | persist |
+|---|---:|---:|---:|---:|
+| execution only, 4 threads | 5.9 s | 1,356 | — | — |
+| **and the rest of a block** | 8.2 s | **976** | 52.6 ms | 0.9 ms |
+
+Of the 53 ms, **50 was recovering senders** — 248 us each, once per
+transaction. The header costs 6.6 us, measured separately over 300 real
+mainnet headers; the body rules and the two tries round out the rest.
+
+### It was the largest thing in the block, and it was serial
+
+`BlockProcessor::recover_senders` was a plain sequential loop, run
+before any execution thread existed:
+
+```rust
+for (i, tx) in transactions.iter().enumerate() {
+    let sender = tx.recover_sender(chain_id)?;
+    senders.push(sender);
+}
+```
+
+Every item of it is independent — no ordering, no shared state, no
+I/O, one signature each — and all of it sat in the part of a block
+that no thread count divides. It is not needed up front either: the
+senders are zipped into `(Transaction, Address)` pairs and handed to
+the executor, and nothing validates nonces before execution.
+
+Two things were wrong with it, and they multiply.
+
+**The library.** Recovery went through `k256`, pure Rust. Measured
+against `secp256k1` — the rust-bitcoin bindings to Pieter Wuille's C
+library — on three hundred real mainnet transactions, medians of five
+rounds, both backends agreeing on every address:
+
+| | median | floor |
+|---|---:|---:|
+| `k256` | 247.9 us | 230.4 us |
+| `secp256k1` | **58.8 us** | 51.7 us |
+
+**The schedule.** Nothing about recovery has to be serial.
+
+### What both were worth
+
+Three interleaved rounds, node stopped, all twelve runs on the same
+state root — the backend and the schedule changed, not what a
+signature means:
+
+| | wall | validation | us/tx |
+|---|---:|---:|---:|
+| `k256`, serial, 1 thread | 9.1 s | 53.7 ms | 267 |
+| `k256`, serial, 4 threads | 9.5 s | 53.4 ms | 265 |
+| `secp256k1`, 1 thread | 5.9 s | **13.6 ms** | 68 |
+| **`secp256k1`, parallel, 4 threads** | **5.2 s** | **7.2 ms** | **36** |
+
+- the library alone is **3.95×**, at one thread where the schedule
+  cannot help;
+- together they are **7.4×** on the phase;
+- the block is 1.83× faster at four threads, and validating throughput
+  goes from 842 to **1,538 tx/s**.
+
+Each arm's six phase measurements fall within 1.3%, so all of this is
+far above the noise.
+
+**Parallel recovery returns 1.89× on four real cores, not 4×.** Of the
+13.6 ms at one thread, about 11.8 is recovery and 1.8 is the header,
+rules and roots, which stay serial; dividing only the divisible part
+by four predicts 4.8 ms against the 7.2 measured, so recovery itself
+scaled about 2.2×. Thread creation per block and memory bandwidth are
+the obvious candidates and neither has been measured. Worth a look if
+someone wants the remaining 1.8×.
+
+**And a trap for whoever optimises this next.** Nothing on the recovery
+path takes a lock today: `signing_hash` only reads `cached_rlp`, and
+libsecp256k1's verification context is immutable once built. A sender
+cache is the obvious next step — rskj keeps one, and most of a block's
+transactions already passed through our own pool, which recovered them
+there. A `Mutex<HashMap>` consulted per transaction would serialise
+exactly this region again, and would do it invisibly: the work still
+happens, one thread at a time. Shard it, make it lock-free, or look the
+whole block up once before the threads start.
+
+## A full block, with everything on
+
+Everything above runs 200 transfers a block, which is 4.2M gas against
+a 25M limit. Here is a block filled to the limit: **1,190 native
+transfers, 24,990,000 gas**, with Arc-shared trie nodes, FlatDB, a
+prefetched access list and parallel libsecp256k1 recovery. Four
+threads, four sublists, medians of three interleaved rounds, mainnet
+node stopped. Each arm ended on one state root across its three runs.
+
+| | execution only | **whole block** |
+|---|---:|---:|
+| **sum of phases** | **388.0 ms** | **420.1 ms** |
+| wall ÷ blocks | 555 ms | 595 ms |
+| transactions/s | 3,067 | **2,833** |
+| gas/s | 64.4 M | **59.5 M** |
+
+Both time figures are real and measure different things. The sum of
+phases is what processing a block costs in steady state. The wall
+figure also carries opening the fixture and the cold first block,
+spread over only twenty blocks, which does not amortise. Quote the
+first against a benchmark that measures blocks, the second against one
+that starts a node.
+
+| phase, ms/block | execution only | whole block |
+|---|---:|---:|
+| access-list prefetch | 46.2 | 42.3 |
+| **validation** (recovery, header + PoW, rules, tries) | — | **40.7** |
+| execution | 222.0 | 213.8 |
+| ├ sublists — the only parallel part | 76.7 | 70.8 |
+| └ ordered commit | 141.6 | 141.8 |
+| write (root hash, save, flush) | 112.2 | 116.0 |
+| └ root hash | 30.3 | 29.9 |
+| lazy reload | 7.6 | 7.3 |
+
+**The commit is the largest phase again**: 141.8 ms against 70.8 to
+execute the transactions, a ratio of 2.0 where a 200-transaction block
+gives 1.0. It is linear now rather than quadratic, but it grows with
+the accounts a block touches — 2,381 here — and no sublist divides it.
+
+**Validation is no longer the problem**: 40.7 ms of 420, under 10%.
+With serial `k256` it would have been 1,190 × 248 us = 295 ms, and the
+block would take about 675 ms instead of 420.
+
+**Read the workload before comparing this to anything.** 1,190 native
+transfers is the cheapest possible block in computation and the most
+expensive in I/O per unit of gas. A real 25M-gas block of contract
+calls does far more EVM work per state access. These 420 ms are not
+"a 25M-gas block" in general; they are a 25M-gas block of transfers.
+A comparison against another client on a different mix measures the
+two mixes as much as the two clients.
 
 ## What is left
 
@@ -745,6 +871,11 @@ format and no operational plan, and it is a strictly local change to
 how the trie holds its children. 3.4× end to end, 15× on the commit,
 and twenty-four runs on the same state root.
 
+**Then the recovery work**, for the same reasons: local, no consensus
+exposure, 7.4× on the phase and 1.83× on a validating block, twelve
+runs on one state root. The library swap is the larger half and the
+simpler one.
+
 **Deploy FlatDB.** 1.76× on the read pattern execution actually uses, a
 thirtyfold smaller memory demand, no compaction, and a simpler
 durability story. Running on the mainnet node now. The remaining
@@ -767,13 +898,14 @@ count on the strength of these numbers; do re-measure once validation
 is in the workload, because that is all parallelisable work and all of
 it is currently missing.
 
-**Measure a whole block next, not a whole execution.** The sequential
-section has been profiled and the one thing in it that mattered is
-fixed. The open question is no longer which phase of execution is
-slow — it is that the load test only measures execution. Signature
-recovery, the transaction and receipt tries, header and
-proof-of-work validation and block persistence are all absent, and
-together they are now a large fraction of what a real block costs.
+**The whole block is measured now.** `--validate true` covers sender
+recovery, header and body rules with proof of work, the transaction and
+receipt tries, REMASC and block persistence. What is still outside
+every figure here is the workload itself: native transfers between
+accounts that already exist, so no run has executed a contract call or
+inserted a key. `parallel_workload` builds ERC-20 traffic and
+`--new-accounts` creates accounts the fixture does not hold; neither
+has been run.
 
 ---
 
