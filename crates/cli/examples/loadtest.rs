@@ -64,6 +64,12 @@ fn main() -> Result<()> {
     // Ways to descend the block's access list before executing it. 0 is
     // off. See `prefetch_access_list`.
     let mut prefetch: usize = 0;
+    // Percentage of recipients drawn from beyond the fixture, so the
+    // transfer creates the account rather than updating one. 0 -- the
+    // default, and what every published figure was measured at -- never
+    // inserts a key, so `TrieNode::split` is never reached and the trie
+    // keeps its shape for the whole run.
+    let mut new_accounts: u64 = 0;
 
     while let Some(flag) = args.next() {
         let value = args.next().with_context(|| format!("{flag} needs a value"))?;
@@ -84,6 +90,7 @@ fn main() -> Result<()> {
             "--expected-keys" => expected_keys = value.parse()?,
             "--flush-every" => flush_every = value.parse()?,
             "--prefetch" => prefetch = value.parse()?,
+            "--new-accounts" => new_accounts = value.parse()?,
             other => anyhow::bail!("unknown option {other}"),
         }
     }
@@ -182,7 +189,7 @@ fn main() -> Result<()> {
         }
 
         let (transactions, senders) =
-            build_transactions(number, txs, &manifest, &mut nonces);
+            build_transactions(number, txs, &manifest, new_accounts, &mut nonces);
         let header = bench_header(number, parent_hash, state.compute_hash(trie_store.as_ref()),
                                   edges_for(sublists, transactions.len()));
         let block = Block { header, transactions, ommers: Vec::new() };
@@ -505,6 +512,7 @@ fn build_transactions(
     block: u64,
     count: usize,
     manifest: &Manifest,
+    new_accounts: u64,
     nonces: &mut [u64],
 ) -> (Vec<Transaction>, Vec<(Transaction, Address)>) {
     let mut transactions = Vec::with_capacity(count);
@@ -515,7 +523,7 @@ fn build_transactions(
         let s = ((block as usize * count + i) % manifest.signers as usize) as u64;
         let key = account_key(manifest.seed, s as usize);
         let from = address_of(&key);
-        let to = recipient(manifest, block, i);
+        let to = recipient(manifest, block, i, new_accounts);
 
         let mut tx = Transaction {
             nonce: nonces[s as usize],
@@ -538,11 +546,28 @@ fn build_transactions(
 }
 
 /// An account somewhere in the fixture, chosen so the reads scatter.
-fn recipient(manifest: &Manifest, block: u64, i: usize) -> Address {
+///
+/// With `new_accounts` above zero, that share of recipients is drawn from
+/// *past* the fixture's account count instead, so the transfer inserts a
+/// key the trie does not hold. That is the only way a run reaches
+/// `TrieNode::split` and deepens the trie; at the default of zero it never
+/// does, and the run measures updates to a trie of fixed shape.
+///
+/// Two things change when it is non-zero, and a measurement has to allow
+/// for both: the final state root is no longer comparable across different
+/// values of the flag, and the trie grows as the run proceeds, so repeated
+/// runs must start from a fresh copy of the fixture to be measuring the
+/// same thing.
+fn recipient(manifest: &Manifest, block: u64, i: usize, new_accounts: u64) -> Address {
     // A multiplicative step coprime with the account count walks the whole
     // range without repeating, which a modulo of a counter would not.
-    let index = (block.wrapping_mul(2_654_435_761).wrapping_add(i as u64 * 40_503))
-        % manifest.accounts;
+    let step = block.wrapping_mul(2_654_435_761).wrapping_add(i as u64 * 40_503);
+    if new_accounts > 0 && step % 100 < new_accounts {
+        // Past the fixture's range, so no such account exists yet. The
+        // index still advances, so no two transfers create the same one.
+        return filler_address(manifest.seed, manifest.accounts + step);
+    }
+    let index = step % manifest.accounts;
     if index < manifest.signers {
         address_of(&account_key(manifest.seed, index as usize))
     } else {
