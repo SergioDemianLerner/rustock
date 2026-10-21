@@ -247,14 +247,16 @@ impl FlatDb {
         rows: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
     ) -> io::Result<()> {
         self.check_writable()?;
-        {
-            let _guard = self.writer.lock().expect("flatdb writer");
-            for (key, value) in rows {
-                self.index.put(&self.heap, &self.keys, key, value)?;
-                self.puts.fetch_add(1, Ordering::Relaxed);
-            }
-            self.committed_heap_size.store(self.heap.size(), Ordering::Release);
-        }
+        let rows: Vec<(&[u8], &[u8])> = rows.into_iter().collect();
+        // No writer mutex. Space is claimed atomically inside
+        // `append_many` and slots are published with a compare-exchange,
+        // so writers only serialise on the one atomic each needs rather
+        // than on the whole insertion -- which used to include a Keccak
+        // per probe step.
+        self.index.put_many(&self.heap, &self.keys, &rows)?;
+        self.puts.fetch_add(rows.len() as u64, Ordering::Relaxed);
+        self.committed_heap_size
+            .fetch_max(self.heap.size(), Ordering::AcqRel);
         if self.sync_writes {
             self.flush()?;
         }

@@ -331,6 +331,138 @@ impl Index {
         }
     }
 
+    /// Insert many entries with **one** heap reservation and no mutex.
+    ///
+    /// Three phases, and the middle one is the point:
+    ///
+    /// 1. probe for each key, lock-free, to find which are new — this is
+    ///    the expensive part, because the index stores no key bytes and
+    ///    a probe step has to fetch the candidate record and hash it;
+    /// 2. append all the new records in a single batch, which claims
+    ///    space once instead of once per record;
+    /// 3. publish each slot with a compare-exchange.
+    ///
+    /// Step 3 has to be a CAS and not a store. Two threads probing
+    /// concurrently can settle on the same empty slot, and a plain store
+    /// would let the second overwrite the first — leaving a record in
+    /// the heap that nothing points at and a key that cannot be found.
+    ///
+    /// Concurrent inserts of the *same* key append it twice. Content
+    /// addressing makes the two records identical, so this is wasted
+    /// space rather than a wrong answer, and a later `grow` drops the
+    /// duplicate.
+    pub fn put_many(
+        &self,
+        heap: &Heap,
+        keys: &dyn Keys,
+        rows: &[(&[u8], &[u8])],
+    ) -> io::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Room for the whole batch before anything is reserved, so a
+        // grow cannot land in the middle of one.
+        while self.size.load(Ordering::Acquire) + rows.len() as u64 > self.capacity() / 2 {
+            self.grow(heap, keys)?;
+        }
+
+        let table = self.table.read().expect("index table");
+        let key_length = keys.length();
+
+        let mut fresh: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(rows.len());
+        for (key, data) in rows {
+            if !Self::probe_finds(&table, heap, keys, key, key_length) {
+                fresh.push((key, data, data.len() > STORE_KEY_THRESHOLD));
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(());
+        }
+
+        let offsets = heap.append_many(&fresh)?;
+
+        let mut added = 0u64;
+        for ((key, _, _), offset) in fresh.iter().zip(offsets) {
+            if Self::claim_slot(&table, heap, keys, key, offset, key_length) {
+                added += 1;
+            }
+        }
+        self.size.fetch_add(added, Ordering::AcqRel);
+        self.dirty.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Is this key already in the table? Lock-free, allocation-free.
+    fn probe_finds(
+        table: &Table,
+        heap: &Heap,
+        keys: &dyn Keys,
+        key: &[u8],
+        key_length: usize,
+    ) -> bool {
+        let mask = table.capacity - 1;
+        let mut i = keys.hash(key) as u64 & mask;
+        for _ in 0..table.capacity {
+            // SAFETY: `i` is masked into the table.
+            let slot = unsafe { table.at(i) }.load(Ordering::Acquire);
+            if slot == EMPTY {
+                return false;
+            }
+            let same = heap
+                .with_record(slot - 1, key_length, |record| Self::key_of(keys, &record) == key)
+                .unwrap_or(false);
+            if same {
+                return true;
+            }
+            i = (i + 1) & mask;
+        }
+        false
+    }
+
+    /// Put `offset` into the first slot this key's probe chain can claim.
+    ///
+    /// Returns whether a new entry was added. `false` means another
+    /// thread published the same key first, which leaves this record
+    /// unreferenced in the heap.
+    fn claim_slot(
+        table: &Table,
+        heap: &Heap,
+        keys: &dyn Keys,
+        key: &[u8],
+        offset: u64,
+        key_length: usize,
+    ) -> bool {
+        let mask = table.capacity - 1;
+        let mut i = keys.hash(key) as u64 & mask;
+        for _ in 0..table.capacity {
+            // SAFETY: `i` is masked into the table.
+            let cell = unsafe { table.at(i) };
+            let slot = cell.load(Ordering::Acquire);
+            if slot == EMPTY {
+                // Release, so a reader that acquires this slot sees the
+                // record's bytes. They were published before this ran.
+                match cell.compare_exchange(
+                    EMPTY,
+                    offset + 1,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    // Lost the race; look at what landed there instead.
+                    Err(_) => continue,
+                }
+            }
+            let same = heap
+                .with_record(slot - 1, key_length, |record| Self::key_of(keys, &record) == key)
+                .unwrap_or(false);
+            if same {
+                return false;
+            }
+            i = (i + 1) & mask;
+        }
+        false
+    }
+
     /// Doubles the table into a new file and rehashes every live entry.
     ///
     /// Stop-the-world: it holds the write lock, and it reads every record

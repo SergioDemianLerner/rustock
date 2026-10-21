@@ -71,6 +71,22 @@ impl TrieStore for FlatTrieStore {
         }
     }
 
+    /// One reservation and one batch, which is what `TrieNode::save`
+    /// now hands over: a block's whole dirty subtree at once.
+    fn put_many(&self, entries: &[(Vec<u8>, Vec<u8>)]) {
+        let rows: Vec<(&[u8], &[u8])> =
+            entries.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        if let Err(e) = self.db.update_batch(rows) {
+            if !self.write_failed.swap(true, Ordering::Relaxed) {
+                error!(
+                    target: "rustock::flat_trie",
+                    "flatdb batch put failed, so this store is now incomplete \
+                     and anything computed from it is unsound: {e}"
+                );
+            }
+        }
+    }
+
     fn flush(&self) {
         if let Err(e) = self.db.flush() {
             if !self.write_failed.swap(true, Ordering::Relaxed) {

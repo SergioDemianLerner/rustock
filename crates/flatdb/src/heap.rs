@@ -69,7 +69,18 @@ pub struct Heap {
     /// shared lock, so a grow cannot move the `Vec` under a reader.
     segments: RwLock<Vec<MmapRaw>>,
     segment_size: u64,
-    /// One past the last byte written. Monotonic.
+    /// One past the last byte **reserved**. Writers move this; readers
+    /// never look at it.
+    ///
+    /// Split from `size` on purpose. `size` is the publication barrier —
+    /// `with_record` rejects anything at or beyond it, and the
+    /// release/acquire pair with it is the only thing making lock-free
+    /// reads sound. Moving that barrier to claim space would expose a
+    /// range while it is still being written, so claiming happens here
+    /// and publication happens there, in that order.
+    alloc: AtomicU64,
+    /// One past the last byte **written and published**. Monotonic, and
+    /// what every reader checks against.
     size: AtomicU64,
     /// Lowest segment touched since the last `force`.
     first_dirty: AtomicUsize,
@@ -95,6 +106,7 @@ impl Heap {
             read_only,
             segments: RwLock::new(Vec::new()),
             segment_size,
+            alloc: AtomicU64::new(committed_size),
             size: AtomicU64::new(committed_size),
             first_dirty: AtomicUsize::new(NOTHING_DIRTY),
         };
@@ -173,6 +185,181 @@ impl Heap {
             + data_length
     }
 
+    /// Claim a contiguous range for as many of `sizes` as fit in one
+    /// segment, atomically.
+    ///
+    /// Returns the frontier it claimed **from**, where the records
+    /// actually start, how many the run covers, and the new frontier.
+    ///
+    /// `from` and `start` differ when the run had to skip a segment,
+    /// because a record may not straddle one. The skipped tail belongs to
+    /// the reservation and publication has to cover it -- publishing from
+    /// `start` instead would wait for a value the frontier never takes,
+    /// and every later writer would spin behind it. That is a deadlock,
+    /// and it is how this was first written.
+    fn reserve_run(&self, sizes: &[usize]) -> io::Result<(u64, u64, usize, u64)> {
+        let segment_size = self.segment_size;
+        loop {
+            let from = self.alloc.load(Ordering::Acquire);
+            let mut start = from;
+            let mut room = segment_size - (start % segment_size);
+            if sizes[0] as u64 > room {
+                // Not even the first record fits: skip to the next segment.
+                start = (start / segment_size + 1) * segment_size;
+                room = segment_size;
+            }
+            let mut used = 0u64;
+            let mut count = 0usize;
+            for size in sizes {
+                if used + *size as u64 > room {
+                    break;
+                }
+                used += *size as u64;
+                count += 1;
+            }
+            let end = start + used;
+            if end > MAX_SIZE {
+                return Err(io::Error::other(format!(
+                    "heap would exceed the addressable limit of {MAX_SIZE} bytes"
+                )));
+            }
+            if self
+                .alloc
+                .compare_exchange_weak(from, end, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok((from, start, count, end));
+            }
+        }
+    }
+
+    /// Advance the published frontier from `from` to `to`, in order.
+    ///
+    /// Reservations complete out of order; publication must not, or
+    /// `size` would run ahead of a range still being written. A writer
+    /// that reserved earlier publishes earlier, so waiting for `size` to
+    /// reach this writer's own start is exactly the condition that every
+    /// byte below `to` is written.
+    ///
+    /// The wait is bounded by how long it takes the predecessor to copy
+    /// its own records, which is why batching matters here: a block
+    /// produces a handful of reservations rather than thousands.
+    fn publish(&self, from: u64, to: u64) {
+        let mut spins = 0u32;
+        while self
+            .size
+            .compare_exchange_weak(from, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// Appends many records at once and returns their offsets, in order.
+    ///
+    /// Space for the whole batch is claimed in one atomic step; the bytes
+    /// are then copied with **no lock held**, so several writers overlap;
+    /// and the range is published once, in reservation order.
+    pub fn append_many(&self, records: &[(&[u8], &[u8], bool)]) -> io::Result<Vec<u64>> {
+        let sizes: Vec<usize> = records
+            .iter()
+            .map(|(key, data, store_key)| Self::record_size(data.len(), *store_key, key.len()))
+            .collect();
+        for (size, (_, data, _)) in sizes.iter().zip(records) {
+            if *size as u64 > self.segment_size {
+                return Err(io::Error::other(format!(
+                    "record of {size} bytes ({} of data) exceeds the segment size of {}",
+                    data.len(),
+                    self.segment_size
+                )));
+            }
+        }
+
+        let mut offsets = Vec::with_capacity(records.len());
+        let mut done = 0usize;
+        while done < records.len() {
+            let (from, start, count, end) = self.reserve_run(&sizes[done..])?;
+            debug_assert!(count > 0, "a reservation that fits nothing cannot make progress");
+
+            let segment = (start / self.segment_size) as usize;
+            // Mapping can fail, and returning here without publishing
+            // would strand every writer queued behind this reservation.
+            // The range is released as written-but-empty: nothing points
+            // into it, so it is dead space and not a wrong answer.
+            if let Err(e) = self.map_up_to(segment) {
+                self.publish(from, end);
+                return Err(e);
+            }
+
+            let segments = self.segments.read().expect("heap segments");
+            let base = segments[segment].as_mut_ptr();
+            let mut at = start;
+            for index in done..done + count {
+                let (key, data, store_key) = records[index];
+                // SAFETY: this range was claimed by this thread alone and
+                // lies wholly inside one mapped segment, so no other
+                // thread writes it and no reader can reach it -- `size`
+                // still sits at or below `start`.
+                unsafe {
+                    self.write_record(base, (at % self.segment_size) as usize, key, data, store_key);
+                }
+                offsets.push(at);
+                at += sizes[index] as u64;
+            }
+            drop(segments);
+
+            self.first_dirty.fetch_min(segment, Ordering::Relaxed);
+            self.publish(from, end);
+            done += count;
+        }
+        Ok(offsets)
+    }
+
+    fn map_up_to(&self, segment: usize) -> io::Result<()> {
+        let mut segments = self.segments.write().expect("heap segments");
+        while segment >= segments.len() {
+            let next = segments.len();
+            segments.push(self.map_segment(next)?);
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    ///
+    /// `offset` plus the record's size must lie inside the segment `base`
+    /// maps, and the range must be claimed by this thread alone.
+    unsafe fn write_record(
+        &self,
+        base: *mut u8,
+        offset: usize,
+        key: &[u8],
+        data: &[u8],
+        store_key: bool,
+    ) {
+        let mut p = base.add(offset);
+        std::ptr::copy_nonoverlapping(MAGIC.to_be_bytes().as_ptr(), p, MAGIC_LENGTH);
+        p = p.add(MAGIC_LENGTH);
+        if Self::length_field_size(data.len(), store_key) == 1 {
+            *p = data.len() as u8;
+            p = p.add(1);
+        } else {
+            let header =
+                LONG_FORM_BIT | if store_key { KEY_STORED_BIT } else { 0 } | data.len() as u32;
+            std::ptr::copy_nonoverlapping(header.to_be_bytes().as_ptr(), p, 4);
+            p = p.add(4);
+        }
+        if store_key {
+            std::ptr::copy_nonoverlapping(key.as_ptr(), p, key.len());
+            p = p.add(key.len());
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+    }
+
     /// Appends a record and returns its offset.
     ///
     /// A record never straddles a segment boundary: if it does not fit in
@@ -180,72 +367,10 @@ impl Heap {
     /// offsets monotonic and lets a read resolve an offset to exactly one
     /// mapping.
     ///
-    /// The caller must serialise calls to this; `FlatDb` does so with its
-    /// writer mutex. Readers need no such exclusion.
+    /// Safe to call concurrently: see [`Self::append_many`], which this
+    /// is a one-record case of.
     pub fn append(&self, key: &[u8], data: &[u8], store_key: bool) -> io::Result<u64> {
-        let total = Self::record_size(data.len(), store_key, key.len());
-        if total as u64 > self.segment_size {
-            return Err(io::Error::other(format!(
-                "record of {total} bytes exceeds the segment size of {}",
-                self.segment_size
-            )));
-        }
-
-        let mut size = self.size.load(Ordering::Relaxed);
-        let mut segment = (size / self.segment_size) as usize;
-        let mut offset = (size % self.segment_size) as usize;
-        if offset + total > self.segment_size as usize {
-            segment += 1;
-            offset = 0;
-            size = segment as u64 * self.segment_size;
-        }
-        if size + total as u64 > MAX_SIZE {
-            return Err(io::Error::other(format!(
-                "heap would exceed the addressable limit of {MAX_SIZE} bytes"
-            )));
-        }
-
-        {
-            let mut segments = self.segments.write().expect("heap segments");
-            while segment >= segments.len() {
-                let next = segments.len();
-                segments.push(self.map_segment(next)?);
-            }
-        }
-
-        let segments = self.segments.read().expect("heap segments");
-        let base = segments[segment].as_mut_ptr();
-        // SAFETY: `offset + total <= segment_size` was checked above, so
-        // every write below lands inside the mapping. These bytes are at or
-        // beyond the write frontier, which means no slot points at them
-        // yet, which means no reader can be looking at them: a reader only
-        // reaches a record through a slot, and the slot is published with a
-        // release store *after* this returns.
-        unsafe {
-            let mut p = base.add(offset);
-            std::ptr::copy_nonoverlapping(MAGIC.to_be_bytes().as_ptr(), p, MAGIC_LENGTH);
-            p = p.add(MAGIC_LENGTH);
-            if Self::length_field_size(data.len(), store_key) == 1 {
-                *p = data.len() as u8;
-                p = p.add(1);
-            } else {
-                let header = LONG_FORM_BIT
-                    | if store_key { KEY_STORED_BIT } else { 0 }
-                    | data.len() as u32;
-                std::ptr::copy_nonoverlapping(header.to_be_bytes().as_ptr(), p, 4);
-                p = p.add(4);
-            }
-            if store_key {
-                std::ptr::copy_nonoverlapping(key.as_ptr(), p, key.len());
-                p = p.add(key.len());
-            }
-            std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
-        }
-        drop(segments);
-
-        self.first_dirty.fetch_min(segment, Ordering::Relaxed);
-        self.size.store(size + total as u64, Ordering::Release);
-        Ok(size)
+        Ok(self.append_many(&[(key, data, store_key)])?[0])
     }
 
     /// Reads the record at `offset` and hands it to `f`, or returns `None`
@@ -399,7 +524,12 @@ impl Heap {
 
     /// Drops the frontier back to a committed position, discarding appends
     /// that no checkpoint ever made real.
+    ///
+    /// Both cursors move: leaving `alloc` ahead would make the next
+    /// reservation skip the space being reclaimed, and leaving it behind
+    /// would hand out a range that is already published.
     pub fn truncate_to(&self, committed_size: u64) {
+        self.alloc.store(committed_size, Ordering::Release);
         self.size.store(committed_size, Ordering::Release);
     }
 }
@@ -531,5 +661,112 @@ mod tests {
             let offset = heap.append(&[5u8; 32], &data, store_key).unwrap();
             assert_eq!(read_data(&heap, offset).unwrap(), data, "length {length}");
         }
+    }
+
+    /// A batch that does not fit in the current segment reserves across
+    /// the skip, and publication has to cover the skipped tail. Getting
+    /// that wrong deadlocks: the frontier waits for a value it never
+    /// takes. This is the test that caught it.
+    #[test]
+    fn a_batch_that_skips_a_segment_still_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let heap = heap(dir.path());
+        let big = vec![0xCDu8; 20_000];
+
+        // Fill until only a little of the first segment is left.
+        while heap.size() % TEST_SEGMENT < TEST_SEGMENT - 25_000 {
+            heap.append(&[0u8; 32], &big, false).unwrap();
+        }
+        let before = heap.size();
+
+        // A batch that cannot fit in what remains.
+        let records: Vec<(&[u8], &[u8], bool)> =
+            (0..4).map(|_| (&[1u8; 32][..], &big[..], false)).collect();
+        let offsets = heap.append_many(&records).unwrap();
+
+        assert_eq!(offsets.len(), 4);
+        assert!(heap.size() > before, "the frontier moved past the skip");
+        // The point of the test: a skip must actually have happened, or
+        // it is exercising the ordinary path and would not have caught
+        // the deadlock.
+        let segments: std::collections::BTreeSet<u64> =
+            offsets.iter().map(|o| o / TEST_SEGMENT).collect();
+        assert!(
+            segments.len() > 1 || offsets[0] % TEST_SEGMENT == 0,
+            "no segment boundary was crossed: offsets {offsets:?}"
+        );
+        for offset in &offsets {
+            assert_eq!(read_data(&heap, *offset).unwrap(), big, "offset {offset}");
+        }
+    }
+
+    /// Several threads appending at once must get disjoint ranges, and
+    /// every record must be readable afterwards. The frontier is the only
+    /// thing they share.
+    #[test]
+    fn concurrent_batches_do_not_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let heap = Heap::open(dir.path(), false, 0, 1 << 22).unwrap();
+
+        let per_thread = 200usize;
+        let all: Vec<Vec<Vec<u8>>> = (0..4u8)
+            .map(|t| {
+                (0..per_thread)
+                    .map(|i| {
+                        let mut v = vec![t; 60];
+                        v[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                        v
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let results: Vec<Vec<u64>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = all
+                .iter()
+                .map(|mine| {
+                    let heap = &heap;
+                    scope.spawn(move || {
+                        let records: Vec<(&[u8], &[u8], bool)> =
+                            mine.iter().map(|v| (&[7u8; 32][..], v.as_slice(), false)).collect();
+                        heap.append_many(&records).unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Every record reads back as itself: no two writers shared a byte.
+        for (offsets, mine) in results.iter().zip(&all) {
+            for (offset, expected) in offsets.iter().zip(mine) {
+                assert_eq!(read_data(&heap, *offset).as_ref(), Some(expected));
+            }
+        }
+        // And every offset handed out is distinct.
+        let mut flat: Vec<u64> = results.iter().flatten().copied().collect();
+        let handed = flat.len();
+        flat.sort_unstable();
+        flat.dedup();
+        assert_eq!(flat.len(), handed, "two writers were given the same offset");
+    }
+
+    /// The published frontier never runs ahead of the written bytes, which
+    /// is what makes a lock-free read sound. After every batch it must
+    /// equal the reservation cursor, with nothing in flight.
+    #[test]
+    fn publication_catches_up_to_every_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let heap = Heap::open(dir.path(), false, 0, 1 << 22).unwrap();
+        let value = vec![3u8; 80];
+        let records: Vec<(&[u8], &[u8], bool)> =
+            (0..500).map(|_| (&[2u8; 32][..], value.as_slice(), false)).collect();
+        for _ in 0..5 {
+            heap.append_many(&records).unwrap();
+        }
+        assert_eq!(
+            heap.size(),
+            heap.alloc.load(Ordering::Acquire),
+            "a reservation was never published"
+        );
     }
 }

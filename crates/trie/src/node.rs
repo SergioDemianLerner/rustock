@@ -921,28 +921,58 @@ impl TrieNode {
     }
 
     /// Recursively saves this node (and its children) to the store.
+    /// Persist this node and everything dirty beneath it.
+    ///
+    /// The whole subtree is collected first and written in **one** call.
+    /// A block rewrites roughly 6,900 nodes -- every node on the path
+    /// from each touched account up to the root -- and handing them over
+    /// singly makes the store pay its per-write cost that many times. For
+    /// an append-only store that cost includes reserving space in a
+    /// frontier shared between threads, which is the part that has to be
+    /// serialised; one batch reserves once.
     pub fn save(&mut self, store: &dyn TrieStore, is_root: bool) {
+        let mut batch = Vec::new();
+        self.collect_for_save(store, is_root, &mut batch);
+        if !batch.is_empty() {
+            store.put_many(&batch);
+        }
+    }
+
+    /// The body of [`Self::save`], accumulating instead of writing.
+    ///
+    /// Reads still go to the store while this runs -- `to_message` and
+    /// `is_embeddable` consult it -- but only for nodes that are already
+    /// there. Everything this produces is in memory and is reachable
+    /// through the node graph, so nothing in the batch is needed to build
+    /// the rest of it.
+    fn collect_for_save(
+        &mut self,
+        store: &dyn TrieStore,
+        is_root: bool,
+        batch: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
         if self.saved {
             return;
         }
 
-        // Recursively save children if they are in-memory
+        // Children first, so a parent's message is built from children
+        // whose hashes are settled.
         if let NodeRef::Node(ref mut child) = self.left {
-            child.save(store, false);
+            child.collect_for_save(store, false, batch);
         }
         if let NodeRef::Node(ref mut child) = self.right {
-            child.save(store, false);
+            child.collect_for_save(store, false, batch);
         }
 
-        // Save long values separately
+        // A long value lives outside its node, under its own hash.
         if self.has_long_value() {
             if let Some(ref v) = self.value {
                 let vh = self.get_value_hash();
-                store.put(vh.as_slice(), v);
+                batch.push((vh.as_slice().to_vec(), v.clone()));
             }
         }
 
-        // Embeddable non-root nodes are not stored independently
+        // Embeddable non-root nodes are not stored independently.
         if self.is_embeddable(store) && !is_root {
             self.saved = true;
             return;
@@ -954,7 +984,7 @@ impl TrieNode {
         // dirty subtree beneath this node, not merely this node.
         let msg = self.to_message(store);
         let hash = *self.hash_cache.get_or_init(|| keccak(&msg));
-        store.put(hash.as_slice(), &msg);
+        batch.push((hash.as_slice().to_vec(), msg));
         self.saved = true;
     }
 }
