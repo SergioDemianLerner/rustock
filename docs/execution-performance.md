@@ -257,9 +257,17 @@ run-to-run spread.
 only the sublists. The block-level maintenance run, the ordered commit,
 the root hashing and the lazy reload are all sequential. Measured on
 FlatDB, where reads no longer hide it, the parallel fraction is **16%**
-at 200 transactions a block and 32% at 40 — and it *shrinks as writes
-grow*, because the writes inside the sublists serialise on the store's
-writer mutex ([#319](https://github.com/SergioDemianLerner/rustock/issues/319)).
+at 200 transactions a block and 32% at 40 — it *shrinks as writes grow*.
+
+That was first read as a lock inside the parallel region, and the
+store's writer mutex was removed to test it. Nothing got faster: 1/2/3/4
+threads went from 64.1 / 67.2 / 62.8 / 58.7 s to 64.4 / 67.2 / 63.4 /
+57.6 s. The duller explanation is the right one — more transactions mean
+more **sequential** work per block, not more contention. More nodes to
+hash when recomputing the root, more to walk in the ordered commit, more
+to write; work that grows with block size and that no thread count
+divides. [`flatdb-writer-lock.md`](flatdb-writer-lock.md) records the
+disproof.
 
 With a fast store, four threads buy 1.09×.
 
@@ -429,21 +437,20 @@ Amdahl, at most a third of a block is parallelisable; the rest is:
 - the block-level maintenance run,
 - the ordered commit of each sublist,
 - the root hashing, which walks every dirty node,
-- the lazy reload of the root between blocks,
-- and, inside the sublists, the writes serialising on the store's
-  writer mutex.
+- the lazy reload of the root between blocks.
 
-That last one has a known fix and a known ceiling of about 10% of wall
-clock — [`flatdb-writer-lock.md`](flatdb-writer-lock.md) explains it from
-scratch for someone who has not read the store's code, and
-[#319](https://github.com/SergioDemianLerner/rustock/issues/319) tracks it —
-with the naive version of it disproved — `size` is both the allocation
-cursor and the publication barrier, so reserving ahead of writing breaks
-the release/acquire pair that makes lock-free reads sound.
+All four are sequential by construction and **none of them has been
+profiled**. That is where the next measurement should go: it is the
+larger share, and it is the only one left that has not been ruled out.
 
-The other four are sequential by construction and have not been
-profiled. **That is where the next measurement should go**, because it
-is now the larger share.
+What has been ruled out is the store's writer mutex. It was the obvious
+suspect — scaling tracked write volume, which looks exactly like a lock
+inside the parallel region — and removing it changed nothing measurable.
+[`flatdb-writer-lock.md`](flatdb-writer-lock.md) records that, along
+with the regression the same work introduced: batching the writes made
+one thread 1.16–1.80× faster and four threads slower than one, because
+publication is ordered and a reservation is now a whole sublist rather
+than a single record.
 
 ---
 
@@ -451,9 +458,10 @@ is now the larger share.
 
 **Deploy FlatDB.** 1.76× on the read pattern execution actually uses, a
 thirtyfold smaller memory demand, no compaction, and a simpler
-durability story. Running on the mainnet node now. The remaining work is
-in issues #319 and the operational items in
-[`flatdb-rollout.md`](flatdb-rollout.md).
+durability story. Running on the mainnet node now. The remaining work
+is the ordered-publication regression in
+[`flatdb-writer-lock.md`](flatdb-writer-lock.md) §4 and the operational
+items in [`flatdb-rollout.md`](flatdb-rollout.md).
 
 **Pursue the access list, as a peer-supplied hint.** The cheapest
 intervention measured and the second largest, with no consensus

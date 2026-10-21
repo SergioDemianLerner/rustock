@@ -558,8 +558,7 @@ on a single thread is the fastest of the eight, and adding threads to it
 makes it *slower* — 50.4 s against 58.0 s. Parallel sublist execution
 contributes nothing once reads stop being the constraint, and then costs
 something: each sublist rewrites the top of the trie independently
-against the same base, and the writes serialise on FlatDB's writer mutex
-(#319).
+against the same base, which is more total work for the same result.
 
 **The levers do not add up, because they attack the same bottleneck.**
 All three — a faster store, a prefetched access list, more threads —

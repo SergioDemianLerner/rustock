@@ -332,7 +332,7 @@ them. **And it scales 1.09×**, against RocksDB's 1.39×.
 99% CPU on four cores is one core busy. The bottleneck stopped being the
 disk and became a lock.
 
-### Write volume governs it (#319)
+### Write volume governs the scaling, but not for the reason it looked like
 
 60 blocks on FlatDB, varying only the transactions:
 
@@ -341,15 +341,28 @@ disk and became a lock.
 | 200 | 43.4 s | 38.0 s | 1.14× | 93% |
 | 40 | 18.2 s | 13.9 s | 1.31× | 41% |
 
-Cutting writes five-fold raises the scaling. By Amdahl the parallel
-fraction is 16% at 200 tx and 32% at 40: it **shrinks as writes grow**,
-which is what a lock inside the parallel region looks like. That lock is
-`FlatDb`'s writer mutex, held across the probe, the key comparison, the
-heap append and the slot store, some 6,900 times a block.
+Cutting writes five-fold raises the scaling, and the parallel fraction
+by Amdahl goes from 16% to 32%. That was read as a lock inside the
+parallel region — `FlatDb`'s writer mutex, held across the probe, the
+key comparison, the heap append and the slot store some 6,900 times a
+block.
 
-[`flatdb-writer-lock.md`](flatdb-writer-lock.md) is a standalone
-explanation of this for someone picking it up cold, with the code
-quoted and the two fixes spelled out.
+**It was removed, and nothing got faster.** 1/2/3/4 threads went from
+64.1 / 67.2 / 62.8 / 58.7 s to 64.4 / 67.2 / 63.4 / 57.6 s. The mutex
+was real and cost about 7 ms against a 611 ms block: visible in a
+profile, invisible in a wall clock.
+
+What the gap actually reflects is that more transactions mean more
+**sequential** work per block — more nodes to hash recomputing the root,
+more to walk in the ordered commit, more to write — and no thread count
+divides that.
+
+[`flatdb-writer-lock.md`](flatdb-writer-lock.md) records the disproof
+and the concurrency of the write path as it stands, for someone picking
+it up cold. It also covers what *is* serialising now: batching the
+writes made one thread 1.16–1.80× faster and made four threads slower
+than one, because publication is ordered and a reservation is now a
+whole sublist rather than a single record.
 
 ### Why the obvious fix is unsound
 

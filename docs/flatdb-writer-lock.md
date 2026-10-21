@@ -1,317 +1,267 @@
-# The lock that is holding back parallel execution
+# What serialises FlatDB's writes
 
-A guide to one specific bottleneck in FlatDB, written for someone who
-did not write the code and wants to fix it.
+A guide to the concurrency of FlatDB's write path, for someone who did
+not write the code and wants to make it faster.
 
-No prior knowledge of the store is assumed. Everything you need is
-quoted here.
+It is also the record of a hypothesis that was wrong. An earlier version
+of this document argued that a writer mutex was holding back parallel
+execution, and said how to remove it. The mutex was removed. **Nothing
+got faster.** That result is kept here because the reasoning behind the
+hypothesis looked sound and was not, and the next person deserves to
+know which arguments already failed.
 
-Related: [#319](https://github.com/SergioDemianLerner/rustock/issues/319)
-for the issue, [`execution-performance.md`](execution-performance.md)
-for where this sits among the other bottlenecks, and `crates/flatdb/`
-for the code.
+No prior knowledge of the store is assumed.
+
+Related: [#320](https://github.com/SergioDemianLerner/rustock/issues/320)
+for the live problem,
+[`execution-performance.md`](execution-performance.md) for where this
+sits among the other bottlenecks, and `crates/flatdb/` for the code.
 
 ---
 
-## 1. The symptom
+## 1. Where things stand
 
-Execute 100 blocks on a four-core machine, varying only the thread
-count:
+Executing 100 blocks of 200 native transfers on a four-core machine,
+before and after the mutex was removed:
 
-| threads | wall | CPU |
+| threads | with the mutex | without it |
 |---|---|---|
-| 1 | 64.1 s | 67% |
-| 2 | 67.2 s | 89% |
-| 3 | 62.8 s | 96% |
-| 4 | 58.7 s | **99%** |
+| 1 | 64.1 s | 64.4 s |
+| 2 | 67.2 s | 67.2 s |
+| 3 | 62.8 s | 63.4 s |
+| 4 | 58.7 s (99% CPU) | 57.6 s (101% CPU) |
 
-Four threads buy 9%.
+Four threads on four cores still reach about one core's worth of CPU.
+Scaling went from 1.09× to 1.12×, which is inside the run-to-run spread.
 
-The CPU column is the tell. On four cores, work that genuinely ran on
-four threads would approach **400%**. It reaches 99% — one core's worth.
-Three of the four threads are, on average, doing nothing.
+**The mutex was not the bottleneck.** It existed, it did serialise
+writers, and removing it bought nothing measurable.
 
-They are not waiting on the disk. That was the previous bottleneck and
-it was fixed; the same test on the old store sat at 46% CPU with one
-thread, meaning it spent half its time waiting for reads. FlatDB made
-reads cheap. The threads now wait on **each other**.
+### What the same change did buy
 
----
+The work that replaced the mutex also batched the writes — a block's
+whole dirty subtree is collected and written in one call instead of
+roughly 6,900 — and *that* paid, on a single thread:
 
-## 2. Where the lock is
-
-One line, in `crates/flatdb/src/lib.rs`:
-
-```rust
-pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
-    self.check_writable()?;
-    {
-        let _guard = self.writer.lock().expect("flatdb writer");   // <-- here
-        self.index.put(&self.heap, &self.keys, key, value)?;
-        self.puts.fetch_add(1, Ordering::Relaxed);
-        self.committed_heap_size.store(self.heap.size(), Ordering::Release);
-    }
-    ...
-}
-```
-
-Every write to the store passes through that mutex, one at a time.
-
-A block of 200 transactions rewrites roughly **6,900 trie nodes** —
-every node on the path from each touched account up to the root. All
-6,900 go through this lock, however many threads are executing.
-
-Reads do not. `Index::get` takes no exclusive lock at all and several
-threads can be inside it at once. The asymmetry is deliberate and it is
-why reads scale and writes do not.
-
----
-
-## 3. What the lock is actually protecting
-
-`index.put` does three things while holding it. Only one of them needs
-protection.
-
-### (a) Probing — does not need the lock
-
-The index is a hash table with linear probing. To insert, you walk
-forward from `hash(key)` until you find an empty slot, checking each
-occupied one in case your key is already there.
-
-The check is expensive, and for a reason specific to this design: **the
-index stores no key bytes.** A slot holds nothing but a heap offset. So
-to ask "is this slot my key?", you have to fetch the record it points at
-and recompute `H(value)`:
-
-```rust
-fn key_of(keys: &dyn Keys, record: &Record<'_>) -> Vec<u8> {
-    match record.key {
-        Some(stored) => stored.to_vec(),
-        None => keys.compute_key(record.data),     // a Keccak-256, ~483 ns
-    }
-}
-```
-
-That is a hash per probe step, roughly 1.5 steps per insert, plus a
-possible page fault to fetch the record. **None of it mutates
-anything.** Two threads probing at the same time cannot interfere.
-
-### (b) Publishing a slot — does not need the lock
-
-Once a free slot is found, the record's location is written into it:
-
-```rust
-unsafe { table.at(target) }.store(offset + 1, Ordering::Release);
-```
-
-`table.at(i)` returns an `&AtomicU64`. This is already an atomic
-operation with release ordering — it is *designed* to be safe without a
-lock. The matching `Ordering::Acquire` is in `get`.
-
-### (c) Appending to the heap — **this one does need it**
-
-```rust
-pub fn append(&self, key: &[u8], data: &[u8], store_key: bool) -> io::Result<u64> {
-    let total = Self::record_size(data.len(), store_key, key.len());
-
-    let mut size = self.size.load(Ordering::Relaxed);        // 1. read the frontier
-    let mut segment = (size / self.segment_size) as usize;
-    let mut offset = (size % self.segment_size) as usize;
-    if offset + total > self.segment_size as usize {          // 2. maybe skip a segment
-        segment += 1;
-        offset = 0;
-        size = segment as u64 * self.segment_size;
-    }
-    ...
-    unsafe {
-        /* 3. write the record's bytes at `offset` */
-    }
-    self.size.store(size + total as u64, Ordering::Release);  // 4. publish
-    Ok(size)
-}
-```
-
-Step 1 reads `size`, step 4 writes it back. That is a **read-modify-write
-that is not atomic**. Two threads running this concurrently both read the
-same `size`, both decide to write at the same offset, and one record
-lands on top of the other.
-
-So the lock is genuinely load-bearing — but only for this, and this is
-the cheap part. The expensive parts, the probe and its hashes, are
-inside the lock for no reason.
-
----
-
-## 4. The obvious fix is wrong, and here is why
-
-The natural idea: make the reservation atomic and move the byte-writing
-outside.
-
-```rust
-let start = self.size.fetch_add(total, Ordering::AcqRel);   // reserve
-/* write the bytes at `start`, no lock held */               // then write
-```
-
-Each thread gets its own range, so no two writes overlap. It looks
-right. **It is not**, and the reason is the single most important thing
-in this document.
-
-`size` has **two jobs at once**. It is the allocation cursor, and it is
-also the signal that says "everything below here is written and safe to
-read". Here is the reader:
-
-```rust
-pub fn with_record<R>(&self, offset: u64, key_length: usize, f: ...) -> Option<R> {
-    let size = self.size.load(Ordering::Acquire);
-    if offset >= size {
-        return None;              // beyond the frontier: not a record
-    }
-    ...                           // otherwise, read the bytes
-}
-```
-
-The pairing is what makes lock-free reading safe:
-
-- the writer writes the bytes, **then** stores `size` with `Release`;
-- the reader loads `size` with `Acquire`, **then** reads the bytes.
-
-A reader therefore either sees the old `size` — and rejects the offset
-as beyond the frontier — or sees the new one, in which case the
-release/acquire edge guarantees the bytes it is about to read are
-already there.
-
-`fetch_add` before writing **moves the frontier in front of the bytes**.
-There is now a window where `size` says a range is readable and the
-range contains whatever was there before, while a thread is overwriting
-it.
-
-Can a reader actually land in that window? Yes. Slots are never cleared,
-so the table can hold slots left behind by an interrupted flush, pointing
-at offsets that were beyond the frontier at the time. As the frontier
-advances past them they start resolving again (the store calls these
-*resurrected* slots and handles them deliberately). A reader following
-one lands exactly in the range being written.
-
-A common objection: *the content is address-checked, so a bad read is
-rejected anyway.* That argument is about which **values** come back. A
-concurrent read and write of the same memory with no synchronisation
-between them is a data race, and a data race is undefined behaviour
-regardless of what values it would have produced. The compiler is
-entitled to assume it cannot happen.
-
----
-
-## 5. Two fixes that do work
-
-### Option A — narrow the lock (simpler)
-
-Keep the mutex, but hold it only for the append and the slot store.
-Move the probe and its hashing outside.
-
-```
-outside the lock:  probe from hash(key), find a candidate slot
-                   (or discover the key is already present — then stop)
-inside the lock:   resume probing from the candidate, append, publish
-```
-
-Why resuming is correct: a slot that was occupied when you probed it
-stays occupied. The only thing that empties slots is `grow`, which takes
-the table's *write* lock and would make your candidate stale — detect a
-capacity change and start over.
-
-What you get: the hashing and the record fetches, which are the bulk of
-the time, now overlap across threads. The remaining critical section is
-a memcpy of about 75 bytes plus an atomic store.
-
-Watch for: two threads may insert the same key concurrently, since
-neither sees the other's unpublished slot. That is already a handled
-condition — content addressing means both records are identical, and
-`grow` drops duplicates — but it does mean the entry count can
-temporarily exceed the live key count.
-
-### Option B — split the two jobs of `size` (faster, more work)
-
-Give the heap two frontiers:
-
-- `alloc` — the allocation cursor. Reserved with a CAS loop, which also
-  handles the segment skip atomically.
-- `size` — the publication frontier. Advanced **only in order**.
-
-```
-let (start, end) = reserve();              // CAS on `alloc`
-write the bytes into [start, end);         // no lock held, fully concurrent
-while size.load(Acquire) != start { yield }   // wait your turn
-size.store(end, Release);                  // publish
-```
-
-The invariant survives exactly: `size` still only advances when
-everything below it is written, so `with_record` is unchanged and reads
-stay safe.
-
-The expensive part — the memcpy and the page faults it causes on fresh
-heap pages — now genuinely overlaps. Only the publication is ordered,
-and that is a single atomic store.
-
-Cost: a thread descheduled after reserving blocks later publishers until
-it finishes writing one record.
-
----
-
-## 6. How to tell whether you fixed it
-
-Two measurements, in this order.
-
-**Does the CPU go up?** This is the direct test. Four threads at 99% on
-four cores is the symptom. If your change does not move that number, it
-did not remove the serialisation, whatever the wall clock says.
-
-```sh
-/usr/bin/time -f "%P %e" cargo run --release --example parallel_bench -- <fixture> \
-    --threads 4 --sublists 4 --txs 200 --blocks 100 --flatdb true --flush-every 100
-```
-
-**Does the scaling track the write volume?** This is how the lock was
-located in the first place, and it is the sharper test.
-
-| tx/block | 1 thread | 4 threads | scaling |
+| 60 blocks, one thread | before | after | |
 |---|---|---|---|
-| 200 | 43.4 s | 38.0 s | 1.14× |
-| 40 | 18.2 s | 13.9 s | 1.31× |
+| 200 tx/block | 43.4 s | **37.3 s** | 1.16× |
+| 40 tx/block | 18.2 s | **10.1 s** | **1.80×** |
 
-Fewer writes, better scaling — the parallel region shrinks as writes
-grow, which is what a lock inside it looks like. **After a correct fix,
-those two scaling numbers should converge.** If 200 tx/block still
-scales noticeably worse than 40, something is still serialised.
+Which matters, because RSKIP-144 is unscheduled on mainnet and the node
+executes on one thread.
 
-Run it with `--txs 200` and `--txs 40`, one and four threads, 60 blocks.
+### And what it broke
 
-And the correctness gate, which costs nothing: `parallel_bench` prints
-the final state root. **It must not change.** Every run in the
-measurements above ends on the same root; a change means the fix altered
-the chain, not its speed.
+| 60 blocks, 200 tx | before | after |
+|---|---|---|
+| 1 thread | 43.4 s | 37.3 s |
+| 4 threads | 38.0 s | **42.2 s** |
+
+With full blocks, four threads are now **slower than one**. That
+regression is the subject of section 4 and is the thing actually worth
+fixing.
 
 ---
 
-## 7. What it is worth, so you can decide whether to start
+## 2. How the write path works now
 
-Be realistic about the ceiling before spending a week on it.
+Three pieces, and only the middle one still orders anything.
 
-Applying Amdahl's law to the measurements, the parallel fraction of a
-block is **16%** at 200 transactions and **32%** at 40. Perfect removal
-of the lock recovers what the writes are stealing — roughly from 16%
-back towards 32% — which is about **10% of wall clock**.
+### The heap has two frontiers
 
-It is not 4×, and the reason is that most of a block is sequential by
-construction and has nothing to do with this lock:
+```rust
+/// One past the last byte **reserved**. Writers move this.
+alloc: AtomicU64,
+/// One past the last byte **written and published**. Every reader
+/// checks against this.
+size: AtomicU64,
+```
+
+They are separate for a reason that constrains every change here.
+`size` is the publication barrier: the writer stores it with `Release`
+*after* copying the bytes, and the reader loads it with `Acquire`
+*before* reading them.
+
+```rust
+// with_record, the read path
+let size = self.size.load(Ordering::Acquire);
+if offset >= size {
+    return None;              // beyond the frontier: not a record
+}
+```
+
+A reader therefore either sees the old `size` and rejects the offset, or
+sees the new one — and the release/acquire edge guarantees the bytes are
+already there. **This is the only thing making lock-free reads sound.**
+Any scheme that lets `size` run ahead of written bytes is a data race,
+whatever the values would have been.
+
+### Space is claimed with a CAS
+
+```rust
+fn reserve_run(&self, sizes: &[usize]) -> io::Result<(u64, u64, usize, u64)> {
+    loop {
+        let from = self.alloc.load(Ordering::Acquire);
+        let mut start = from;
+        let mut room = segment_size - (start % segment_size);
+        if sizes[0] as u64 > room {
+            start = (start / segment_size + 1) * segment_size;   // skip
+            room = segment_size;
+        }
+        /* take as many records as fit in `room` */
+        if self.alloc.compare_exchange_weak(from, end, AcqRel, Acquire).is_ok() {
+            return Ok((from, start, count, end));
+        }
+    }
+}
+```
+
+It returns `from` *and* `start` because they differ when a record would
+have straddled a segment and the run had to skip one. The reservation
+covers the skipped tail, so publication must too — keying publication on
+`start` instead makes the barrier wait for a value it never takes, which
+deadlocks every later writer. That was a real bug and
+`a_batch_that_skips_a_segment_still_publishes` is the test for it.
+
+### Slots are published with a compare-exchange
+
+```rust
+match cell.compare_exchange(EMPTY, offset + 1, Release, Acquire) {
+    Ok(_) => return true,
+    Err(_) => continue,        // someone took it; look at what landed
+}
+```
+
+A plain store would not do. Two threads probing concurrently can settle
+on the same empty slot, and the loser's record would be left in the heap
+with nothing pointing at it.
+
+---
+
+## 3. Why the mutex hypothesis failed
+
+Worth understanding, because the evidence for it was real.
+
+Scaling tracked write volume: 1.14× at 200 transactions a block against
+1.31× at 40. The parallel region appeared to shrink as writes grew,
+which is what a lock inside it looks like. The inference was that the
+writes were serialising on the mutex.
+
+They were. It just did not cost anything worth measuring. The mutex held
+the probe, the key comparison and the append — about a microsecond each,
+6,900 times a block, call it 7 ms against a 611 ms block. Visible in a
+profile, invisible in a wall clock.
+
+The gap between 1.14× and 1.31× had a duller explanation: **more
+transactions mean more sequential work per block**, not more contention.
+More nodes to hash when recomputing the root, more to walk in the
+ordered commit, more to write. Work that grows with block size and that
+no thread count divides.
+
+The test proposed at the time — "after a correct fix those two scaling
+numbers should converge" — was the right test. They were measured again
+after the fix and they **diverged**: 0.88× and 1.32×. A good test that
+refuted the thing it was built to confirm.
+
+---
+
+## 4. What is actually serialising now
+
+```rust
+fn publish(&self, from: u64, to: u64) {
+    let mut spins = 0u32;
+    while self.size.compare_exchange_weak(from, to, AcqRel, Acquire).is_err() {
+        spins += 1;
+        if spins < 64 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+    }
+}
+```
+
+That loop only succeeds once `size` has reached `from` — that is, once
+**every writer that reserved earlier has published**. Reservations
+complete out of order; publication may not, or `size` would run ahead of
+a range still being written and break the invariant in section 2.
+
+Which was affordable when a reservation was one record. A writer waited
+for a predecessor to memcpy 115 bytes.
+
+It is not affordable now that a reservation is a whole batch. Each
+sublist reserves ~1,380 nodes, so the first to reserve blocks the other
+three for its entire copy. The batching that made one thread 1.16–1.80×
+faster is the same change that made four threads slower than one.
+
+### The fix ([#320](https://github.com/SergioDemianLerner/rustock/issues/320))
+
+Publish **out of order**. Keep a small record of in-flight ranges, and
+when a writer finishes, advance `size` to the start of the lowest range
+that is still incomplete rather than waiting for a turn.
+
+A sketch, not a prescription: with at most a handful of batches in
+flight — four sublists — a fixed-size array of `(start, end, done)`
+under a short lock, or a sorted small-vec, is enough. The writer marks
+its own range done, then advances `size` as far as the contiguous
+completed prefix allows.
+
+The invariant to preserve is unchanged and is the only hard
+requirement: **`size` must never exceed the lowest unwritten byte.**
+
+### What to expect from it
+
+It should recover the parallel path without giving back the serial gain,
+so roughly 42.2 s back to 38 s or better at 200 tx and four threads.
+It will not deliver 4×, because of section 5.
+
+---
+
+## 5. The ceiling, before you start
+
+At four threads with *few* writes — where neither the old mutex nor the
+new publication ordering costs much — the CPU still only reaches 41%.
+Most of a block is sequential by construction and has nothing to do with
+any of this:
 
 - the block-level maintenance run;
 - the ordered commit of each sublist;
 - the root hashing, which walks every dirty node;
 - the lazy reload of the root between blocks.
 
-At four threads with *few* writes the CPU is still only 41%, which says
-the lock is not the only thing in the way.
+By Amdahl the parallel fraction is a third of a block at best. And there
+is a prior question: with a fast store and a prefetched access list, the
+best measured configuration **uses one thread**, and adding threads made
+it slower even before this regression existed. See
+[`execution-performance.md`](execution-performance.md).
 
-So: a real bottleneck, a bounded prize, and a well-defined fix. Option A
-is a day's careful work. Option B is the one that actually removes the
-serialisation and deserves tests written before the code.
+So fix the regression, because a change should not leave things worse
+than it found them. Do not expect throughput from thread count.
+
+---
+
+## 6. How to tell whether you fixed it
+
+**The regression test.** Four threads at 200 tx/block must beat one
+thread again.
+
+```sh
+for t in 1 4; do
+  /usr/bin/time -f "%P %e" cargo run --release --example parallel_bench -- <fixture> \
+      --threads $t --sublists 4 --txs 200 --blocks 60 --flatdb true --flush-every 100
+done
+```
+
+**The convergence test**, which is sharper and which is how the previous
+hypothesis was refuted. Scaling at 200 and at 40 transactions a block
+should land in the same place once nothing inside the parallel region
+depends on batch size:
+
+| tx/block | 1 thread | 4 threads | scaling |
+|---|---|---|---|
+| 200 | 37.3 s | 42.2 s | 0.88× |
+| 40 | 10.1 s | 7.65 s | 1.32× |
+
+**The CPU figure.** Four threads at about one core on four cores is the
+symptom. If it does not move, the serialisation did not.
+
+**And the correctness gate, which costs nothing.** `parallel_bench`
+prints the final state root; it must not change. Every run quoted in
+this document ends on the same one.
