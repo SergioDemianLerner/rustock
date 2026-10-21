@@ -19,7 +19,43 @@
 //!   --csv FILE         write the per-block series here
 //!   --label TEXT       a name for the run, carried into the CSV
 //!   --cache-mb N       RocksDB block cache (default 256, the node's)
+//!   --validate BOOL    also do everything a node does besides execute
 //! ```
+//!
+//! # What `--validate` adds, and why it is off by default
+//!
+//! Without it this measures execution and the commit and nothing else:
+//! senders are handed to `execute_block` rather than recovered from their
+//! signatures, the header carries `difficulty: 1` and no merged-mining
+//! fields, and the transaction and receipt roots are left zero. That is
+//! the right shape for an instrument -- the fewer things in the loop, the
+//! more a change shows up as itself -- and it is what every figure in
+//! `docs/execution-performance.md` was measured with.
+//!
+//! `--validate true` adds the rest of what a node pays per block, timed
+//! as its own phase so it can be read separately or subtracted back out:
+//!
+//!   * recovering every sender from its signature, checked against the
+//!     sender the generator used, so the run fails rather than quietly
+//!     measures the wrong thing;
+//!   * the full `HeaderVerifier::default_rsk` set against the real parent,
+//!     merged-mining proof of work included;
+//!   * `BlockVerifier::default_rsk`, the body rules;
+//!   * the transaction trie root, compared against the header, and the
+//!     receipt trie root.
+//!
+//! **Proof of work costs the same at any difficulty**, which is what makes
+//! this affordable: verification decodes the Bitcoin header, hashes it and
+//! compares against the target, and none of those depend on how hard the
+//! target is. The blocks are sealed at difficulty 1, where the target is
+//! `U256::MAX` and the first nonce tried always clears it, so sealing
+//! costs nothing and verifying costs exactly what it costs on mainnet.
+//! Difficulty 0 would be cheaper still and is not allowed -- the rule
+//! rejects it with `DifficultyZero` before doing any work, which would
+//! measure nothing.
+//!
+//! Sealing is deliberately **outside** the timed region. A node receives
+//! blocks already mined; making one is not a cost it pays.
 //!
 //! `--sublists` above `TX_EXECUTION_THREADS` produces blocks that **are not
 //! valid on the network**. That is deliberate and is the point of the
@@ -28,6 +64,9 @@
 
 use anyhow::{Context, Result};
 use alloy_primitives::{Address, B256, U256};
+use rustock_core::config::ChainConfig;
+use rustock_core::types::receipt::{ordered_trie_root, ordered_tx_trie_root, Receipt};
+use rustock_core::validation::{BlockVerifier, HeaderVerifier};
 use rustock_core::{Block, Header, Transaction};
 use rustock_execution::hardfork::RskHardforkConfig;
 use rustock_execution::mining::workload::{account_key, address_of, filler_address, sign};
@@ -70,6 +109,9 @@ fn main() -> Result<()> {
     // inserts a key, so `TrieNode::split` is never reached and the trie
     // keeps its shape for the whole run.
     let mut new_accounts: u64 = 0;
+    // Do the rest of what a node does per block, not only execute it. Off
+    // by default so every figure already recorded stays comparable.
+    let mut validate = false;
 
     while let Some(flag) = args.next() {
         let value = args.next().with_context(|| format!("{flag} needs a value"))?;
@@ -91,6 +133,7 @@ fn main() -> Result<()> {
             "--flush-every" => flush_every = value.parse()?,
             "--prefetch" => prefetch = value.parse()?,
             "--new-accounts" => new_accounts = value.parse()?,
+            "--validate" => validate = value.parse()?,
             other => anyhow::bail!("unknown option {other}"),
         }
     }
@@ -175,8 +218,20 @@ fn main() -> Result<()> {
     let processor = BlockProcessor::new(hardfork_cfg.clone(), block_store.clone())
         .with_execution_threads(threads);
 
+    // Regtest's activation heights are all zero, so every rule -- orchid,
+    // wasabi100, iris300 -- is live from block one. On mainnet's heights a
+    // 40-block run would skip merged mining entirely and measure nothing.
+    // Regtest's bounds, with the gas limit raised to the one the
+    // benchmark's headers have always carried. Changing the header
+    // instead would move every figure already recorded, and the bound is
+    // not what is being measured.
+    let chain = Arc::new(ChainConfig { max_gas_limit: 100_000_000, ..ChainConfig::regtest() });
+    let header_verifier = HeaderVerifier::default_rsk(chain.clone());
+    let block_verifier = BlockVerifier::default_rsk(&chain);
+
     let mut state = root;
     let mut parent_hash = B256::ZERO;
+    let mut parent_header: Option<Header> = None;
     let mut nonces = vec![0u64; manifest.signers as usize];
     let mut rows: Vec<Row> = Vec::with_capacity(blocks);
     let deadline = seconds.map(|s| Instant::now() + Duration::from_secs(s));
@@ -188,11 +243,71 @@ fn main() -> Result<()> {
             break;
         }
 
-        let (transactions, senders) =
+        let (mut transactions, mut senders) =
             build_transactions(number, txs, &manifest, new_accounts, &mut nonces);
-        let header = bench_header(number, parent_hash, state.compute_hash(trie_store.as_ref()),
-                                  edges_for(sublists, transactions.len()));
+        // The sublist edges are computed over the user transactions, so
+        // REMASC lands in the sequential tail where it belongs -- it
+        // reaches a precompile RSKIP-144 marks sequential-only.
+        let edges = edges_for(sublists, transactions.len());
+        if validate {
+            // Every real block ends with REMASC, and `RemascValidationRule`
+            // rejects one that does not. It carries no signature, pays no
+            // gas, and the executor recognises it by that shape.
+            let remasc = remasc_tx();
+            transactions.push(remasc.clone());
+            senders.push((remasc, Address::ZERO));
+        }
+        let mut header = bench_header(number, parent_hash,
+                                      state.compute_hash(trie_store.as_ref()), edges);
+        if validate {
+            // Untimed: a node receives blocks already mined, so sealing is
+            // not a cost it pays. Only verifying is.
+            header.transactions_root = ordered_tx_trie_root(&transactions, true);
+            header.gas_used = 21_000 * txs as u64;
+            seal_merged_mining(&mut header)?;
+        }
         let block = Block { header, transactions, ommers: Vec::new() };
+
+        let validating = Instant::now();
+        if validate {
+            // Sender recovery, which `execute_block` is spared because the
+            // generator already knows who signed.
+            //
+            // Through the processor's own `recover_senders` rather than a
+            // loop written here, so this measures what the node runs --
+            // including its threading, which a copy would have to keep in
+            // step by hand. Checked rather than discarded: a recovery that
+            // silently returned the wrong address would turn this into a
+            // benchmark of nothing.
+            let recovered = processor
+                .recover_senders(&block.transactions, CHAIN_ID)
+                .with_context(|| format!("recovering senders in block {number}"))?;
+            for ((tx, expected), got) in senders.iter().zip(&recovered) {
+                // REMASC gets the zero address rather than a recovery.
+                if tx.v == 0 && tx.r.is_zero() && tx.s.is_zero() {
+                    continue;
+                }
+                anyhow::ensure!(
+                    got == expected,
+                    "block {number}: recovered {got} but the generator signed as {expected}"
+                );
+            }
+            if let Some(parent) = parent_header.as_ref() {
+                header_verifier
+                    .verify(&block.header, Some(parent))
+                    .map_err(|e| anyhow::anyhow!("verifying header {number}: {e:?}"))?;
+            }
+            block_verifier
+                .verify(&block)
+                .map_err(|e| anyhow::anyhow!("verifying body {number}: {e:?}"))?;
+            let root = ordered_tx_trie_root(&block.transactions, true);
+            anyhow::ensure!(
+                root == block.header.transactions_root,
+                "block {number}: transaction root does not match the header"
+            );
+        }
+        let mut validated = validating.elapsed();
+        let mut persisted = Duration::ZERO;
 
         // Simulate an EIP-2930 access list at 100% coverage.
         //
@@ -225,6 +340,62 @@ fn main() -> Result<()> {
             )
             .with_context(|| format!("executing block {number}"))?;
         let execution = at.elapsed();
+
+        if validate {
+            // The receipt root needs the receipts, so it cannot be paid
+            // before execution. There is nothing in the header to compare
+            // it against -- a miner fills that field *after* executing,
+            // and this header was built before -- but computing it costs
+            // the same either way, which is what is being measured.
+            let at = Instant::now();
+            let mut cumulative = 0u64;
+            let receipts: Vec<Receipt> = executed
+                .tx_results
+                .iter()
+                .map(|r| {
+                    cumulative += r.gas_used;
+                    // revm's Log and the core Receipt's Log are distinct
+                    // types; a node converts between them here too.
+                    let logs: Vec<rustock_core::types::receipt::Log> = r
+                        .logs
+                        .iter()
+                        .map(|l| rustock_core::types::receipt::Log {
+                            address: l.address,
+                            topics: l.topics().to_vec(),
+                            data: l.data.data.clone(),
+                        })
+                        .collect();
+                    let mut logs_bloom = Default::default();
+                    for log in &logs {
+                        rustock_core::bloom::accrue_log(&mut logs_bloom, log);
+                    }
+                    Receipt {
+                        post_tx_state: if r.success { vec![1] } else { Vec::new() },
+                        cumulative_gas_used: cumulative,
+                        gas_used: r.gas_used,
+                        logs_bloom,
+                        logs,
+                        status: r.success,
+                    }
+                })
+                .collect();
+            std::hint::black_box(ordered_trie_root(&receipts, true));
+            validated += at.elapsed();
+
+            // Persisting the block is not optional here even as a
+            // measurement: REMASC distributes the fees of the block that
+            // matured `maturity` blocks ago and reads it back out of the
+            // store, so a run longer than the maturity fails without it.
+            // A real node writes this anyway. Timed apart because it is
+            // I/O and the rest of validation is not.
+            let at = Instant::now();
+            block_store.put_header(&block.header)?;
+            block_store.put_header_number(block.header.hash(), number)?;
+            block_store.put_body(block.header.hash(), &block.transactions, &block.ommers)?;
+            block_store.put_canonical_hash(number, block.header.hash())?;
+            block_store.put_receipts(block.header.hash(), &receipts)?;
+            persisted = at.elapsed();
+        }
 
         // Persist, so the I/O a real node pays is paid here too.
         let writing = Instant::now();
@@ -270,6 +441,7 @@ fn main() -> Result<()> {
             .unwrap_or(next);
         let reloaded = reloading.elapsed();
         parent_hash = block.header.hash();
+        parent_header = Some(block.header.clone());
 
         rows.push(Row {
             number,
@@ -284,6 +456,8 @@ fn main() -> Result<()> {
             accounts: executed.state_changes.len() as u64,
             hash_us: hashed.as_micros() as u64,
             reload_us: reloaded.as_micros() as u64,
+            validate_us: validated.as_micros() as u64,
+            persist_us: persisted.as_micros() as u64,
             elapsed_s: started.elapsed().as_secs_f64(),
         });
 
@@ -296,7 +470,6 @@ fn main() -> Result<()> {
                 mean(recent, |r| r.write_us) / 1000.0
             );
         }
-        let _ = &processor; // built to validate the configuration early
     }
 
     // The state root after the last block. Every configuration of the store
@@ -409,6 +582,15 @@ struct Row {
     accounts: u64,
     hash_us: u64,
     reload_us: u64,
+    /// Everything a node pays per block besides executing it: sender
+    /// recovery, header and body rules, the transaction and receipt
+    /// roots. CPU, and all of it divides across transactions. Zero
+    /// unless `--validate`.
+    validate_us: u64,
+    /// Writing the block and its receipts to the block store. I/O, and
+    /// kept apart from `validate_us` for that reason. Zero unless
+    /// `--validate`.
+    persist_us: u64,
     elapsed_s: f64,
 }
 
@@ -466,6 +648,21 @@ fn report(rows: &[Row], label: &str, threads: usize, sublists: usize) {
         mean(rows, |r| r.accounts),
         mean(rows, |r| r.commit_us) / mean(rows, |r| r.accounts).max(1.0),
     );
+    let validating = mean(rows, |r| r.validate_us);
+    if validating > 0.0 {
+        // Reported next to the per-transaction figure because that is how
+        // it scales: sender recovery is once per transaction and dominates
+        // the rest of validation by two orders of magnitude.
+        println!(
+            "  validation      {:.1} ms/block   {:.0} us per transaction",
+            validating / 1000.0,
+            validating / mean(rows, |r| r.transactions as u64).max(1.0),
+        );
+        println!(
+            "  persist block   {:.1} ms/block",
+            mean(rows, |r| r.persist_us) / 1000.0
+        );
+    }
     let sequential = mean(rows, |r| r.maintenance_us)
         + mean(rows, |r| r.commit_us)
         + mean(rows, |r| r.hash_us)
@@ -543,6 +740,62 @@ fn build_transactions(
         with_senders.push((tx, from));
     }
     (transactions, with_senders)
+}
+
+/// The transaction every real block ends with.
+///
+/// rskj `RemascTransaction`: no signature, no gas, addressed to the REMASC
+/// precompile. `RemascValidationRule` checks for exactly this shape as the
+/// last entry, and the executor recognises it the same way.
+fn remasc_tx() -> Transaction {
+    Transaction {
+        nonce: 0,
+        gas_price: U256::ZERO,
+        gas_limit: U256::ZERO,
+        to: alloy_primitives::Bytes::copy_from_slice(
+            rustock_execution::precompiles::REMASC_ADDR.as_slice(),
+        ),
+        value: U256::ZERO,
+        input: alloy_primitives::Bytes::new(),
+        v: 0,
+        r: U256::ZERO,
+        s: U256::ZERO,
+        cached_rlp: None,
+    }
+}
+
+/// Give a header the merged-mining proof a verifier will check.
+///
+/// Not a cost a node pays -- it receives blocks already mined -- so this
+/// runs outside the timed region. It is here because verification has
+/// nothing to verify without it, and because at `difficulty: 1` the
+/// target is `U256::MAX`, so the first nonce tried clears it and sealing
+/// is a handful of hashes rather than a search. Verification does the
+/// same work it would against a real mainnet target.
+fn seal_merged_mining(header: &mut Header) -> Result<()> {
+    use rustock_core::validation::merged_mining::compress_coinbase;
+    use rustock_execution::mining::{coinbase, fork_detection, merkle};
+
+    // The coinbase commits to the header's merged-mining hash, which is
+    // computed over the header *without* these three fields -- so the
+    // order here is not circular, and the caches must be clear or the
+    // hash is the one from before the transaction root was set.
+    header.cached_hash = None;
+    header.cached_hash_for_merged_mining = None;
+    let payload = fork_detection::apply_to_hash(header.hash_for_merged_mining(), &[0u8; 12]);
+
+    let cb = coinbase::build_coinbase(&payload, 0);
+    let btc = coinbase::build_bitcoin_block(cb.clone(), 0);
+    let compressed = compress_coinbase(&coinbase::encode_transaction(&cb), true)
+        .map_err(|e| anyhow::anyhow!("compressing the coinbase: {e}"))?;
+    let proof = merkle::proof_from_txids(&coinbase::txids_display_order(&btc))
+        .map_err(|e| anyhow::anyhow!("building the merkle proof: {e}"))?;
+
+    header.bitcoin_merged_mining_header = Some(coinbase::encode_header(&btc.header).into());
+    header.bitcoin_merged_mining_coinbase_transaction = Some(compressed.into());
+    header.bitcoin_merged_mining_merkle_proof = Some(proof.into());
+    header.cached_hash = None;
+    Ok(())
 }
 
 /// An account somewhere in the fixture, chosen so the reads scatter.

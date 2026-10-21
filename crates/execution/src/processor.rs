@@ -875,7 +875,11 @@ impl BlockProcessor {
         Ok(result)
     }
 
-    fn recover_senders(
+    /// Recover every transaction's sender.
+    ///
+    /// Public so a benchmark measures this function rather than a copy of
+    /// it that drifts: `crates/cli/examples/loadtest.rs --validate`.
+    pub fn recover_senders(
         &self,
         transactions: &[Transaction],
         chain_id: u64,
