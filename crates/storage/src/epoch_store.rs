@@ -1046,11 +1046,32 @@ impl EpochTrieStore {
     /// the WAL makes the writes durable anyway and a clean shutdown flushes
     /// the memtables; it surfaced only when a read-only open, which does not
     /// replay the WAL, came back one entry short.
+    /// Every backend's failure is reported, and the first is returned.
+    ///
+    /// This swallowed them with `.ok()` and returned `Ok(())`
+    /// unconditionally, which is a quiet way to lose a chain. A flush
+    /// that fails and says nothing is how durability disappears without
+    /// anyone noticing -- which is precisely what happened here by a
+    /// different route when the trait's no-op default meant no flush ran
+    /// at all. One silent path was enough.
+    ///
+    /// Every epoch is attempted even after one fails: they are separate
+    /// stores and the failure of an old one is no reason to leave the
+    /// newest unflushed.
     pub fn flush(&self) -> Result<()> {
+        let mut first_error = None;
         for e in self.epochs.read().unwrap().iter() {
-            e.backend.flush().ok();
+            if let Err(err) = e.backend.flush() {
+                warn!(target: "rustock::gc", "Flushing an epoch failed: {err}");
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
         }
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
