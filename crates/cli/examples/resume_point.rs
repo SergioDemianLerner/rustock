@@ -50,12 +50,31 @@ impl ChainView for View {
 fn main() -> Result<()> {
     let data_dir = arg("data-dir", "/var/lib/rustock");
     let trie_dir = arg("trie-dir", "/var/lib/rustock/trie-epochs");
+    // Without this the tool could only read RocksDB epochs, which is to
+    // say it could not inspect the store the node was actually running:
+    // asked about a FlatDB store it failed on a missing `CURRENT` file.
+    // A diagnostic that cannot see the live configuration answers a
+    // question nobody asked.
+    let engine = arg("trie-engine", "rocksdb");
 
-    println!("Opening READ-ONLY: {data_dir} and {trie_dir}\n");
+    println!("Opening READ-ONLY: {data_dir} and {trie_dir} ({engine})\n");
 
     let store = BlockStore::open_read_only(&data_dir)?;
     let cfg = EpochConfig { epochs: 4, burial_depth: 4_000, rotate_bytes: 1 << 30 };
-    let trie = EpochTrieStore::open_read_only(&trie_dir, cfg)?;
+    let factory: std::sync::Arc<dyn rustock_storage::epoch_backend::EpochBackendFactory> =
+        match rustock_storage::TrieEngine::parse(&engine)? {
+            rustock_storage::TrieEngine::RocksDb => std::sync::Arc::new(
+                rustock_storage::epoch_backend::RocksFactory::new(256 << 20),
+            ),
+            rustock_storage::TrieEngine::FlatDb => std::sync::Arc::new(
+                rustock_storage::epoch_backend::FlatFactory {
+                    expected_keys: rustock_storage::epoch_backend::keys_for_rotation(1 << 30),
+                    segment_size: 512 << 20,
+                    read_threads: 1,
+                },
+            ),
+        };
+    let trie = EpochTrieStore::open_read_only_with(&trie_dir, cfg, factory)?;
     let view = View { store, trie };
 
     let (exec_hash, exec_root) = view

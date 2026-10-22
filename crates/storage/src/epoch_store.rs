@@ -1097,6 +1097,67 @@ impl TrieStore for EpochTrieStore {
         }
     }
 
+    /// Make every epoch durable.
+    ///
+    /// **`TrieStore::flush` defaults to doing nothing, and this impl did
+    /// not override it**, so every `flush` the node issued through its
+    /// `Arc<dyn TrieStore>` was a no-op and no epoch was ever made
+    /// durable. The inherent `EpochTrieStore::flush` right above did the
+    /// work and nothing reached it.
+    ///
+    /// On RocksDB that was invisible: its own WAL persists whatever the
+    /// store forgets to flush, so a restart lost nothing. On FlatDB it
+    /// is fatal. FlatDB's durability *is* the checkpoint -- the frontier
+    /// a reopened heap restores to -- and the checkpoint is written only
+    /// by `flush`. Without it the heap grew for two days while its
+    /// checkpoint stayed at the moment of conversion, so every restart
+    /// silently rolled the store back to that moment and the state for
+    /// every block executed since became unreachable. The mainnet node
+    /// stopped being able to execute at all:
+    ///
+    /// ```text
+    /// ERROR No block on the ancestry of #9343756 is canonical with state
+    ///       in the trie store (TooDeep { searched: 1024 }); execution
+    ///       cannot resume and the node needs a resync
+    /// ```
+    ///
+    /// It also made `ExecutionCommitter` vacuous. That type exists to
+    /// make "flush, then advance the executed head" structural rather
+    /// than conventional, and it was faithfully calling a flush that did
+    /// nothing before advancing a head that then named state nobody had
+    /// written.
+    fn flush(&self) {
+        if let Err(e) = EpochTrieStore::flush(self) {
+            warn!(target: "rustock::gc", "Epoch flush failed: {e}");
+        }
+    }
+
+    /// One batch to the newest epoch, which is where `put` sends writes.
+    ///
+    /// Also missing, with a quieter cost: the trait's default turns a
+    /// batch back into one `put` per entry, so a block's whole dirty
+    /// subtree -- collected precisely so it could be written in one
+    /// reservation -- was decomposed again before it reached FlatDB.
+    fn put_many(&self, entries: &[(Vec<u8>, Vec<u8>)]) {
+        assert!(
+            !self.read_only,
+            "write to a read-only epoch store: this store was opened for measurement \
+             and must not be able to modify the database"
+        );
+        if entries.is_empty() {
+            return;
+        }
+        self.writes.fetch_add(entries.len() as u64, Ordering::Relaxed);
+        let bytes: u64 = entries.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
+        self.newest_written.fetch_add(bytes, Ordering::Relaxed);
+        let epochs = self.epochs.read().unwrap();
+        if let Some(e) = epochs.last() {
+            if let Err(err) = e.backend.put_many(entries) {
+                warn!(target: "rustock::gc", "Epoch batch write failed: {err}");
+            }
+        }
+    }
+
     /// One batch per epoch, newest first, carrying forward only what is
     /// still unresolved.
     ///
@@ -1258,6 +1319,113 @@ mod tests {
         let mut k = vec![0u8; 8];
         k.copy_from_slice(&n.to_be_bytes());
         k
+    }
+
+    /// A FlatDB-backed epoch store, which is what the mainnet node runs.
+    fn flat_store(dir: &std::path::Path, epochs: usize) -> EpochTrieStore {
+        EpochTrieStore::open_with(
+            dir,
+            EpochConfig { epochs, burial_depth: 0, rotate_bytes: 1 << 30 },
+            None,
+            Arc::new(crate::epoch_backend::FlatFactory {
+                expected_keys: 4096,
+                segment_size: 1 << 20,
+                read_threads: 1,
+            }),
+        )
+        .unwrap()
+    }
+
+    /// The checkpoint on disk must change when `flush` is called through
+    /// the trait object.
+    ///
+    /// `TrieStore::flush` defaults to a no-op and this impl did not
+    /// override it, so every flush the node issued did nothing. RocksDB
+    /// hid that -- its WAL persists what the store forgets -- but
+    /// FlatDB's durability *is* this checkpoint: it is the frontier a
+    /// reopened heap restores to. On the mainnet node the heap grew for
+    /// two days while its checkpoint stayed at the minute of conversion,
+    /// so every restart rolled the store back there and the state for
+    /// every block executed since became unreachable:
+    ///
+    /// ```text
+    /// ERROR No block on the ancestry of #9343756 is canonical with state
+    ///       in the trie store (TooDeep { searched: 1024 }); execution
+    ///       cannot resume and the node needs a resync
+    /// ```
+    ///
+    /// Asserting on the file rather than on a reopened store, for two
+    /// reasons. `FlatDb::drop` flushes, so a test that closes and
+    /// reopens passes whether or not `flush` does anything -- the first
+    /// version of this test did exactly that and passed against the bug
+    /// it was written for. And leaking the store instead keeps its
+    /// directory lock, so the reopen fails for an unrelated reason.
+    /// The file is the thing that was wrong; check the file.
+    #[test]
+    fn a_flush_through_the_trait_object_rewrites_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = flat_store(dir.path(), 3);
+        let checkpoint = dir.path().join("epoch-000000000000").join("checkpoint.dat");
+
+        // A fresh epoch has no checkpoint until something flushes one.
+        let before = std::fs::read(&checkpoint).ok();
+
+        let as_trait: &dyn TrieStore = &store;
+        build(as_trait, 64, 7);
+        assert_eq!(
+            std::fs::read(&checkpoint).ok(),
+            before,
+            "writing alone must not move the checkpoint; only a flush does"
+        );
+
+        as_trait.flush();
+        let after = std::fs::read(&checkpoint).ok();
+        assert!(after.is_some(), "flush left no checkpoint at all");
+        assert_ne!(
+            after, before,
+            "flush through the trait object did not reach the epoch, so nothing \
+             written since the store opened would survive a restart"
+        );
+    }
+
+    /// A batch must reach the epoch and be durable once flushed.
+    ///
+    /// Note what this does **not** check. `TrieStore::put_many` defaults
+    /// to a loop over `put`, and this impl did not override it, so a
+    /// block's whole dirty subtree -- collected precisely so FlatDB
+    /// could take it in one reservation -- was decomposed again on the
+    /// way in. That is a performance defect, not a correctness one: the
+    /// entries arrive either way, and this test passes with the override
+    /// removed. It is kept for the routing and the durability, which it
+    /// does check; the batching is measured in
+    /// `docs/execution-performance.md`, not asserted here.
+    #[test]
+    fn put_many_reaches_the_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = flat_store(dir.path(), 3);
+        // Content-addressed: FlatDB stores no key bytes for a short record
+        // and verifies a hit by rehashing it, so a key that is not its
+        // value's hash can never be found. The trie satisfies this by
+        // construction -- it writes `keccak(message) -> message`.
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..32u64)
+            .map(|i| {
+                let v = vec![i as u8; 40];
+                (alloy_primitives::keccak256(&v).to_vec(), v)
+            })
+            .collect();
+
+        let as_trait: &dyn TrieStore = &store;
+        as_trait.put_many(&entries);
+
+        for (k, v) in &entries {
+            assert_eq!(store.get(k).as_ref(), Some(v), "batched entry missing");
+        }
+        // And it is durable once flushed, which is the pair of properties
+        // the node needs: the batch landed, and the batch survives.
+        let checkpoint = dir.path().join("epoch-000000000000").join("checkpoint.dat");
+        let before = std::fs::read(&checkpoint).ok();
+        as_trait.flush();
+        assert_ne!(std::fs::read(&checkpoint).ok(), before, "the batch was never made durable");
     }
 
     /// Builds a trie holding `n` entries and returns its saved root hash.
