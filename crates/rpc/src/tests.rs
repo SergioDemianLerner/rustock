@@ -62,6 +62,8 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -437,10 +439,13 @@ async fn test_method_not_found() {
     assert_eq!(resp.error.unwrap().code, METHOD_NOT_FOUND);
 }
 
+/// `eth_sendTransaction` moved out of this list when the node learned to
+/// hold keys -- it is refused for want of a wallet now, not for want of
+/// an execution engine. The compilation methods are what is left.
 #[tokio::test]
 async fn test_unsupported_eth_method() {
     let (state, _tmp) = setup_state();
-    let req = make_request("eth_sendTransaction", json!(["0x1234", "latest"]));
+    let req = make_request("eth_getCompilers", json!([]));
     let resp = dispatch_for_test(&state, req).await;
     assert!(resp.error.is_some());
     let err = resp.error.unwrap();
@@ -609,6 +614,8 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -661,6 +668,8 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -746,6 +755,8 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -883,6 +894,8 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -985,6 +998,8 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -1175,6 +1190,8 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -1440,6 +1457,8 @@ async fn test_receipt_dto_failed_status() {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -2298,6 +2317,8 @@ fn setup_state_with_receipts(
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -2569,6 +2590,8 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -3516,6 +3539,8 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -3949,6 +3974,8 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
+        wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
         gc_pins: None,
@@ -4741,5 +4768,491 @@ async fn evm_reset_returns_to_genesis_and_clears_the_clock() {
         rustock_execution::mining::dev::time_offset(),
         0,
         "a clock offset must not survive a reset"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The wallet
+//
+// Everything here checks the behaviour a load-testing harness depends on,
+// and the two properties that matter more: that a node given no keys
+// behaves exactly as it did before it could hold any, and that a node
+// given keys will sign for those and nothing else.
+// ---------------------------------------------------------------------
+
+/// Two keys with known addresses. Fixed rather than random so a failure
+/// names the same account twice.
+fn test_wallet() -> crate::wallet::Wallet {
+    let keys = [[0x11u8; 32], [0x22u8; 32]]
+        .into_iter()
+        .map(|b| secp256k1::SecretKey::from_byte_array(b).unwrap());
+    crate::wallet::Wallet::from_keys(keys)
+}
+
+fn setup_state_with_wallet() -> (RpcState, tempfile::TempDir) {
+    let (mut state, tmp) = setup_state();
+    state.wallet = Some(Arc::new(test_wallet()));
+    // Signing needs a chain id, which comes from the hardfork config.
+    state.hardfork_cfg =
+        Some(rustock_execution::hardfork::RskHardforkConfig::all_active_parallel(33));
+    (state, tmp)
+}
+
+#[tokio::test]
+async fn test_eth_accounts_lists_the_wallet_in_a_stable_order() {
+    let (state, _tmp) = setup_state_with_wallet();
+
+    let first = dispatch_for_test(&state, make_request("eth_accounts", json!([]))).await;
+    let second = dispatch_for_test(&state, make_request("eth_accounts", json!([]))).await;
+
+    let listed = first.result.clone().unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 2, "both keys are reported");
+    assert_eq!(listed, second.result.unwrap(), "the order must not vary between calls");
+
+    // A harness picks accounts[0] as its sender and expects it to keep
+    // being the same account.
+    for entry in listed.as_array().unwrap() {
+        let s = entry.as_str().expect("an address string");
+        assert!(s.starts_with("0x") && s.len() == 42, "not an address: {s}");
+    }
+}
+
+#[tokio::test]
+async fn test_eth_sign_returns_sixty_five_bytes() {
+    let (state, _tmp) = setup_state_with_wallet();
+    let account = test_wallet().accounts()[0];
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_sign", json!([format!("{account:#x}"), "0xdeadbeef"])),
+    )
+    .await;
+
+    let sig = resp.result.expect("a signature").as_str().unwrap().to_string();
+    // The k6 suite asserts exactly this: 0x plus 130 hex characters.
+    assert_eq!(sig.len(), 132, "a signature is 65 bytes: {sig}");
+    assert!(sig.starts_with("0x"));
+
+    let v = u8::from_str_radix(&sig[130..], 16).unwrap();
+    assert!(v == 27 || v == 28, "eth_sign uses the 27/28 form, got {v}");
+}
+
+/// The signature must recover to the account that signed, which is the
+/// only check that says the bytes mean anything.
+#[tokio::test]
+async fn test_eth_sign_recovers_to_the_signing_account() {
+    let (state, _tmp) = setup_state_with_wallet();
+    let account = test_wallet().accounts()[0];
+    let message = b"hello rootstock";
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_sign",
+            json!([format!("{account:#x}"), format!("0x{}", hex::encode(message))]),
+        ),
+    )
+    .await;
+    let sig = hex::decode(
+        resp.result.unwrap().as_str().unwrap().strip_prefix("0x").unwrap(),
+    )
+    .unwrap();
+
+    let digest = crate::wallet::personal_digest(message);
+    let secp = secp256k1::Secp256k1::new();
+    let recid = secp256k1::ecdsa::RecoveryId::try_from(i32::from(sig[64]) - 27).unwrap();
+    let recoverable =
+        secp256k1::ecdsa::RecoverableSignature::from_compact(&sig[..64], recid).unwrap();
+    let key = secp
+        .recover_ecdsa(secp256k1::Message::from_digest(digest.0), &recoverable)
+        .expect("the signature recovers");
+
+    use sha3::{Digest, Keccak256};
+    let hashed = Keccak256::digest(&key.serialize_uncompressed()[1..]);
+    assert_eq!(
+        Address::from_slice(&hashed[12..]),
+        account,
+        "the signature must recover to the account that produced it"
+    );
+}
+
+/// The EIP-191 prefix is the reason `eth_sign` cannot be used to forge a
+/// transaction signature, so check it is actually applied rather than
+/// trusting that it was.
+#[tokio::test]
+async fn test_eth_sign_prefixes_the_message() {
+    let message = b"abc";
+    let digest = crate::wallet::personal_digest(message);
+
+    use sha3::{Digest, Keccak256};
+    let unprefixed = Keccak256::digest(message);
+    assert_ne!(
+        digest.as_slice(),
+        &unprefixed[..],
+        "eth_sign must not sign the raw message: a caller could hand over a \
+         transaction's signing hash and be given a valid transaction signature"
+    );
+
+    let mut expected = Keccak256::new();
+    expected.update(b"\x19Ethereum Signed Message:\n3");
+    expected.update(message);
+    assert_eq!(digest.as_slice(), &expected.finalize()[..]);
+}
+
+#[tokio::test]
+async fn test_signing_is_refused_for_an_account_the_wallet_does_not_hold() {
+    let (state, _tmp) = setup_state_with_wallet();
+    let stranger = "0x00000000000000000000000000000000000000ff";
+
+    for (method, params) in [
+        ("eth_sign", json!([stranger, "0xdeadbeef"])),
+        ("eth_signTransaction", json!([{"from": stranger}])),
+        ("eth_sendTransaction", json!([{"from": stranger}])),
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, params)).await;
+        assert!(resp.result.is_none(), "{method} must not sign for a stranger");
+        let err = resp.error.expect("an error");
+        assert_eq!(err.code, INVALID_PARAMS, "{method}");
+        assert!(err.message.contains("No key for"), "{method}: {}", err.message);
+    }
+}
+
+/// `eth_signTransaction` returns a transaction whose signature recovers
+/// to the sender, which is what makes it usable by a caller that goes on
+/// to submit it.
+#[tokio::test]
+async fn test_eth_sign_transaction_produces_a_transaction_from_the_sender() {
+    let (state, _tmp) = setup_state_with_wallet();
+    let account = test_wallet().accounts()[0];
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_signTransaction",
+            json!([{
+                "from": format!("{account:#x}"),
+                "to": "0x00000000000000000000000000000000000000aa",
+                "value": "0x1",
+                "gas": "0x5208",
+                "gasPrice": "0x1",
+                "nonce": "0x0",
+            }]),
+        ),
+    )
+    .await;
+
+    let raw = hex::decode(
+        resp.result.expect("signed rlp").as_str().unwrap().strip_prefix("0x").unwrap(),
+    )
+    .unwrap();
+
+    use alloy_rlp::Decodable;
+    let tx = rustock_core::Transaction::decode(&mut raw.as_slice()).expect("decodes");
+    let chain_id = state.hardfork_cfg.as_ref().unwrap().chain_id;
+    assert_eq!(
+        tx.recover_sender(chain_id).expect("recovers"),
+        account,
+        "the signed transaction must come from the account asked for"
+    );
+    assert_eq!(tx.nonce, 0);
+    assert_eq!(tx.value, U256::from(1));
+}
+
+/// `to: null` is how the suite asks for a contract creation, and it must
+/// not become the zero address.
+#[tokio::test]
+async fn test_a_null_recipient_is_a_contract_creation() {
+    let (state, _tmp) = setup_state_with_wallet();
+    let account = test_wallet().accounts()[0];
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_signTransaction",
+            json!([{
+                "from": format!("{account:#x}"),
+                "to": Value::Null,
+                "data": "0x6000",
+                "gas": "0x100000",
+                "gasPrice": "0x1",
+                "nonce": "0x0",
+            }]),
+        ),
+    )
+    .await;
+
+    let raw = hex::decode(
+        resp.result.expect("signed rlp").as_str().unwrap().strip_prefix("0x").unwrap(),
+    )
+    .unwrap();
+    use alloy_rlp::Decodable;
+    let tx = rustock_core::Transaction::decode(&mut raw.as_slice()).unwrap();
+    assert!(tx.to.is_empty(), "a creation has an empty recipient, not a zero address");
+}
+
+/// Reading a key file is the only way a key gets in, so the parsing has
+/// to accept what an operator will actually write.
+#[test]
+fn test_a_wallet_file_is_read_forgivingly_but_not_loosely() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let good = dir.path().join("keys");
+    std::fs::write(
+        &good,
+        "# the funded sender\n\
+         0x1111111111111111111111111111111111111111111111111111111111111111\n\
+         \n\
+         2222222222222222222222222222222222222222222222222222222222222222\n\
+         # the same key again, which is the same account\n\
+         0x1111111111111111111111111111111111111111111111111111111111111111\n",
+    )
+    .unwrap();
+    let wallet = crate::wallet::Wallet::from_file(&good).expect("loads");
+    assert_eq!(wallet.accounts().len(), 2, "comments, blanks and a repeat collapse to two");
+
+    let bad = dir.path().join("bad");
+    std::fs::write(&bad, "0xnothex\n").unwrap();
+    assert!(crate::wallet::Wallet::from_file(&bad).is_err(), "a bad key must not be skipped");
+
+    let empty = dir.path().join("empty");
+    std::fs::write(&empty, "# nothing but a comment\n").unwrap();
+    assert!(
+        crate::wallet::Wallet::from_file(&empty).is_err(),
+        "an empty wallet is a configuration mistake, not an empty account list"
+    );
+
+    assert!(crate::wallet::Wallet::from_file(dir.path().join("absent")).is_err());
+}
+
+/// A `Debug` of the state reaches logs and panic messages; it must not
+/// carry key material.
+#[test]
+fn test_a_wallet_does_not_print_its_keys() {
+    let rendered = format!("{:?}", test_wallet());
+    assert!(rendered.contains("accounts"), "it should say how many: {rendered}");
+    assert!(!rendered.contains("1111"), "key material must not be printable: {rendered}");
+}
+
+
+// ---------------------------------------------------------------------
+// Continuous mining
+// ---------------------------------------------------------------------
+
+/// A miner that records what it was asked to do, and a pool whose
+/// pending count the test drives.
+struct CountingMiner {
+    mined: Arc<std::sync::atomic::AtomicUsize>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::mnr::MiningService for CountingMiner {
+    fn coinbase(&self) -> [u8; 20] {
+        [0u8; 20]
+    }
+    fn get_work(&self) -> Result<rustock_execution::mining::MinerWork, rustock_execution::mining::SubmitError> {
+        unimplemented!("not reached by these tests")
+    }
+    fn submit_bitcoin_block(
+        &self,
+        _raw: &[u8],
+    ) -> Result<rustock_execution::mining::SubmittedBlockInfo, rustock_execution::mining::SubmitError> {
+        unimplemented!("not reached by these tests")
+    }
+    fn submit_bitcoin_block_transactions(
+        &self,
+        _h: &[u8],
+        _c: &[u8],
+        _t: &str,
+    ) -> Result<rustock_execution::mining::SubmittedBlockInfo, rustock_execution::mining::SubmitError> {
+        unimplemented!("not reached by these tests")
+    }
+    fn submit_bitcoin_block_partial_merkle(
+        &self,
+        _h: &[u8],
+        _c: &[u8],
+        _m: &str,
+        _n: u32,
+    ) -> Result<rustock_execution::mining::SubmittedBlockInfo, rustock_execution::mining::SubmitError> {
+        unimplemented!("not reached by these tests")
+    }
+    fn mine_one_now(&self) -> Result<u64, String> {
+        use std::sync::atomic::Ordering;
+        // Mining a block drains the pool, as a real one does now that a
+        // locally mined block evicts what it included.
+        self.pending.store(0, Ordering::Relaxed);
+        Ok(self.mined.fetch_add(1, Ordering::Relaxed) as u64 + 1)
+    }
+}
+
+struct CountingPool {
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::server::TxPoolReader for CountingPool {
+    fn get_pending_tx(
+        &self,
+        _h: &B256,
+    ) -> Option<(rustock_core::Transaction, Address, B256)> {
+        None
+    }
+    fn pending_nonce(&self, _a: &Address) -> Option<u64> {
+        None
+    }
+    fn pool_status(&self) -> (usize, usize) {
+        (self.pending.load(std::sync::atomic::Ordering::Relaxed), 0)
+    }
+    fn pool_content(&self) -> crate::server::PoolContent {
+        crate::server::PoolContent { pending: Vec::new(), queued: Vec::new() }
+    }
+    fn quota_report(&self, _a: &Address) -> Option<(f64, u64)> {
+        None
+    }
+}
+
+fn autominer() -> (crate::evm::AutoMiner, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+    let mined = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let auto = crate::evm::AutoMiner::new(
+        Arc::new(CountingMiner { mined: mined.clone(), pending: pending.clone() }),
+        Some(Arc::new(CountingPool { pending: pending.clone() })),
+        std::time::Duration::from_millis(10),
+    );
+    (auto, mined, pending)
+}
+
+/// An idle chain must not fill with empty blocks.
+///
+/// This is the failure the pool-eviction bug produced: with mined
+/// transactions never leaving the pool, the loop saw work forever and
+/// mined four thousand empty blocks in ten seconds.
+#[test]
+fn an_idle_chain_is_not_mined() {
+    use std::sync::atomic::Ordering;
+    let (auto, mined, _pending) = autominer();
+    auto.start();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    auto.stop();
+    assert_eq!(mined.load(Ordering::Relaxed), 0, "nothing pending, nothing to mine");
+}
+
+#[test]
+fn a_pending_transaction_is_mined_without_being_asked() {
+    use std::sync::atomic::Ordering;
+    let (auto, mined, pending) = autominer();
+    auto.start();
+    pending.store(1, Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    auto.stop();
+    let n = mined.load(Ordering::Relaxed);
+    assert!(n >= 1, "the pending transaction should have been mined");
+    // And then stopped: draining the pool must end the mining, not
+    // start a block-per-tick chain.
+    assert!(n <= 3, "mined {n} blocks for one transaction");
+}
+
+/// `evm_startMining` is called once per scenario and there are eleven of
+/// them. Starting twice must not give two threads mining one chain.
+#[test]
+fn starting_twice_runs_one_miner() {
+    use std::sync::atomic::Ordering;
+    let (auto, mined, pending) = autominer();
+    for _ in 0..5 {
+        auto.start();
+    }
+    assert!(auto.is_running());
+    pending.store(1, Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    auto.stop();
+    assert!(mined.load(Ordering::Relaxed) <= 3, "one transaction, one miner, one block");
+}
+
+#[test]
+fn stopping_is_idempotent_and_reported() {
+    let (auto, _mined, _pending) = autominer();
+    assert!(!auto.is_running(), "off until asked");
+    auto.start();
+    assert!(auto.is_running());
+    auto.stop();
+    auto.stop();
+    assert!(!auto.is_running());
+    // And it can be started again, which a scenario that stops and
+    // restarts mining depends on.
+    auto.start();
+    assert!(auto.is_running());
+    auto.stop();
+}
+
+
+/// A receipt must name the account that signed the transaction, on
+/// whatever chain the node is running.
+///
+/// The sender recovery here was hardcoded to chain id 30, so on testnet
+/// and on every regtest chain the EIP-155 recovery failed and the
+/// `unwrap_or` turned it into the zero address. Silent, because a
+/// receipt with a plausible-looking zero address is not obviously
+/// broken, and invisible on mainnet, which is the only chain whose id
+/// matched the constant.
+#[tokio::test]
+async fn a_receipt_names_the_sender_on_a_chain_that_is_not_mainnet() {
+    use rustock_core::types::receipt::Receipt;
+
+    let (mut state, _tmp) = setup_state();
+    // Regtest, deliberately: the bug was invisible wherever the chain
+    // id happened to be 30.
+    let chain_id = 33u64;
+    state.hardfork_cfg =
+        Some(rustock_execution::hardfork::RskHardforkConfig::all_active_parallel(chain_id));
+
+    // A transaction signed for this chain, by a key whose address we know.
+    let wallet = test_wallet();
+    let signer = wallet.accounts()[0];
+    let mut tx = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::from(1),
+        gas_limit: U256::from(21_000),
+        to: Bytes::copy_from_slice(&[0xAAu8; 20]),
+        value: U256::from(1),
+        input: Bytes::new(),
+        v: 0,
+        r: U256::ZERO,
+        s: U256::ZERO,
+        cached_rlp: None,
+    };
+    assert!(wallet.sign_transaction(&signer, &mut tx, chain_id));
+
+    // Put it in a block with a receipt, the way the store would hold it.
+    let header = test_header(43);
+    let hash = header.hash();
+    state.store.put_header_with_hash(hash, &header).unwrap();
+    state.store.put_body(hash, std::slice::from_ref(&tx), &[]).unwrap();
+    state.store.put_canonical_hash(43, hash).unwrap();
+    let tx_hash = crate::tx::compute_tx_hash(&tx);
+    state.store.put_tx_index(tx_hash, hash, 0).unwrap();
+    state
+        .store
+        .put_receipts(
+            hash,
+            &[Receipt {
+                post_tx_state: vec![1],
+                cumulative_gas_used: 21_000,
+                gas_used: 21_000,
+                logs_bloom: Default::default(),
+                logs: Vec::new(),
+                status: true,
+            }],
+        )
+        .unwrap();
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getTransactionReceipt", json!([format!("{tx_hash:#x}")])),
+    )
+    .await;
+
+    let from = resp.result.expect("a receipt")["from"].as_str().unwrap().to_string();
+    assert_eq!(
+        from,
+        format!("{signer:#x}"),
+        "the receipt must name the signer, not the zero address"
     );
 }

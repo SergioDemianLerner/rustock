@@ -1,0 +1,111 @@
+# Rustock configured for the k6 load-test suite, on regtest.
+#
+#   rustock-cli --config regtest-loadtest.example.toml
+#
+# Two things this is tuned for and one it is not. It is tuned for speed
+# of block execution and for a harness that signs through the node. It is
+# **not** safe on anything but a throwaway local chain: it holds private
+# keys and will sign with them for anyone who can reach the RPC port.
+#
+# Everything here was measured. The numbers are in
+# docs/execution-performance.md; the short version is that FlatDB plus
+# shared trie nodes plus parallel sender recovery take a full 25M-gas
+# block of transfers from about 1.4 s to 420 ms.
+
+[node]
+# Anything that is not 30 or 31 is a regtest chain. 33 is what rskj uses
+# for its own regtest, and it is the chain id transactions are signed
+# against, so a harness configured for rskj's regtest needs this value.
+network_id = 33
+data_dir = "/tmp/rustock-regtest"
+
+# Four, to match the cores on the measuring machine. Above the core count
+# the sublists contend rather than divide. Note the ceiling this does not
+# lift: RSKIP-144 allows two execution threads on a real network, and a
+# block declaring four sublists is not valid there -- fine for regtest,
+# wrong for anything else.
+execution_threads = 4
+
+[trie]
+# **external, not single.** `single` keeps the trie in a column family
+# inside the main database, which only RocksDB can provide -- the node
+# refuses `single` with flatdb and says so. `external` gives the trie its
+# own database, which is what lets a different engine hold it.
+#
+# Not `epoch` either. Epoch is what mainnet runs: it rotates and collects
+# so the disk stays bounded, at the cost of spending CPU doing it and of
+# losing historical state below the window. A load test wants neither --
+# it wants every cycle going into blocks, and it is going to be deleted
+# afterwards. `external` keeps everything and collects nothing.
+backend = "external"
+dir = "/tmp/rustock-regtest-trie"
+
+# The reason for all of the above. 1.76x on the read pattern execution
+# actually uses, about thirty times less memory demand, and no
+# compaction pauses in the middle of a measurement.
+#
+# Marked experimental in the flag's own help, and that is accurate: it
+# has been running on one mainnet node since October 2026 and nowhere
+# else. For a regtest chain that is thrown away, the risk is a crash, not
+# a loss.
+engine = "flatdb"
+
+# Durability costs a flush, and a regtest chain that is deleted after the
+# run has nothing to be durable about. 100 blocks between flushes is the
+# catch-up default; raising it further trades a longer replay on restart
+# for fewer pauses, and a replay of a regtest chain costs nothing.
+flush_every = 100
+
+[rpc]
+host = "127.0.0.1"
+port = 4444
+
+# `evm_*`: snapshot, revert, mine, increaseTime. The suite uses
+# evm_mine and evm_stopMining, and without this they report as unknown.
+dev = true
+
+# The suite opens filters and subscriptions.
+ws = true
+ws_port = 4445
+
+# eth_getLogs over a whole regtest chain is a small query; the default
+# cap exists for mainnet.
+logs_max_blocks = 100000
+
+# The keys the node will sign `eth_sendTransaction` and `eth_sign` with.
+#
+# Generate the file with the ten accounts regtest's genesis funds:
+#
+#   for s in cow cow1 cow2 cow3 cow4 cow5 cow6 cow7 cow8 cow9; do
+#     printf '%s\n' "$(printf '%s' "$s" | keccak-256sum -x -l | cut -d' ' -f1)"
+#   done > /tmp/rustock-wallet.keys
+#   chmod 600 /tmp/rustock-wallet.keys
+#
+# or copy the ready-made one this repository ships as
+# regtest-wallet.example.keys, whose contents are those ten hashes.
+#
+# **These are published private keys.** They fund nothing anywhere real,
+# and they must never appear on a node whose RPC is reachable by anyone
+# you do not control.
+wallet_file = "/tmp/rustock-wallet.keys"
+
+[mining]
+# `evm_mine` needs a miner to drive, and the suite calls it ten times.
+# Note what this does *not* give you: `evm_startMining` is a stub that
+# answers true and starts nothing, so there is no continuous mining and
+# no equivalent of rskj's `miner.client.autoMine`. A harness that sends
+# a transaction and waits for a receipt must call `evm_mine` itself.
+enabled = true
+coinbase = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826"
+
+[peers]
+# A regtest chain has no peers to find and nothing to learn from looking.
+bootnodes = []
+
+[account_tx_rate_limit]
+# Off. The limiter exists to stop one account monopolising a real node's
+# block space; a load test is one account trying to do exactly that, on
+# purpose, and leaving it on would be measuring the limiter. rskj's own
+# suite config does the same: `transaction.accountTxRateLimit.enabled =
+# false`.
+enabled = false

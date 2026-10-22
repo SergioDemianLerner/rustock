@@ -115,6 +115,10 @@ pub struct RpcSection {
     pub logs_max_blocks: Option<u64>,
     /// Enable the `evm_*` development-chain namespace. Off by default.
     pub dev: Option<bool>,
+    /// A file of private keys this node may sign with, one 32-byte hex
+    /// key per line. Off by default; see `Args::wallet_file`, which
+    /// documents what it costs to turn on.
+    pub wallet_file: Option<std::path::PathBuf>,
 }
 
 /// Snapshot sync, off on both sides by default (rskj ships it the same way).
@@ -387,6 +391,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "metrics_host",
     "metrics_port",
     "rpc_admin",
+    "wallet_file",
     "no_rpc",
     "ws",
     "ws_port",

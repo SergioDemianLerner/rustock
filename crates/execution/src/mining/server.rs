@@ -117,6 +117,21 @@ pub trait ChainAccess: Send + Sync {
 pub struct StoreChainAccess {
     pub store: Arc<BlockStore>,
     pub trie_store: Arc<dyn TrieStore>,
+    /// Called with every block this commits, so a transaction pool can
+    /// drop what has just been mined.
+    ///
+    /// A locally mined block does not travel the sync service's import
+    /// path, which is the only place that called `remove_mined`. So
+    /// without this the pool keeps every transaction the node itself
+    /// mined, forever: `txpool_status` reports them as pending, a miner
+    /// rebuilds them into the next block, and the pool grows without
+    /// bound. Invisible on a node that only follows the chain, which is
+    /// why it survived; immediate on one that mines.
+    ///
+    /// A closure rather than a pool handle because this crate does not
+    /// know what a pool is, and should not have to in order to say "this
+    /// block is now committed".
+    pub on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
 }
 
 impl ChainAccess for StoreChainAccess {
@@ -211,6 +226,10 @@ impl ChainAccess for StoreChainAccess {
                 .unwrap_or(U256::ZERO),
             None => U256::ZERO,
         };
+
+        if let Some(hook) = &self.on_committed {
+            hook(block);
+        }
 
         let result = if td > current_td {
             self.store.update_canonical_chain(hash).map_err(|e| e.to_string())?;

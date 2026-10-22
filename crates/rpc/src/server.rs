@@ -19,7 +19,7 @@ use tracing::info;
 use crate::evm;
 use crate::txpool;
 use crate::types::*;
-use crate::{admin, call, debug, eth, logs, mnr, net, rsk, sco, state, trace, tx, web3};
+use crate::{admin, call, debug, eth, logs, mnr, net, rsk, sco, sign, state, trace, tx, web3};
 
 /// Trait for submitting raw transactions, allowing the RPC layer to use
 /// the P2P relay without depending on the sync crate directly.
@@ -84,6 +84,20 @@ pub struct RpcState {
     /// The miner, present only when the node was started with mining enabled.
     /// Absent, the `mnr_*` namespace answers as it always did.
     pub miner: Option<Arc<dyn mnr::MiningService>>,
+    /// Drives `evm_startMining`. Present whenever `miner` is, since it
+    /// is that miner with a loop around it; `evm_mine` reaches the miner
+    /// directly and does not need this.
+    pub auto_miner: Option<Arc<crate::evm::AutoMiner>>,
+    /// Keys the operator supplied with `--wallet-file`, and the only keys
+    /// this node will ever sign with.
+    ///
+    /// `None` -- the default -- means `eth_accounts` is empty and
+    /// `eth_sign`, `eth_signTransaction` and `eth_sendTransaction` are
+    /// refused, which is how the node behaved before it could hold keys
+    /// at all. Nothing here can reach the node identity key or a miner
+    /// key: a signature is produced only for an account whose key was
+    /// handed over on purpose.
+    pub wallet: Option<Arc<crate::wallet::Wallet>>,
     /// Administrative methods are refused unless the operator enabled them.
     pub admin_enabled: bool,
     /// Burial depth used when an admin collection request names no block.
@@ -202,7 +216,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
             &state.store,
             state.miner.as_ref().map(|m| alloy_primitives::Address::from(m.coinbase())),
         ),
-        "eth_accounts" => eth::eth_accounts(id),
+        "eth_accounts" => sign::eth_accounts(id, state),
         "eth_pendingTransactions" => eth::eth_pending_transactions(id),
         "eth_bridgeState" => eth::eth_bridge_state(id, state),
         "eth_coinbase" => eth::eth_coinbase(id, &state.miner),
@@ -321,12 +335,15 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_getFilterLogs" => logs::eth_get_filter_logs(id, params, state),
         "eth_uninstallFilter" => logs::eth_uninstall_filter(id, params, state),
 
+        // Answered out of the operator-supplied wallet, and refused with
+        // METHOD_NOT_FOUND when there is none -- which is what they did
+        // before a wallet was possible.
+        "eth_sendTransaction" => sign::eth_send_transaction(id, params, state).await,
+        "eth_sign" => sign::eth_sign(id, params, state),
+        "eth_signTransaction" => sign::eth_sign_transaction(id, params, state),
+
         // -- unsupported methods --
-        "eth_sendTransaction"
-        | "eth_getCompilers"
-        | "eth_compileSolidity"
-        | "eth_sign"
-        | "eth_signTransaction" => {
+        "eth_getCompilers" | "eth_compileSolidity" => {
             execution_not_available(id, &req.method)
         }
 

@@ -247,7 +247,19 @@ impl ChainConfig {
                 parent_hash: B256::ZERO,
                 ommers_hash: B256::ZERO,
                 beneficiary: Address::ZERO,
-                state_root: B256::ZERO,
+                // The root of `genesis_alloc()` for this chain: the Bridge and
+                // the ten funded test accounts. Zero until regtest funded
+                // nobody, and zero was wrong the moment it did -- the header
+                // is what every state lookup resolves through, so a header
+                // claiming an empty state makes the funded accounts
+                // unreachable and every transaction fail for want of funds.
+                //
+                // Hardcoded as mainnet's and testnet's are, and checked the
+                // same way: `regtest_genesis_state_root_matches_the_header`
+                // builds the allocation and compares.
+                state_root: "0xa8775bf8dcbdc856680b62089a632e8f389a18cf51dc2c9aee3918792989fc4b"
+                    .parse()
+                    .unwrap(),
                 transactions_root: B256::ZERO,
                 receipts_root: B256::ZERO,
                 logs_bloom: Default::default(),
@@ -272,6 +284,47 @@ impl ChainConfig {
         }
     }
 
+/// The ten accounts rskj's regtest genesis funds, in its own order.
+///
+/// `keccak256("cow")`, then `keccak256("cow1")` through
+/// `keccak256("cow9")`. Addresses rather than seeds because the address
+/// is what the genesis commits to; the seeds are recorded here so the
+/// private keys can be re-derived rather than kept anywhere:
+///
+/// | seed | address |
+/// |---|---|
+/// | cow  | cd2a3d9f938e13cd947ec05abc7fe734df8dd826 |
+/// | cow1 | 7986b3df570230288501eea3d890bd66948c9b79 |
+/// | cow2 | 0a3aa774752ec2042c46548456c094a76c7f3a79 |
+/// | cow3 | cf7cdbbb5f7ba79d3ffe74a0bba13fc0295f6036 |
+/// | cow4 | 39b12c05e8503356e3a7df0b7b33efa4c054c409 |
+/// | cow5 | c354d97642faa06781b76ffb6786f72cd7746c97 |
+/// | cow6 | debe71e1de41fc77c44df4b6db940026e31b0e71 |
+/// | cow7 | 7857288e171c6159c5576d1bd9ac40c0c48a771c |
+/// | cow8 | a4dea4d5c954f5fd9e87f0e9752911e83a3d18b3 |
+/// | cow9 | 09a1eda29f664ac8f68106f6567276df0c65d859 |
+    const REGTEST_TEST_ACCOUNTS: [&'static str; 10] = [
+    "cd2a3d9f938e13cd947ec05abc7fe734df8dd826",
+    "7986b3df570230288501eea3d890bd66948c9b79",
+    "0a3aa774752ec2042c46548456c094a76c7f3a79",
+    "cf7cdbbb5f7ba79d3ffe74a0bba13fc0295f6036",
+    "39b12c05e8503356e3a7df0b7b33efa4c054c409",
+    "c354d97642faa06781b76ffb6786f72cd7746c97",
+    "debe71e1de41fc77c44df4b6db940026e31b0e71",
+    "7857288e171c6159c5576d1bd9ac40c0c48a771c",
+    "a4dea4d5c954f5fd9e87f0e9752911e83a3d18b3",
+    "09a1eda29f664ac8f68106f6567276df0c65d859",
+];
+
+    fn address_bytes(s: &str) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .expect("REGTEST_TEST_ACCOUNTS holds hex");
+    }
+    out
+}
+
     /// Returns the genesis state allocations for this network.
     ///
     /// For mainnet/testnet, the Bridge contract (0x01000006) is pre-funded with
@@ -282,13 +335,47 @@ impl ChainConfig {
         // 21_000_000 RBTC = 21_000_000 * 10^18 wei
         let twenty_one_million_rbtc = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
 
+        let bridge = GenesisAlloc {
+            address: BRIDGE,
+            balance: twenty_one_million_rbtc,
+            nonce: U256::ZERO,
+        };
+
         match self.chain_id {
-            30 | 31 => vec![GenesisAlloc {
-                address: BRIDGE,
-                balance: twenty_one_million_rbtc,
-                nonce: U256::ZERO,
-            }],
-            _ => vec![],
+            30 | 31 => vec![bridge],
+            // Regtest funds ten test accounts as well, because a chain
+            // where nobody holds anything cannot be used to test
+            // anything: the first transaction fails for want of funds
+            // and no amount of mining fixes it, since regtest starts at
+            // genesis with no coinbase history.
+            //
+            // The addresses and the balance are rskj's
+            // `genesis/rsk-dev.json` verbatim, so a contract or a test
+            // suite written against rskj's regtest finds the same
+            // accounts holding the same amounts here. Each is
+            // `keccak256(seed)` for seed "cow", "cow1" .. "cow9", which
+            // is how rskj's own tooling derives them -- verified, not
+            // assumed: all ten derivations reproduce the listed
+            // addresses.
+            //
+            // The *genesis hash* is still ours rather than rskj's: the
+            // header fields it hashes over have not been compared, and
+            // the state root now differs from the empty one it was. A
+            // regtest chain is local by definition, so nothing peers
+            // across the difference, but do not read a matching hash
+            // into this.
+            _ => {
+                let mut alloc = vec![bridge];
+                alloc.extend(Self::REGTEST_TEST_ACCOUNTS.iter().map(|hex| GenesisAlloc {
+                    address: Address::from_slice(&Self::address_bytes(hex)),
+                    // 10^30 wei, rskj's figure. Deliberately absurd: a
+                    // load test should never be measuring what happens
+                    // when a sender runs out.
+                    balance: U256::from(10u64).pow(U256::from(30)),
+                    nonce: U256::ZERO,
+                }));
+                alloc
+            }
         }
     }
 
@@ -351,6 +438,58 @@ fn u256_to_storage_bytes(val: U256) -> Vec<u8> {
 mod tests {
     use super::*;
     use alloy_primitives::U256;
+
+    /// The regtest accounts must be the ones rskj funds, and they must be
+    /// what their seeds derive to.
+    ///
+    /// Addresses are listed rather than computed, so without this the
+    /// list is a row of magic constants nobody can check. Deriving them
+    /// here means a typo in the table fails the build rather than
+    /// quietly funding an account nobody holds the key to -- which would
+    /// look exactly like a working configuration until the first
+    /// transaction.
+    #[test]
+    fn regtest_funds_the_accounts_rskj_funds() {
+        use sha3::{Digest, Keccak256};
+
+        let alloc = ChainConfig::regtest().genesis_alloc();
+        assert_eq!(alloc.len(), 11, "the Bridge and ten test accounts");
+
+        let expected = U256::from(10u64).pow(U256::from(30));
+        for (i, entry) in alloc.iter().skip(1).enumerate() {
+            let seed = if i == 0 { "cow".to_string() } else { format!("cow{i}") };
+
+            // keccak(seed) is the private key; the address is the last
+            // twenty bytes of keccak of the uncompressed public key.
+            let secret = Keccak256::digest(seed.as_bytes());
+            let key = secp256k1::SecretKey::from_byte_array(secret.into())
+                .expect("a valid secp256k1 key");
+            let public = secp256k1::PublicKey::from_secret_key(
+                &secp256k1::Secp256k1::new(),
+                &key,
+            );
+            let hashed = Keccak256::digest(&public.serialize_uncompressed()[1..]);
+            let derived = alloy_primitives::Address::from_slice(&hashed[12..]);
+
+            assert_eq!(
+                entry.address, derived,
+                "entry {i} should be keccak256(\"{seed}\")"
+            );
+            assert_eq!(entry.balance, expected, "{seed} is funded with 10^30 wei");
+            assert_eq!(entry.nonce, U256::ZERO);
+        }
+    }
+
+    /// Mainnet and testnet fund the Bridge and nobody else. A test
+    /// account reachable on a real network would be a live private key
+    /// published in this file.
+    #[test]
+    fn only_regtest_funds_test_accounts() {
+        for config in [ChainConfig::mainnet(), ChainConfig::testnet()] {
+            let alloc = config.genesis_alloc();
+            assert_eq!(alloc.len(), 1, "chain {} funds only the Bridge", config.chain_id);
+        }
+    }
 
     #[test]
     fn test_mainnet_activation_heights() {
@@ -525,12 +664,29 @@ mod tests {
         );
     }
 
-    /// Regtest has no pre-funded allocations (tests build their own state).
+    /// Regtest *does* have pre-funded allocations, and the assertion that
+    /// stood here saying otherwise was wrong about rskj.
+    ///
+    /// It read "regtest has no pre-funded allocations (tests build their
+    /// own state)" and sat among tests labelled as ported from rskj --
+    /// but rskj's `genesis/rsk-dev.json` funds the Bridge and ten test
+    /// accounts. A unit test can indeed build its own state and never
+    /// notice; a node cannot, and a chain where nobody holds anything
+    /// fails its first transaction for want of funds with no way to
+    /// acquire any.
+    ///
+    /// What the allocation is, and that the addresses are the ones their
+    /// seeds derive to, is checked by
+    /// `regtest_funds_the_accounts_rskj_funds`.
     #[test]
-    fn rskj_genesis_regtest_no_alloc() {
-        let config = ChainConfig::regtest();
-        let alloc = config.genesis_alloc();
-        assert!(alloc.is_empty(), "regtest should have no genesis allocations");
+    fn rskj_genesis_regtest_funds_the_bridge_and_ten_accounts() {
+        let alloc = ChainConfig::regtest().genesis_alloc();
+        assert_eq!(alloc.len(), 11);
+        assert_eq!(
+            alloc[0].balance,
+            U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18)),
+            "the Bridge holds the same 21M here as on every other chain"
+        );
     }
 
     /// Ported from rskj: genesis Bridge storage includes feePerKb and lockingCap.

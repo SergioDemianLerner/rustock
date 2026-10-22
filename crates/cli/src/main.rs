@@ -1133,6 +1133,27 @@ struct Args {
     #[arg(long)]
     rpc_admin: bool,
 
+    /// Private keys this node may sign with, one 32-byte hex key per line.
+    ///
+    /// Off by default, and the only way the node ever holds a key for
+    /// signing. Without it `eth_accounts` is empty and `eth_sign`,
+    /// `eth_signTransaction` and `eth_sendTransaction` report as unknown
+    /// methods, so a node with no wallet is indistinguishable from one
+    /// built without the feature.
+    ///
+    /// A file rather than a flag taking the key itself, because a private
+    /// key on the command line is visible in `ps` to every user on the
+    /// machine and lands in shell history. Give the file mode 0600.
+    ///
+    /// Keys are held in memory for the life of the process and never
+    /// written anywhere. This is not a keystore: there is no encryption,
+    /// no passphrase and no `personal_*` namespace. It exists so a test
+    /// harness can drive `eth_sendTransaction` from funded senders.
+    ///
+    /// **Do not point this at a node serving a public RPC endpoint.**
+    #[arg(long, value_name = "FILE")]
+    wallet_file: Option<std::path::PathBuf>,
+
     /// Seconds between checks of whether the store needs collecting.
     #[arg(long, default_value_t = 60)]
     gc_check_secs: u64,
@@ -1179,6 +1200,7 @@ fn apply_file_config(
     apply(matches, "rpc_host", f.rpc.host.as_ref(), &mut a.rpc_host);
     apply(matches, "rpc_port", f.rpc.port.as_ref(), &mut a.rpc_port);
     apply(matches, "rpc_admin", f.rpc.admin.as_ref(), &mut a.rpc_admin);
+    apply_opt(matches, "wallet_file", f.rpc.wallet_file.as_ref(), &mut a.wallet_file);
     apply(matches, "no_rpc", f.rpc.disabled.as_ref(), &mut a.no_rpc);
     apply(matches, "ws", f.rpc.ws.as_ref(), &mut a.ws);
     apply(matches, "ws_port", f.rpc.ws_port.as_ref(), &mut a.ws_port);
@@ -3042,6 +3064,15 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         let chain = Arc::new(rustock_execution::mining::StoreChainAccess {
             store: store.clone(),
             trie_store: trie_store_for_pool.clone(),
+            // What the sync service's import path does for a block that
+            // arrived from a peer, done here for one this node mined.
+            on_committed: Some({
+                let pool = pool.clone();
+                Arc::new(move |block: &rustock_core::Block| {
+                    pool.remove_mined(&block.transactions);
+                    pool.evict_outdated(block.header.number);
+                })
+            }),
         });
         let server = Arc::new(rustock_execution::MinerServer::new(
             builder,
@@ -3078,6 +3109,28 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None
     };
 
+    // Loaded before the server starts, so a bad key file stops the node
+    // rather than surfacing as a confusing refusal on the first signing
+    // call hours later.
+    let wallet = match &args.wallet_file {
+        Some(path) => {
+            let w = rustock_rpc::wallet::Wallet::from_file(path)
+                .with_context(|| format!("loading the wallet from {}", path.display()))?;
+            let accounts = w.accounts();
+            warn!(
+                target: "rustock::rpc",
+                "Wallet loaded with {} account(s) from {}; this node will sign \
+                 eth_sendTransaction and eth_sign for them. Do not expose this \
+                 RPC endpoint publicly. Accounts: {}",
+                accounts.len(),
+                path.display(),
+                accounts.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(", ")
+            );
+            Some(Arc::new(w))
+        }
+        None => None,
+    };
+
     if !args.no_rpc {
         let trie_store: Arc<dyn rustock_trie::TrieStore> = match &detached_for_readers {
             Some(t) => t.clone(),
@@ -3098,6 +3151,20 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 
             epoch_store: epoch_store.clone(),
             miner: miner.clone().map(|m| m as Arc<dyn rustock_rpc::mnr::MiningService>),
+            // The same miner with a loop around it, for
+            // `evm_startMining`. The tick bounds how long a transaction
+            // waits for its block; a quarter second is short enough that
+            // a harness does not notice and long enough that an idle
+            // chain is not spinning.
+            auto_miner: miner.clone().map(|m| {
+                Arc::new(rustock_rpc::evm::AutoMiner::new(
+                    m as Arc<dyn rustock_rpc::mnr::MiningService>,
+                    Some(Arc::new(PoolAdapter(pool.clone()))
+                        as Arc<dyn rustock_rpc::server::TxPoolReader>),
+                    std::time::Duration::from_millis(250),
+                ))
+            }),
+            wallet: wallet.clone(),
             admin_enabled: args.rpc_admin,
             gc_burial: args.gc_burial,
             gc_pins: {
@@ -4479,6 +4546,27 @@ mod genesis_tests {
                 .parse::<alloy_primitives::B256>()
                 .unwrap(),
             "testnet genesis state must match the published root"
+        );
+    }
+
+    /// Regtest's header must commit to its allocation, or the ten funded
+    /// accounts cannot be reached.
+    ///
+    /// This is not a formality. The header is what a state lookup
+    /// resolves through, so a header carrying the empty root -- which
+    /// regtest's did, correctly, while it funded nobody -- makes
+    /// `eth_getBalance` answer "cannot resolve block" and every
+    /// transaction fail for insufficient funds, with the state sitting
+    /// in the trie the whole time.
+    #[test]
+    fn regtest_genesis_state_root_matches_the_header() {
+        let config = ChainConfig::regtest();
+        let store = MemoryTrieStore::new();
+        let root = build_genesis_state(&config, &store).unwrap();
+        assert_eq!(
+            root.compute_hash(&store),
+            config.genesis_header().state_root,
+            "the regtest header must carry the root of its own allocation"
         );
     }
 
