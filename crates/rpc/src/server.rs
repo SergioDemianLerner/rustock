@@ -84,6 +84,10 @@ pub struct RpcState {
     /// The miner, present only when the node was started with mining enabled.
     /// Absent, the `mnr_*` namespace answers as it always did.
     pub miner: Option<Arc<dyn mnr::MiningService>>,
+    /// Drives `evm_startMining`. Present whenever `miner` is, since it
+    /// is that miner with a loop around it; `evm_mine` reaches the miner
+    /// directly and does not need this.
+    pub auto_miner: Option<Arc<crate::evm::AutoMiner>>,
     /// Keys the operator supplied with `--wallet-file`, and the only keys
     /// this node will ever sign with.
     ///

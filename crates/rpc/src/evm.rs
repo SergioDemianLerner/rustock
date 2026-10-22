@@ -177,11 +177,30 @@ pub fn evm_mine(id: Value, state: &RpcState) -> JsonRpcResponse {
 /// asked, so both are accepted and answer truthfully about what they did
 /// rather than pretending to control a loop that does not exist -- a test
 /// suite calls these for symmetry and does not inspect the result.
-pub fn evm_set_mining(id: Value, state: &RpcState, _start: bool) -> JsonRpcResponse {
+/// `evm_startMining` and `evm_stopMining`.
+///
+/// This answered `true` and started nothing until there was an
+/// [`AutoMiner`] to drive, which made a harness relying on it wait
+/// forever for a receipt. It now reports whether mining is actually on:
+/// a caller that asks to start and is told `false` knows the node was
+/// built without a miner, rather than believing it is mining.
+pub fn evm_set_mining(id: Value, state: &RpcState, start: bool) -> JsonRpcResponse {
     if state.snapshots.is_none() {
         return unavailable(id);
     }
-    JsonRpcResponse::success(id, json!(true))
+    let Some(auto) = &state.auto_miner else {
+        return JsonRpcResponse::error(
+            id,
+            INVALID_PARAMS,
+            "node was not started with mining enabled; evm_startMining needs --mine",
+        );
+    };
+    if start {
+        auto.start();
+    } else {
+        auto.stop();
+    }
+    JsonRpcResponse::success(id, json!(auto.is_running()))
 }
 
 fn unavailable(id: Value) -> JsonRpcResponse {
@@ -238,4 +257,117 @@ fn rewind_to_height(state: &RpcState, target: u64) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
 
     Ok(true)
+}
+
+/// Mines blocks on its own, for `evm_startMining` / `evm_stopMining`.
+///
+/// rskj's development chain has `miner.client.autoMine`, which mines a
+/// block per transaction, and a test suite written against it sends a
+/// transaction and then asks for its receipt without mining anything
+/// itself. Without an equivalent, every such test waits forever for a
+/// receipt that nothing will produce.
+///
+/// This is not quite rskj's design and the difference is deliberate.
+/// rskj's pool tells its miner that a transaction arrived; doing that
+/// here would make the pool depend on the miner, which is backwards on a
+/// real node, where a pool exists whether or not anything mines. Instead
+/// this polls: it asks the pool whether anything is pending, mines if so,
+/// and idles otherwise. The RPC layer already holds both, so nothing new
+/// points at anything.
+///
+/// The practical difference is a tick of latency between a transaction
+/// arriving and its block, not a change in what gets mined.
+pub struct AutoMiner {
+    miner: std::sync::Arc<dyn crate::mnr::MiningService>,
+    /// Consulted so that an idle chain is not filled with empty blocks.
+    /// Absent, every tick mines regardless, which is what a caller asking
+    /// for continuous mining with no pool to read would mean.
+    pool: Option<std::sync::Arc<dyn crate::server::TxPoolReader>>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tick: std::time::Duration,
+}
+
+impl AutoMiner {
+    /// `tick` is how long the loop waits before looking again. It bounds
+    /// the delay between a transaction arriving and its block, so it
+    /// wants to be short; it is also how often an idle chain wakes up to
+    /// find nothing, so it does not want to be zero.
+    pub fn new(
+        miner: std::sync::Arc<dyn crate::mnr::MiningService>,
+        pool: Option<std::sync::Arc<dyn crate::server::TxPoolReader>>,
+        tick: std::time::Duration,
+    ) -> Self {
+        Self {
+            miner,
+            pool,
+            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tick,
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Start mining, or do nothing if already started.
+    ///
+    /// Idempotent because the method is: a harness calls
+    /// `evm_startMining` once per scenario and there are eleven of them.
+    /// The compare-exchange is what makes it so -- a plain
+    /// `store(true)` followed by a spawn would leave one thread running
+    /// per call, all mining the same chain.
+    ///
+    /// A plain OS thread rather than a tokio task: `mine_one_now`
+    /// brute-forces a nonce, which is CPU-bound and would hold a runtime
+    /// worker for as long as it took.
+    pub fn start(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let miner = self.miner.clone();
+        let pool = self.pool.clone();
+        let running = self.running.clone();
+        let tick = self.tick;
+        std::thread::Builder::new()
+            .name("rustock-automine".into())
+            .spawn(move || {
+                while running.load(Ordering::Relaxed) {
+                    // Nothing waiting means nothing to mine. An empty
+                    // block costs a template build and a nonce search,
+                    // and a chain full of them makes every later test
+                    // walk further to find anything.
+                    let pending = pool.as_ref().map(|p| p.pool_status().0).unwrap_or(1);
+                    if pending == 0 {
+                        std::thread::sleep(tick);
+                        continue;
+                    }
+                    match miner.mine_one_now() {
+                        Ok(number) => {
+                            tracing::debug!(target: "rustock::rpc", "automine: #{number}")
+                        }
+                        Err(e) => {
+                            // Sleep before trying again, or a persistent
+                            // failure becomes a busy loop writing a log
+                            // line per iteration.
+                            tracing::warn!(target: "rustock::rpc", "automine failed: {e}");
+                            std::thread::sleep(tick);
+                        }
+                    }
+                }
+                tracing::info!(target: "rustock::rpc", "automine stopped");
+            })
+            .expect("spawning the automine thread");
+        tracing::info!(target: "rustock::rpc", "automine started");
+    }
+
+    /// Stop after the block in flight. Idempotent.
+    pub fn stop(&self) {
+        self.running.store(false, std::sync::atomic::Ordering::Release);
+    }
 }

@@ -3064,6 +3064,15 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         let chain = Arc::new(rustock_execution::mining::StoreChainAccess {
             store: store.clone(),
             trie_store: trie_store_for_pool.clone(),
+            // What the sync service's import path does for a block that
+            // arrived from a peer, done here for one this node mined.
+            on_committed: Some({
+                let pool = pool.clone();
+                Arc::new(move |block: &rustock_core::Block| {
+                    pool.remove_mined(&block.transactions);
+                    pool.evict_outdated(block.header.number);
+                })
+            }),
         });
         let server = Arc::new(rustock_execution::MinerServer::new(
             builder,
@@ -3142,6 +3151,19 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 
             epoch_store: epoch_store.clone(),
             miner: miner.clone().map(|m| m as Arc<dyn rustock_rpc::mnr::MiningService>),
+            // The same miner with a loop around it, for
+            // `evm_startMining`. The tick bounds how long a transaction
+            // waits for its block; a quarter second is short enough that
+            // a harness does not notice and long enough that an idle
+            // chain is not spinning.
+            auto_miner: miner.clone().map(|m| {
+                Arc::new(rustock_rpc::evm::AutoMiner::new(
+                    m as Arc<dyn rustock_rpc::mnr::MiningService>,
+                    Some(Arc::new(PoolAdapter(pool.clone()))
+                        as Arc<dyn rustock_rpc::server::TxPoolReader>),
+                    std::time::Duration::from_millis(250),
+                ))
+            }),
             wallet: wallet.clone(),
             admin_enabled: args.rpc_admin,
             gc_burial: args.gc_burial,

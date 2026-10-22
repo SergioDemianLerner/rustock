@@ -180,6 +180,7 @@ fn fixture_with(
         },
     );
     let chain = Arc::new(StoreChainAccess {
+        on_committed: None,
         store: store.clone(),
         trie_store: trie_store.clone(),
     });

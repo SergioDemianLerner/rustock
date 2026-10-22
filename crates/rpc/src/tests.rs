@@ -62,6 +62,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -613,6 +614,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -666,6 +668,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -752,6 +755,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -890,6 +894,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -993,6 +998,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -1184,6 +1190,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -1450,6 +1457,7 @@ async fn test_receipt_dto_failed_status() {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -2309,6 +2317,7 @@ fn setup_state_with_receipts(
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -2581,6 +2590,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -3529,6 +3539,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -3963,6 +3974,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         gas_price: None,
         epoch_store: None,
         miner: None,
+        auto_miner: None,
         wallet: None,
         admin_enabled: false,
         gc_burial: 4000,
@@ -5019,4 +5031,153 @@ fn test_a_wallet_does_not_print_its_keys() {
     let rendered = format!("{:?}", test_wallet());
     assert!(rendered.contains("accounts"), "it should say how many: {rendered}");
     assert!(!rendered.contains("1111"), "key material must not be printable: {rendered}");
+}
+
+
+// ---------------------------------------------------------------------
+// Continuous mining
+// ---------------------------------------------------------------------
+
+/// A miner that records what it was asked to do, and a pool whose
+/// pending count the test drives.
+struct CountingMiner {
+    mined: Arc<std::sync::atomic::AtomicUsize>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::mnr::MiningService for CountingMiner {
+    fn coinbase(&self) -> [u8; 20] {
+        [0u8; 20]
+    }
+    fn get_work(&self) -> Result<rustock_execution::mining::MinerWork, rustock_execution::mining::SubmitError> {
+        unimplemented!("not reached by these tests")
+    }
+    fn submit_bitcoin_block(
+        &self,
+        _raw: &[u8],
+    ) -> Result<rustock_execution::mining::SubmittedBlockInfo, rustock_execution::mining::SubmitError> {
+        unimplemented!("not reached by these tests")
+    }
+    fn submit_bitcoin_block_transactions(
+        &self,
+        _h: &[u8],
+        _c: &[u8],
+        _t: &str,
+    ) -> Result<rustock_execution::mining::SubmittedBlockInfo, rustock_execution::mining::SubmitError> {
+        unimplemented!("not reached by these tests")
+    }
+    fn submit_bitcoin_block_partial_merkle(
+        &self,
+        _h: &[u8],
+        _c: &[u8],
+        _m: &str,
+        _n: u32,
+    ) -> Result<rustock_execution::mining::SubmittedBlockInfo, rustock_execution::mining::SubmitError> {
+        unimplemented!("not reached by these tests")
+    }
+    fn mine_one_now(&self) -> Result<u64, String> {
+        use std::sync::atomic::Ordering;
+        // Mining a block drains the pool, as a real one does now that a
+        // locally mined block evicts what it included.
+        self.pending.store(0, Ordering::Relaxed);
+        Ok(self.mined.fetch_add(1, Ordering::Relaxed) as u64 + 1)
+    }
+}
+
+struct CountingPool {
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::server::TxPoolReader for CountingPool {
+    fn get_pending_tx(
+        &self,
+        _h: &B256,
+    ) -> Option<(rustock_core::Transaction, Address, B256)> {
+        None
+    }
+    fn pending_nonce(&self, _a: &Address) -> Option<u64> {
+        None
+    }
+    fn pool_status(&self) -> (usize, usize) {
+        (self.pending.load(std::sync::atomic::Ordering::Relaxed), 0)
+    }
+    fn pool_content(&self) -> crate::server::PoolContent {
+        crate::server::PoolContent { pending: Vec::new(), queued: Vec::new() }
+    }
+    fn quota_report(&self, _a: &Address) -> Option<(f64, u64)> {
+        None
+    }
+}
+
+fn autominer() -> (crate::evm::AutoMiner, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+    let mined = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let auto = crate::evm::AutoMiner::new(
+        Arc::new(CountingMiner { mined: mined.clone(), pending: pending.clone() }),
+        Some(Arc::new(CountingPool { pending: pending.clone() })),
+        std::time::Duration::from_millis(10),
+    );
+    (auto, mined, pending)
+}
+
+/// An idle chain must not fill with empty blocks.
+///
+/// This is the failure the pool-eviction bug produced: with mined
+/// transactions never leaving the pool, the loop saw work forever and
+/// mined four thousand empty blocks in ten seconds.
+#[test]
+fn an_idle_chain_is_not_mined() {
+    use std::sync::atomic::Ordering;
+    let (auto, mined, _pending) = autominer();
+    auto.start();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    auto.stop();
+    assert_eq!(mined.load(Ordering::Relaxed), 0, "nothing pending, nothing to mine");
+}
+
+#[test]
+fn a_pending_transaction_is_mined_without_being_asked() {
+    use std::sync::atomic::Ordering;
+    let (auto, mined, pending) = autominer();
+    auto.start();
+    pending.store(1, Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    auto.stop();
+    let n = mined.load(Ordering::Relaxed);
+    assert!(n >= 1, "the pending transaction should have been mined");
+    // And then stopped: draining the pool must end the mining, not
+    // start a block-per-tick chain.
+    assert!(n <= 3, "mined {n} blocks for one transaction");
+}
+
+/// `evm_startMining` is called once per scenario and there are eleven of
+/// them. Starting twice must not give two threads mining one chain.
+#[test]
+fn starting_twice_runs_one_miner() {
+    use std::sync::atomic::Ordering;
+    let (auto, mined, pending) = autominer();
+    for _ in 0..5 {
+        auto.start();
+    }
+    assert!(auto.is_running());
+    pending.store(1, Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    auto.stop();
+    assert!(mined.load(Ordering::Relaxed) <= 3, "one transaction, one miner, one block");
+}
+
+#[test]
+fn stopping_is_idempotent_and_reported() {
+    let (auto, _mined, _pending) = autominer();
+    assert!(!auto.is_running(), "off until asked");
+    auto.start();
+    assert!(auto.is_running());
+    auto.stop();
+    auto.stop();
+    assert!(!auto.is_running());
+    // And it can be started again, which a scenario that stops and
+    // restarts mining depends on.
+    auto.start();
+    assert!(auto.is_running());
+    auto.stop();
 }
