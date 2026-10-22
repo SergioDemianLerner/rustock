@@ -5181,3 +5181,78 @@ fn stopping_is_idempotent_and_reported() {
     assert!(auto.is_running());
     auto.stop();
 }
+
+
+/// A receipt must name the account that signed the transaction, on
+/// whatever chain the node is running.
+///
+/// The sender recovery here was hardcoded to chain id 30, so on testnet
+/// and on every regtest chain the EIP-155 recovery failed and the
+/// `unwrap_or` turned it into the zero address. Silent, because a
+/// receipt with a plausible-looking zero address is not obviously
+/// broken, and invisible on mainnet, which is the only chain whose id
+/// matched the constant.
+#[tokio::test]
+async fn a_receipt_names_the_sender_on_a_chain_that_is_not_mainnet() {
+    use rustock_core::types::receipt::Receipt;
+
+    let (mut state, _tmp) = setup_state();
+    // Regtest, deliberately: the bug was invisible wherever the chain
+    // id happened to be 30.
+    let chain_id = 33u64;
+    state.hardfork_cfg =
+        Some(rustock_execution::hardfork::RskHardforkConfig::all_active_parallel(chain_id));
+
+    // A transaction signed for this chain, by a key whose address we know.
+    let wallet = test_wallet();
+    let signer = wallet.accounts()[0];
+    let mut tx = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::from(1),
+        gas_limit: U256::from(21_000),
+        to: Bytes::copy_from_slice(&[0xAAu8; 20]),
+        value: U256::from(1),
+        input: Bytes::new(),
+        v: 0,
+        r: U256::ZERO,
+        s: U256::ZERO,
+        cached_rlp: None,
+    };
+    assert!(wallet.sign_transaction(&signer, &mut tx, chain_id));
+
+    // Put it in a block with a receipt, the way the store would hold it.
+    let header = test_header(43);
+    let hash = header.hash();
+    state.store.put_header_with_hash(hash, &header).unwrap();
+    state.store.put_body(hash, std::slice::from_ref(&tx), &[]).unwrap();
+    state.store.put_canonical_hash(43, hash).unwrap();
+    let tx_hash = crate::tx::compute_tx_hash(&tx);
+    state.store.put_tx_index(tx_hash, hash, 0).unwrap();
+    state
+        .store
+        .put_receipts(
+            hash,
+            &[Receipt {
+                post_tx_state: vec![1],
+                cumulative_gas_used: 21_000,
+                gas_used: 21_000,
+                logs_bloom: Default::default(),
+                logs: Vec::new(),
+                status: true,
+            }],
+        )
+        .unwrap();
+
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getTransactionReceipt", json!([format!("{tx_hash:#x}")])),
+    )
+    .await;
+
+    let from = resp.result.expect("a receipt")["from"].as_str().unwrap().to_string();
+    assert_eq!(
+        from,
+        format!("{signer:#x}"),
+        "the receipt must name the signer, not the zero address"
+    );
+}

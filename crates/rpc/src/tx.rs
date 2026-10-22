@@ -34,7 +34,7 @@ pub fn eth_get_transaction_by_hash(id: Value, params: &Value, state: &RpcState) 
         return JsonRpcResponse::success(id, Value::Null);
     };
 
-    let sender = recover_sender_or_zero(tx);
+    let sender = recover_sender_or_zero(tx, state);
     let dto = TransactionDto::from_tx(tx, tx_hash, Some(block_hash), Some(header.number), Some(tx_index), sender);
     JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap())
 }
@@ -97,7 +97,7 @@ pub fn eth_get_transaction_receipt(id: Value, params: &Value, state: &RpcState) 
         return JsonRpcResponse::success(id, Value::Null);
     };
 
-    let sender = recover_sender_or_zero(tx);
+    let sender = recover_sender_or_zero(tx, state);
 
     // Compute log_index_start: sum of logs in preceding receipts
     let log_index_start: u32 = receipts[..tx_index as usize]
@@ -127,7 +127,7 @@ fn tx_by_block_and_index(id: Value, block_hash: B256, index: u32, state: &RpcSta
     };
 
     let tx_hash = compute_tx_hash(tx);
-    let sender = recover_sender_or_zero(tx);
+    let sender = recover_sender_or_zero(tx, state);
 
     let dto = TransactionDto::from_tx(tx, tx_hash, Some(block_hash), Some(header.number), Some(index), sender);
     JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap())
@@ -144,11 +144,27 @@ fn head_number(store: &rustock_storage::BlockStore) -> Option<u64> {
 /// `eth_getTransactionByBlockNumberAndIndex`, which reported a hash that
 /// disagreed with `eth_getBlockBy*` for the same transaction and resolved to
 /// nothing.
-fn compute_tx_hash(tx: &rustock_core::Transaction) -> B256 {
+pub(crate) fn compute_tx_hash(tx: &rustock_core::Transaction) -> B256 {
     tx.tx_hash()
 }
 
-fn recover_sender_or_zero(tx: &rustock_core::Transaction) -> Address {
-    tx.recover_sender(30).unwrap_or(Address::ZERO)
+/// The sender a transaction was signed by, or the zero address if it
+/// cannot be recovered.
+///
+/// **The chain id has to come from the node's own configuration.** It
+/// was hardcoded to 30 here, which is mainnet, so on any other chain
+/// every EIP-155 signature failed to recover and every receipt and
+/// transaction this module served reported `from` as the zero address:
+/// `v` encodes the chain a transaction was signed for, and recovering
+/// it against a different one puts the recovery id out of range. That
+/// is testnet as much as regtest, and it was silent because the failure
+/// path is an `unwrap_or` rather than an error.
+///
+/// Zero remains the fallback, because a transaction whose signature
+/// does not recover is a real thing -- REMASC's has none at all -- and
+/// a receipt with an obviously wrong field beats one that fails.
+fn recover_sender_or_zero(tx: &rustock_core::Transaction, state: &RpcState) -> Address {
+    let chain_id = state.hardfork_cfg.as_ref().map(|c| c.chain_id).unwrap_or(30);
+    tx.recover_sender(chain_id).unwrap_or(Address::ZERO)
 }
 
