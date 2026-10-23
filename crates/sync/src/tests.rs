@@ -7094,3 +7094,189 @@ async fn an_unsendable_batch_is_retried_rather_than_finished() {
         other => panic!("expected DownloadingBodies, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Follow mode executes a block as its body *arrives*: `drain_follow_buffer`
+// is reachable only from `on_body_response`. When something empties the
+// buffer for a block whose body has already come and gone -- which
+// `resync_state_root_with_exec_head` does, correctly, because what it
+// discards was queued against a root that no longer exists -- nothing
+// re-queues it, and the block sits until the 120s watchdog.
+// ---------------------------------------------------------------------------
+
+/// Genesis + `count` canonical blocks with bodies stored, exec head at
+/// genesis, service in follow mode with a matching in-memory root.
+fn follow_service_with_canonical_bodies(
+    store: &Arc<BlockStore>,
+    count: u64,
+    missing_body_at: Option<u64>,
+) -> (SyncService, Vec<Header>) {
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    let root = empty.compute_hash(trie.as_ref());
+    trie.put(root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    store.put_canonical_hash(0, genesis.hash()).unwrap();
+    store.set_exec_head(genesis.hash(), root).unwrap();
+
+    let mut chain = Vec::new();
+    let mut prev = genesis.hash();
+    for n in 1..=count {
+        let h = dummy_header(n, prev, U256::from(1));
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        store.put_canonical_hash(n, h.hash()).unwrap();
+        if missing_body_at != Some(n) {
+            store.put_body(h.hash(), &[], &[]).unwrap();
+        }
+        prev = h.hash();
+        chain.push(h);
+    }
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    service.state = SyncState::Following;
+    (service, chain)
+}
+
+/// A canonical block whose body is already stored, one ahead of the executed
+/// head, with an empty follow buffer -- the state the resync leaves behind.
+/// No body response is coming, so the tick must find the work itself.
+#[tokio::test]
+async fn a_tick_requeues_a_canonical_block_whose_body_is_already_stored() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (mut service, chain) = follow_service_with_canonical_bodies(&store, 1, None);
+
+    assert!(service.follow_buffer.is_empty(), "fixture must start with nothing queued");
+
+    service.refill_follow_buffer_from_store();
+
+    assert_eq!(
+        service.follow_buffer.keys().copied().collect::<Vec<_>>(),
+        vec![1u64],
+        "the canonical block above the executed head must be re-queued from the store"
+    );
+    assert_eq!(
+        service.follow_buffer.get(&1).map(|(h, _, _, _)| *h),
+        Some(chain[0].hash()),
+        "and it must be the canonical one"
+    );
+}
+
+/// The refill stops at the backlog follow mode is willing to carry; past that
+/// it is `leave_follow_if_backlog`'s job to hand over to the body pipeline.
+#[tokio::test]
+async fn the_refill_is_bounded_by_the_follow_backlog_tolerance() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (mut service, _) = follow_service_with_canonical_bodies(&store, 10, None);
+
+    service.refill_follow_buffer_from_store();
+
+    assert_eq!(
+        service.follow_buffer.len() as u64,
+        crate::service::FOLLOW_BACKLOG_TOLERANCE,
+        "follow mode must not hoover up an unbounded backlog"
+    );
+}
+
+/// A block with no body yet is `fill_follow_body_gap`'s business, not this
+/// one's: queueing a bodyless block would hand the drain something it cannot
+/// execute.
+#[tokio::test]
+async fn the_refill_skips_a_block_whose_body_has_not_arrived() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    // The first block's body has not arrived yet.
+    let (mut service, _) = follow_service_with_canonical_bodies(&store, 2, Some(1));
+
+    service.refill_follow_buffer_from_store();
+
+    assert!(
+        service.follow_buffer.is_empty(),
+        "with the lower block's body missing there is nothing executable to queue"
+    );
+}
+
+/// Running while a batch executes would queue work against a root that
+/// `poll_execution` has not installed yet -- the #9238768 state-root mismatch.
+#[tokio::test]
+async fn the_refill_stands_down_while_a_batch_is_executing() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (mut service, chain) = follow_service_with_canonical_bodies(&store, 1, None);
+
+    let ctrl = ExecController::new();
+    service.set_test_exec(ctrl.exec_fn());
+    // Hand a batch to execution; the controller holds it running.
+    service.finish_batch(&pending_of(&chain), 1).await;
+    assert!(service.is_executing_for_test(), "fixture must leave a batch executing");
+
+    service.refill_follow_buffer_from_store();
+
+    assert!(
+        service.follow_buffer.is_empty(),
+        "nothing may be queued while a batch is parked or running"
+    );
+
+    ctrl.release(true);
+    ctrl.wait_completed(1);
+}
+
+/// The wiring: `on_tick` must actually call the refill. Block #1 is canonical
+/// with a body but does not build on the executed head, so `drain_follow_buffer`
+/// parks it rather than running it -- which leaves it visible in the buffer as
+/// proof the tick queued it.
+#[tokio::test]
+async fn the_following_tick_drives_the_refill() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    let root = empty.compute_hash(trie.as_ref());
+    trie.put(root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    store.put_canonical_hash(0, genesis.hash()).unwrap();
+    store.set_exec_head(genesis.hash(), root).unwrap();
+
+    // Canonical, bodied -- but its parent is not the executed head.
+    let b1 = dummy_header(1, B256::repeat_byte(0x77), U256::from(1));
+    store.update_head(&b1, U256::from(2)).unwrap();
+    store.put_canonical_hash(1, b1.hash()).unwrap();
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    service.state = SyncState::Following;
+    assert!(service.follow_buffer.is_empty());
+
+    service.on_tick().await;
+
+    assert!(
+        service.follow_buffer.contains_key(&1),
+        "the follow-mode tick must re-queue canonical work the node already holds"
+    );
+}

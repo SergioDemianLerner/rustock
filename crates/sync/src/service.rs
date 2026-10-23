@@ -96,7 +96,7 @@ const FOLLOW_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// One or two is ordinary -- a tip has arrived and is about to be executed.
 /// More than that means blocks were missed, and follow mode has no way to go
 /// back for them.
-const FOLLOW_BACKLOG_TOLERANCE: u64 = 2;
+pub(crate) const FOLLOW_BACKLOG_TOLERANCE: u64 = 2;
 
 /// Whether downloaded-but-unexecuted blocks must be executed before following.
 ///
@@ -1475,6 +1475,10 @@ impl SyncService {
                     self.state = SyncState::Idle;
                 } else {
                     self.fill_follow_body_gap().await;
+                    // Canonical blocks whose bodies we already hold but never
+                    // executed. See `refill_follow_buffer_from_store`.
+                    self.refill_follow_buffer_from_store();
+                    self.drain_follow_buffer().await;
                     self.check_follow_gap().await;
                     self.leave_follow_if_backlog().await;
                 }
@@ -2067,6 +2071,57 @@ impl SyncService {
                 "The executed head's committed state root {:?} is not in the trie store; \
                  execution cannot resume from it", committed
             ),
+        }
+    }
+
+    /// Re-queue canonical blocks this node already holds but has not executed.
+    ///
+    /// `drain_follow_buffer` is reachable from exactly one place:
+    /// `on_body_response`. Follow mode therefore only ever executes a block as
+    /// its body *arrives*. That is sound while every unexecuted block is still
+    /// waiting on a body, and it stops being true the moment something empties
+    /// the buffer for a block whose body has already come and gone.
+    /// `resync_state_root_with_exec_head` does exactly that, and rightly so --
+    /// what it discards was queued against a root that no longer exists.
+    ///
+    /// Nothing re-queues it. The rest of the `Following` arm declines: the
+    /// reconcile finds no rollback to make, `fill_follow_body_gap` only
+    /// re-requests blocks with *no* body, and `leave_follow_if_backlog` wants
+    /// a backlog over `FOLLOW_BACKLOG_TOLERANCE`. So a canonical block one
+    /// ahead of the executed head, whose body is already stored, is dropped on
+    /// the floor until the execution watchdog restarts the pipeline 120s
+    /// later. Mainnet 2026-10-23 18:17:33: a tip reorg, the reload, then
+    /// nothing at all for 125 seconds, then `Processed 1 blocks` the instant
+    /// the watchdog kicked it.
+    ///
+    /// The fix is to read the work back out of the store rather than wait for
+    /// a message that has already been delivered. Bounded by the backlog
+    /// follow mode is willing to carry anyway: past `FOLLOW_BACKLOG_TOLERANCE`
+    /// it is `leave_follow_if_backlog`'s job to hand over to the body
+    /// pipeline, which fetches on its own initiative.
+    ///
+    /// Safe to run every tick. `drain_follow_buffer` refuses to execute while
+    /// a batch is running or parked, and parent-links each block against the
+    /// executed head before running it, so a block queued here is subject to
+    /// exactly the checks a block queued by a body response is.
+    pub(crate) fn refill_follow_buffer_from_store(&mut self) {
+        if self.executing.is_some() || self.pending_exec.is_some() {
+            return;
+        }
+        let Ok(Some((exec_hash, _))) = self.manager.store.exec_head() else { return };
+        let Ok(Some(exec_header)) = self.manager.store.header(exec_hash) else { return };
+
+        for number in
+            (exec_header.number + 1)..=(exec_header.number + FOLLOW_BACKLOG_TOLERANCE)
+        {
+            if self.follow_buffer.contains_key(&number) {
+                continue;
+            }
+            let Ok(Some(hash)) = self.manager.store.canonical_hash(number) else { break };
+            let Ok(Some(header)) = self.manager.store.header(hash) else { break };
+            // No body yet: `fill_follow_body_gap` is the path for that one.
+            let Ok(Some((txs, uncles))) = self.manager.store.body(hash) else { break };
+            self.follow_buffer.insert(number, (hash, header, txs, uncles));
         }
     }
 
