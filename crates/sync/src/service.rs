@@ -4768,32 +4768,87 @@ impl SyncService {
             pool.evict_outdated(header.number);
         }
 
-        let (processor, trie_store, state_root) = match (
-            &self.block_processor,
-            &self.trie_store,
-            &self.current_state_root,
-        ) {
-            (Some(p), Some(ts), Some(sr)) => (p, ts.clone(), sr.clone()),
+        let (trie_store, mut state_root) = match (&self.trie_store, &self.current_state_root) {
+            (Some(ts), Some(sr)) => (ts.clone(), sr.clone()),
             _ => return false,
         };
 
         // The in-memory root must be the state the executed head committed.
         // Executing against anything else silently computes a wrong state root
         // for a perfectly valid block -- the failure looks like a bad block and
-        // is not. The drain guard above should make this unreachable; check
-        // anyway, because the cost of being wrong here is a consensus error.
-        if let Ok(Some((_, committed_root))) = self.manager.store.exec_head() {
-            let in_memory = state_root.compute_hash(trie_store.as_ref());
-            if in_memory != committed_root {
-                warn!(
-                    target: "rustock::sync",
-                    "Refusing to execute #{} in follow mode: in-memory state root {:?} \
-                     is not the executed head's committed root {:?}",
-                    header.number, in_memory, committed_root
-                );
-                return false;
+        // is not. The cost of being wrong here is a consensus error, so this
+        // stays a hard gate.
+        //
+        // What changed is what happens when it trips. It used to refuse and
+        // return, which is safe and is not recovery: a reorg at the tip leaves
+        // the in-memory root holding the state of the block that just stopped
+        // being canonical, and the tick-level reconcile then reloads the right
+        // root *and clears the follow buffer* -- discarding this very block.
+        // The backlog that leaves is one block, which
+        // `leave_follow_if_backlog` tolerates as "a tip about to be executed",
+        // so nothing moved until the 120-second progress watchdog escalated.
+        // Measured on mainnet: 38 `Sync halted` cycles and 69 watchdog
+        // escalations in under seven hours.
+        //
+        // Nothing about that wait was necessary. The committed root is the
+        // authority and it is on disk; this block is in hand and builds on the
+        // committed head. So reload and carry on, and the reorg costs a trie
+        // read rather than two minutes.
+        if let Ok(Some((committed_hash, committed_root))) = self.manager.store.exec_head() {
+            if state_root.compute_hash(trie_store.as_ref()) != committed_root {
+                // Only when this block extends the committed head. A block
+                // that does not is a different disagreement and the tick-level
+                // reconcile is the right place for it.
+                if header.parent_hash != committed_hash {
+                    warn!(
+                        target: "rustock::sync",
+                        "Refusing to execute #{} in follow mode: it builds on {:?}, not on \
+                         the executed head {:?}",
+                        header.number, header.parent_hash, committed_hash
+                    );
+                    return false;
+                }
+                match trie_store.get(committed_root.as_slice()) {
+                    Some(data) => {
+                        let reloaded = TrieNode::from_message(&data, trie_store.as_ref());
+                        // The store can hold bytes under a hash they do not
+                        // hash to. Executing against those would be the
+                        // consensus error this gate exists to prevent.
+                        if reloaded.compute_hash(trie_store.as_ref()) != committed_root {
+                            warn!(
+                                target: "rustock::sync",
+                                "Refusing to execute #{}: the trie store's entry for the \
+                                 committed root {:?} does not hash to it",
+                                header.number, committed_root
+                            );
+                            return false;
+                        }
+                        debug!(
+                            target: "rustock::sync",
+                            "Reloaded the in-memory state root from the committed one \
+                             before executing #{}",
+                            header.number
+                        );
+                        self.current_state_root = Some(reloaded.clone());
+                        state_root = reloaded;
+                    }
+                    None => {
+                        warn!(
+                            target: "rustock::sync",
+                            "Refusing to execute #{} in follow mode: the executed head's \
+                             committed root {:?} is not in the trie store",
+                            header.number, committed_root
+                        );
+                        return false;
+                    }
+                }
             }
         }
+
+        let processor = match &self.block_processor {
+            Some(p) => p,
+            None => return false,
+        };
 
         let block = Block {
             header: header.clone(),
