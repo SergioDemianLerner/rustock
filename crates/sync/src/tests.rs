@@ -6877,3 +6877,220 @@ async fn a_body_from_a_peer_that_was_not_asked_is_ignored() {
         "the genuine answer must still be accepted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A body batch that needs no network must still end.
+//
+// `DownloadingBodies` is advanced by exactly one thing: a body response. That
+// holds only while every pending header is waiting on a peer, and
+// `send_body_requests` has two arms that satisfy a header locally and send
+// nothing -- the body is already stored, or it is derivable from the header.
+// When those absorb the last header the batch is complete, nothing is in
+// flight, and no response will ever arrive to notice. On mainnet the node sat
+// on a finished batch until the 120s execution watchdog restarted the
+// pipeline, 1.9 times an hour.
+// ---------------------------------------------------------------------------
+
+/// A header whose body is derivable: it commits to the REMASC transaction
+/// alone, which `derivable_body` reconstructs from the header itself.
+fn derivable_header(number: u64, parent: B256) -> Header {
+    let mut h = dummy_header(number, parent, U256::from(1));
+    h.transactions_root =
+        rustock_core::ordered_tx_trie_root(&[rustock_core::Transaction::remasc(number)], true);
+    h
+}
+
+/// Every pending body is derivable, so `send_body_requests` stores them all
+/// and sends nothing. With no peer registered at all, the batch cannot be
+/// finished by anything arriving from the network -- a tick has to do it.
+#[tokio::test]
+async fn a_batch_of_derivable_bodies_is_executed_without_any_request() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    store.set_exec_head(genesis.hash(), B256::ZERO).unwrap();
+
+    let b1 = derivable_header(1, genesis.hash());
+    let b2 = derivable_header(2, b1.hash());
+    for h in [&b1, &b2] {
+        store.put_header(h).unwrap();
+        store.put_canonical_hash(h.number, h.hash()).unwrap();
+    }
+
+    let ctrl = ExecController::new();
+    let mut service = make_service(store.clone());
+    service.set_test_exec(ctrl.exec_fn());
+
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 2,
+        pending_headers: pending_of(&[b1.clone(), b2.clone()]),
+        next_request: 0,
+        in_flight: std::collections::HashMap::new(),
+        id_index: std::collections::HashMap::new(),
+    };
+
+    // This is the step that used to strand the batch: both bodies are derived
+    // and stored, so nothing goes out and nothing is outstanding.
+    service.send_body_requests().await;
+    assert!(
+        store.body(b1.hash()).unwrap().is_some() && store.body(b2.hash()).unwrap().is_some(),
+        "both bodies must have been derived from their headers"
+    );
+    match &service.state {
+        SyncState::DownloadingBodies { in_flight, .. } => {
+            assert!(in_flight.is_empty(), "nothing can be in flight: no request was sent");
+        }
+        other => panic!("expected DownloadingBodies, got {other:?}"),
+    }
+
+    // One tick must notice the batch is complete and hand it to execution.
+    ctrl.release(true);
+    service.on_tick().await;
+    assert!(
+        service.is_executing_for_test(),
+        "a batch with every body present must have been handed to execution"
+    );
+    assert!(
+        !matches!(service.state, SyncState::DownloadingBodies { .. }),
+        "and the state must not still be waiting for a body"
+    );
+    ctrl.wait_completed(1);
+}
+
+/// The same hole reached the other way: the bodies were already in the store,
+/// so every pending header takes the "already stored" arm.
+#[tokio::test]
+async fn a_batch_whose_bodies_are_already_stored_is_executed_without_any_request() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let headers = store_chain(&store, 3);
+
+    let ctrl = ExecController::new();
+    let mut service = make_service(store.clone());
+    service.set_test_exec(ctrl.exec_fn());
+
+    // `store_chain` stores every body, so no request can be needed.
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 3,
+        pending_headers: pending_of(&headers),
+        next_request: 0,
+        in_flight: std::collections::HashMap::new(),
+        id_index: std::collections::HashMap::new(),
+    };
+
+    ctrl.release(true);
+    service.on_tick().await;
+    assert!(
+        service.is_executing_for_test(),
+        "a batch with every body in the store must not wait for a response"
+    );
+    ctrl.wait_completed(1);
+}
+
+/// The guard must be narrow. A body that is genuinely missing and not
+/// derivable is requested, and while that request is outstanding the tick must
+/// leave the batch alone -- finishing it here would hand execution a block
+/// whose body has not arrived.
+#[tokio::test]
+async fn a_batch_still_waiting_on_a_body_is_not_finished_by_a_tick() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    store.set_exec_head(genesis.hash(), B256::ZERO).unwrap();
+
+    // `dummy_header` commits to an empty transaction list, which the REMASC
+    // derivation does not reproduce -- so this one has to be asked for.
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+    store.put_canonical_hash(1, b1.hash()).unwrap();
+
+    let ctrl = ExecController::new();
+    let mut service = make_service(store.clone());
+    service.set_test_exec(ctrl.exec_fn());
+
+    let peer = B512::repeat_byte(0x33);
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    service.peer_store_for_test().add_peer(peer, tx).await;
+
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 1,
+        pending_headers: pending_of(std::slice::from_ref(&b1)),
+        next_request: 0,
+        in_flight: std::collections::HashMap::new(),
+        id_index: std::collections::HashMap::new(),
+    };
+
+    service.send_body_requests().await;
+    match &service.state {
+        SyncState::DownloadingBodies { in_flight, .. } => {
+            assert_eq!(in_flight.len(), 1, "the missing body must have been requested");
+        }
+        other => panic!("expected DownloadingBodies, got {other:?}"),
+    }
+
+    service.on_tick().await;
+    assert!(
+        matches!(service.state, SyncState::DownloadingBodies { .. }),
+        "a batch with an outstanding request must keep waiting"
+    );
+    assert!(
+        store.body(b1.hash()).unwrap().is_none(),
+        "and no body may have been invented for it"
+    );
+}
+
+/// `in_flight` can also be empty because the request loop stopped early: with
+/// no peer to take it, nothing is sent and the cursor does not reach the end.
+/// That batch is not complete, so the tick must not finish it -- but it must
+/// keep trying, so the request goes out once a peer appears.
+#[tokio::test]
+async fn an_unsendable_batch_is_retried_rather_than_finished() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    store.set_exec_head(genesis.hash(), B256::ZERO).unwrap();
+
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+    store.put_canonical_hash(1, b1.hash()).unwrap();
+
+    let ctrl = ExecController::new();
+    let mut service = make_service(store.clone());
+    service.set_test_exec(ctrl.exec_fn());
+
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 1,
+        pending_headers: pending_of(std::slice::from_ref(&b1)),
+        next_request: 0,
+        in_flight: std::collections::HashMap::new(),
+        id_index: std::collections::HashMap::new(),
+    };
+
+    // No peers yet: nothing can be sent.
+    service.on_tick().await;
+    assert!(
+        matches!(service.state, SyncState::DownloadingBodies { .. }),
+        "a batch whose body is missing must not be declared complete"
+    );
+
+    // A peer arrives. The next tick must get the request out.
+    let peer = B512::repeat_byte(0x44);
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    service.peer_store_for_test().add_peer(peer, tx).await;
+    service.on_tick().await;
+    match &service.state {
+        SyncState::DownloadingBodies { in_flight, .. } => {
+            assert_eq!(in_flight.len(), 1, "the tick must resume a batch that could not be sent");
+        }
+        other => panic!("expected DownloadingBodies, got {other:?}"),
+    }
+}
