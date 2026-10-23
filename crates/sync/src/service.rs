@@ -1480,6 +1480,15 @@ impl SyncService {
                 }
             }
             SyncState::DownloadingBodies { .. } => {
+                // Nothing in flight means nothing will call back, because a
+                // body response is the only thing that advances this state.
+                // Either the request loop stopped early -- no peer would take
+                // one -- so top it up, or it consumed the batch locally, so
+                // finish it. See `finish_body_batch_if_complete`.
+                if self.body_requests_idle() {
+                    self.send_body_requests().await;
+                    self.finish_body_batch_if_complete().await;
+                }
                 // Per-request timeout: re-send only the individually-stalled
                 // requests (older than REQUEST_TIMEOUT), each to a rotated
                 // peer — never re-blast the whole in-flight window.
@@ -4192,10 +4201,16 @@ impl SyncService {
     /// so throughput comes from pipelining many in flight — concentrated on the
     /// peers that actually answer rather than spread evenly onto slow ones.
     pub(crate) async fn send_body_requests(&mut self) {
+        // Not an early return on an empty peer set. Two of the arms below need
+        // no peer at all -- a body already in the store, and one derivable
+        // from its header -- and returning here left a batch that needed
+        // nothing from the network waiting on a peer to arrive before it could
+        // be recognised as finished. The request path is still guarded: with
+        // no peers `pick_body_peer` yields None and the loop breaks at the
+        // first body that genuinely has to be asked for.
         let peers = self.peer_store.peers().await;
         if peers.is_empty() {
             debug!(target: "rustock::sync", "No connected peers for body requests");
-            return;
         }
         let SyncService {
             state,
@@ -4315,6 +4330,76 @@ impl SyncService {
                 pending_headers.len().saturating_sub(*next_request)
             );
         }
+    }
+
+    /// Is the body pipeline waiting on nobody?
+    fn body_requests_idle(&self) -> bool {
+        matches!(
+            &self.state,
+            SyncState::DownloadingBodies { in_flight, .. } if in_flight.is_empty()
+        )
+    }
+
+    /// Hand a body batch to execution when it completed without a response.
+    ///
+    /// Returns true if the batch was handed over.
+    ///
+    /// `DownloadingBodies` is driven entirely by `on_body_response`, which
+    /// holds the only check that the batch is complete. That is sound only if
+    /// every header in the batch is waiting on a peer, and two of them need
+    /// not be: `send_body_requests` skips a header whose body is already in
+    /// the store, and derives and stores one the header itself determines.
+    /// Both are a `continue` that sends nothing. When they absorb the last
+    /// outstanding header, `in_flight` empties with no request outstanding and
+    /// no response will ever arrive to run the completion check.
+    ///
+    /// `start_body_downloads` means to catch this with its `missing_bodies ==
+    /// 0` early-out, but it counts a header as missing from `store.body` and
+    /// `try_fill_body_locally` alone -- it does not consult `derivable_body`.
+    /// So a batch that needs no network at all still enters the state, and
+    /// then cannot leave it.
+    ///
+    /// Nothing else rescues it. `retry_stale_body_requests` returns early on
+    /// an empty `in_flight`, and `DownloadingBodies` has its own `on_tick`
+    /// arm, so it never reaches the `REQUEST_TIMEOUT` reset in the fallback
+    /// arm. The node sits on a fully downloaded batch until the execution
+    /// watchdog restarts the pipeline 120s later -- 1.9 times an hour on
+    /// mainnet, and the whole of what was left of #323 once the follow-mode
+    /// refusal was removed.
+    async fn finish_body_batch_if_complete(&mut self) -> bool {
+        let SyncState::DownloadingBodies { pending_headers, in_flight, .. } = &self.state
+        else {
+            return false;
+        };
+        if !in_flight.is_empty() {
+            return false;
+        }
+        // Completeness is every body being in the store, not the request
+        // cursor reaching the end. The cursor is the wrong question twice
+        // over: it does not move when the loop breaks for want of a peer, and
+        // it moves past a header whose derived body failed to store. Execution
+        // is what pays for the difference, so ask the store.
+        if !pending_headers
+            .iter()
+            .all(|(hash, _)| matches!(self.manager.store.body(*hash), Ok(Some(_))))
+        {
+            return false;
+        }
+
+        let SyncState::DownloadingBodies { pending_headers, peer_best, .. } =
+            std::mem::take(&mut self.state)
+        else {
+            return false;
+        };
+        info!(
+            target: "rustock::sync",
+            "All {} block bodies present with no request outstanding \
+             ({} derived from their headers so far)",
+            pending_headers.len(),
+            self.derived_bodies
+        );
+        self.finish_batch(&pending_headers, peer_best).await;
+        true
     }
 
     /// Reclaim body requests outstanding past `BODY_RECLAIM_TIMEOUT`: re-send
