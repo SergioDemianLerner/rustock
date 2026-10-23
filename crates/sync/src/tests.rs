@@ -3766,6 +3766,8 @@ struct ExecControllerInner {
     completed: usize,
     /// Pending release tokens: each `Some(all_ok)` releases one waiting batch.
     releases: VecDeque<bool>,
+    /// The state root each batch was actually handed, in order.
+    received: Vec<rustock_trie::TrieNode>,
 }
 
 struct ExecController {
@@ -3785,6 +3787,7 @@ impl ExecController {
             let last = pending.last().map(|(_, h)| h.number).unwrap_or(0);
             let mut guard = this.inner.lock().unwrap();
             guard.started.push(last);
+            guard.received.push(state_root.clone());
             this.cv.notify_all();
             // Wait for a release token.
             while guard.releases.is_empty() {
@@ -3826,6 +3829,11 @@ impl ExecController {
 
     fn started(&self) -> Vec<u64> {
         self.inner.lock().unwrap().started.clone()
+    }
+
+    /// The state roots batches were handed, in order.
+    fn received(&self) -> Vec<rustock_trie::TrieNode> {
+        self.inner.lock().unwrap().received.clone()
     }
 }
 
@@ -7278,5 +7286,202 @@ async fn the_following_tick_drives_the_refill() {
     assert!(
         service.follow_buffer.contains_key(&1),
         "the follow-mode tick must re-queue canonical work the node already holds"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Execute a block against its own parent's state, not against wherever
+// execution happens to be standing. rskj's rule; see
+// docs/follow-mode-rskj-vs-rustock.md §7.
+// ---------------------------------------------------------------------------
+
+/// Build two distinct, resolvable states in `trie` and return their roots.
+fn two_states(trie: &Arc<dyn rustock_trie::TrieStore>) -> (B256, B256) {
+    let a = rustock_trie::TrieNode::empty();
+    let a_root = a.compute_hash(trie.as_ref());
+    trie.put(a_root.as_slice(), &a.to_message(trie.as_ref()));
+
+    let mut b = rustock_trie::TrieNode::empty();
+    b = b.put(
+        &rustock_trie::TrieKeySlice::from_key(&[7u8, 7, 7]),
+        &[1u8; 8],
+        trie.as_ref(),
+    );
+    b.save(trie.as_ref(), true);
+    let b_root = b.compute_hash(trie.as_ref());
+    assert_ne!(a_root, b_root, "fixture needs two different states");
+    (a_root, b_root)
+}
+
+/// A service wired to `trie`, standing on the state `root`.
+fn service_on_state(
+    store: &Arc<BlockStore>,
+    trie: &Arc<dyn rustock_trie::TrieStore>,
+    root: B256,
+) -> SyncService {
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let node = rustock_trie::TrieNode::from_message(
+        &trie.get(root.as_slice()).unwrap(),
+        trie.as_ref(),
+    );
+    SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie.clone(), node)
+}
+
+/// The 2026-10-23 #9,350,770 shape: the in-memory root is the state *after*
+/// the block about to be executed, because a reorg retreated the committed
+/// head without telling it. The batch must run against the parent's state.
+#[tokio::test]
+async fn a_batch_runs_against_its_parents_state_not_the_in_memory_root() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let (parent_root, stale_root) = two_states(&trie);
+
+    // Parent #1 commits `parent_root`; its child #2 is the block to execute.
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut p = dummy_header(1, genesis.hash(), U256::from(1));
+    p.state_root = parent_root;
+    store.update_head(&p, U256::from(2)).unwrap();
+    store.put_header(&p).unwrap();
+    let child = dummy_header(2, p.hash(), U256::from(1));
+    store.put_header(&child).unwrap();
+
+    let service = service_on_state(&store, &trie, stale_root);
+
+    let chosen = service.state_for_batch(&pending_of(&[child]));
+
+    assert_eq!(
+        chosen.map(|n| n.compute_hash(trie.as_ref())),
+        Some(parent_root),
+        "the batch must be executed against the state its parent committed, \
+         not the in-memory root left behind by a retreat"
+    );
+}
+
+/// The common case costs nothing and changes nothing: already standing on the
+/// parent's state, so there is no substitution to make.
+#[tokio::test]
+async fn a_batch_already_on_its_parents_state_is_left_alone() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let (parent_root, _) = two_states(&trie);
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut p = dummy_header(1, genesis.hash(), U256::from(1));
+    p.state_root = parent_root;
+    store.update_head(&p, U256::from(2)).unwrap();
+    store.put_header(&p).unwrap();
+    let child = dummy_header(2, p.hash(), U256::from(1));
+
+    let service = service_on_state(&store, &trie, parent_root);
+
+    assert!(
+        service.state_for_batch(&pending_of(&[child])).is_none(),
+        "no substitution is needed when execution is already on the right state"
+    );
+}
+
+/// A node that has pruned the parent's state, or not executed that far, must
+/// fall back rather than refuse. This change removes a way of being wrong; it
+/// must not add a way of stopping.
+#[tokio::test]
+async fn an_unresolvable_parent_state_falls_back_instead_of_refusing() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let (_, stale_root) = two_states(&trie);
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    // The parent claims a state root that is NOT in the trie store.
+    let mut p = dummy_header(1, genesis.hash(), U256::from(1));
+    p.state_root = B256::repeat_byte(0xAB);
+    store.update_head(&p, U256::from(2)).unwrap();
+    store.put_header(&p).unwrap();
+    let child = dummy_header(2, p.hash(), U256::from(1));
+
+    let service = service_on_state(&store, &trie, stale_root);
+
+    assert!(
+        service.state_for_batch(&pending_of(&[child])).is_none(),
+        "an unresolvable parent state must fall back to the ambient root"
+    );
+}
+
+/// Bytes stored under a hash they do not hash to must never be executed
+/// against -- that is the consensus error the check exists to prevent.
+#[tokio::test]
+async fn a_parent_root_whose_entry_does_not_hash_to_it_is_rejected() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let (good_root, stale_root) = two_states(&trie);
+
+    // File the good state's bytes under a hash they do not hash to.
+    let liar = B256::repeat_byte(0xCD);
+    trie.put(liar.as_slice(), &trie.get(good_root.as_slice()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut p = dummy_header(1, genesis.hash(), U256::from(1));
+    p.state_root = liar;
+    store.update_head(&p, U256::from(2)).unwrap();
+    store.put_header(&p).unwrap();
+    let child = dummy_header(2, p.hash(), U256::from(1));
+
+    let service = service_on_state(&store, &trie, stale_root);
+
+    assert!(
+        service.state_for_batch(&pending_of(&[child])).is_none(),
+        "a trie entry that does not hash to its key must not be executed against"
+    );
+}
+
+/// The wiring: `spawn_execution` must hand the executor the parent's state,
+/// not the ambient root. The unit tests above exercise the choice; this one
+/// proves the choice is actually used.
+#[tokio::test]
+async fn spawn_execution_hands_the_executor_the_parents_state() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let (parent_root, stale_root) = two_states(&trie);
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut p = dummy_header(1, genesis.hash(), U256::from(1));
+    p.state_root = parent_root;
+    store.update_head(&p, U256::from(2)).unwrap();
+    store.put_header(&p).unwrap();
+    let child = dummy_header(2, p.hash(), U256::from(1));
+    store.put_header(&child).unwrap();
+
+    // Standing on the wrong state, as a retreat would leave it.
+    let mut service = service_on_state(&store, &trie, stale_root);
+    let ctrl = ExecController::new();
+    service.set_test_exec(ctrl.exec_fn());
+    ctrl.release(true);
+
+    service.finish_batch(&pending_of(&[child]), 2).await;
+    ctrl.wait_started(1);
+
+    let got = ctrl.received();
+    assert_eq!(got.len(), 1, "exactly one batch should have been executed");
+    assert_eq!(
+        got[0].compute_hash(trie.as_ref()),
+        parent_root,
+        "the executor was handed the in-memory root instead of the parent's state, \
+         which is how #9,350,770 came to be applied on top of itself"
     );
 }
