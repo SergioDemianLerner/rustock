@@ -4811,6 +4811,126 @@ async fn an_in_memory_state_root_ahead_of_the_committed_one_is_reloaded() {
     );
 }
 
+/// A reorg at the tip must cost a trie read, not two minutes.
+///
+/// After a reorg the node has executed the block that just stopped being
+/// canonical, so its in-memory root is that orphan's state while the
+/// committed root is the rolled-back head's. Follow mode used to refuse
+/// to execute in that state -- correctly, since executing against the
+/// wrong state computes a wrong root for a valid block -- and then wait.
+/// The tick-level reconcile would reload the right root and clear the
+/// follow buffer, discarding this very block; the one-block backlog that
+/// left is exactly what `leave_follow_if_backlog` tolerates as "a tip
+/// about to be executed", so nothing moved until the 120-second progress
+/// watchdog escalated. Mainnet, under seven hours: 38 `Sync halted`
+/// cycles and 69 watchdog escalations.
+///
+/// `drain_follow_buffer` is called directly rather than through
+/// `on_tick`, so the reload can only have come from `process_single_block`
+/// -- going through the tick would let the tick-level reconcile do it and
+/// the test would pass either way.
+#[tokio::test]
+async fn follow_mode_reloads_the_committed_root_instead_of_refusing() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let committed = rustock_trie::TrieNode::empty();
+    let committed_root = committed.compute_hash(trie.as_ref());
+    trie.put(committed_root.as_slice(), &committed.to_message(trie.as_ref()));
+    store.set_exec_head(genesis_hash, committed_root).unwrap();
+
+    // The orphan's state: what executing the block a reorg replaced left
+    // behind.
+    let mut orphan = rustock_trie::TrieNode::empty();
+    orphan = orphan.put(
+        &rustock_trie::TrieKeySlice::from_key(&[1u8, 1, 1]),
+        &[2u8; 8],
+        trie.as_ref(),
+    );
+    orphan.save(trie.as_ref(), true);
+    assert_ne!(orphan.compute_hash(trie.as_ref()), committed_root);
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie.clone(), orphan);
+    service.state = SyncState::Following;
+
+    // The replacement block, building on the committed head.
+    let next = dummy_header(1, genesis_hash, U256::from(1));
+    service.follow_buffer.insert(1, (next.hash(), next, vec![], vec![]));
+
+    service.drain_follow_buffer().await;
+
+    assert_eq!(
+        service.current_state_root.as_ref().map(|r| r.compute_hash(trie.as_ref())),
+        Some(committed_root),
+        "the block was refused instead of reloading the committed root, so recovery \
+         waits for the 120s watchdog"
+    );
+}
+
+/// But not when the block does not build on the committed head: that is a
+/// different disagreement, and reloading would be executing a block
+/// against a state it was never meant to extend.
+#[tokio::test]
+async fn follow_mode_still_refuses_a_block_that_is_not_the_committed_head_s_child() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let committed = rustock_trie::TrieNode::empty();
+    let committed_root = committed.compute_hash(trie.as_ref());
+    trie.put(committed_root.as_slice(), &committed.to_message(trie.as_ref()));
+    store.set_exec_head(genesis.hash(), committed_root).unwrap();
+
+    let mut orphan = rustock_trie::TrieNode::empty();
+    orphan = orphan.put(
+        &rustock_trie::TrieKeySlice::from_key(&[3u8, 3, 3]),
+        &[4u8; 8],
+        trie.as_ref(),
+    );
+    orphan.save(trie.as_ref(), true);
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie.clone(), orphan.clone());
+    service.state = SyncState::Following;
+
+    // Parent is some other block, not the executed head.
+    let stranger = dummy_header(1, B256::repeat_byte(0xAB), U256::from(1));
+    service.follow_buffer.insert(1, (stranger.hash(), stranger, vec![], vec![]));
+
+    service.drain_follow_buffer().await;
+
+    assert_eq!(
+        service.current_state_root.as_ref().map(|r| r.compute_hash(trie.as_ref())),
+        Some(orphan.compute_hash(trie.as_ref())),
+        "a block that does not extend the committed head must not cause a reload"
+    );
+}
+
 /// And it must not churn when they already agree.
 #[tokio::test]
 async fn a_matching_state_root_is_left_alone() {
