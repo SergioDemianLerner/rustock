@@ -4114,18 +4114,97 @@ impl SyncService {
     /// concurrent downloading only writes headers/bodies (an independent key
     /// space) and touches network state, so the two cannot race.
     fn spawn_execution(&mut self, pending: Vec<(B256, Header)>, peer_best: u64) {
-        let (Some(exec_fn), Some(state_root)) =
+        let (Some(exec_fn), Some(ambient)) =
             (self.exec_fn.clone(), self.current_state_root.clone())
         else {
             // No processor configured — should not reach here (finish_batch
             // guards on it), but stay safe and just advance.
             return;
         };
+        // Execute against the state this batch's first block builds on, not
+        // against wherever execution happens to be standing.
+        let state_root = self.state_for_batch(&pending).unwrap_or(ambient);
         let blocks_since_flush = self.blocks_since_flush;
         let handle = tokio::task::spawn_blocking(move || {
             exec_fn(state_root, blocks_since_flush, pending)
         });
         self.executing = Some(ExecutionJob { handle, peer_best });
+    }
+
+    /// The state a batch must be executed against: the one its first block's
+    /// parent committed.
+    ///
+    /// Returns `None` when the ambient root is already correct, or when the
+    /// parent's state cannot be resolved — the caller then falls back to
+    /// `current_state_root`, which is the behaviour this replaces.
+    ///
+    /// Executing a block is a function of two things, the block and the state
+    /// it is applied to. The block is fixed; the state was not. The body
+    /// pipeline passed `self.current_state_root` — a field, mutated by every
+    /// other execution path — when the answer is fully determined by the block
+    /// itself. Follow mode has refused to execute against a root that is not
+    /// its parent's since #326; this path had no such check, and that
+    /// asymmetry is the bug.
+    ///
+    /// Mainnet 2026-10-23, #9,350,770. Follow mode executed it correctly and
+    /// produced the header's root. A reorg then retreated the committed
+    /// `exec_head` to #9,350,769 without telling the in-memory root, which
+    /// still held "after #9,350,770". Twenty-four seconds later this path
+    /// re-executed #9,350,770 against that root — applying the block on top of
+    /// itself — and computed a different state. The tick-level guard,
+    /// `resync_state_root_with_exec_head`, fired 0.1s afterwards: it runs on a
+    /// timer and the bug is a race, which is why no amount of tightening the
+    /// timer fixes it.
+    ///
+    /// rskj cannot reach this state at all, because it executes against
+    /// `parent.getHeader()` rather than a head pointer -- see
+    /// `docs/follow-mode-rskj-vs-rustock.md` §7. Adopting that rule here needs
+    /// no equivalent of its `stateRootHandler`: rustock verifies the computed
+    /// root against the header on every block, so the parent header's
+    /// `state_root` *is* the state the child must build on, already stored.
+    ///
+    /// Note what this does to a duplicated batch rather than a wrong one.
+    /// Re-executing a block the node has already executed is now harmless: it
+    /// is applied to its parent's state again and recomputes the same result.
+    /// The failure above becomes a redundant execution instead of a halt.
+    pub(crate) fn state_for_batch(&self, pending: &[(B256, Header)]) -> Option<TrieNode> {
+        let trie_store = self.trie_store.as_ref()?;
+        let (_, first) = pending.first()?;
+        let parent = self.manager.store.header(first.parent_hash).ok().flatten()?;
+
+        // Already standing on the right state: the overwhelmingly common case,
+        // and it costs one memoised hash.
+        let ambient = self.current_state_root.as_ref()?;
+        if ambient.compute_hash(trie_store.as_ref()) == parent.state_root {
+            return None;
+        }
+
+        // The parent's state must actually be there. A node that has pruned
+        // it, or has not yet executed that far, falls back rather than
+        // refusing -- this change is meant to remove a way of being wrong, not
+        // to add a way of stopping.
+        let data = trie_store.get(parent.state_root.as_slice())?;
+        let node = TrieNode::from_message(&data, trie_store.as_ref());
+        // The store can hold bytes under a hash they do not hash to; executing
+        // against those is the consensus error this exists to prevent.
+        if node.compute_hash(trie_store.as_ref()) != parent.state_root {
+            warn!(
+                target: "rustock::sync",
+                "Not using the parent state for #{}: the trie store's entry for {:?} \
+                 does not hash to it",
+                first.number, parent.state_root
+            );
+            return None;
+        }
+        info!(
+            target: "rustock::sync",
+            "Executing #{} against its parent's committed state {:?}, not the in-memory \
+             root {:?} that execution was standing on",
+            first.number,
+            parent.state_root,
+            ambient.compute_hash(trie_store.as_ref())
+        );
+        Some(node)
     }
 
     /// If a background execution job has finished, reap it and apply the
