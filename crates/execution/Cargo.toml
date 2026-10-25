@@ -8,6 +8,7 @@ license = "MIT"
 workspace = true
 
 [dependencies]
+lru = { workspace = true }
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-trie = { version = "0.1.0", path = "../trie" }
 rustock-storage = { version = "0.1.0", path = "../storage" }

@@ -115,6 +115,10 @@ pub struct BlockProcessor {
     /// RSKIP110 fork-detection validation reads 449 ancestor headers per
     /// block. Correct, but costly during a bulk replay, so it is opt-in.
     validate_fork_detection_data: bool,
+    /// Senders already recovered elsewhere -- chiefly by the pool, which
+    /// recovered most of this block's transactions when it admitted them.
+    /// `None` disables the cache entirely and every sender is recomputed.
+    sender_cache: Option<Arc<crate::sender_cache::SenderCache>>,
 }
 
 /// Ancestry lookups backed by the block store, for the uncle and
@@ -165,7 +169,25 @@ impl BlockProcessor {
             hardfork_cfg,
             block_store,
             validate_fork_detection_data: false,
+            sender_cache: None,
         }
+    }
+
+    /// Share a sender cache with whoever else recovers senders -- the pool,
+    /// above all. Handing the same `Arc` to both is the point: a transaction
+    /// the pool admitted should not be recovered a second time when the
+    /// block carrying it executes.
+    pub fn with_sender_cache(
+        mut self,
+        cache: Arc<crate::sender_cache::SenderCache>,
+    ) -> Self {
+        self.sender_cache = Some(cache);
+        self
+    }
+
+    /// The cache this processor shares, if any.
+    pub fn sender_cache(&self) -> Option<&Arc<crate::sender_cache::SenderCache>> {
+        self.sender_cache.as_ref()
     }
 
     /// Share a BTC stored-block cache across every block this processor runs.
@@ -930,10 +952,63 @@ impl BlockProcessor {
                 .map_err(|e| ProcessError::SenderRecovery { index: i, source: e })
         };
 
+        // The cache is consulted exactly once for the whole block, before any
+        // thread starts, and written exactly once after they have all
+        // joined. Nothing below this point touches it -- see
+        // `sender_cache` for why a per-transaction lookup would quietly
+        // serialise the parallel region this function exists for.
+        let hashes: Vec<alloy_primitives::B256> = match &self.sender_cache {
+            Some(_) => transactions.iter().map(|tx| tx.tx_hash()).collect(),
+            None => Vec::new(),
+        };
+        let known: Vec<Option<Address>> = match &self.sender_cache {
+            Some(cache) => cache.get_many(&hashes),
+            None => vec![None; transactions.len()],
+        };
+
+        // `one`, but answering from the lookup above where it can.
+        let one = |i: usize, tx: &Transaction| -> Result<Address, ProcessError> {
+            match known.get(i).copied().flatten() {
+                Some(address) => Ok(address),
+                None => one(i, tx),
+            }
+        };
+
         let width = self.execution_threads().max(1).min(transactions.len());
-        if width <= 1 || transactions.len() < Self::RECOVERY_PARALLEL_THRESHOLD {
-            return transactions.iter().enumerate().map(|(i, tx)| one(i, tx)).collect();
+        let senders: Vec<Address> = if width <= 1
+            || transactions.len() < Self::RECOVERY_PARALLEL_THRESHOLD
+        {
+            transactions
+                .iter()
+                .enumerate()
+                .map(|(i, tx)| one(i, tx))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Self::recover_in_parallel(transactions, width, &one)?
+        };
+
+        // Record only what had to be computed. Re-inserting a hit would be
+        // harmless but would churn the LRU for no gain.
+        if let Some(cache) = &self.sender_cache {
+            cache.put_many(
+                senders
+                    .iter()
+                    .zip(&hashes)
+                    .zip(&known)
+                    .filter(|((_, _), was_known)| was_known.is_none())
+                    .map(|((address, hash), _)| (*hash, *address)),
+            );
         }
+        Ok(senders)
+    }
+
+    /// The shared-cursor scheduler, split out so the cached and uncached
+    /// paths cannot drift apart.
+    fn recover_in_parallel(
+        transactions: &[Transaction],
+        width: usize,
+        one: &(dyn Fn(usize, &Transaction) -> Result<Address, ProcessError> + Sync),
+    ) -> Result<Vec<Address>, ProcessError> {
 
         let slots: Vec<std::sync::Mutex<Option<Result<Address, ProcessError>>>> =
             (0..transactions.len()).map(|_| std::sync::Mutex::new(None)).collect();
@@ -1063,7 +1138,7 @@ mod tests {
         root.put(&key, &acct.encode(), store)
     }
 
-    fn sign_tx(tx: &mut Transaction, key: &SigningKey, chain_id: u64) {
+    pub(super) fn sign_tx(tx: &mut Transaction, key: &SigningKey, chain_id: u64) {
         let hash = tx.signing_hash_eip155(chain_id);
         let (signature, recid): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
             key.sign_prehash_recoverable(hash.as_slice()).unwrap();
@@ -1073,7 +1148,7 @@ mod tests {
         tx.v = chain_id * 2 + 35 + recid.to_byte() as u64;
     }
 
-    fn sender_address(key: &SigningKey) -> Address {
+    pub(super) fn sender_address(key: &SigningKey) -> Address {
         let vk = key.verifying_key();
         let pubkey = vk.to_encoded_point(false);
         Address::from_slice(&Keccak256::digest(&pubkey.as_bytes()[1..])[12..])
@@ -2619,5 +2694,119 @@ mod sublist_gas_tests {
             out.push(running);
         }
         assert_eq!(out, vec![5, 7, 18, 13]);
+    }
+}
+
+#[cfg(test)]
+mod sender_cache_integration {
+    use super::tests::{sender_address, sign_tx};
+    use super::*;
+    use crate::sender_cache::SenderCache;
+    use alloy_primitives::{Bytes, U256};
+    use k256::ecdsa::SigningKey;
+
+    fn block_of(n: usize, chain_id: u64) -> (Vec<Transaction>, Vec<Address>) {
+        let mut txs = Vec::new();
+        let mut want = Vec::new();
+        for i in 0..n {
+            let key = SigningKey::from_slice(&[(i as u8) + 1; 32]).unwrap();
+            let mut tx = Transaction {
+                nonce: i as u64,
+                gas_price: U256::from(1u64),
+                gas_limit: U256::from(21_000u64),
+                to: Bytes::from(vec![0xBB; 20]),
+                value: U256::from(1u64),
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            sign_tx(&mut tx, &key, chain_id);
+            want.push(sender_address(&key));
+            txs.push(tx);
+        }
+        (txs, want)
+    }
+
+    fn processor(cache: Option<Arc<SenderCache>>) -> BlockProcessor {
+        let store = Arc::new(rustock_storage::BlockStore::open(tempfile::tempdir().unwrap()).unwrap());
+        let p = BlockProcessor::new(RskHardforkConfig::regtest(), store);
+        match cache {
+            Some(c) => p.with_sender_cache(c),
+            None => p,
+        }
+    }
+
+    /// The cache may change how long recovery takes. It may never change what
+    /// it returns -- not the senders, not their order.
+    #[test]
+    fn a_cached_run_returns_exactly_what_an_uncached_one_does() {
+        // Either side of RECOVERY_PARALLEL_THRESHOLD, so both the sequential
+        // and the threaded path are covered.
+        for n in [1usize, 4, 16, 40] {
+            let (txs, want) = block_of(n, 33);
+
+            let plain = processor(None).recover_senders(&txs, 33).unwrap();
+            assert_eq!(plain, want, "uncached recovery is wrong at n={n}");
+
+            let cache = Arc::new(SenderCache::new(1024));
+            let warm = processor(Some(cache.clone()));
+            let first = warm.recover_senders(&txs, 33).unwrap();
+            let second = warm.recover_senders(&txs, 33).unwrap();
+
+            assert_eq!(first, want, "first (cold) cached run differs at n={n}");
+            assert_eq!(second, want, "second (warm) cached run differs at n={n}");
+        }
+    }
+
+    /// The second pass must actually hit, or the cache is doing nothing but
+    /// taking two locks per block.
+    #[test]
+    fn the_second_pass_over_a_block_is_all_hits() {
+        let (txs, _) = block_of(20, 33);
+        let cache = Arc::new(SenderCache::new(1024));
+        let p = processor(Some(cache.clone()));
+
+        p.recover_senders(&txs, 33).unwrap();
+        let (_, misses_after_first) = cache.stats();
+        assert_eq!(misses_after_first, 20, "a cold block should miss on every transaction");
+
+        p.recover_senders(&txs, 33).unwrap();
+        let (hits, misses) = cache.stats();
+        assert_eq!(misses, 20, "the warm pass must not add misses");
+        assert_eq!(hits, 20, "the warm pass must hit on every transaction");
+    }
+
+    /// A cache shared between two processors is the whole point: the pool
+    /// recovers a transaction, and execution must not recover it again.
+    #[test]
+    fn a_shared_cache_carries_across_processors() {
+        let (txs, want) = block_of(20, 33);
+        let cache = Arc::new(SenderCache::new(1024));
+
+        let pool_side = processor(Some(cache.clone()));
+        assert_eq!(pool_side.recover_senders(&txs, 33).unwrap(), want);
+
+        let exec_side = processor(Some(cache.clone()));
+        let (hits_before, _) = cache.stats();
+        assert_eq!(exec_side.recover_senders(&txs, 33).unwrap(), want);
+        let (hits_after, _) = cache.stats();
+        assert_eq!(hits_after - hits_before, 20, "execution recovered what the pool already had");
+    }
+
+    /// REMASC carries no signature and is given the zero address. It must not
+    /// be cached as if it were a recovered sender -- every block has one, at
+    /// a different hash, and they would churn the LRU for nothing.
+    #[test]
+    fn remasc_is_handled_without_consulting_the_signature() {
+        let (mut txs, mut want) = block_of(3, 33);
+        txs.push(Transaction::remasc(100));
+        want.push(Address::ZERO);
+
+        let cache = Arc::new(SenderCache::new(1024));
+        let p = processor(Some(cache.clone()));
+        assert_eq!(p.recover_senders(&txs, 33).unwrap(), want);
+        assert_eq!(p.recover_senders(&txs, 33).unwrap(), want, "and again from the cache");
     }
 }

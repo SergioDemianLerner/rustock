@@ -3319,6 +3319,7 @@ dependencies = [
  "bitcoin",
  "hex",
  "k256",
+ "lru",
  "revm",
  "ripemd",
  "rustock-core",
