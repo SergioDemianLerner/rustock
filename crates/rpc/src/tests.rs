@@ -118,13 +118,29 @@ async fn test_web3_sha3_invalid_hex() {
 
 // ========== net ==========
 
+/// `net_version` is the chain id in decimal, not the network id -- see the
+/// method's own comment for rskj's implementation. This test used to assert
+/// `network_id`, which pinned the disagreement: the node answered 775 on
+/// mainnet where rskj answers 30, and contradicted its own `eth_chainId`.
 #[tokio::test]
 async fn test_net_version() {
     let (state, _tmp) = setup_state();
     let req = make_request("net_version", json!([]));
     let resp = dispatch_for_test(&state, req).await;
     let version = resp.result.unwrap();
-    assert_eq!(version, json!(ChainConfig::mainnet().network_id.to_string()));
+    assert_eq!(version, json!(ChainConfig::mainnet().chain_id.to_string()));
+    assert_eq!(version, json!("30"), "rskj answers 30 on mainnet");
+
+    // And it must agree with eth_chainId, which reports the same number in hex.
+    let chain_id = dispatch_for_test(&state, make_request("eth_chainId", json!([])))
+        .await.result.unwrap();
+    let as_dec = u64::from_str_radix(
+        chain_id.as_str().unwrap().trim_start_matches("0x"), 16,
+    ).unwrap();
+    assert_eq!(
+        version, json!(as_dec.to_string()),
+        "net_version and eth_chainId must name the same chain"
+    );
 }
 
 #[tokio::test]
@@ -1341,12 +1357,116 @@ async fn test_eth_uninstall_filter() {
     assert_eq!(resp3.result.unwrap(), json!(false));
 }
 
+/// A pool whose contents the test sets directly.
+#[derive(Default)]
+struct MutablePool {
+    pending: std::sync::Mutex<Vec<rustock_core::Transaction>>,
+}
+
+impl MutablePool {
+    fn set(&self, txs: Vec<rustock_core::Transaction>) {
+        *self.pending.lock().unwrap() = txs;
+    }
+}
+
+impl crate::server::TxPoolReader for MutablePool {
+    fn get_pending_tx(
+        &self,
+        _hash: &B256,
+    ) -> Option<(rustock_core::Transaction, alloy_primitives::Address, B256)> {
+        None
+    }
+    fn pending_nonce(&self, _addr: &alloy_primitives::Address) -> Option<u64> {
+        None
+    }
+    fn pool_status(&self) -> (usize, usize) {
+        (self.pending.lock().unwrap().len(), 0)
+    }
+    fn pool_content(&self) -> crate::server::PoolContent {
+        let txs = self.pending.lock().unwrap().clone();
+        crate::server::PoolContent {
+            pending: vec![(
+                alloy_primitives::Address::ZERO,
+                txs.into_iter().enumerate().map(|(i, t)| (i as u64, t)).collect(),
+            )],
+            queued: Vec::new(),
+        }
+    }
+    fn quota_report(&self, _a: &alloy_primitives::Address) -> Option<(f64, u64)> {
+        None
+    }
+}
+
+fn filter_pool_tx(nonce: u64) -> rustock_core::Transaction {
+    rustock_core::Transaction {
+        nonce,
+        gas_price: U256::from(20_000_000_000u64),
+        gas_limit: U256::from(21_000),
+        to: alloy_primitives::Bytes::from(vec![0x12; 20]),
+        value: U256::from(1_000_000),
+        input: alloy_primitives::Bytes::default(),
+        v: 27,
+        r: U256::from(100),
+        s: U256::from(200),
+        cached_rlp: None,
+    }
+}
+
+/// Two filters must be distinguishable, and a filter must be removable.
+///
+/// This used to assert `"0x0"` -- the stub's constant -- which pinned three
+/// defects at once: every filter had the same id, the id was not a real
+/// filter so `eth_uninstallFilter` answered false, and polling it always
+/// returned empty.
 #[tokio::test]
 async fn test_eth_new_pending_transaction_filter() {
     let (state, _tmp) = setup_state();
-    let req = make_request("eth_newPendingTransactionFilter", json!([]));
-    let resp = dispatch_for_test(&state, req).await;
-    assert_eq!(resp.result.unwrap(), json!("0x0"));
+
+    let one = dispatch_for_test(&state, make_request("eth_newPendingTransactionFilter", json!([])))
+        .await.result.unwrap();
+    let two = dispatch_for_test(&state, make_request("eth_newPendingTransactionFilter", json!([])))
+        .await.result.unwrap();
+
+    assert_ne!(one, json!("0x0"), "a filter id of zero is the old stub");
+    assert_ne!(one, two, "two filters must have different ids");
+
+    let gone = dispatch_for_test(
+        &state,
+        make_request("eth_uninstallFilter", json!([one.as_str().unwrap()])),
+    ).await.result.unwrap();
+    assert_eq!(gone, json!(true), "a real filter must be removable");
+}
+
+/// The filter reports transactions that arrive after it was created, once
+/// each, and does not replay what was already pending when it was opened.
+#[tokio::test]
+async fn test_pending_transaction_filter_reports_new_transactions() {
+    let (mut state, _tmp) = setup_state();
+    let pool = std::sync::Arc::new(MutablePool::default());
+    pool.set(vec![filter_pool_tx(0)]); // already pending before the filter exists
+    state.tx_pool = Some(pool.clone());
+
+    let fid = dispatch_for_test(&state, make_request("eth_newPendingTransactionFilter", json!([])))
+        .await.result.unwrap();
+    let fid = fid.as_str().unwrap().to_string();
+
+    let first = dispatch_for_test(&state, make_request("eth_getFilterChanges", json!([&fid])))
+        .await.result.unwrap();
+    assert_eq!(first, json!([]), "what was already pending must not be replayed");
+
+    // A new transaction arrives.
+    pool.set(vec![filter_pool_tx(0), filter_pool_tx(1)]);
+    let second = dispatch_for_test(&state, make_request("eth_getFilterChanges", json!([&fid])))
+        .await.result.unwrap();
+    assert_eq!(
+        second.as_array().map(|a| a.len()),
+        Some(1),
+        "the newly pending transaction must be reported exactly once"
+    );
+
+    let third = dispatch_for_test(&state, make_request("eth_getFilterChanges", json!([&fid])))
+        .await.result.unwrap();
+    assert_eq!(third, json!([]), "and must not be reported again");
 }
 
 // ========== Phase 6: DTO field name compatibility with rskj ==========
@@ -5255,4 +5375,82 @@ async fn a_receipt_names_the_sender_on_a_chain_that_is_not_mainnet() {
         format!("{signer:#x}"),
         "the receipt must name the signer, not the zero address"
     );
+}
+
+// ===== Findings from the rskj-k6-tests battery, 2026-10-25 =====
+
+/// Genesis must be retrievable even though its header claims roots no empty
+/// trie produces.
+///
+/// Only mainnet's genesis header carries the real empty-list and empty-trie
+/// hashes. Testnet's and regtest's carry `B256::ZERO` for `ommers_hash` and
+/// `transactions_root`, and `setup_genesis` writes no body row -- so the
+/// "does this header claim an empty body?" test said no, the body lookup
+/// failed, and block 0 came back `null` by number, by tag and by hash alike.
+///
+/// The consequence that reached past the test suite: while the head *is*
+/// genesis, `eth_getBlockByNumber("latest")` answered `null` to every client.
+/// That is the state of a fresh regtest node until something is mined.
+#[tokio::test]
+async fn genesis_is_served_even_with_zeroed_body_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+
+    // Regtest's genesis, as `ChainConfig::regtest().genesis_header()` builds it.
+    let mut genesis = test_header(0);
+    genesis.ommers_hash = B256::ZERO;
+    genesis.transactions_root = B256::ZERO;
+    let hash = genesis.hash();
+    store.put_header_with_hash(hash, &genesis).unwrap();
+    store.put_total_difficulty(hash, U256::from(1)).unwrap();
+    store.put_canonical_hash(0, hash).unwrap();
+    store.set_head(hash).unwrap();
+    // Deliberately no `put_body` -- `setup_genesis` writes none.
+
+    let (mut state, _tmp2) = setup_state();
+    state.store = store;
+
+    for params in [json!(["0x0", false]), json!(["earliest", false]), json!(["latest", false])] {
+        let resp = dispatch_for_test(&state, make_request("eth_getBlockByNumber", params.clone()))
+            .await.result.unwrap();
+        assert!(resp.is_object(), "eth_getBlockByNumber({params}) returned {resp}");
+        assert_eq!(resp["transactions"], json!([]), "genesis has no transactions");
+    }
+
+    let by_hash = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockByHash", json!([format!("{hash:#x}"), false])),
+    ).await.result.unwrap();
+    assert!(by_hash.is_object(), "eth_getBlockByHash returned {by_hash}");
+
+    let count = dispatch_for_test(
+        &state,
+        make_request("eth_getBlockTransactionCountByNumber", json!(["0x0"])),
+    ).await.result.unwrap();
+    assert_eq!(count, json!("0x0"), "genesis transaction count must be zero, not null");
+}
+
+/// `rpc_modules` must list every namespace this server dispatches, because a
+/// client that gates on it will not call what is missing. `evm` and `txpool`
+/// were absent even when enabled; `debug`, `trace` and `sco` were absent
+/// despite being answered unconditionally.
+#[tokio::test]
+async fn rpc_modules_lists_the_namespaces_that_answer() {
+    let (state, _tmp) = setup_state();
+    let base = dispatch_for_test(&state, make_request("rpc_modules", json!([])))
+        .await.result.unwrap();
+    for name in ["eth", "net", "web3", "rpc", "rsk", "debug", "trace", "sco"] {
+        assert!(base.get(name).is_some(), "{name} is dispatched but not listed: {base}");
+    }
+    // Off by default, and correctly absent.
+    assert!(base.get("evm").is_none(), "evm must not be listed without --dev-rpc");
+    assert!(base.get("txpool").is_none(), "txpool must not be listed without a pool");
+
+    let (mut state, _tmp) = setup_state();
+    state.snapshots = Some(Arc::new(crate::evm::SnapshotManager::new()));
+    state.tx_pool = Some(Arc::new(MutablePool::default()));
+    let on = dispatch_for_test(&state, make_request("rpc_modules", json!([])))
+        .await.result.unwrap();
+    assert!(on.get("evm").is_some(), "evm answers with --dev-rpc, so it must be listed: {on}");
+    assert!(on.get("txpool").is_some(), "txpool answers with a pool, so it must be listed: {on}");
 }

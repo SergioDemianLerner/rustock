@@ -230,13 +230,28 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_getUncleByBlockNumberAndIndex" => eth::eth_get_uncle_by_block_number_and_index(id, params, &state.store),
 
         // -- rpc --
+        // The answer decides what a client will even attempt: anything that
+        // gates on `rpc_modules` skips a namespace that is missing here, so
+        // omitting one this server dispatches makes working methods
+        // unreachable. `debug`, `trace` and `sco` were absent despite being
+        // answered unconditionally, and `evm` and `txpool` were absent even
+        // when enabled. Each entry below is a namespace this match arm
+        // actually serves, under the same condition it serves it.
         "rpc_modules" => {
             let mut modules = serde_json::Map::new();
-            for name in ["eth", "net", "web3", "rpc", "rsk"] {
+            for name in ["eth", "net", "web3", "rpc", "rsk", "debug", "trace", "sco"] {
                 modules.insert(name.to_string(), json!("1.0"));
             }
             if state.miner.is_some() {
                 modules.insert("mnr".to_string(), json!("1.0"));
+            }
+            // `snapshots` is `Some` exactly when `--dev-rpc` is on, which is
+            // what gates the `evm_` namespace.
+            if state.snapshots.is_some() {
+                modules.insert("evm".to_string(), json!("1.0"));
+            }
+            if state.tx_pool.is_some() {
+                modules.insert("txpool".to_string(), json!("1.0"));
             }
             JsonRpcResponse::success(id, Value::Object(modules))
         }
@@ -330,7 +345,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_getLogs" => logs::eth_get_logs(id, params, state),
         "eth_newFilter" => logs::eth_new_filter(id, params, state),
         "eth_newBlockFilter" => logs::eth_new_block_filter(id, state),
-        "eth_newPendingTransactionFilter" => logs::eth_new_pending_transaction_filter(id),
+        "eth_newPendingTransactionFilter" => logs::eth_new_pending_transaction_filter(id, state),
         "eth_getFilterChanges" => logs::eth_get_filter_changes(id, params, state),
         "eth_getFilterLogs" => logs::eth_get_filter_logs(id, params, state),
         "eth_uninstallFilter" => logs::eth_uninstall_filter(id, params, state),
