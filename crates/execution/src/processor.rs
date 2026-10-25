@@ -990,7 +990,7 @@ impl BlockProcessor {
         // Record only what had to be computed. Re-inserting a hit would be
         // harmless but would churn the LRU for no gain.
         if let Some(cache) = &self.sender_cache {
-            cache.put_many(
+            cache.put_many(crate::sender_cache::Origin::Block,
                 senders
                     .iter()
                     .zip(&hashes)
@@ -2750,7 +2750,7 @@ mod sender_cache_integration {
             let plain = processor(None).recover_senders(&txs, 33).unwrap();
             assert_eq!(plain, want, "uncached recovery is wrong at n={n}");
 
-            let cache = Arc::new(SenderCache::new(1024));
+            let cache = Arc::new(SenderCache::new(1024, 1024));
             let warm = processor(Some(cache.clone()));
             let first = warm.recover_senders(&txs, 33).unwrap();
             let second = warm.recover_senders(&txs, 33).unwrap();
@@ -2765,7 +2765,7 @@ mod sender_cache_integration {
     #[test]
     fn the_second_pass_over_a_block_is_all_hits() {
         let (txs, _) = block_of(20, 33);
-        let cache = Arc::new(SenderCache::new(1024));
+        let cache = Arc::new(SenderCache::new(1024, 1024));
         let p = processor(Some(cache.clone()));
 
         p.recover_senders(&txs, 33).unwrap();
@@ -2783,7 +2783,7 @@ mod sender_cache_integration {
     #[test]
     fn a_shared_cache_carries_across_processors() {
         let (txs, want) = block_of(20, 33);
-        let cache = Arc::new(SenderCache::new(1024));
+        let cache = Arc::new(SenderCache::new(1024, 1024));
 
         let pool_side = processor(Some(cache.clone()));
         assert_eq!(pool_side.recover_senders(&txs, 33).unwrap(), want);
@@ -2804,7 +2804,7 @@ mod sender_cache_integration {
         txs.push(Transaction::remasc(100));
         want.push(Address::ZERO);
 
-        let cache = Arc::new(SenderCache::new(1024));
+        let cache = Arc::new(SenderCache::new(1024, 1024));
         let p = processor(Some(cache.clone()));
         assert_eq!(p.recover_senders(&txs, 33).unwrap(), want);
         assert_eq!(p.recover_senders(&txs, 33).unwrap(), want, "and again from the cache");

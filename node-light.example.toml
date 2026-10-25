@@ -72,6 +72,10 @@
 # nothing. Opening read-only is the defence behind it: if some path is missed,
 # the database refuses the write rather than taking it.
 # read_only = false                 # default
+# sigcache = true                   # default — remember recovered transaction
+#                                   # senders so the pool and the executor do
+#                                   # not each recover the same signature.
+#                                   # false recomputes every one.
 # follow_up = true                  # default
 # Behave as though the chain ends here. Everything announced agrees with it,
 # total difficulty included; nothing above it is served. Requires following to

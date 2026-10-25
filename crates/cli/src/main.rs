@@ -1088,6 +1088,18 @@ struct Args {
     #[arg(long, default_value_t = rustock_rpc::logs::DEFAULT_MAX_BLOCK_RANGE, value_name = "BLOCKS")]
     rpc_logs_max_blocks: u64,
 
+    /// Remember which key signed which transaction, so the pool and the
+    /// executor do not each recover the same signature.
+    ///
+    /// Recovery is the most expensive arithmetic the node does per
+    /// transaction, and almost every transaction in a block passed through
+    /// this node's own pool first. On by default. `--sigcache=false` turns it
+    /// off and every sender is recomputed, which is how this node behaved
+    /// before the cache existed -- useful for measuring what it is worth, or
+    /// for ruling it out while diagnosing something else.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    sigcache: bool,
+
     /// Rate-limit accounts that broadcast transactions consuming large amounts
     /// of shared resources (rskj `transaction.accountTxRateLimit.enabled`).
     ///
@@ -1292,6 +1304,7 @@ fn apply_file_config(
         &mut a.prune_frozen_headers);
     apply(matches, "freezer", f.prune.freezer.as_ref(), &mut a.freezer);
     apply(matches, "dev_rpc", f.rpc.dev.as_ref(), &mut a.dev_rpc);
+    apply(matches, "sigcache", f.node.sigcache.as_ref(), &mut a.sigcache);
     apply(
         matches,
         "rpc_logs_max_blocks",
@@ -2206,15 +2219,28 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let gas_price_tracker = Arc::new(rustock_sync::gas_price::GasPriceTracker::default());
     gas_price_tracker.initialize_from_store(&store);
 
-    let pool = Arc::new(
-        rustock_sync::TransactionPool::new(
-            pool_config,
-            config.chain_id.into(),
-            store.clone(),
-            trie_store_for_pool.clone(),
-        )
-        .with_gas_price_tracker(gas_price_tracker.clone()),
-    );
+    // One cache, shared. The pool recovers a sender when it admits a
+    // transaction; the executor needs the same answer later, when a block
+    // carries it. Two private caches would miss exactly that hop, which is
+    // the one worth caching.
+    let sender_cache = args
+        .sigcache
+        .then(|| Arc::new(rustock_execution::sender_cache::SenderCache::default()));
+    if sender_cache.is_none() {
+        info!("Sender cache disabled (--sigcache=false); every sender is recovered");
+    }
+
+    let mut pool_builder = rustock_sync::TransactionPool::new(
+        pool_config,
+        config.chain_id.into(),
+        store.clone(),
+        trie_store_for_pool.clone(),
+    )
+    .with_gas_price_tracker(gas_price_tracker.clone());
+    if let Some(cache) = &sender_cache {
+        pool_builder = pool_builder.with_sender_cache(cache.clone());
+    }
+    let pool = Arc::new(pool_builder);
 
     // Every line in the transaction path logs at `debug` or `trace` and this
     // node runs at `info`, so the pool is otherwise entirely unobservable: an
@@ -2315,6 +2341,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     );
     if let Some(cache) = &btc_block_cache {
         block_processor = block_processor.with_btc_block_cache(cache.clone());
+    }
+    if let Some(cache) = &sender_cache {
+        block_processor = block_processor.with_sender_cache(cache.clone());
     }
     block_processor = block_processor.with_execution_threads(args.execution_threads);
     info!(

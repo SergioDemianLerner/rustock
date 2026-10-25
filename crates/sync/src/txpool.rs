@@ -160,6 +160,10 @@ pub struct TransactionPool {
     /// before the pool lock is acquired, so a slow quota refresh never holds up
     /// readers of the pool.
     quota: RwLock<crate::quota::QuotaChecker>,
+    /// Shared with the executor, so a sender recovered here is not recovered
+    /// again when the block carrying this transaction arrives. `None`
+    /// disables it and every recovery is recomputed.
+    sender_cache: Option<Arc<rustock_execution::sender_cache::SenderCache>>,
     /// Activity since the last summary.
     ///
     /// Not part of the rskj port -- rskj keeps no such counter. It exists
@@ -234,7 +238,20 @@ impl TransactionPool {
             quota: RwLock::new(quota),
             stats: RwLock::new(PoolStats::default()),
             gas_price: None,
+            sender_cache: None,
         }
+    }
+
+    /// Share the executor's sender cache, so a transaction recovered on
+    /// admission is not recovered again when its block executes. Handing the
+    /// same `Arc` to both is the whole point; a pool-private cache would miss
+    /// exactly the hop worth caching.
+    pub fn with_sender_cache(
+        mut self,
+        cache: Arc<rustock_execution::sender_cache::SenderCache>,
+    ) -> Self {
+        self.sender_cache = Some(cache);
+        self
     }
 
     /// Attach the gas-price tracker, which enables the rate limiter's
@@ -325,9 +342,29 @@ impl TransactionPool {
         tx.encode(&mut encoded);
         let encoded_size = encoded.len();
 
-        let sender = tx
-            .recover_sender(self.chain_id)
-            .map_err(|e| PoolError::InvalidSignature(format!("{e}")))?;
+        // A transaction offered twice -- re-broadcast, or seen by both a peer
+        // and the RPC -- is recovered once. The write goes to the pool tier,
+        // which is what execution reads when the block carrying it arrives.
+        let tx_hash_for_cache = tx.tx_hash();
+        let cached = self
+            .sender_cache
+            .as_ref()
+            .and_then(|c| c.get_many(&[tx_hash_for_cache]).pop().flatten());
+        let sender = match cached {
+            Some(sender) => sender,
+            None => {
+                let recovered = tx
+                    .recover_sender(self.chain_id)
+                    .map_err(|e| PoolError::InvalidSignature(format!("{e}")))?;
+                if let Some(c) = &self.sender_cache {
+                    c.put_many(
+                        rustock_execution::sender_cache::Origin::Pool,
+                        [(tx_hash_for_cache, recovered)],
+                    );
+                }
+                recovered
+            }
+        };
 
         let head_header = self.head_header()?;
         let (state_nonce, balance) = self.account_state(&head_header, &sender);
