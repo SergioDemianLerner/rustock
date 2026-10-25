@@ -30,6 +30,33 @@ ignore = [
     # rather than relaxing the unmaintained policy, so that a NEW unmaintained
     # crate still fails CI and forces a deliberate decision.
     { id = "RUSTSEC-2024-0436", reason = "paste, unmaintained; transitive via ark-* under revm precompiles" },
+    # crypto-bigint 0.5.5 -- leading-zero counting, division and Montgomery
+    # multiplication are not constant-time, so an operation on a secret
+    # integer can leak it through timing. Fixed in 0.7.6, which we cannot
+    # reach: the version is pinned transitively by revm 36, through
+    # revm-context-interface -> alloy-eip7702 -> k256 0.13.4 -> ecdsa ->
+    # elliptic-curve 0.13.8. `cargo update -p crypto-bigint` locks 0 packages.
+    #
+    # This entry is NOT a claim that the node is unaffected, because it is
+    # not. Most of the path is harmless -- revm reaches k256 only to *recover*
+    # signatures, which is arithmetic on public data, and the `--wallet-file`
+    # signer uses secp256k1 rather than k256, so no transaction key goes
+    # through this crate. But the node's own identity key does:
+    # `networking/src/handshake.rs` performs the RLPx ECDH with it, and
+    # `networking/src/node.rs` and `cli/src/main.rs` build a SigningKey from
+    # it. A peer can initiate handshakes and time the replies.
+    #
+    # Worst case is therefore disclosure of node.key -- the network identity,
+    # not funds, not consensus, and not the miner key. A remote timing attack
+    # on ECDH is a hard thing to actually land, which is why this is an
+    # ignore and not an incident, but "hard" is not "impossible" and the
+    # distinction belongs in writing rather than in someone's memory.
+    #
+    # The real remedy is #335: move the handshake and node-key operations to
+    # secp256k1, which this node already depends on and which is Bitcoin
+    # Core's constant-time implementation. That removes the first-party
+    # exposure without waiting for revm. Revisit this entry when either lands.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint timing variability; pinned by revm 36. Exposure is node.key via RLPx ECDH -- see #335" },
 ]
 
 # Note on RUSTSEC-2025-0055 (tracing-subscriber 0.2.25, ANSI escape injection)
