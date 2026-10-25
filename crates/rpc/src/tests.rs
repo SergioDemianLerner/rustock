@@ -5593,6 +5593,29 @@ async fn the_exactimator_never_undercuts_binary_search() {
     }
 }
 
+/// The binary search has to find the true minimum, including when that
+/// minimum is the intrinsic cost itself.
+///
+/// Its invariant is "`lo` fails, `hi` succeeds", and it answers `hi`. `lo`
+/// started at 21,000 and was never tested -- so for the commonest
+/// transaction there is, a plain transfer costing exactly 21,000, the search
+/// had assumed the answer away and returned 21,001. Found by comparing it
+/// against the single-pass estimator, which answered 21,000.
+///
+/// Unrelated to the refund overshoot in #334: that one is inherited from
+/// rskj's formula, this one was ours alone and is simply wrong.
+#[tokio::test]
+async fn binary_search_finds_the_intrinsic_cost_exactly() {
+    let (state, _tmp, from, _) = setup_estimation_state(0, 0, true);
+    let empty: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
+    assert_eq!(
+        estimate(&state, from, empty).await,
+        21_000,
+        "a plain transfer costs exactly 21,000; one more than that means the \
+         search never tested its own lower bound"
+    );
+}
+
 /// The property the peak exists for, and the one binary search cannot give:
 /// the estimate has to be large enough for the caller to hand over the whole
 /// allowance its CALL asks for.

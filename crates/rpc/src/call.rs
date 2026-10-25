@@ -100,7 +100,17 @@ fn estimate_by_binary_search(
     trie_store: std::sync::Arc<dyn rustock_trie::TrieStore>,
     gas_cap: u64,
 ) -> JsonRpcResponse {
-    let mut lo = 21_000u64;
+    // The invariant is "`lo` fails, `hi` succeeds", and the answer returned
+    // is `hi`. So `lo` has to be a limit that genuinely fails -- and it used
+    // to be 21,000, which was never tested and is the one value most likely
+    // to *succeed*: it is the intrinsic cost of the simplest transaction
+    // there is. A plain transfer needs exactly 21,000, and this search
+    // answered 21,001, having assumed the true minimum away before it began.
+    //
+    // Zero is the only start that needs no assumption: nothing can pay its
+    // intrinsic cost out of nothing. It costs at most one extra probe, which
+    // is lost among the two dozen this already does.
+    let mut lo = 0u64;
     let mut hi = gas_cap;
 
     // First check if the transaction even succeeds at the gas cap
