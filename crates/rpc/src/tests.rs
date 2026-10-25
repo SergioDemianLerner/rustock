@@ -5621,3 +5621,98 @@ async fn the_estimate_covers_the_allowance_a_call_asks_for() {
          {slow}, which already covers the allowance"
     );
 }
+
+/// A contract that clears a storage slot (earning a refund) and then calls
+/// out with `GAS` (handing over everything it has left). That lands on the
+/// `movedRemainingGasToChild` branch *and* has a refund, which is the
+/// combination where the two branches of rskj's formula disagree with each
+/// other about whether a refund belongs in an estimate.
+fn setup_refund_state(binary_search: bool) -> (RpcState, tempfile::TempDir, Address, Address) {
+    use rustock_trie::{account_key, code_key, storage_key, MemoryTrieStore, TrieKeySlice, TrieNode};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let trie_store = Arc::new(MemoryTrieStore::new());
+    let mut root = TrieNode::empty();
+
+    let sender: Address = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826".parse().unwrap();
+    let caller: Address = "0x4444444444444444444444444444444444444444".parse().unwrap();
+    let callee: Address = "0x5555555555555555555555555555555555555555".parse().unwrap();
+
+    for addr in [sender, caller, callee] {
+        let acct = rustock_trie::AccountState::new(U256::ZERO, U256::from(10u64).pow(U256::from(20)));
+        root = root.put(&TrieKeySlice::from_key(&account_key(&addr)), &acct.encode(), &*trie_store);
+    }
+
+    // Slot 1 starts non-zero, so storing zero into it earns the refund.
+    let mut slot = [0u8; 32];
+    slot[31] = 1;
+    root = root.put(
+        &TrieKeySlice::from_key(&storage_key(&caller, &B256::from(slot))),
+        &[7u8],
+        &*trie_store,
+    );
+
+    // SSTORE(1, 0); CALL(GAS, callee, 0, 0,0,0,0); STOP
+    let mut code: Vec<u8> = vec![0x60, 0x00, 0x60, 0x01, 0x55];
+    for _ in 0..5 {
+        code.extend_from_slice(&[0x60, 0x00]); // retSize, retOffset, argsSize, argsOffset, value
+    }
+    code.push(0x73);
+    code.extend_from_slice(callee.as_slice());
+    code.extend_from_slice(&[0x5A, 0xF1, 0x00]); // GAS; CALL; STOP
+    root = root.put(&TrieKeySlice::from_key(&code_key(&caller)), &code, &*trie_store);
+    root = root.put(&TrieKeySlice::from_key(&code_key(&callee)), &[0x00], &*trie_store);
+
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+    rustock_trie::TrieStore::put(&*trie_store, state_root.as_slice(), &root.to_message(&*trie_store));
+
+    let header = Header { state_root, gas_limit: U256::from(6_800_000u64), ..test_header(42) };
+    let hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(42, hash).unwrap();
+    store.set_head(hash).unwrap();
+    store.put_total_difficulty(hash, U256::from(42_000)).unwrap();
+
+    let (mut state, discard) = setup_state();
+    state.store = store;
+    state.trie_store = Some(trie_store);
+    state.hardfork_cfg = Some(rustock_execution::RskHardforkConfig::mainnet());
+    state.gas_estimator_binary_search = binary_search;
+    std::mem::forget(discard);
+    (state, tmp, sender, caller)
+}
+
+/// rskj's formula adds the refund back on the `movedRemainingGasToChild`
+/// branch and not on the other, and this test pins the consequence: the
+/// estimate comes out `deductedRefund` higher than the limit the transaction
+/// actually needs -- here 40,089 against a demonstrated 26,726, which is the
+/// `gasUsed/2` refund cap, so 50% high.
+///
+/// Kept as an assertion rather than fixed, because it is rskj's behaviour and
+/// this estimator is meant to agree with rskj. If the rskj side ever drops
+/// the `+ deductedRefund`, this test is the thing to update alongside.
+///
+/// Note the contrast with `the_estimate_covers_the_allowance_a_call_asks_for`:
+/// *that* divergence from binary search is a deliberate, minimal answer to a
+/// stricter question. This one buys nothing.
+#[tokio::test]
+async fn the_refund_branch_overshoots_by_the_refund() {
+    let (fast_state, _t1, from, to) = setup_refund_state(false);
+    let (slow_state, _t2, _, _) = setup_refund_state(true);
+
+    let fast = estimate(&fast_state, from, to).await;
+    let slow = estimate(&slow_state, from, to).await;
+
+    assert!(
+        fast > slow,
+        "fixture no longer reaches the refund branch: {fast} vs {slow}"
+    );
+    // The gap is exactly the refund, capped at half the gas used.
+    assert_eq!(
+        fast - slow,
+        slow / 2,
+        "the overshoot should be the capped refund and nothing else"
+    );
+}
