@@ -115,6 +115,9 @@ pub struct RpcState {
     /// Widest block range an `eth_getLogs` may span. rskj's
     /// `rpc.logs.maxBlocksToQuery`; see `logs::DEFAULT_MAX_BLOCK_RANGE`.
     pub logs_max_blocks: u64,
+    /// Answer `eth_estimateGas` by binary search instead of in a single pass.
+    /// False by default -- see `rustock_execution::gas_estimator`.
+    pub gas_estimator_binary_search: bool,
     /// Peer scoring and banning. Absent, the `sco_*` namespace reports itself
     /// as unavailable rather than answering from an empty table.
     pub scoring: Option<Arc<rustock_networking::scoring::ScoringService>>,

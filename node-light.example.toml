@@ -87,6 +87,12 @@
 # admin = false                     # default — enables rsk_collectTrie, rsk_pruneBlocks, …
 # disabled = false                  # default — true is the same as --no-rpc
 # logs_max_blocks = 10000           # default — widest eth_getLogs span; rskj's rpc.logs.maxBlocksToQuery is 5000
+# gas_estimator_binary_search = false # default — estimate gas in one pass.
+#                                   # true restores the old estimator, which
+#                                   # executes ~24 times narrowing an interval.
+#                                   # The two differ on a CALL with a large
+#                                   # fixed allowance: see
+#                                   # rustock_execution::gas_estimator.
 # dev = false                       # default — evm_* namespace: snapshot/revert/mine — development chains only
 # ws = false                        # default — WebSocket JSON-RPC, for eth_subscribe
 # ws_port = 4445                    # default

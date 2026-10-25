@@ -1088,6 +1088,17 @@ struct Args {
     #[arg(long, default_value_t = rustock_rpc::logs::DEFAULT_MAX_BLOCK_RANGE, value_name = "BLOCKS")]
     rpc_logs_max_blocks: u64,
 
+    /// Estimate gas by binary search, as this node did before the
+    /// single-pass estimator landed: execute at the cap, then halve the
+    /// interval until it closes, about two dozen executions in all.
+    ///
+    /// The single-pass estimator is the default and answers the same
+    /// question from one execution. This flag keeps the old one reachable
+    /// for comparison; `the_exactimator_agrees_with_binary_search` is the
+    /// test that says they agree.
+    #[arg(long, default_value_t = false)]
+    gas_estimator_binary_search: bool,
+
     /// Rate-limit accounts that broadcast transactions consuming large amounts
     /// of shared resources (rskj `transaction.accountTxRateLimit.enabled`).
     ///
@@ -1297,6 +1308,12 @@ fn apply_file_config(
         "rpc_logs_max_blocks",
         f.rpc.logs_max_blocks.as_ref(),
         &mut a.rpc_logs_max_blocks,
+    );
+    apply(
+        matches,
+        "gas_estimator_binary_search",
+        f.rpc.gas_estimator_binary_search.as_ref(),
+        &mut a.gas_estimator_binary_search,
     );
 
     apply(matches, "mine", f.mining.enabled.as_ref(), &mut a.mine);
@@ -3178,6 +3195,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             prune_keep_depth: args.prune_keep_depth,
             prune_max_batch: args.prune_max_batch,
             logs_max_blocks: args.rpc_logs_max_blocks,
+            gas_estimator_binary_search: args.gas_estimator_binary_search,
             snapshots: args
                 .dev_rpc
                 .then(|| Arc::new(rustock_rpc::evm::SnapshotManager::new())),

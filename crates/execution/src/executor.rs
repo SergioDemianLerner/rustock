@@ -593,6 +593,175 @@ impl RskExecutor {
     }
 
 
+    /// Estimate a transaction's gas in one execution.
+    ///
+    /// Returns `(estimate, success, output)`. On failure the estimate is zero
+    /// and the output is the revert data, so the caller can report the reason
+    /// rather than a number.
+    ///
+    /// The floor matters: a plain value transfer never enters the
+    /// interpreter, so the inspector sees no opcodes and reports no peak. Its
+    /// whole cost is intrinsic, which only `gas_used` knows.
+    pub fn estimate_gas_exact(
+        &self,
+        header: &Header,
+        tx: &rustock_core::Transaction,
+        sender: Address,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        cap: u64,
+    ) -> Result<(u64, bool, Vec<u8>), ExecutionError> {
+        let (result, telemetry) =
+            self.execute_tx_for_estimate(header, tx, sender, state_root, trie_store, true)?;
+        if !result.success {
+            return Ok((0, false, result.output));
+        }
+        let estimate = telemetry.estimate(cap);
+        Ok((estimate, true, result.output))
+    }
+
+    /// The same execution as `execute_tx_inner`, with the gas-estimation
+    /// inspector attached. Returns what one pass has to know for
+    /// `EstimateTelemetry::estimate` to answer without a binary search.
+    ///
+    /// A third copy of the setup, for the reason the traced copy above gives:
+    /// the estimate has to describe the execution the chain would actually
+    /// perform, so every line of the environment has to stay identical.
+    /// `the_exactimator_agrees_with_binary_search` is the guard against drift
+    /// -- it runs both estimators over the same transactions and requires the
+    /// same answer.
+    pub fn execute_tx_for_estimate(
+        &self,
+        header: &Header,
+        tx: &rustock_core::Transaction,
+        sender: Address,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        local_call: bool,
+    ) -> Result<(TxExecutionResult, crate::gas_estimator::EstimateTelemetry), ExecutionError> {
+        let spec_id = self.hardfork_cfg.spec_id(header.number);
+        let block_env = block_env_from_header(header, &self.hardfork_cfg);
+        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg);
+        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
+
+        let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
+
+        let mut chain_ext = crate::raw_storage::RskChainExt::default();
+        chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
+        chain_ext.btc_block_cache = self.btc_block_cache.clone();
+        let ctx = revm::Context::mainnet()
+            .with_db(WrapDatabaseRef(db))
+            .with_block(block_env)
+            .with_cfg(cfg)
+            .with_chain(chain_ext);
+
+        let precompile_provider = RskPrecompileProvider::new(
+            rsk_precompiles(&self.hardfork_cfg, header.number),
+            &self.hardfork_cfg,
+            Some(self.block_store.clone()),
+            self.remasc_config.clone(),
+        )
+        .with_bridge_config(self.bridge_constants.clone());
+        // rskj sets this on the transaction itself; the Bridge reads it out of
+        // the per-transaction context, so that is where it goes here.
+        if local_call {
+            if let Ok(mut guard) = precompile_provider.bridge_tx_context_slot().lock() {
+                guard.local_call = true;
+            }
+        }
+        let invisible_flag = precompile_provider.invisible_exception_flag();
+        let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
+        let active_precompiles: Vec<Address> =
+            rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
+        let extcodesize_max_precompiles: Vec<Address> = if self.hardfork_cfg.has_rskip90(header.number) {
+            active_precompiles.clone()
+        } else {
+            Vec::new()
+        };
+        let pre_rskip150_precompiles = (!self.hardfork_cfg.has_rskip150(header.number))
+            .then(|| active_precompiles.clone());
+        // rskj `VM.doEXTCODEHASH` reports `keccak256("")` for any active
+        // precompile; EXTCODEHASH activates at RSKIP140 (papyrus).
+        let extcodehash_precompiles: Vec<Address> =
+            if self.hardfork_cfg.has_rskip140(header.number) {
+                active_precompiles.clone()
+            } else {
+                Vec::new()
+            };
+        let mut evm = ctx
+            .build_mainnet_with_inspector(crate::gas_estimator::EstimationInspector::new())
+            .with_precompiles(precompile_provider);
+        crate::rsk_instructions::install(
+            &mut evm.instruction,
+            self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_chainid(header.number),
+            self.hardfork_cfg.has_push0(header.number),
+            self.hardfork_cfg.has_basefee(header.number),
+            self.hardfork_cfg.has_rskip91(header.number),
+            self.hardfork_cfg.has_rskip446(header.number),
+            self.hardfork_cfg.has_rskip445(header.number),
+            &extcodesize_max_precompiles,
+            &extcodehash_precompiles,
+            header.beneficiary,
+        );
+
+        let exec_out = {
+            use revm::context::ContextSetters;
+            evm.ctx.set_tx(tx_env);
+            let mut handler = crate::rsk_handler::RskHandler::with_rskip125(
+                !self.hardfork_cfg.has_rskip453(header.number),
+                self.hardfork_cfg.has_rskip125(header.number),
+                invisible_flag,
+                pre_rskip150_precompiles,
+                active_precompiles,
+                self.hardfork_cfg.has_rskip171(header.number),
+            );
+            use revm::inspector::InspectorHandler;
+            let out = handler
+                .inspect_run(&mut evm)
+                .map_err(|e: revm::context::result::EVMError<_>| {
+                    ExecutionError::Evm(format!("{e:?}"))
+                })?;
+            out
+        };
+        let state = {
+            use revm::context_interface::{ContextTr, JournalTr};
+            evm.ctx.journal_mut().finalize()
+        };
+        let result = revm::context::result::ExecResultAndState::new(exec_out, state);
+
+        let exec = result.result;
+        let success = exec.is_success();
+        let gas_used = exec.gas_used();
+        let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
+        // `spent` is revm's pre-refund figure -- limit minus remaining --
+        // which is the same quantity rskj's `getGasUsed()` holds, and what an
+        // estimate has to cover. `used()` is after the refund and would
+        // under-report.
+        let spent = exec.gas().spent();
+        let refunded = exec.gas().final_refunded();
+        let logs = exec.into_logs();
+
+        let created_address = Self::extract_created_address(tx, sender, &success);
+
+        let telemetry =
+            std::mem::take(&mut evm.inspector).into_telemetry(spent, refunded);
+
+        Ok((
+            TxExecutionResult {
+                gas_used,
+                success,
+                output,
+                logs,
+                created_address,
+                reached_sequential_only: reached_sequential_only
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+            telemetry,
+        ))
+    }
+
+
     /// Execute all transactions in a block.
     /// Account for one transaction's balance changes, rejecting the block if it
     /// created rBTC.
