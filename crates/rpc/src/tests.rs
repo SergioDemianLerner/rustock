@@ -5691,8 +5691,9 @@ fn setup_refund_state(binary_search: bool) -> (RpcState, tempfile::TempDir, Addr
 /// `gasUsed/2` refund cap, so 50% high.
 ///
 /// Kept as an assertion rather than fixed, because it is rskj's behaviour and
-/// this estimator is meant to agree with rskj. If the rskj side ever drops
-/// the `+ deductedRefund`, this test is the thing to update alongside.
+/// this estimator is meant to agree with rskj. See `docs/gas-estimation.md`
+/// §2 -- if the rskj side ever drops the `+ deductedRefund`, this test is the
+/// thing to update alongside.
 ///
 /// Note the contrast with `the_estimate_covers_the_allowance_a_call_asks_for`:
 /// *that* divergence from binary search is a deliberate, minimal answer to a
