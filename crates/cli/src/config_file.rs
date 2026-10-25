@@ -115,6 +115,11 @@ pub struct RpcSection {
     pub logs_max_blocks: Option<u64>,
     /// Enable the `evm_*` development-chain namespace. Off by default.
     pub dev: Option<bool>,
+    /// Fall back to the pre-exactimator gas estimator: a binary search over
+    /// roughly two dozen executions. The single-pass estimator is the
+    /// default; this exists so an operator who suspects it can compare
+    /// without rebuilding. See `rustock_execution::gas_estimator`.
+    pub gas_estimator_binary_search: Option<bool>,
     /// A file of private keys this node may sign with, one 32-byte hex
     /// key per line. Off by default; see `Args::wallet_file`, which
     /// documents what it costs to turn on.
@@ -425,6 +430,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "checkpoint_verify_hash",
     "checkpoint_bound_work",
     "rpc_logs_max_blocks",
+    "gas_estimator_binary_search",
     "dev_rpc",
     "mine",
     "mining_coinbase",

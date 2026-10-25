@@ -58,14 +58,55 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
 
     let gas_cap = call_req.gas.unwrap_or(header.gas_limit.to::<u64>());
 
-    // Binary search for the minimum gas that allows the transaction to succeed
+    let mut tx = build_call_tx(&call_req, &header, &root, sender, state);
+    tx.gas_limit = U256::from(gas_cap);
+
+    if state.gas_estimator_binary_search {
+        return estimate_by_binary_search(
+            id, &call_req, &header, &root, sender, state, &executor, trie_store, gas_cap,
+        );
+    }
+
+    // One execution, at the cap, with the estimation inspector attached. See
+    // `rustock_execution::gas_estimator` for why the three things it records
+    // are enough to answer without searching.
+    match executor.estimate_gas_exact(&header, &tx, sender, &root, trie_store, gas_cap) {
+        Ok((estimate, true, _)) => {
+            JsonRpcResponse::success(id, json!(crate::helpers::to_hex_u64(estimate)))
+        }
+        Ok((_, false, _)) => {
+            JsonRpcResponse::error(id, INTERNAL_ERROR, "Transaction would revert")
+        }
+        Err(e) => JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Execution failed: {e}")),
+    }
+}
+
+/// The estimator this node used before the single-pass one: execute at the
+/// cap, then halve the interval until it closes.
+///
+/// Kept reachable behind `--gas-estimator-binary-search` rather than deleted.
+/// It is the independent check on the new one -- a disagreement between them
+/// is a bug in one or the other, and the test that compares them needs
+/// something to compare against.
+#[allow(clippy::too_many_arguments)]
+fn estimate_by_binary_search(
+    id: Value,
+    call_req: &CallRequest,
+    header: &rustock_core::types::header::Header,
+    root: &rustock_trie::TrieNode,
+    sender: Address,
+    state: &RpcState,
+    executor: &RskExecutor,
+    trie_store: std::sync::Arc<dyn rustock_trie::TrieStore>,
+    gas_cap: u64,
+) -> JsonRpcResponse {
     let mut lo = 21_000u64;
     let mut hi = gas_cap;
 
     // First check if the transaction even succeeds at the gas cap
-    let mut tx = build_call_tx(&call_req, &header, &root, sender, state);
+    let mut tx = build_call_tx(call_req, header, root, sender, state);
     tx.gas_limit = U256::from(hi);
-    match executor.execute_local_call(&header, &tx, sender, &root, trie_store.clone()) {
+    match executor.execute_local_call(header, &tx, sender, root, trie_store.clone()) {
         Ok(result) if result.success => {}
         Ok(_) => {
             return JsonRpcResponse::error(id, INTERNAL_ERROR, "Transaction would revert");
@@ -77,10 +118,10 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
 
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
-        let mut probe_tx = build_call_tx(&call_req, &header, &root, sender, state);
+        let mut probe_tx = build_call_tx(call_req, header, root, sender, state);
         probe_tx.gas_limit = U256::from(mid);
 
-        match executor.execute_local_call(&header, &probe_tx, sender, &root, trie_store.clone()) {
+        match executor.execute_local_call(header, &probe_tx, sender, root, trie_store.clone()) {
             Ok(result) if result.success => hi = mid,
             _ => lo = mid,
         }

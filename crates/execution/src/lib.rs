@@ -3,6 +3,7 @@ pub mod collision;
 pub mod database;
 pub mod env;
 pub mod executor;
+pub mod gas_estimator;
 pub mod hardfork;
 pub mod mining;
 pub mod precompiles;
