@@ -57,6 +57,17 @@ impl FilterStore {
         }
     }
 
+    /// Replace a pending-transaction filter's seen-set with the pool as it is
+    /// now. Called straight after the difference has been handed to the
+    /// caller.
+    fn replace_reported(&self, id: u64, now: std::collections::HashSet<B256>) {
+        if let Some(f) = self.filters.write().unwrap().get_mut(&id) {
+            if let FilterKind::PendingTransaction { reported } = &mut f.kind {
+                *reported = now;
+            }
+        }
+    }
+
     fn remove(&self, id: u64) -> bool {
         self.filters.write().unwrap().remove(&id).is_some()
     }
@@ -66,8 +77,12 @@ impl FilterStore {
 enum FilterKind {
     Log(LogFilter),
     Block,
-    #[allow(dead_code)]
-    PendingTransaction,
+    /// `reported` is the pool as this filter last saw it. A poll answers the
+    /// difference and then replaces it, which bounds the set by the pool's own
+    /// size rather than letting it grow for the filter's lifetime. A
+    /// transaction that leaves the pool and comes back is reported again,
+    /// which is correct: it is pending again.
+    PendingTransaction { reported: std::collections::HashSet<B256> },
 }
 
 #[derive(Clone, Debug)]
@@ -135,9 +150,38 @@ pub fn eth_new_block_filter(id: Value, state: &RpcState) -> JsonRpcResponse {
     JsonRpcResponse::success(id, json!(to_hex_u64(filter_id)))
 }
 
-pub fn eth_new_pending_transaction_filter(id: Value) -> JsonRpcResponse {
-    // No mempool support — return a dummy filter that always returns empty
-    JsonRpcResponse::success(id, json!("0x0"))
+/// A filter over transactions entering the pool.
+///
+/// This used to answer the constant `"0x0"` with the comment "no mempool
+/// support". There is a mempool now -- `txpool_status` and `txpool_content`
+/// both read it -- but the stub outlived it, with three consequences a caller
+/// can see: every filter had the same id, so two were indistinguishable; id
+/// zero is not a real filter, so `eth_uninstallFilter` answered false and the
+/// filter could not be removed; and `eth_getFilterChanges` special-cases zero
+/// to an empty array, so it never reported anything.
+pub fn eth_new_pending_transaction_filter(id: Value, state: &RpcState) -> JsonRpcResponse {
+    // Seeded with what is already pending, so the first poll reports what
+    // arrives *after* the filter was created rather than replaying the pool.
+    let filter = Filter {
+        kind: FilterKind::PendingTransaction { reported: pool_hashes(state) },
+        last_polled_block: head_number(&state.store).unwrap_or(0),
+    };
+    let filter_id = state.filter_store.insert(filter);
+    JsonRpcResponse::success(id, json!(to_hex_u64(filter_id)))
+}
+
+/// Every transaction hash currently in the pool, pending or queued.
+fn pool_hashes(state: &RpcState) -> std::collections::HashSet<B256> {
+    let Some(pool) = &state.tx_pool else {
+        return std::collections::HashSet::new();
+    };
+    let content = pool.pool_content();
+    content
+        .pending
+        .iter()
+        .chain(content.queued.iter())
+        .flat_map(|(_, txs)| txs.iter().map(|(_, tx)| tx.tx_hash()))
+        .collect()
 }
 
 pub fn eth_get_filter_changes(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
@@ -178,8 +222,15 @@ pub fn eth_get_filter_changes(id: Value, params: &Value, state: &RpcState) -> Js
             state.filter_store.update_last_polled(filter_id, head_num);
             JsonRpcResponse::success(id, json!(hashes))
         }
-        FilterKind::PendingTransaction => {
-            JsonRpcResponse::success(id, json!([]))
+        FilterKind::PendingTransaction { reported } => {
+            let now = pool_hashes(state);
+            let mut fresh: Vec<String> =
+                now.difference(reported).map(to_hex_b256).collect();
+            // `HashSet` has no order and a caller reading a diff should not
+            // see one invented at random between polls.
+            fresh.sort();
+            state.filter_store.replace_reported(filter_id, now);
+            JsonRpcResponse::success(id, json!(fresh))
         }
     }
 }
