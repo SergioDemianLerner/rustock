@@ -153,6 +153,22 @@ rskj's `blockchain.config.consensusRules` (today `rskip97`), and
 mined without real merged mining. The same settings go in a `[chain]` section
 of the `--config` file. All of them are refused on mainnet and testnet.
 
+Blocks rskj exported with its `ExportBlocks` tool (`number,hash,td,rlp` per
+line, plain or gzipped) can then be imported from an empty data directory:
+
+```bash
+rustock --network-id 33 --genesis genesis.json ... \
+  --trie-backend external --trie-dir ./trie --data-dir ./data \
+  --import-blocks blocks.txt --import-flush-every 10
+```
+
+Each block goes through the validation and execution follow mode uses, and
+its state root, receipts root, logs bloom, gas used and paid fees are checked
+against its header. The import stops at the first block that fails, naming
+its number, hash and the check, and exits non-zero. The trie is flushed every
+`--import-flush-every` blocks (10, rskj's `blockchain.flushNumberOfBlocks`
+default).
+
 ### Dependency Auditing
 
 Supply chain checks run in CI on every push and pull request, and on a daily

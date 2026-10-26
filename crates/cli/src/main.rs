@@ -1295,6 +1295,18 @@ struct Args {
     /// Regtest: largest gas limit a header may declare (rskj has none).
     #[arg(long, value_name = "GAS")]
     max_gas_limit: Option<u64>,
+
+    /// Import the blocks of an rskj `ExportBlocks` file (`number,hash,td,rlp`
+    /// per line, plain or .gz) on top of this node's best block, through the
+    /// validation and execution follow mode uses, then exit. Stops with a
+    /// non-zero status at the first block that fails a check.
+    #[arg(long, value_name = "FILE")]
+    import_blocks: Option<std::path::PathBuf>,
+
+    /// With --import-blocks: blocks between trie flushes (rskj's
+    /// `blockchain.flushNumberOfBlocks`).
+    #[arg(long, value_name = "N", default_value_t = rustock_sync::import::DEFAULT_IMPORT_FLUSH_EVERY)]
+    import_flush_every: u64,
 }
 
 /// Apply the file underneath the command line, one setting per line so the
@@ -2641,6 +2653,18 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
 
+    if let Some(path) = &args.import_blocks {
+        let importer = rustock_sync::import::BlockImporter::new(
+            store.clone(),
+            HeaderVerifier::default_rsk(config.clone()),
+            block_processor,
+            trie_store_for_exec.clone(),
+            initial_state_root,
+            args.import_flush_every,
+        )?;
+        return run_import_blocks(path, importer);
+    }
+
     let snap_checkpoint = snap_checkpoint_for(args.network_id);
     if checkpoint_defence.any() && snap_checkpoint.is_none() {
         warn!(
@@ -3458,6 +3482,54 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 
     node.start().await?;
 
+    Ok(())
+}
+
+/// `--import-blocks`: feed every block of an rskj `ExportBlocks` file to
+/// `importer`, in file order. The first failure ends the process with the
+/// block's number, hash and the check that failed.
+fn run_import_blocks(
+    path: &std::path::Path,
+    mut importer: rustock_sync::import::BlockImporter,
+) -> Result<()> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "gz") {
+        Box::new(std::io::BufReader::new(flate2::read::MultiGzDecoder::new(file)))
+    } else {
+        Box::new(std::io::BufReader::new(file))
+    };
+    let (start_number, _) = importer.best();
+    info!("Importing blocks from {} on top of #{start_number}", path.display());
+    let started = std::time::Instant::now();
+    let mut imported = 0u64;
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading {}", path.display()))?;
+        let exported = match rustock_sync::import::parse_export_line(&line) {
+            Ok(Some(b)) => b,
+            Ok(None) => continue,
+            Err(e) => anyhow::bail!("{}:{}: {e:#}", path.display(), index + 1),
+        };
+        let (number, hash) = (exported.number, exported.hash);
+        if let Err(e) = importer.import(exported.block) {
+            anyhow::bail!(
+                "import failed at block {number} hash {} check {}: {e}",
+                alloy_primitives::hex::encode(hash),
+                e.check()
+            );
+        }
+        imported += 1;
+        if imported.is_multiple_of(1000) {
+            info!("Imported {imported} blocks (#{number})");
+        }
+    }
+    let (number, hash) = importer.best();
+    importer.finish().map_err(|e| anyhow::anyhow!("final flush: {e}"))?;
+    info!(
+        "Imported {imported} blocks in {:.1}s; best block #{number} {hash:?}",
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 

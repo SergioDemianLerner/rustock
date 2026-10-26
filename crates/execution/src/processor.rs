@@ -913,6 +913,18 @@ impl BlockProcessor {
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
         let result = self.process_block(block, state_root, trie_store)?;
+        self.commit_receipts(block, &result)?;
+        Ok(result)
+    }
+
+    /// The commit half of [`BlockProcessor::process_and_commit`]: store the
+    /// receipts of a processed block and index its transactions and Bridge
+    /// events.
+    pub fn commit_receipts(
+        &self,
+        block: &Block,
+        result: &ProcessedBlock,
+    ) -> Result<(), ProcessError> {
         let hash = block.hash();
         self.block_store
             .put_receipts(hash, &result.receipts)
@@ -939,7 +951,7 @@ impl BlockProcessor {
                 crate::precompiles::BRIDGE_ADDR,
             )
             .map_err(ProcessError::Storage)?;
-        Ok(result)
+        Ok(())
     }
 
     /// Below this many transactions, recovery stays on the calling thread.

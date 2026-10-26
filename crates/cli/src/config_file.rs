@@ -369,6 +369,8 @@ pub const ONE_SHOT: &[&str] = &[
     "repair_from",
     "repair_to",
     "import_blocks_db",
+    "import_blocks",
+    "import_flush_every",
     "import_rskj",
     "import_metrics",
     "import_skip_existing",
