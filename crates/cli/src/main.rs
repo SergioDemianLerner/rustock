@@ -1307,6 +1307,13 @@ struct Args {
     /// `blockchain.flushNumberOfBlocks`).
     #[arg(long, value_name = "N", default_value_t = rustock_sync::import::DEFAULT_IMPORT_FLUSH_EVERY)]
     import_flush_every: u64,
+
+    /// With --import-blocks: write one timing line per imported block to
+    /// this file, in the shape of rskj's `block connect breakdown best:`
+    /// debug line (milliseconds, three decimals). Off by default, and then
+    /// no clock is read.
+    #[arg(long, value_name = "FILE")]
+    breakdown_log: Option<std::path::PathBuf>,
 }
 
 /// Apply the file underneath the command line, one setting per line so the
@@ -2661,8 +2668,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             trie_store_for_exec.clone(),
             initial_state_root,
             args.import_flush_every,
-        )?;
-        return run_import_blocks(path, importer);
+        )?
+        .measure(args.breakdown_log.is_some());
+        return run_import_blocks(path, importer, args.breakdown_log.as_deref());
     }
 
     let snap_checkpoint = snap_checkpoint_for(args.network_id);
@@ -3491,8 +3499,20 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 fn run_import_blocks(
     path: &std::path::Path,
     mut importer: rustock_sync::import::BlockImporter,
+    breakdown_log: Option<&std::path::Path>,
 ) -> Result<()> {
-    use std::io::BufRead;
+    use std::io::{BufRead, Write};
+    let mut breakdown = match breakdown_log {
+        Some(log) => {
+            if let Some(dir) = log.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
+            }
+            let file = std::fs::File::create(log)
+                .with_context(|| format!("cannot create {}", log.display()))?;
+            Some(std::io::BufWriter::new(file))
+        }
+        None => None,
+    };
     let file = std::fs::File::open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
     let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "gz") {
@@ -3512,12 +3532,16 @@ fn run_import_blocks(
             Err(e) => anyhow::bail!("{}:{}: {e:#}", path.display(), index + 1),
         };
         let (number, hash) = (exported.number, exported.hash);
-        if let Err(e) = importer.import(exported.block) {
-            anyhow::bail!(
+        let block = match importer.import(exported.block) {
+            Ok(block) => block,
+            Err(e) => anyhow::bail!(
                 "import failed at block {number} hash {} check {}: {e}",
                 alloy_primitives::hex::encode(hash),
                 e.check()
-            );
+            ),
+        };
+        if let (Some(out), Some(t)) = (breakdown.as_mut(), block.timings.as_ref()) {
+            writeln!(out, "{}", t.breakdown_line(&block))?;
         }
         imported += 1;
         if imported.is_multiple_of(1000) {
@@ -3526,6 +3550,9 @@ fn run_import_blocks(
     }
     let (number, hash) = importer.best();
     importer.finish().map_err(|e| anyhow::anyhow!("final flush: {e}"))?;
+    if let Some(mut out) = breakdown {
+        out.flush()?;
+    }
     info!(
         "Imported {imported} blocks in {:.1}s; best block #{number} {hash:?}",
         started.elapsed().as_secs_f64()

@@ -77,6 +77,21 @@ fn orchid_check_interval() -> Option<u64> {
     })
 }
 
+/// Wall time of the stages of [`BlockProcessor::process_block_timed`], in
+/// the order they run. Together they cover the whole call.
+#[derive(Debug, Default, Clone)]
+pub struct ProcessTimings {
+    /// Transactions root and ommers hash checked against the header.
+    pub pre_validation: std::time::Duration,
+    /// `execute_block`: senders recovered, transactions and REMASC executed,
+    /// state changes applied to the trie, state root hashed, trie nodes
+    /// saved, receipts and their root built.
+    pub execute: std::time::Duration,
+    /// Gas used, paid fees, state root, receipts root and logs bloom checked
+    /// against the header.
+    pub post_validation: std::time::Duration,
+}
+
 /// Result of processing a block.
 #[derive(Debug)]
 pub struct ProcessedBlock {
@@ -768,6 +783,37 @@ impl BlockProcessor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
+        self.process_block_inner(block, state_root, trie_store, None)
+    }
+
+    /// [`BlockProcessor::process_block`], adding the wall time of each of its
+    /// three stages to `timings`. Instrumentation only: the work is the same.
+    pub fn process_block_timed(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        timings: &mut ProcessTimings,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        self.process_block_inner(block, state_root, trie_store, Some(timings))
+    }
+
+    fn process_block_inner(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        mut timings: Option<&mut ProcessTimings>,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        // Reads the clock only when timing was asked for.
+        let mut last = timings.is_some().then(std::time::Instant::now);
+        let mut lap = |stage: fn(&mut ProcessTimings) -> &mut std::time::Duration| {
+            if let (Some(t), Some(prev)) = (timings.as_deref_mut(), last) {
+                let now = std::time::Instant::now();
+                *stage(t) += now - prev;
+                last = Some(now);
+            }
+        };
         let header = &block.header;
 
         let computed_tx_root = ordered_tx_trie_root(
@@ -789,7 +835,9 @@ impl BlockProcessor {
             });
         }
 
+        lap(|t| &mut t.pre_validation);
         let result = self.execute_block(block, state_root, trie_store.clone())?;
+        lap(|t| &mut t.execute);
 
         if result.gas_used != header.gas_used {
             for (i, r) in result.receipts.iter().enumerate() {
@@ -886,6 +934,7 @@ impl BlockProcessor {
             tx_count = result.receipts.len(),
             "block processed successfully"
         );
+        lap(|t| &mut t.post_validation);
 
         Ok(result)
     }

@@ -34,7 +34,7 @@ pub use precompiles::{
     BRIDGE_ADDR, REMASC_ADDR,
 };
 pub use mining::{BlockTemplate, BlockTemplateBuilder, MinerServer, MinerWork, MiningConfig};
-pub use processor::{BlockProcessor, ProcessError, ProcessedBlock};
+pub use processor::{BlockProcessor, ProcessError, ProcessTimings, ProcessedBlock};
 pub use remasc::RemascConfig;
 pub mod tracer;
 pub mod supply;

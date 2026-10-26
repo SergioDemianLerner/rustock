@@ -12,8 +12,14 @@ use std::process::Command;
 const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
 fn import(blocks: &Path, dir: &Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rustock-cli"))
-        .args(["--network-id", "33", "--no-rpc", "--log-to-stdout"])
+    import_command(blocks, dir)
+        .output()
+        .expect("rustock-cli runs")
+}
+
+fn import_command(blocks: &Path, dir: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rustock-cli"));
+    cmd.args(["--network-id", "33", "--no-rpc", "--log-to-stdout"])
         .arg("--data-dir")
         .arg(dir.join("db"))
         .args(["--trie-backend", "external", "--trie-dir"])
@@ -28,9 +34,8 @@ fn import(blocks: &Path, dir: &Path) -> std::process::Output {
             "18446744073709551615",
         ])
         .arg("--import-blocks")
-        .arg(blocks)
-        .output()
-        .expect("rustock-cli runs")
+        .arg(blocks);
+    cmd
 }
 
 #[test]
@@ -51,6 +56,46 @@ fn imports_rskj_regtest_blocks() {
         ),
         "{stdout}"
     );
+}
+
+#[test]
+fn the_breakdown_log_has_a_line_per_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("logs").join("block-breakdown.log");
+    let mut cmd = import_command(
+        &Path::new(DATA).join("rskj-regtest-ecdsa-1-15.txt.gz"),
+        dir.path(),
+    );
+    let out = cmd.arg("--breakdown-log").arg(&log).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 15);
+    for (i, line) in lines.iter().enumerate() {
+        let prefix = format!("block connect breakdown best: block={} hash=", i + 1);
+        assert!(line.starts_with(&prefix), "{line}");
+        for key in [
+            "totalMs=",
+            "preambleMs=",
+            "initialValidationMs=",
+            "executeMs=",
+            "postExecuteValidationMs=",
+            "switchChainMs=",
+            "saveReceiptsMs=",
+            "onBestBlockMs=",
+            "txCount=",
+            "gasUsed=",
+        ] {
+            assert!(line.contains(key), "{key} missing: {line}");
+        }
+    }
+    assert!(lines[14]
+        .contains("hash=c06f0fa7bd7aae0c0c3066bf2c5b8e5fb8eea326238a67f5bbdf338221cae448 "));
+    assert!(lines[14].contains(" txCount=21 "));
 }
 
 #[test]

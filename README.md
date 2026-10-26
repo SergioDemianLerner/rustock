@@ -169,6 +169,20 @@ its number, hash and the check, and exits non-zero. The trie is flushed every
 `--import-flush-every` blocks (10, rskj's `blockchain.flushNumberOfBlocks`
 default).
 
+`--breakdown-log <file>` adds one line per block in the shape of rskj's
+`block connect breakdown best:` debug line, so the two clients' timings can be
+compared phase by phase:
+
+```
+block connect breakdown best: block=15 hash=c06f… totalMs=41.207 preambleMs=0.002
+  initialValidationMs=0.311 executeMs=38.950 postExecuteValidationMs=0.004
+  switchChainMs=0.402 saveReceiptsMs=0.517 onBestBlockMs=1.021 txCount=21 gasUsed=…
+```
+
+(one line in the file). `totalMs` covers the whole import of the block, the
+periodic flush included, as rskj's covers its `onBestBlock` flush. Without the
+flag no clock is read.
+
 ### Dependency Auditing
 
 Supply chain checks run in CI on every push and pull request, and on a daily

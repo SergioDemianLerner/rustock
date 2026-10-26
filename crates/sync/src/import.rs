@@ -32,6 +32,7 @@ use rustock_execution::{BlockProcessor, ProcessError};
 use rustock_storage::BlockStore;
 use rustock_trie::{TrieNode, TrieStore};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::execution_commit::ExecutionCommitter;
 
@@ -95,6 +96,96 @@ pub struct ImportedBlock {
     pub gas_used: u64,
     /// Whether this block ended with a flush.
     pub flushed: bool,
+    /// Where the time went, when the importer measures it
+    /// ([`BlockImporter::measure`]).
+    pub timings: Option<ImportTimings>,
+}
+
+/// Wall time of each phase of [`BlockImporter::import`], from a monotonic
+/// clock. The phases run in this order and `total` covers the whole call.
+///
+/// Each phase is named after the phase of rskj's
+/// `BlockChainImpl.internalTryToConnect` that does the same work, so the two
+/// clients' lines can be read side by side.
+#[derive(Debug, Default, Clone)]
+pub struct ImportTimings {
+    pub total: Duration,
+    /// Checking that the block extends the best block (rskj `preambleMs`).
+    pub preamble: Duration,
+    /// Header against its parent, body rules, transactions root and ommers
+    /// hash (rskj `initialValidationMs`).
+    pub initial_validation: Duration,
+    /// `execute_block` (rskj `executeMs`).
+    pub execute: Duration,
+    /// Results checked against the header (rskj `postExecuteValidationMs`).
+    pub post_execute_validation: Duration,
+    /// Header, total difficulty, canonical index and body stored (rskj
+    /// `switchChainMs`, which saves the block and makes it best).
+    pub switch_chain: Duration,
+    /// Receipts and transaction and Bridge-event indexes stored (rskj
+    /// `saveReceiptsMs`).
+    pub save_receipts: Duration,
+    /// Every `flush_every` blocks: the trie flushed and the executed head
+    /// recorded, zero on other blocks (rskj `onBestBlockMs`, whose listener
+    /// runs the flush every `flushNumberOfBlocks`).
+    pub on_best_block: Duration,
+}
+
+impl ImportTimings {
+    /// One line in the shape of rskj's `block connect breakdown best:` debug
+    /// line, milliseconds with three decimals.
+    pub fn breakdown_line(&self, block: &ImportedBlock) -> String {
+        let ms = |d: Duration| format!("{:.3}", d.as_secs_f64() * 1000.0);
+        format!(
+            "block connect breakdown best: block={} hash={} totalMs={} preambleMs={} \
+             initialValidationMs={} executeMs={} postExecuteValidationMs={} switchChainMs={} \
+             saveReceiptsMs={} onBestBlockMs={} txCount={} gasUsed={}",
+            block.number,
+            alloy_primitives::hex::encode(block.hash),
+            ms(self.total),
+            ms(self.preamble),
+            ms(self.initial_validation),
+            ms(self.execute),
+            ms(self.post_execute_validation),
+            ms(self.switch_chain),
+            ms(self.save_receipts),
+            ms(self.on_best_block),
+            block.tx_count,
+            block.gas_used,
+        )
+    }
+}
+
+/// Times consecutive phases; reads no clock when disabled.
+struct Laps {
+    start: Option<Instant>,
+    last: Option<Instant>,
+}
+
+impl Laps {
+    fn new(enabled: bool) -> Self {
+        let now = enabled.then(Instant::now);
+        Self {
+            start: now,
+            last: now,
+        }
+    }
+
+    /// Time since the previous lap, zero when disabled.
+    fn lap(&mut self) -> Duration {
+        match self.last {
+            Some(last) => {
+                let now = Instant::now();
+                self.last = Some(now);
+                now - last
+            }
+            None => Duration::ZERO,
+        }
+    }
+
+    fn total(&self) -> Duration {
+        self.start.map(|s| s.elapsed()).unwrap_or_default()
+    }
 }
 
 /// Imports a chain block by block on top of the store's best block.
@@ -109,6 +200,7 @@ pub struct BlockImporter {
     best_td: U256,
     committer: ExecutionCommitter,
     last_executed: Option<(B256, B256)>,
+    measure: bool,
 }
 
 impl BlockImporter {
@@ -140,7 +232,15 @@ impl BlockImporter {
             best_td,
             committer: ExecutionCommitter::new(flush_every),
             last_executed: None,
+            measure: false,
         })
+    }
+
+    /// Measure each import ([`ImportedBlock::timings`]). Off by default, and
+    /// then no clock is read.
+    pub fn measure(mut self, measure: bool) -> Self {
+        self.measure = measure;
+        self
     }
 
     /// Number and hash of the best block.
@@ -150,6 +250,9 @@ impl BlockImporter {
 
     /// Validate, execute and store `block` as the new best block.
     pub fn import(&mut self, block: Block) -> Result<ImportedBlock, ImportError> {
+        let mut laps = Laps::new(self.measure);
+        let mut t = ImportTimings::default();
+        let mut process = rustock_execution::ProcessTimings::default();
         let header = &block.header;
         let hash = header.hash();
         if header.parent_hash != self.best_hash || header.number != self.best.number + 1 {
@@ -160,6 +263,7 @@ impl BlockImporter {
                 best_hash: self.best_hash,
             });
         }
+        t.preamble = laps.lap();
 
         self.verifier
             .verify(header, Some(&self.best))
@@ -167,26 +271,37 @@ impl BlockImporter {
         self.processor
             .validate_block(&block)
             .map_err(ImportError::Block)?;
-        let result =
-            match self
-                .processor
-                .process_block(&block, &self.state_root, self.trie_store.clone())
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    // Keep the trie nodes the failed block wrote: its computed
-                    // state can then be diffed against the reference client's.
-                    self.trie_store.flush();
-                    return Err(e.into());
-                }
-            };
+        t.initial_validation = laps.lap();
+        let trie_store = self.trie_store.clone();
+        let processed = if self.measure {
+            self.processor
+                .process_block_timed(&block, &self.state_root, trie_store, &mut process)
+        } else {
+            self.processor
+                .process_block(&block, &self.state_root, trie_store)
+        };
+        let result = match processed {
+            Ok(result) => result,
+            Err(e) => {
+                // Keep the trie nodes the failed block wrote: its computed
+                // state can then be diffed against the reference client's.
+                self.trie_store.flush();
+                return Err(e.into());
+            }
+        };
+        laps.lap();
+        t.initial_validation += process.pre_validation;
+        t.execute = process.execute;
+        t.post_execute_validation = process.post_validation;
 
         let td = self.best_td + header.difficulty;
         self.store
             .store_headers_batch(&[(header, td)], Some(self.best_hash), self.best_td)?;
         self.store
             .put_body(hash, &block.transactions, &block.ommers)?;
+        t.switch_chain = laps.lap();
         self.processor.commit_receipts(&block, &result)?;
+        t.save_receipts = laps.lap();
         self.state_root = result.new_state_root;
         self.last_executed = Some((hash, result.state_root_hash));
 
@@ -201,6 +316,8 @@ impl BlockImporter {
             Some(true) => true,
             Some(false) => return Err(ImportError::ExecHead),
         };
+        t.on_best_block = laps.lap();
+        t.total = laps.total();
 
         let imported = ImportedBlock {
             number: header.number,
@@ -208,6 +325,7 @@ impl BlockImporter {
             tx_count: block.transactions.len(),
             gas_used: header.gas_used,
             flushed,
+            timings: self.measure.then_some(t),
         };
         self.best_hash = hash;
         self.best_td = td;
@@ -323,6 +441,30 @@ mod tests {
     fn short_lines_are_skipped_like_rskj_connect_blocks() {
         assert!(parse_export_line("").unwrap().is_none());
         assert!(parse_export_line("1,abc,01").unwrap().is_none());
+    }
+
+    #[test]
+    fn the_breakdown_line_reads_like_rskjs() {
+        let block = ImportedBlock {
+            number: 7,
+            hash: B256::repeat_byte(0xab),
+            tx_count: 21,
+            gas_used: 24_000_000,
+            flushed: false,
+            timings: None,
+        };
+        let t = ImportTimings {
+            total: Duration::from_micros(12_345),
+            execute: Duration::from_micros(10_000),
+            ..Default::default()
+        };
+        let line = t.breakdown_line(&block);
+        assert!(line.starts_with(&format!(
+            "block connect breakdown best: block=7 hash={} totalMs=12.345 preambleMs=0.000 ",
+            "ab".repeat(32)
+        )));
+        assert!(line.contains(" executeMs=10.000 "));
+        assert!(line.ends_with(" onBestBlockMs=0.000 txCount=21 gasUsed=24000000"));
     }
 
     #[test]
