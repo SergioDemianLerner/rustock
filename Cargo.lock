@@ -3307,6 +3307,7 @@ dependencies = [
  "rustock-trie",
  "secp256k1 0.31.1",
  "serde",
+ "serde_json",
  "sha2",
  "sha3",
  "thiserror 2.0.18",

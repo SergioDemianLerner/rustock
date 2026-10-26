@@ -132,6 +132,27 @@ options, and measured performance. [`tools/dump-index`](tools/dump-index) is a
 companion Java tool for reading rskj's MapDB index directly, used as an
 independent cross-check.
 
+### A regtest chain rskj runs
+
+rustock's regtest is its own chain: its own genesis, no Bridge federation, and
+gas limits of its own. To run the chain an rskj regtest node runs, so that
+blocks rskj mined connect here, start from rskj's genesis file and its rules:
+
+```bash
+rustock --network-id 33 \
+  --genesis genesis.json \
+  --consensus-rule rskip97=0 \
+  --min-gas-limit 3000000 --max-gas-limit 18446744073709551615 \
+  --skip-pow-validation
+```
+
+`--genesis` takes an rskj genesis JSON file and gives the genesis rskj gives
+it, hash included, along with rskj's regtest federation. `--consensus-rule` is
+rskj's `blockchain.config.consensusRules` (today `rskip97`), and
+`--skip-pow-validation` is its `miner.server.skipPowValidation`, for chains
+mined without real merged mining. The same settings go in a `[chain]` section
+of the `--config` file. All of them are refused on mainnet and testnet.
+
 ### Dependency Auditing
 
 Supply chain checks run in CI on every push and pull request, and on a daily

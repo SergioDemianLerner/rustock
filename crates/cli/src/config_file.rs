@@ -60,6 +60,25 @@ pub struct FileConfig {
     pub checkpoint: CheckpointSection,
     #[serde(default)]
     pub metrics: MetricsSection,
+    #[serde(default)]
+    pub chain: ChainSection,
+}
+
+/// Regtest chain settings, for a chain that has to match one an rskj node
+/// runs: its genesis file, its consensus-rule overrides, its gas-limit
+/// bounds, and whether proof of work is checked.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainSection {
+    /// An rskj genesis JSON file, used instead of the built-in regtest genesis.
+    pub genesis: Option<std::path::PathBuf>,
+    /// rskj `miner.server.skipPowValidation`.
+    pub skip_pow_validation: Option<bool>,
+    /// rskj `blockchain.config.consensusRules`, as `name = height`
+    /// (-1 disables).
+    pub consensus_rules: Option<std::collections::BTreeMap<String, i64>>,
+    pub min_gas_limit: Option<u64>,
+    pub max_gas_limit: Option<u64>,
 }
 
 /// Prometheus metrics. Separate from `[rpc]` because the listener is: a
@@ -472,6 +491,11 @@ pub const CONFIGURABLE: &[&str] = &[
     "snap_peer_rate",
     "snap_total_rate",
     "alerts_config",
+    "genesis",
+    "skip_pow_validation",
+    "consensus_rule",
+    "min_gas_limit",
+    "max_gas_limit",
 ];
 
 #[cfg(test)]

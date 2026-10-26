@@ -1270,6 +1270,31 @@ struct Args {
     /// be passed straight back in.
     #[arg(long)]
     trie_node: Option<String>,
+
+    /// Regtest: start from this rskj genesis JSON file instead of the
+    /// built-in genesis, so blocks an rskj node mined from it connect here.
+    #[arg(long, value_name = "FILE")]
+    genesis: Option<std::path::PathBuf>,
+
+    /// Regtest: accept headers without checking merged-mining proof of work,
+    /// like rskj's `miner.server.skipPowValidation = true`. For replaying a
+    /// chain mined without real proof of work.
+    #[arg(long, default_value_t = false)]
+    skip_pow_validation: bool,
+
+    /// Regtest: override an rskj consensus rule, as `name=height` (`-1`
+    /// disables it), like rskj's `blockchain.config.consensusRules`.
+    /// Repeatable. Supported: rskip97.
+    #[arg(long, value_name = "NAME=HEIGHT")]
+    consensus_rule: Vec<String>,
+
+    /// Regtest: smallest gas limit a header may declare (rskj: 3,000,000).
+    #[arg(long, value_name = "GAS")]
+    min_gas_limit: Option<u64>,
+
+    /// Regtest: largest gas limit a header may declare (rskj has none).
+    #[arg(long, value_name = "GAS")]
+    max_gas_limit: Option<u64>,
 }
 
 /// Apply the file underneath the command line, one setting per line so the
@@ -1285,6 +1310,15 @@ fn apply_file_config(
     use config_file::{apply, apply_opt};
 
     apply(matches, "port", f.node.port.as_ref(), &mut a.port);
+    apply_opt(matches, "genesis", f.chain.genesis.as_ref(), &mut a.genesis);
+    apply(matches, "skip_pow_validation", f.chain.skip_pow_validation.as_ref(),
+        &mut a.skip_pow_validation);
+    let rules = f.chain.consensus_rules.as_ref().map(|r| {
+        r.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>()
+    });
+    apply(matches, "consensus_rule", rules.as_ref(), &mut a.consensus_rule);
+    apply_opt(matches, "min_gas_limit", f.chain.min_gas_limit.as_ref(), &mut a.min_gas_limit);
+    apply_opt(matches, "max_gas_limit", f.chain.max_gas_limit.as_ref(), &mut a.max_gas_limit);
     apply(matches, "data_dir", f.node.data_dir.as_ref(), &mut a.data_dir);
     apply(matches, "network_id", f.node.network_id.as_ref(), &mut a.network_id);
     apply_opt(matches, "secret_key", f.node.secret_key.as_ref(), &mut a.secret_key);
@@ -1681,7 +1715,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         31 => ChainConfig::testnet(),
         _ => ChainConfig::regtest(),
     };
-    let config = Arc::new(config);
+    let config = Arc::new(apply_chain_options(config, &args)?);
     // Block-hash computation (RSKIP92) needs the activation heights before
     // any header is decoded.
     config.activation_heights.clone().install();
@@ -2461,6 +2495,13 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         block_processor = block_processor.with_sender_cache(cache.clone());
     }
     block_processor = block_processor.with_execution_threads(args.execution_threads);
+    if config.genesis_spec.is_some() {
+        // A chain from an rskj genesis file is rskj's regtest, Bridge
+        // federation included.
+        block_processor = block_processor.with_bridge_constants(
+            rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
+        );
+    }
     info!(
         "Block processor wired (hardfork config: {:?}, execution threads: {})",
         hardfork_cfg,
@@ -3420,6 +3461,67 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     Ok(())
 }
 
+/// Apply the regtest chain options (`--genesis`, `--skip-pow-validation`,
+/// `--consensus-rule`, `--min-gas-limit`, `--max-gas-limit`). Refused on
+/// mainnet and testnet, whose rules are not the operator's to change.
+fn apply_chain_options(mut config: ChainConfig, args: &Args) -> Result<ChainConfig> {
+    let any = args.genesis.is_some()
+        || args.skip_pow_validation
+        || !args.consensus_rule.is_empty()
+        || args.min_gas_limit.is_some()
+        || args.max_gas_limit.is_some();
+    if !any {
+        return Ok(config);
+    }
+    anyhow::ensure!(
+        !matches!(config.chain_id, 30 | 31),
+        "--genesis, --skip-pow-validation, --consensus-rule and the gas-limit bounds \
+         are regtest options"
+    );
+    for rule in &args.consensus_rule {
+        let (name, height) = rule
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--consensus-rule {rule:?}: expected name=height"))?;
+        let height: i64 = height
+            .trim()
+            .parse()
+            .with_context(|| format!("--consensus-rule {rule:?}: height"))?;
+        let height = u64::try_from(height).ok();
+        match name.trim() {
+            "rskip97" => config.activation_heights.rskip97 = height,
+            other => anyhow::bail!(
+                "--consensus-rule: {other} is not supported (supported: rskip97)"
+            ),
+        }
+    }
+    if let Some(gas) = args.min_gas_limit {
+        config.min_gas_limit = gas;
+    }
+    if let Some(gas) = args.max_gas_limit {
+        config.max_gas_limit = gas;
+    }
+    config.skip_pow_validation = args.skip_pow_validation;
+    if let Some(path) = &args.genesis {
+        let spec = rustock_core::rskj_genesis::GenesisSpec::from_file(path)?;
+        config.genesis_spec = Some(spec);
+        // rskj writes the root of the state it built into the genesis header,
+        // so build it once, in memory, to learn the root.
+        let scratch = rustock_trie::MemoryTrieStore::new();
+        let root = build_genesis_state(&config, &scratch)?.compute_hash(&scratch);
+        let spec = config.genesis_spec.take().map(|s| s.with_state_root(root));
+        config.genesis_spec = spec;
+        info!(
+            "Genesis from {}: state root {root:?}, hash {:?}",
+            path.display(),
+            config.known_genesis_hash().unwrap_or_default()
+        );
+    }
+    if config.skip_pow_validation {
+        tracing::warn!("Merged-mining proof of work is NOT validated (--skip-pow-validation)");
+    }
+    Ok(config)
+}
+
 /// Try to resume from persisted state, falling back to genesis if unavailable.
 ///
 /// On restart, loads the Unitrie root recorded at the last EXECUTED block
@@ -3509,7 +3611,15 @@ fn build_genesis_state(config: &ChainConfig, trie_store: &dyn TrieStore) -> Resu
         // genesis set above which is only created when absent.
         for (addr, upgrade) in rustock_execution::precompiles::CONSENSUS_ENABLED_PRECOMPILES {
             use rustock_execution::hardfork::RskNetworkUpgrade as U;
+            // A genesis read from an rskj file is rskj's regtest genesis,
+            // where every upgrade in this list is at height 0 (regtest.conf),
+            // so every one of these precompiles is created at genesis. The
+            // execution ladder says the same: it starts at the last upgrade.
+            let ladder = rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
             let height = match upgrade {
+                _ if config.genesis_spec.is_some() => {
+                    (ladder.active_upgrade(0) >= upgrade).then_some(0)
+                }
                 U::Wasabi100 => Some(config.activation_heights.wasabi100),
                 U::Papyrus200 => Some(config.activation_heights.papyrus200),
                 U::Iris300 => Some(config.activation_heights.iris300),
@@ -4756,6 +4866,59 @@ mod snap_checkpoint_tests {
 mod genesis_tests {
     use super::*;
     use rustock_trie::MemoryTrieStore;
+
+    fn regtest_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["rustock-cli", "--network-id", "33"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    /// The lab's rskj regtest genesis (`tests/fixtures/rskj-regtest-genesis.json`,
+    /// sixteen funded accounts, 25M gas limit). rskj gives it this hash:
+    /// block 1 of every chain mined from it names it as parent. Getting there
+    /// takes the file's difficulty bytes as written and the precompile
+    /// accounts rskj creates at genesis when every upgrade is at height 0.
+    #[test]
+    fn an_rskj_genesis_file_gives_rskjs_genesis_hash() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rskj-regtest-genesis.json");
+        let args = regtest_args(&["--genesis", path]);
+        let config = apply_chain_options(ChainConfig::regtest(), &args).unwrap();
+        assert_eq!(
+            config.known_genesis_hash(),
+            Some("0x227d8e8d835f5e7290e333f4177e551ef1222dde4704f677ba4a120051c31cc2".parse().unwrap())
+        );
+        let header = config.genesis_header();
+        assert_eq!(header.hash(), config.known_genesis_hash().unwrap());
+        assert_eq!(header.gas_limit, U256::from(25_000_000));
+        assert_eq!(config.genesis_alloc().len(), 16);
+    }
+
+    #[test]
+    fn chain_options_apply_on_regtest_only() {
+        let args = regtest_args(&[
+            "--skip-pow-validation",
+            "--consensus-rule",
+            "rskip97=0",
+            "--min-gas-limit",
+            "3000000",
+            "--max-gas-limit",
+            "18446744073709551615",
+        ]);
+        let config = apply_chain_options(ChainConfig::regtest(), &args).unwrap();
+        assert!(config.skip_pow_validation);
+        assert_eq!(config.activation_heights.rskip97, Some(0));
+        assert_eq!((config.min_gas_limit, config.max_gas_limit), (3_000_000, u64::MAX));
+
+        let disabled = regtest_args(&["--consensus-rule", "rskip97=-1"]);
+        let config = apply_chain_options(ChainConfig::regtest(), &disabled).unwrap();
+        assert_eq!(config.activation_heights.rskip97, None);
+
+        let unknown = regtest_args(&["--consensus-rule", "rskip144=0"]);
+        assert!(apply_chain_options(ChainConfig::regtest(), &unknown).is_err());
+
+        let mainnet = Args::parse_from(["rustock-cli", "--skip-pow-validation"]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &mainnet).is_err());
+    }
 
     /// Testnet's genesis state root, published in rskj's
     /// `genesis/orchid-testnet.json` and in every testnet block #0.

@@ -48,7 +48,10 @@ fn test_chain_config() -> Arc<ChainConfig> {
             // Active from genesis: this fixture mines blocks back to back,
             // so the ten-minute drop would only add noise.
             rskip97: Some(0),
+            rskip144: None,
         },
+        genesis_spec: None,
+        skip_pow_validation: false,
     })
 }
 

@@ -190,6 +190,16 @@ impl BlockProcessor {
         self.sender_cache.as_ref()
     }
 
+    /// Use these Bridge constants instead of the network's built-in ones
+    /// ([`RskExecutor::with_bridge_constants`]).
+    pub fn with_bridge_constants(
+        mut self,
+        constants: crate::bridge::constants::BridgeConstants,
+    ) -> Self {
+        self.executor = self.executor.with_bridge_constants(constants);
+        self
+    }
+
     /// Share a BTC stored-block cache across every block this processor runs.
     ///
     /// Latency only: the cache is filled solely from reads consensus already

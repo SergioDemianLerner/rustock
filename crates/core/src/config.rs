@@ -50,6 +50,15 @@ pub struct ActivationHeights {
     /// difficulty is the 131,072 floor because its parent is genesis at
     /// timestamp 0.
     pub rskip97: Option<u64>,
+    /// Height at which RSKIP-144 (parallel transaction sublists) activates,
+    /// or `None` where it never does. rskj gates it on `reed810`.
+    ///
+    /// The header decoder needs it: after an RSKIP-351 version byte, one
+    /// trailing item is the sublist edges where RSKIP-144 is active and the
+    /// V2 base event where it is not (rskj `BlockFactory` decides by the same
+    /// activation). rskj's own regtest is the second case: `rskip144 = -1`
+    /// with `rskip535 = 1`.
+    pub rskip144: Option<u64>,
 }
 
 /// Process-wide activation heights, consulted by block-hash computation
@@ -79,6 +88,8 @@ impl ActivationHeights {
             hop400: 4_598_500,
             // reference.conf: `rskip97 = orchid`, not overridden by main.conf.
             rskip97: Some(729_000),
+            // main.conf: reed810 = -1.
+            rskip144: None,
         }
     }
 
@@ -94,6 +105,8 @@ impl ActivationHeights {
             hop400: 3_103_000,
             // testnet.conf: `rskip97 = -1  # disable orchid difficulty drop`.
             rskip97: None,
+            // testnet.conf: reed810.
+            rskip144: Some(7_139_600),
         }
     }
 
@@ -107,6 +120,9 @@ impl ActivationHeights {
             hop400: 0,
             // regtest.conf: `rskip97 = -1`, same as testnet.
             rskip97: None,
+            // regtest.conf: `rskip144 = -1`; rustock's regtest ladder does
+            // not schedule reed810 either.
+            rskip144: None,
         }
     }
 }
@@ -135,6 +151,15 @@ pub struct ChainConfig {
     /// it the parallel sublists get no gas at all.
     pub min_sequential_set_gas_limit: u64,
     pub activation_heights: ActivationHeights,
+    /// A genesis read from an rskj genesis file, replacing the built-in one
+    /// (regtest only). Its state root must be filled in before the genesis
+    /// header is used; see [`crate::rskj_genesis`].
+    pub genesis_spec: Option<crate::rskj_genesis::GenesisSpec>,
+    /// Accept headers without checking their merged-mining proof of work,
+    /// as rskj does with `miner.server.skipPowValidation = true`. For
+    /// replaying a regtest chain mined without real proof of work; off by
+    /// default, and refused on mainnet and testnet.
+    pub skip_pow_validation: bool,
 }
 
 impl ChainConfig {
@@ -151,6 +176,8 @@ impl ChainConfig {
             max_gas_limit: 1_000_000_000,
             min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::mainnet(),
+            genesis_spec: None,
+            skip_pow_validation: false,
         }
     }
 
@@ -167,6 +194,8 @@ impl ChainConfig {
             max_gas_limit: 1_000_000_000,
             min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::testnet(),
+            genesis_spec: None,
+            skip_pow_validation: false,
         }
     }
 
@@ -183,6 +212,8 @@ impl ChainConfig {
             max_gas_limit: 10_000_000,
             min_sequential_set_gas_limit: 6_800_000,
             activation_heights: ActivationHeights::regtest(),
+            genesis_spec: None,
+            skip_pow_validation: false,
         }
     }
 
@@ -191,6 +222,9 @@ impl ChainConfig {
     /// of the genesis difficulty includes a leading zero byte that differs
     /// from standard encoding, producing a different hash.
     pub fn known_genesis_hash(&self) -> Option<B256> {
+        if let Some(spec) = &self.genesis_spec {
+            return Some(spec.hash());
+        }
         match self.chain_id {
             30 => Some("0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0".parse().unwrap()),
             31 => Some("0xcabb7fbe88cd6d922042a32ffc08ce8b1fbb37d650b9d4e7dbfe2a7469adfa42".parse().unwrap()),
@@ -202,6 +236,10 @@ impl ChainConfig {
     pub fn genesis_header(&self) -> Header {
         let empty_list_hash: B256 = "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347".parse().unwrap();
         let empty_trie_hash: B256 = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421".parse().unwrap();
+
+        if let Some(spec) = &self.genesis_spec {
+            return spec.header();
+        }
 
         match self.chain_id {
             30 => Header {
@@ -347,6 +385,10 @@ impl ChainConfig {
         const BRIDGE: Address = address!("0000000000000000000000000000000001000006");
         // 21_000_000 RBTC = 21_000_000 * 10^18 wei
         let twenty_one_million_rbtc = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
+
+        if let Some(spec) = &self.genesis_spec {
+            return spec.alloc.clone();
+        }
 
         let bridge = GenesisAlloc {
             address: BRIDGE,
