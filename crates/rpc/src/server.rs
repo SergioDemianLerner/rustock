@@ -19,7 +19,7 @@ use tracing::info;
 use crate::evm;
 use crate::txpool;
 use crate::types::*;
-use crate::{admin, call, debug, eth, logs, mnr, net, rsk, sco, sign, state, trace, tx, web3};
+use crate::{admin, call, debug, eth, logs, mnr, net, proof, rsk, sco, sign, state, trace, tx, web3};
 
 /// Trait for submitting raw transactions, allowing the RPC layer to use
 /// the P2P relay without depending on the sync crate directly.
@@ -225,6 +225,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_coinbase" => eth::eth_coinbase(id, &state.miner),
         "eth_getBlockByHash" => eth::eth_get_block_by_hash(id, params, &state.store),
         "eth_getBlockByNumber" => eth::eth_get_block_by_number(id, params, &state.store),
+        "eth_getProof" => proof::eth_get_proof(id, params, state),
         "eth_getBlockTransactionCountByHash" => eth::eth_get_block_transaction_count_by_hash(id, params, &state.store),
         "eth_getBlockTransactionCountByNumber" => eth::eth_get_block_transaction_count_by_number(id, params, &state.store),
         "eth_getUncleCountByBlockHash" => eth::eth_get_uncle_count_by_block_hash(id, params, &state.store),
