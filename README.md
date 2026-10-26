@@ -61,6 +61,18 @@ each side has that the other does not.
 cargo build --workspace --release
 ```
 
+### Docker
+
+The `Dockerfile` builds `rustock-cli` on Ubuntu 22.04 (glibc 2.35) with the
+toolchain `rust-toolchain.toml` pins, for `linux/amd64` and `linux/arm64`:
+
+```bash
+docker build -t rustock .
+docker run --rm rustock rustock-cli --help
+```
+
+The image has no entrypoint; the binary is `/usr/local/bin/rustock-cli`.
+
 ### Running
 
 Start the full node on RSK Mainnet (default):
