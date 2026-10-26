@@ -5740,3 +5740,183 @@ async fn the_refund_branch_overshoots_by_the_refund() {
         "the overshoot should be the capped refund and nothing else"
     );
 }
+
+// ===== eth_getProof =====
+
+/// A chain with one funded account that has code and two storage slots.
+fn setup_proof_state() -> (RpcState, tempfile::TempDir, Address, B256) {
+    use rustock_trie::{account_key, code_key, storage_key, MemoryTrieStore, TrieKeySlice, TrieNode};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let trie_store = Arc::new(MemoryTrieStore::new());
+    let mut root = TrieNode::empty();
+
+    let addr: Address = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826".parse().unwrap();
+    let acct = rustock_trie::AccountState::new(U256::from(7u64), U256::from(1_000_000u64));
+    root = root.put(&TrieKeySlice::from_key(&account_key(&addr)), &acct.encode(), &*trie_store);
+    root = root.put(&TrieKeySlice::from_key(&code_key(&addr)), &[0x60, 0x00, 0x60, 0x00], &*trie_store);
+
+    for (slot_byte, value) in [(1u8, 42u8), (2u8, 99u8)] {
+        let mut s = [0u8; 32];
+        s[31] = slot_byte;
+        root = root.put(
+            &TrieKeySlice::from_key(&storage_key(&addr, &B256::from(s))),
+            &[value],
+            &*trie_store,
+        );
+    }
+
+    // Other accounts, so the trie actually branches. With only the four keys
+    // above, path compression collapses the whole thing to a node or two and
+    // a "proof" spanning one level proves nothing about chaining.
+    for i in 1u8..=64 {
+        let other = Address::repeat_byte(i);
+        let a = rustock_trie::AccountState::new(U256::from(i), U256::from(i) * U256::from(1000u64));
+        root = root.put(&TrieKeySlice::from_key(&account_key(&other)), &a.encode(), &*trie_store);
+    }
+
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+    rustock_trie::TrieStore::put(&*trie_store, state_root.as_slice(), &root.to_message(&*trie_store));
+
+    let header = Header { state_root, ..test_header(42) };
+    let hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(42, hash).unwrap();
+    store.set_head(hash).unwrap();
+    store.put_total_difficulty(hash, U256::from(42_000)).unwrap();
+
+    let (mut state, discard) = setup_state();
+    state.store = store;
+    state.trie_store = Some(trie_store);
+    std::mem::forget(discard);
+    (state, tmp, addr, state_root)
+}
+
+/// The envelope: the values a caller came for, and the shape EIP-1186 asks
+/// for even though the proof arrays inside it are unitrie nodes.
+#[tokio::test]
+async fn get_proof_reports_the_account_and_its_slots() {
+    let (state, _tmp, addr, _) = setup_proof_state();
+    let req = make_request(
+        "eth_getProof",
+        json!([format!("{addr:#x}"), ["0x1", "0x2"], "latest"]),
+    );
+    let r = dispatch_for_test(&state, req).await.result.unwrap();
+
+    assert_eq!(r["balance"], json!("0xf4240"), "1,000,000");
+    assert_eq!(r["nonce"], json!("0x7"));
+    assert_ne!(r["codeHash"], json!(format!("{:#x}", B256::ZERO)), "the account has code");
+    assert_ne!(r["storageHash"], json!(format!("{:#x}", B256::ZERO)), "and storage");
+
+    let sp = r["storageProof"].as_array().unwrap();
+    assert_eq!(sp.len(), 2);
+    assert_eq!(sp[0]["key"], json!("0x1"), "the key is echoed as the caller wrote it");
+    assert_eq!(sp[0]["value"], json!("0x2a"), "42");
+    assert_eq!(sp[1]["value"], json!("0x63"), "99");
+    assert!(!sp[0]["proof"].as_array().unwrap().is_empty());
+    assert!(!r["accountProof"].as_array().unwrap().is_empty());
+}
+
+/// The property that makes a proof a proof: the last node in the array is
+/// the root, and its hash is the block's state root. Without this the
+/// method returns bytes that merely look like evidence.
+#[tokio::test]
+async fn the_proof_chains_up_to_the_state_root() {
+    use rustock_trie::TrieNode;
+
+    let (state, _tmp, addr, state_root) = setup_proof_state();
+    let trie_store = state.trie_store.clone().unwrap();
+    let req = make_request("eth_getProof", json!([format!("{addr:#x}"), ["0x1"], "latest"]));
+    let r = dispatch_for_test(&state, req).await.result.unwrap();
+
+    for which in ["accountProof", "storageProof"] {
+        let nodes: Vec<String> = if which == "accountProof" {
+            r[which].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect()
+        } else {
+            r[which][0]["proof"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(nodes.len() > 1, "{which} should span more than one level");
+
+        let last = hex::decode(nodes.last().unwrap().trim_start_matches("0x")).unwrap();
+        let root_node = TrieNode::from_message(&last, &*trie_store);
+        assert_eq!(
+            root_node.compute_hash(&*trie_store),
+            state_root,
+            "{which}: the last node must hash to the block's state root"
+        );
+
+        // And every node must parse -- a caller walking the array upward has
+        // to be able to decode each one.
+        for n in &nodes {
+            let bytes = hex::decode(n.trim_start_matches("0x")).unwrap();
+            let _ = TrieNode::from_message(&bytes, &*trie_store);
+        }
+    }
+}
+
+/// An address the trie never heard of still gets a well-formed answer,
+/// rather than an error or a half-built path.
+#[tokio::test]
+async fn get_proof_answers_for_an_absent_account() {
+    let (state, _tmp, _, _) = setup_proof_state();
+    let absent: Address = "0x0000000000000000000000000000000000009999".parse().unwrap();
+    let req = make_request("eth_getProof", json!([format!("{absent:#x}"), [], "latest"]));
+    let r = dispatch_for_test(&state, req).await.result.unwrap();
+
+    assert_eq!(r["balance"], json!("0x0"));
+    assert_eq!(r["nonce"], json!("0x0"));
+    assert_eq!(
+        r["accountProof"].as_array().unwrap().len(),
+        0,
+        "absence is an empty array, not a truncated path that would read as inclusion"
+    );
+    assert_eq!(r["storageHash"], json!(format!("{:#x}", B256::ZERO)));
+    assert_eq!(r["storageProof"].as_array().unwrap().len(), 0);
+}
+
+/// Slots are quantities, as `eth_getStorageAt` accepts them -- `0x1`, not a
+/// 64-character hash. A wallet sends the short form (#179).
+#[tokio::test]
+async fn get_proof_accepts_a_slot_as_a_quantity() {
+    let (state, _tmp, addr, _) = setup_proof_state();
+    let padded = format!("{:#066x}", {
+        let mut s = [0u8; 32];
+        s[31] = 1;
+        B256::from(s)
+    });
+    let short = dispatch_for_test(
+        &state,
+        make_request("eth_getProof", json!([format!("{addr:#x}"), ["0x1"], "latest"])),
+    )
+    .await
+    .result
+    .unwrap();
+    let long = dispatch_for_test(
+        &state,
+        make_request("eth_getProof", json!([format!("{addr:#x}"), [padded], "latest"])),
+    )
+    .await
+    .result
+    .unwrap();
+
+    assert_eq!(short["storageProof"][0]["value"], long["storageProof"][0]["value"]);
+    assert_eq!(short["storageProof"][0]["proof"], long["storageProof"][0]["proof"]);
+}
+
+#[tokio::test]
+async fn get_proof_rejects_a_missing_slot_array() {
+    let (state, _tmp, addr, _) = setup_proof_state();
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getProof", json!([format!("{addr:#x}")])),
+    )
+    .await;
+    assert!(resp.error.is_some(), "the slot array is required, even when empty");
+}

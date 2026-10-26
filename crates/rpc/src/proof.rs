@@ -1,0 +1,203 @@
+//! `eth_getProof` over the unitrie.
+//!
+//! # What this returns, and what it does not
+//!
+//! EIP-1186 defines `accountProof` and `storageProof[].proof` as arrays of
+//! **RLP-encoded Merkle-Patricia trie nodes**. RSK has no Merkle-Patricia
+//! trie. It has a unitrie: one binary radix trie with path compression
+//! holding accounts, code and storage together, with its own node encoding.
+//!
+//! So the envelope here is EIP-1186's -- `balance`, `nonce`, `codeHash`,
+//! `storageHash`, and a `storageProof` entry per requested slot, which are
+//! trie-agnostic and useful -- while the proof arrays carry **unitrie node
+//! messages**, hex-encoded, deepest node first.
+//!
+//! **A stock EIP-1186 verifier will not verify these.** It will fail to parse
+//! them, which is the safe failure, but a caller expecting Ethereum semantics
+//! should know before it starts. Verification is described under "How to
+//! check one" below.
+//!
+//! The encoding is not invented here. rskj already exposes proofs this way --
+//! `RskModuleImpl.getTransactionReceiptNodesByHash` returns
+//! `HexUtils.toUnformattedJsonHex(node.toMessage())` for each node of
+//! `Trie.getNodes(...)` -- so a hex array of `toMessage()` bytes in
+//! `findNodes` order is RSK's established shape for a Merkle proof. This
+//! method reuses it rather than inventing a second one.
+//!
+//! rskj does not implement `eth_getProof` at all. Offering it is a deliberate
+//! divergence, taken because the question it answers -- prove this balance,
+//! this nonce, this slot, against a state root -- is worth answering, and
+//! because no standard shape exists that RSK could satisfy instead.
+//!
+//! # The three paths
+//!
+//! The unitrie holds everything under one root, which makes the mapping onto
+//! EIP-1186's fields more direct than it is on Ethereum, not less:
+//!
+//! | EIP-1186 | unitrie |
+//! |---|---|
+//! | `accountProof` | nodes on the path to `account_key(addr)` |
+//! | `storageHash` | hash of the node at `storage_prefix_key(addr)` |
+//! | `storageProof[i].proof` | nodes on the path to `storage_key(addr, slot)` |
+//!
+//! `storageHash` deserves a note. On Ethereum it is the root of a *separate*
+//! storage trie. RSK has no such thing: an account's storage lives beneath
+//! `account_key || 0x00` in the same trie. The hash of the node at that path
+//! is the closest true analogue -- it commits to exactly that account's
+//! storage and nothing else -- and it is what this returns. An account with
+//! no storage has no such node, and gets `0x0…0`, mirroring Ethereum's empty
+//! storage root being a constant the caller can recognise.
+//!
+//! # How to check one
+//!
+//! Walk the returned array from index 0 (the deepest node) upward. For each
+//! node, decode the message, recompute its hash with the unitrie's rules, and
+//! confirm it appears as the expected child reference of the next node in the
+//! array. The last element is the root; its hash must equal the `stateRoot`
+//! of the block that was asked about.
+//!
+//! A proof is returned only for a key the trie actually holds. `None` from
+//! `nodes_on_path` means absent, and this answers an empty array rather than
+//! a partial path -- an absence proof over a radix trie needs the divergence
+//! point and its siblings, which is a different structure, and emitting a
+//! truncated inclusion path would look like one without being one.
+
+use crate::server::RpcState;
+use crate::state::resolve_state_root;
+use crate::types::*;
+use alloy_primitives::{Address, B256, U256};
+use rustock_trie::{
+    account_key, code_key, storage_key, storage_prefix_key, AccountState, TrieKeySlice, TrieNode,
+    TrieStore,
+};
+use serde_json::{json, Value};
+use sha3::{Digest, Keccak256};
+
+/// `keccak256("")`, what `codeHash` reports for an account with no code.
+fn empty_code_hash() -> B256 {
+    B256::from_slice(&Keccak256::digest([]))
+}
+
+/// Every node from the key's leaf up to the root, hex-encoded, deepest first.
+///
+/// Empty when the trie does not hold the key -- see the module note on why
+/// that is not a truncated path.
+fn path_messages(root: &TrieNode, key: &[u8], store: &dyn TrieStore) -> Vec<String> {
+    let slice = TrieKeySlice::from_key(key);
+    match root.nodes_on_path(&slice, store) {
+        Some(nodes) => nodes
+            .iter()
+            .map(|n| format!("0x{}", hex::encode(n.to_message(store))))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+pub fn eth_get_proof(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
+    let Some(addr) = params
+        .get(0)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Address>().ok())
+    else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid address");
+    };
+
+    // The second parameter is an array of storage slots, and it is required
+    // by EIP-1186 even when empty -- a caller that wants only the account
+    // sends `[]`.
+    let Some(slot_values) = params.get(1).and_then(|v| v.as_array()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing storage key array");
+    };
+    let mut slots: Vec<(String, B256)> = Vec::with_capacity(slot_values.len());
+    for v in slot_values {
+        // Accepted as a quantity, not a padded hash, for the reason
+        // `eth_getStorageAt` accepts one: `0x0` is what wallets send for slot
+        // zero, and demanding 64 hex characters makes the method unusable
+        // from any of them (#179).
+        let Some(raw) = v.as_str() else {
+            return JsonRpcResponse::error(id, INVALID_PARAMS, "Storage key must be a string");
+        };
+        let Some(slot) = crate::helpers::parse_storage_slot(raw) else {
+            return JsonRpcResponse::error(
+                id,
+                INVALID_PARAMS,
+                format!("Invalid storage key: {raw}"),
+            );
+        };
+        slots.push((raw.to_string(), slot));
+    }
+
+    let block_param = params.get(2).and_then(|v| v.as_str()).unwrap_or("latest");
+    let Some((root, _header)) = resolve_state_root(block_param, state) else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    };
+    let Some(trie_store) = state.trie_store.clone() else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "State not available");
+    };
+    let store = &*trie_store;
+
+    // The account itself. An address the trie does not hold still gets a
+    // well-formed answer -- zero balance, zero nonce, empty code hash, empty
+    // proof -- which is what a caller asking about an unused address should
+    // see, and is how Ethereum clients answer the same question.
+    let acct_key = account_key(&addr);
+    let account: Option<AccountState> = root
+        .get(&TrieKeySlice::from_key(&acct_key), store)
+        .and_then(|bytes| AccountState::decode(&bytes).ok());
+    let (nonce, balance) = match &account {
+        Some(a) => (a.nonce, a.balance),
+        None => (U256::ZERO, U256::ZERO),
+    };
+
+    let code_hash = match root.get(&TrieKeySlice::from_key(&code_key(&addr)), store) {
+        Some(code) if !code.is_empty() => B256::from_slice(&Keccak256::digest(&code)),
+        _ => empty_code_hash(),
+    };
+
+    // The storage subtree's own node, which is what commits to this
+    // account's storage and nothing else.
+    // `nodes_on_path` is leaf-first, so element 0 is the node at the key
+    // itself -- the root of this account's storage subtree. Taken this way
+    // rather than through `find`, which is private to the trie: the proof
+    // already needs the path walk, and widening the trie's surface for a
+    // second way to do the same descent would be a poor trade.
+    let storage_hash = root
+        .nodes_on_path(&TrieKeySlice::from_key(&storage_prefix_key(&addr)), store)
+        .and_then(|nodes| nodes.first().map(|n| n.compute_hash(store)))
+        .unwrap_or(B256::ZERO);
+
+    let storage_proof: Vec<Value> = slots
+        .iter()
+        .map(|(raw, slot)| {
+            let key = storage_key(&addr, slot);
+            let value = root
+                .get(&TrieKeySlice::from_key(&key), store)
+                .map(|bytes| {
+                    // Stored minimally, as `eth_getStorageAt` also finds.
+                    let mut padded = [0u8; 32];
+                    let start = 32usize.saturating_sub(bytes.len());
+                    padded[start..].copy_from_slice(&bytes[bytes.len().saturating_sub(32)..]);
+                    U256::from_be_bytes(padded)
+                })
+                .unwrap_or(U256::ZERO);
+            json!({
+                "key": raw,
+                "value": format!("{value:#x}"),
+                "proof": path_messages(&root, &key, store),
+            })
+        })
+        .collect();
+
+    JsonRpcResponse::success(
+        id,
+        json!({
+            "address": format!("{addr:#x}"),
+            "balance": format!("{balance:#x}"),
+            "codeHash": format!("{code_hash:#x}"),
+            "nonce": format!("{nonce:#x}"),
+            "storageHash": format!("{storage_hash:#x}"),
+            "accountProof": path_messages(&root, &acct_key, store),
+            "storageProof": storage_proof,
+        }),
+    )
+}
