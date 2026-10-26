@@ -392,6 +392,57 @@ mod tests {
         assert_ne!(hash, B256::ZERO);
     }
 
+    /// Two transactions that differ only in `v` must hash differently.
+    ///
+    /// The sender cache in `rustock_execution::sender_cache` is keyed by
+    /// `tx_hash()`, and `v` selects both the signing hash (legacy or
+    /// EIP-155) and the recovery id -- so two wire forms that hashed alike
+    /// but recovered differently would let whichever was seen first decide
+    /// the sender of the second.
+    ///
+    /// Two things keep them apart, and this checks both. `v` is stored
+    /// verbatim and re-encoded verbatim, so nothing reconstructs it from a
+    /// chain id and folds two values onto one; and `tx_hash` prefers
+    /// `cached_rlp`, the bytes as received, which differ anyway.
+    #[test]
+    fn the_hash_separates_transactions_that_differ_only_in_v() {
+        let base = Transaction {
+            nonce: 1,
+            gas_price: U256::from(1u64),
+            gas_limit: U256::from(21_000u64),
+            to: Bytes::from(vec![0x11; 20]),
+            value: U256::from(1_000u64),
+            input: Bytes::default(),
+            v: 28,
+            r: U256::from(0x1234u64),
+            s: U256::from(0x5678u64),
+            cached_rlp: None,
+        };
+
+        // Every `v` a legacy or near-legacy wire form could carry, including
+        // the values either side of the canonical pair.
+        let mut seen = std::collections::HashMap::new();
+        for v in [0u64, 26, 27, 28, 29, 35, 36, 37, 38] {
+            let tx = Transaction { v, ..base.clone() };
+            if let Some(other) = seen.insert(tx.tx_hash(), v) {
+                panic!("v={v} and v={other} produce the same transaction hash");
+            }
+        }
+
+        // And again through a real decode, so the cached-bytes path is
+        // covered rather than only the re-encoding one.
+        let mut encoded = Vec::new();
+        base.encode(&mut encoded);
+        let decoded = Transaction::decode(&mut encoded.as_slice()).unwrap();
+        assert!(decoded.cached_rlp.is_some(), "decode must record the wire bytes");
+        assert_eq!(decoded.v, 28, "v must survive the round trip unchanged");
+        assert_eq!(
+            decoded.tx_hash(),
+            base.tx_hash(),
+            "the same bytes must hash the same whether decoded or built"
+        );
+    }
+
     #[test]
     fn test_recover_sender_roundtrip() {
         use k256::ecdsa::SigningKey;
