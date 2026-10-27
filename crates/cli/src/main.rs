@@ -987,6 +987,23 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     mining_refresh_secs: u64,
 
+    /// Mine a block on a clock, as rskj's regtest does with
+    /// `miner.client.timedMine`: each block after an exponentially
+    /// distributed delay with this median (`10s`, `500ms`), floored at
+    /// 100 ms and scaled by the difficulty's drift from the first block's.
+    /// Blocks are mined whether or not the pool holds anything. With
+    /// `--skip-pow-validation` the Bitcoin nonce is 0 and nothing is
+    /// searched, as in rskj. Requires `--mine`; starts with the node, and
+    /// `evm_stopMining` / `evm_startMining` (`--dev-rpc`) pause and resume it.
+    #[arg(long, value_name = "MEDIAN")]
+    mine_timed: Option<String>,
+
+    /// Best blocks between trie flushes for blocks this node mines, like
+    /// rskj's `blockchain.flushNumberOfBlocks`. 1 flushes every block,
+    /// which is what a node mining for a pool wants.
+    #[arg(long, value_name = "N", default_value_t = 10)]
+    flush_every: u64,
+
     /// Blocks of history to keep below the head when pruning.
     ///
     /// Clamped up to 8,000 whatever is given: Rootstock's block-info
@@ -1499,6 +1516,8 @@ fn apply_file_config(
         &mut a.mining_submission_rate_limit_ms);
     apply(matches, "mining_update_work_on_new_transaction",
         f.mining.update_work_on_new_transaction.as_ref(), &mut a.mining_update_work_on_new_transaction);
+    apply_opt(matches, "mine_timed", f.mining.timed.as_ref(), &mut a.mine_timed);
+    apply(matches, "flush_every", f.mining.flush_every.as_ref(), &mut a.flush_every);
 
     apply(matches, "account_tx_rate_limit", f.account_tx_rate_limit.enabled.as_ref(),
         &mut a.account_tx_rate_limit);
@@ -3309,29 +3328,46 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             min_gas_price_target: args.mining_min_gas_price.map(alloy_primitives::U256::from),
             ..Default::default()
         };
+        // The miner's processor is wired like the node's: the same caches,
+        // threads and, on a chain from an rskj genesis file, rskj's regtest
+        // Bridge constants. A bare processor here ran REMASC against the
+        // built-in federation, so the first payout (block 15 on regtest)
+        // reached a state root no node with the right constants reproduces.
+        let mut miner_processor =
+            rustock_execution::BlockProcessor::new(hardfork_cfg.clone(), store.clone());
+        if let Some(cache) = &btc_block_cache {
+            miner_processor = miner_processor.with_btc_block_cache(cache.clone());
+        }
+        if let Some(cache) = &sender_cache {
+            miner_processor = miner_processor.with_sender_cache(cache.clone());
+        }
+        miner_processor = miner_processor.with_execution_threads(args.execution_threads);
+        if config.genesis_spec.is_some() {
+            miner_processor = miner_processor.with_bridge_constants(
+                rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
+            );
+        }
         let builder = rustock_execution::BlockTemplateBuilder::new(
-            Arc::new(rustock_execution::BlockProcessor::new(
-                hardfork_cfg.clone(),
-                store.clone(),
-            )),
+            Arc::new(miner_processor),
             trie_store_for_pool.clone(),
             config.clone(),
             hardfork_cfg.clone(),
             mining_config,
         );
-        let chain = Arc::new(rustock_execution::mining::StoreChainAccess {
-            store: store.clone(),
-            trie_store: trie_store_for_pool.clone(),
+        let chain = Arc::new(rustock_execution::mining::StoreChainAccess::with_flush_every(
+            store.clone(),
+            trie_store_for_pool.clone(),
             // What the sync service's import path does for a block that
             // arrived from a peer, done here for one this node mined.
-            on_committed: Some({
+            Some({
                 let pool = pool.clone();
                 Arc::new(move |block: &rustock_core::Block| {
                     pool.remove_mined(&block.transactions);
                     pool.evict_outdated(block.header.number);
                 })
             }),
-        });
+            args.flush_every,
+        ));
         let server = Arc::new(rustock_execution::MinerServer::new(
             builder,
             chain,
@@ -3399,6 +3435,32 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None
     };
 
+    // The timed miner, rskj's `TimedMinerClient`: started here, with the
+    // node, so a harness that never calls `evm_startMining` still gets
+    // blocks. Nonce 0 without a search when proof of work is not validated;
+    // the bounded development search otherwise.
+    let timed_miner: Option<Arc<rustock_execution::mining::TimedMiner>> =
+        match (&miner, args.mine_timed.as_deref()) {
+            (_, None) => None,
+            (None, Some(_)) => anyhow::bail!("--mine-timed requires --mine"),
+            (Some(server), Some(median)) => {
+                let median = parse_block_time(median)
+                    .map_err(|e| anyhow::anyhow!("--mine-timed {median:?}: {e}"))?;
+                let pow = if config.skip_pow_validation {
+                    rustock_execution::mining::Pow::Skip
+                } else {
+                    rustock_execution::mining::Pow::Search { attempts: 1 << 18 }
+                };
+                let timed = Arc::new(rustock_execution::mining::TimedMiner::new(
+                    server.clone(),
+                    median,
+                    pow,
+                ));
+                timed.start();
+                Some(timed)
+            }
+        };
+
     // Loaded before the server starts, so a bad key file stops the node
     // rather than surfacing as a confusing refusal on the first signing
     // call hours later.
@@ -3446,14 +3508,22 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             // waits for its block; a quarter second is short enough that
             // a harness does not notice and long enough that an idle
             // chain is not spinning.
-            auto_miner: miner.clone().map(|m| {
-                Arc::new(rustock_rpc::evm::AutoMiner::new(
-                    m as Arc<dyn rustock_rpc::mnr::MiningService>,
-                    Some(Arc::new(PoolAdapter(pool.clone()))
-                        as Arc<dyn rustock_rpc::server::TxPoolReader>),
-                    std::time::Duration::from_millis(250),
-                ))
-            }),
+            auto_miner: match &timed_miner {
+                // `--mine-timed`: the loop is the timed one, already
+                // running; `evm_startMining` is then a no-op that answers
+                // true, and `evm_stopMining` pauses it.
+                Some(timed) => {
+                    Some(timed.clone() as Arc<dyn rustock_rpc::evm::BackgroundMiner>)
+                }
+                None => miner.clone().map(|m| {
+                    Arc::new(rustock_rpc::evm::AutoMiner::new(
+                        m as Arc<dyn rustock_rpc::mnr::MiningService>,
+                        Some(Arc::new(PoolAdapter(pool.clone()))
+                            as Arc<dyn rustock_rpc::server::TxPoolReader>),
+                        std::time::Duration::from_millis(250),
+                    )) as Arc<dyn rustock_rpc::evm::BackgroundMiner>
+                }),
+            },
             wallet: wallet.clone(),
             admin_enabled: args.rpc_admin,
             gc_burial: args.gc_burial,
@@ -3516,6 +3586,30 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     node.start().await?;
 
     Ok(())
+}
+
+/// `--mine-timed`'s median: `10s`, `500ms`, `1.5s`, or a bare number of
+/// seconds.
+fn parse_block_time(raw: &str) -> Result<std::time::Duration, String> {
+    let raw = raw.trim();
+    let (number, unit) = match raw.find(|c: char| c.is_ascii_alphabetic()) {
+        Some(i) => (&raw[..i], raw[i..].trim()),
+        None => (raw, "s"),
+    };
+    let value: f64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{number}' is not a number"))?;
+    let seconds = match unit {
+        "s" | "sec" | "secs" => value,
+        "ms" => value / 1000.0,
+        "m" | "min" => value * 60.0,
+        other => return Err(format!("unknown unit '{other}' (use ms, s or m)")),
+    };
+    if seconds <= 0.0 || !seconds.is_finite() {
+        return Err("the median must be positive".into());
+    }
+    Ok(std::time::Duration::from_secs_f64(seconds))
 }
 
 /// `--import-blocks`: feed every block of an rskj `ExportBlocks` file to
@@ -5029,6 +5123,25 @@ mod snap_checkpoint_tests {
             None,
             "the checkpoint contradicts the chain it was read from"
         );
+    }
+}
+
+#[cfg(test)]
+mod block_time_tests {
+    use super::parse_block_time;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_rskj_style_durations() {
+        assert_eq!(parse_block_time("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_block_time("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_block_time("1.5s").unwrap(), Duration::from_millis(1500));
+        assert_eq!(parse_block_time("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_block_time("7").unwrap(), Duration::from_secs(7));
+        assert!(parse_block_time("0s").is_err());
+        assert!(parse_block_time("-1s").is_err());
+        assert!(parse_block_time("10h").is_err());
+        assert!(parse_block_time("abc").is_err());
     }
 }
 

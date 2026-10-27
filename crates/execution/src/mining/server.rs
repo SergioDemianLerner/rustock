@@ -142,6 +142,60 @@ pub struct StoreChainAccess {
     /// know what a pool is, and should not have to in order to say "this
     /// block is now committed".
     pub on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
+    /// Best blocks between trie flushes: rskj's
+    /// `blockchain.flushNumberOfBlocks`, whose `BlockChainFlusher` flushes
+    /// every tenth block a node mines or connects. 1 flushes every block.
+    ///
+    /// The executed head still moves on every block, so the next template
+    /// builds on the block just mined. Between flushes the state of those
+    /// blocks lives in the trie store's memory: a crash there leaves the
+    /// head naming a root that is not on disk, which the node repairs by
+    /// re-executing from the last flushed block, as it does after a crash
+    /// while catching up.
+    pub flush_every: u64,
+    /// Best blocks committed since the last flush.
+    pub since_flush: std::sync::atomic::AtomicU64,
+}
+
+impl StoreChainAccess {
+    /// Flush every block, which is what a node mining for a pool wants:
+    /// its blocks are durable before they are announced.
+    pub fn new(
+        store: Arc<BlockStore>,
+        trie_store: Arc<dyn TrieStore>,
+        on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
+    ) -> Self {
+        Self::with_flush_every(store, trie_store, on_committed, 1)
+    }
+
+    pub fn with_flush_every(
+        store: Arc<BlockStore>,
+        trie_store: Arc<dyn TrieStore>,
+        on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
+        flush_every: u64,
+    ) -> Self {
+        Self {
+            store,
+            trie_store,
+            on_committed,
+            flush_every: flush_every.max(1),
+            since_flush: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Count a best block and say whether it is time to flush. The counter
+    /// starts at 0, so with `flush_every` 10 the flushes fall on the 10th,
+    /// 20th, ... block mined, as rskj's flusher counts.
+    fn flush_due(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let n = self.since_flush.fetch_add(1, Ordering::AcqRel) + 1;
+        if n >= self.flush_every {
+            self.since_flush.store(0, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl ChainAccess for StoreChainAccess {
@@ -159,7 +213,16 @@ impl ChainAccess for StoreChainAccess {
         let mut cursor = head;
         while chain.len() < limit {
             match self.store.header(cursor).map_err(|e| e.to_string())? {
-                Some(header) => {
+                Some(mut header) => {
+                    // The key a header is stored under is its hash, by
+                    // definition; recomputing it from the decoded fields is
+                    // not always the same number. A genesis built from an
+                    // rskj JSON file hashes over the file's difficulty bytes
+                    // as written, which its decoded form no longer has, so
+                    // the first template on such a chain would name a
+                    // parent no other node knows. (`setup_genesis` stores it
+                    // under rskj's hash for the same reason.)
+                    header.cached_hash = Some(cursor);
                     let parent = header.parent_hash;
                     let is_genesis = header.number == 0;
                     chain.push(header);
@@ -250,8 +313,11 @@ impl ChainAccess for StoreChainAccess {
             self.store.set_exec_head(hash, state_root).map_err(|e| e.to_string())?;
             // The trie nodes this block wrote are only durable once flushed;
             // announcing a head whose state cannot be reloaded after a restart
-            // would leave the node unable to build on its own block.
-            self.trie_store.flush();
+            // would leave the node unable to build on its own block. With
+            // `flush_every` above 1 that durability is batched, see the field.
+            if self.flush_due() {
+                self.trie_store.flush();
+            }
             ImportResult::ImportedBest
         } else {
             ImportResult::ImportedNotBest
