@@ -24,8 +24,13 @@ pub struct ConnectTimings {
     /// hash; on the mined path the merged-mining rule in place of the
     /// parent check (rskj `initialValidationMs`).
     pub initial_validation: Duration,
-    /// `execute_block` (rskj `executeMs`).
+    /// `execute_block` (rskj `executeMs`). Includes `trie_save`.
     pub execute: Duration,
+    /// The part of `execute` spent writing dirty trie nodes into the trie
+    /// store (`TrieNode::save`, one batch). Lookups during execution stay in
+    /// `execute`. Zero when the block was not timed. rskj has no such phase:
+    /// it writes trie nodes at flush time, inside `onBestBlockMs`.
+    pub trie_save: Duration,
     /// Results checked against the header (rskj `postExecuteValidationMs`).
     pub post_execute_validation: Duration,
     /// Header, total difficulty, canonical index and body stored (rskj
@@ -54,14 +59,15 @@ impl ConnectTimings {
         let ms = |d: Duration| format!("{:.3}", d.as_secs_f64() * 1000.0);
         format!(
             "block connect breakdown best: block={} hash={} totalMs={} preambleMs={} \
-             initialValidationMs={} executeMs={} postExecuteValidationMs={} switchChainMs={} \
-             saveReceiptsMs={} onBestBlockMs={} txCount={} gasUsed={}",
+             initialValidationMs={} executeMs={} trieSaveMs={} postExecuteValidationMs={} \
+             switchChainMs={} saveReceiptsMs={} onBestBlockMs={} txCount={} gasUsed={}",
             number,
             alloy_primitives::hex::encode(hash),
             ms(self.total),
             ms(self.preamble),
             ms(self.initial_validation),
             ms(self.execute),
+            ms(self.trie_save),
             ms(self.post_execute_validation),
             ms(self.switch_chain),
             ms(self.save_receipts),
@@ -122,6 +128,7 @@ mod tests {
         let t = ConnectTimings {
             total: Duration::from_micros(12_345),
             execute: Duration::from_micros(10_000),
+            trie_save: Duration::from_micros(1_500),
             ..Default::default()
         };
         let line = t.breakdown_line(7, B256::repeat_byte(0xab), 21, 24_000_000);
@@ -129,7 +136,10 @@ mod tests {
             "block connect breakdown best: block=7 hash={} totalMs=12.345 preambleMs=0.000 ",
             "ab".repeat(32)
         )));
-        assert!(line.contains(" executeMs=10.000 "));
+        assert!(line.contains(" executeMs=10.000 trieSaveMs=1.500 postExecuteValidationMs=0.000 "));
+        // Untimed: the key is there, at zero.
+        let zero = ConnectTimings::default().breakdown_line(1, B256::ZERO, 0, 0);
+        assert!(zero.contains(" executeMs=0.000 trieSaveMs=0.000 "));
         assert!(line.ends_with(" onBestBlockMs=0.000 txCount=21 gasUsed=24000000"));
     }
 

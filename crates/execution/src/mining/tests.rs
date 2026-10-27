@@ -2357,8 +2357,8 @@ fn the_template_names_its_parent_by_the_stored_hash() {
 
 /// The keys of the import path's line, in order: the mined path must write
 /// the same set so one analyzer reads both.
-const BREAKDOWN_KEYS: [&str; 12] = [
-    "block", "hash", "totalMs", "preambleMs", "initialValidationMs", "executeMs",
+const BREAKDOWN_KEYS: [&str; 13] = [
+    "block", "hash", "totalMs", "preambleMs", "initialValidationMs", "executeMs", "trieSaveMs",
     "postExecuteValidationMs", "switchChainMs", "saveReceiptsMs", "onBestBlockMs",
     "txCount", "gasUsed",
 ];
@@ -2426,6 +2426,8 @@ fn a_mined_block_writes_the_breakdown_line() {
         assert!(ms("totalMs") >= sum - 0.001, "total {} < phases {sum}: {line}", ms("totalMs"));
         assert!(ms("totalMs") > 0.0, "{line}");
         assert!(ms("executeMs") > 0.0, "{line}");
+        // trieSaveMs is the part of executeMs spent in TrieNode::save.
+        assert!(ms("trieSaveMs") <= ms("executeMs"), "{line}");
         // Only REMASC: the template has no pending transactions to pick.
         assert_eq!(ms("txCount"), 1.0, "{line}");
     }

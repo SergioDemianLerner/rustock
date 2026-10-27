@@ -87,6 +87,10 @@ pub struct ProcessTimings {
     /// state changes applied to the trie, state root hashed, trie nodes
     /// saved, receipts and their root built.
     pub execute: std::time::Duration,
+    /// The part of `execute` spent in `TrieNode::save`: one batch write of
+    /// the dirty trie nodes into the trie store. Lookups during execution
+    /// stay in `execute`.
+    pub trie_save: std::time::Duration,
     /// Gas used, paid fees, state root, receipts root and logs bloom checked
     /// against the header.
     pub post_validation: std::time::Duration,
@@ -278,8 +282,20 @@ impl BlockProcessor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
+        self.finish_execute(block, state_root, trie_store, None)
+    }
+
+    /// [`Self::execute_block`], recording how long `TrieNode::save` took when
+    /// `save_out` is set. The clock is not read otherwise.
+    fn finish_execute(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        save_out: Option<&mut std::time::Duration>,
+    ) -> Result<ProcessedBlock, ProcessError> {
         let started = std::time::Instant::now();
-        let out = self.execute_block_inner(block, state_root, trie_store);
+        let out = self.execute_block_inner(block, state_root, trie_store, save_out);
         // Timed whether or not it succeeded: a block that fails still spent
         // the time, and a measurement that only counts successes reads as a
         // faster node the worse things get.
@@ -297,6 +313,7 @@ impl BlockProcessor {
         block: &Block,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
+        save_out: Option<&mut std::time::Duration>,
     ) -> Result<ProcessedBlock, ProcessError> {
         let header = &block.header;
         let chain_id = self.hardfork_cfg.chain_id;
@@ -476,7 +493,13 @@ impl BlockProcessor {
             ),
         };
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
-        new_state_root.save(trie_store.as_ref(), true);
+        if let Some(slot) = save_out {
+            let started = std::time::Instant::now();
+            new_state_root.save(trie_store.as_ref(), true);
+            *slot += started.elapsed();
+        } else {
+            new_state_root.save(trie_store.as_ref(), true);
+        }
         // Reload the root lazily: children become hash references resolved on
         // demand, so subsequent blocks only walk their dirty paths instead of
         // re-serializing the whole accumulated trie on every state-root
@@ -805,6 +828,7 @@ impl BlockProcessor {
         trie_store: Arc<dyn TrieStore>,
         mut timings: Option<&mut ProcessTimings>,
     ) -> Result<ProcessedBlock, ProcessError> {
+        let timed = timings.is_some();
         // Reads the clock only when timing was asked for.
         let mut last = timings.is_some().then(std::time::Instant::now);
         let mut lap = |stage: fn(&mut ProcessTimings) -> &mut std::time::Duration| {
@@ -836,7 +860,13 @@ impl BlockProcessor {
         }
 
         lap(|t| &mut t.pre_validation);
-        let result = self.execute_block(block, state_root, trie_store.clone())?;
+        let mut trie_save = std::time::Duration::ZERO;
+        let result = self.finish_execute(
+            block,
+            state_root,
+            trie_store.clone(),
+            timed.then_some(&mut trie_save),
+        )?;
         lap(|t| &mut t.execute);
 
         if result.gas_used != header.gas_used {
@@ -935,6 +965,9 @@ impl BlockProcessor {
             "block processed successfully"
         );
         lap(|t| &mut t.post_validation);
+        if let Some(t) = timings {
+            t.trie_save += trie_save;
+        }
 
         Ok(result)
     }

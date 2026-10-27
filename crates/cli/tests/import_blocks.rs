@@ -83,6 +83,7 @@ fn the_breakdown_log_has_a_line_per_block() {
             "preambleMs=",
             "initialValidationMs=",
             "executeMs=",
+            "trieSaveMs=",
             "postExecuteValidationMs=",
             "switchChainMs=",
             "saveReceiptsMs=",

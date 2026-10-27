@@ -827,6 +827,7 @@ impl MinerServer {
         laps.lap();
         t.initial_validation += process.pre_validation;
         t.execute = process.execute;
+        t.trie_save = process.trie_save;
         t.post_execute_validation = process.post_validation;
         processor
             .commit_receipts(&block, &executed)
