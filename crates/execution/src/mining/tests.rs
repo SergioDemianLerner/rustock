@@ -2352,3 +2352,94 @@ fn the_template_names_its_parent_by_the_stored_hash() {
     assert_eq!(mined.parent_hash, stored_under);
     assert_eq!(mined.number, 22);
 }
+
+// ── the breakdown line on the mined path ──────────────────────────────
+
+/// The keys of the import path's line, in order: the mined path must write
+/// the same set so one analyzer reads both.
+const BREAKDOWN_KEYS: [&str; 12] = [
+    "block", "hash", "totalMs", "preambleMs", "initialValidationMs", "executeMs",
+    "postExecuteValidationMs", "switchChainMs", "saveReceiptsMs", "onBestBlockMs",
+    "txCount", "gasUsed",
+];
+
+fn breakdown_fixture() -> (MiningFixture, Arc<std::sync::Mutex<Vec<String>>>) {
+    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    let mut fx = fixture_without_pow(20, 2, Arc::new(MemoryTrieStore::new()));
+    let server = Arc::try_unwrap(std::mem::replace(
+        &mut fx.server,
+        Arc::new(MinerServer::new(
+            BlockTemplateBuilder::new(
+                Arc::new(BlockProcessor::new(RskHardforkConfig::all_active(33), fx.store.clone())),
+                fx.trie_store.clone(),
+                fx.chain_config.clone(),
+                RskHardforkConfig::all_active(33),
+                MiningConfig::default(),
+            ),
+            Arc::new(StoreChainAccess::new(fx.store.clone(), fx.trie_store.clone(), None)),
+            Arc::new(NoPendingTransactions),
+            fx.chain_config.clone(),
+        )),
+    ))
+    .unwrap_or_else(|_| panic!("the fixture's server is not shared"));
+    fx.server = Arc::new(server.with_breakdown_log(Arc::new(move |line: &str| {
+        sink.lock().unwrap().push(line.to_string());
+    })));
+    (fx, lines)
+}
+
+/// One line per block connected as best, with the import path's keys in
+/// the import path's order, and a total that bounds its phases.
+#[test]
+fn a_mined_block_writes_the_breakdown_line() {
+    let (fx, lines) = breakdown_fixture();
+    let mut schedule = TimedSchedule::new(std::time::Duration::from_secs(10));
+    let mut hashes = Vec::new();
+    for _ in 0..3 {
+        let info = timed::mine_block(&fx.server, Pow::Skip, &mut schedule).unwrap();
+        assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+        hashes.push(info.block_hash);
+    }
+
+    let lines = lines.lock().unwrap().clone();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    for (i, line) in lines.iter().enumerate() {
+        let prefix = format!(
+            "block connect breakdown best: block={} hash={} totalMs=",
+            21 + i,
+            alloy_primitives::hex::encode(hashes[i])
+        );
+        assert!(line.starts_with(&prefix), "{line}");
+        let pairs: Vec<(&str, &str)> = line["block connect breakdown best: ".len()..]
+            .split(' ')
+            .map(|kv| kv.split_once('=').unwrap())
+            .collect();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, BREAKDOWN_KEYS, "{line}");
+        let ms = |key: &str| -> f64 {
+            pairs.iter().find(|(k, _)| *k == key).unwrap().1.parse().unwrap()
+        };
+        let phases = ["preambleMs", "initialValidationMs", "executeMs",
+            "postExecuteValidationMs", "switchChainMs", "saveReceiptsMs", "onBestBlockMs"];
+        let sum: f64 = phases.iter().map(|k| ms(k)).sum();
+        assert!(ms("totalMs") >= sum - 0.001, "total {} < phases {sum}: {line}", ms("totalMs"));
+        assert!(ms("totalMs") > 0.0, "{line}");
+        assert!(ms("executeMs") > 0.0, "{line}");
+        // Only REMASC: the template has no pending transactions to pick.
+        assert_eq!(ms("txCount"), 1.0, "{line}");
+    }
+    // flush_every is 1 on this fixture's chain access, so every block pays
+    // the flush inside onBestBlockMs; a memory store makes it near zero but
+    // the phase is still there.
+}
+
+/// Without a sink nothing is written, and the block is still mined.
+#[test]
+fn without_a_breakdown_sink_nothing_is_written_and_mining_is_unchanged() {
+    let fx = fixture_without_pow(20, 1, Arc::new(MemoryTrieStore::new()));
+    let mut schedule = TimedSchedule::new(std::time::Duration::from_secs(10));
+    let info = timed::mine_block(&fx.server, Pow::Skip, &mut schedule).unwrap();
+    assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+    assert_eq!(info.block_included_height, 21);
+}

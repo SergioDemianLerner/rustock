@@ -1344,10 +1344,11 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = rustock_sync::import::DEFAULT_IMPORT_FLUSH_EVERY)]
     import_flush_every: u64,
 
-    /// With --import-blocks: write one timing line per imported block to
-    /// this file, in the shape of rskj's `block connect breakdown best:`
-    /// debug line (milliseconds, three decimals). Off by default, and then
-    /// no clock is read.
+    /// Write one timing line per block connected as best to this file, in
+    /// the shape of rskj's `block connect breakdown best:` debug line
+    /// (milliseconds, three decimals): with --import-blocks for every
+    /// imported block, with --mine for every block this node mines and
+    /// connects. Off by default, and then no clock is read.
     #[arg(long, value_name = "FILE")]
     breakdown_log: Option<std::path::PathBuf>,
 }
@@ -3368,14 +3369,22 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             }),
             args.flush_every,
         ));
-        let server = Arc::new(rustock_execution::MinerServer::new(
+        let mut server = rustock_execution::MinerServer::new(
             builder,
             chain,
             Arc::new(PoolTxSource(pool.clone())),
             config.clone(),
         )
         .with_sync_gate(PeerSyncGate::spawn(store.clone(), peer_store.clone()))
-        .with_submission_rate_limit(args.mining_submission_rate_limit_ms));
+        .with_submission_rate_limit(args.mining_submission_rate_limit_ms);
+        if let Some(log) = &args.breakdown_log {
+            // One line per block at a block time of seconds: written and
+            // flushed as it comes, so the file is complete whenever the
+            // node is stopped.
+            server = server.with_breakdown_log(open_breakdown_log(log)?);
+            info!("Mined-block timing lines go to {}", log.display());
+        }
+        let server = Arc::new(server);
         info!("Mining enabled; rewards to {coinbase_address}");
 
         // rskj `NewBlockTxListener.onBestBlock`: every block the sync
@@ -3588,6 +3597,24 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     Ok(())
 }
 
+/// The `--breakdown-log` file as a sink for the miner's timing lines: each
+/// line written and flushed at once.
+fn open_breakdown_log(log: &std::path::Path) -> Result<rustock_execution::breakdown::BreakdownSink> {
+    use std::io::Write;
+    if let Some(dir) = log.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::File::create(log)
+        .with_context(|| format!("cannot create {}", log.display()))?;
+    let file = std::sync::Mutex::new(std::io::BufWriter::new(file));
+    Ok(Arc::new(move |line: &str| {
+        let mut out = file.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = writeln!(out, "{line}").and_then(|_| out.flush()) {
+            warn!(target: "rustock::mining", "Could not write the breakdown line: {e}");
+        }
+    }))
+}
+
 /// `--mine-timed`'s median: `10s`, `500ms`, `1.5s`, or a bare number of
 /// seconds.
 fn parse_block_time(raw: &str) -> Result<std::time::Duration, String> {
@@ -3660,7 +3687,11 @@ fn run_import_blocks(
             ),
         };
         if let (Some(out), Some(t)) = (breakdown.as_mut(), block.timings.as_ref()) {
-            writeln!(out, "{}", t.breakdown_line(&block))?;
+            writeln!(
+                out,
+                "{}",
+                t.breakdown_line(block.number, block.hash, block.tx_count, block.gas_used)
+            )?;
         }
         imported += 1;
         if imported.is_multiple_of(1000) {
@@ -5243,7 +5274,9 @@ mod genesis_tests {
         assert_eq!(plain.activation_heights.orchid, mainnet.activation_heights.orchid);
         assert_eq!(plain.activation_heights.rskip97, Some(729_000));
         assert_eq!(plain.activation_heights.rskip144, None);
-        assert_eq!((plain.min_gas_limit, plain.max_gas_limit), (5000, 1_000_000_000));
+        // 3,000,000 since the rskj parity fix (rskj `Constants.getMinGasLimit`);
+        // this asserts mainnet's own defaults, so it tracks them.
+        assert_eq!((plain.min_gas_limit, plain.max_gas_limit), (3_000_000, 1_000_000_000));
         assert!(!plain.skip_pow_validation);
         assert!(plain.hardfork_overrides.is_empty());
         let (ladder, unmodelled) = hardfork_config(&plain).unwrap();

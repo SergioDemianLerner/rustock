@@ -29,8 +29,8 @@ pub mod template;
 pub mod timed;
 
 pub use server::{
-    ChainAccess, ImportResult, MinerServer, MinerWork, RebuildPolicy, StoreChainAccess,
-    SubmissionRateLimiter, SubmitError, SubmittedBlockInfo, SyncGate,
+    ChainAccess, CommitOutcome, ImportResult, MinerServer, MinerWork, RebuildPolicy,
+    StoreChainAccess, SubmissionRateLimiter, SubmitError, SubmittedBlockInfo, SyncGate,
     extract_merged_mining_hash,
 };
 pub use uncles::{UNCLE_GENERATION_LIMIT, UNCLE_LIST_LIMIT, select_uncles};

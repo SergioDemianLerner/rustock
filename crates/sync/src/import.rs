@@ -32,7 +32,6 @@ use rustock_execution::{BlockProcessor, ProcessError};
 use rustock_storage::BlockStore;
 use rustock_trie::{TrieNode, TrieStore};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use crate::execution_commit::ExecutionCommitter;
 
@@ -101,92 +100,9 @@ pub struct ImportedBlock {
     pub timings: Option<ImportTimings>,
 }
 
-/// Wall time of each phase of [`BlockImporter::import`], from a monotonic
-/// clock. The phases run in this order and `total` covers the whole call.
-///
-/// Each phase is named after the phase of rskj's
-/// `BlockChainImpl.internalTryToConnect` that does the same work, so the two
-/// clients' lines can be read side by side.
-#[derive(Debug, Default, Clone)]
-pub struct ImportTimings {
-    pub total: Duration,
-    /// Checking that the block extends the best block (rskj `preambleMs`).
-    pub preamble: Duration,
-    /// Header against its parent, body rules, transactions root and ommers
-    /// hash (rskj `initialValidationMs`).
-    pub initial_validation: Duration,
-    /// `execute_block` (rskj `executeMs`).
-    pub execute: Duration,
-    /// Results checked against the header (rskj `postExecuteValidationMs`).
-    pub post_execute_validation: Duration,
-    /// Header, total difficulty, canonical index and body stored (rskj
-    /// `switchChainMs`, which saves the block and makes it best).
-    pub switch_chain: Duration,
-    /// Receipts and transaction and Bridge-event indexes stored (rskj
-    /// `saveReceiptsMs`).
-    pub save_receipts: Duration,
-    /// Every `flush_every` blocks: the trie flushed and the executed head
-    /// recorded, zero on other blocks (rskj `onBestBlockMs`, whose listener
-    /// runs the flush every `flushNumberOfBlocks`).
-    pub on_best_block: Duration,
-}
-
-impl ImportTimings {
-    /// One line in the shape of rskj's `block connect breakdown best:` debug
-    /// line, milliseconds with three decimals.
-    pub fn breakdown_line(&self, block: &ImportedBlock) -> String {
-        let ms = |d: Duration| format!("{:.3}", d.as_secs_f64() * 1000.0);
-        format!(
-            "block connect breakdown best: block={} hash={} totalMs={} preambleMs={} \
-             initialValidationMs={} executeMs={} postExecuteValidationMs={} switchChainMs={} \
-             saveReceiptsMs={} onBestBlockMs={} txCount={} gasUsed={}",
-            block.number,
-            alloy_primitives::hex::encode(block.hash),
-            ms(self.total),
-            ms(self.preamble),
-            ms(self.initial_validation),
-            ms(self.execute),
-            ms(self.post_execute_validation),
-            ms(self.switch_chain),
-            ms(self.save_receipts),
-            ms(self.on_best_block),
-            block.tx_count,
-            block.gas_used,
-        )
-    }
-}
-
-/// Times consecutive phases; reads no clock when disabled.
-struct Laps {
-    start: Option<Instant>,
-    last: Option<Instant>,
-}
-
-impl Laps {
-    fn new(enabled: bool) -> Self {
-        let now = enabled.then(Instant::now);
-        Self {
-            start: now,
-            last: now,
-        }
-    }
-
-    /// Time since the previous lap, zero when disabled.
-    fn lap(&mut self) -> Duration {
-        match self.last {
-            Some(last) => {
-                let now = Instant::now();
-                self.last = Some(now);
-                now - last
-            }
-            None => Duration::ZERO,
-        }
-    }
-
-    fn total(&self) -> Duration {
-        self.start.map(|s| s.elapsed()).unwrap_or_default()
-    }
-}
+/// The phase clock and the timings of one import, shared with the mined
+/// path: [`rustock_execution::breakdown`].
+pub use rustock_execution::breakdown::{ConnectTimings as ImportTimings, Laps};
 
 /// Imports a chain block by block on top of the store's best block.
 pub struct BlockImporter {
@@ -441,30 +357,6 @@ mod tests {
     fn short_lines_are_skipped_like_rskj_connect_blocks() {
         assert!(parse_export_line("").unwrap().is_none());
         assert!(parse_export_line("1,abc,01").unwrap().is_none());
-    }
-
-    #[test]
-    fn the_breakdown_line_reads_like_rskjs() {
-        let block = ImportedBlock {
-            number: 7,
-            hash: B256::repeat_byte(0xab),
-            tx_count: 21,
-            gas_used: 24_000_000,
-            flushed: false,
-            timings: None,
-        };
-        let t = ImportTimings {
-            total: Duration::from_micros(12_345),
-            execute: Duration::from_micros(10_000),
-            ..Default::default()
-        };
-        let line = t.breakdown_line(&block);
-        assert!(line.starts_with(&format!(
-            "block connect breakdown best: block=7 hash={} totalMs=12.345 preambleMs=0.000 ",
-            "ab".repeat(32)
-        )));
-        assert!(line.contains(" executeMs=10.000 "));
-        assert!(line.ends_with(" onBestBlockMs=0.000 txCount=21 gasUsed=24000000"));
     }
 
     #[test]

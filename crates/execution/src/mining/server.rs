@@ -21,6 +21,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
+use crate::breakdown::{BreakdownSink, ConnectTimings, Laps};
 use crate::mining::coinbase;
 use crate::mining::merkle::{self, MerkleProofError};
 use crate::mining::template::{
@@ -120,7 +121,29 @@ pub trait ChainAccess: Send + Sync {
     /// Uncles to include in a block mined on `parent_hash`.
     fn select_uncles(&self, block_number: u64, parent_hash: B256) -> Result<Vec<Header>, String>;
     /// Store a fully executed block and make it the head if it wins.
-    fn commit_mined_block(&self, block: &Block, state_root: B256) -> Result<ImportResult, String>;
+    ///
+    /// `laps` is the caller's phase clock, disabled when nothing measures:
+    /// the implementation laps it around the store writes (`switch_chain`)
+    /// and around the hook and the flush (`on_best_block`).
+    fn commit_mined_block(
+        &self,
+        block: &Block,
+        state_root: B256,
+        laps: &mut Laps,
+    ) -> Result<CommitOutcome, String>;
+}
+
+/// What [`ChainAccess::commit_mined_block`] reports: the import result and
+/// the two phases of the connect that happen inside it.
+#[derive(Debug, Clone, Copy)]
+pub struct CommitOutcome {
+    pub result: ImportResult,
+    /// Header, body, total difficulty, canonical index and executed head
+    /// written (rskj `switchChainMs`).
+    pub switch_chain: std::time::Duration,
+    /// The committed hook (the pool told what was mined) and the trie flush
+    /// when one is due (rskj `onBestBlockMs`).
+    pub on_best_block: std::time::Duration,
 }
 
 /// [`ChainAccess`] over the node's real block store.
@@ -268,12 +291,24 @@ impl ChainAccess for StoreChainAccess {
         Ok(crate::mining::uncles::select_uncles(&self.store, block_number, parent_hash))
     }
 
-    fn commit_mined_block(&self, block: &Block, state_root: B256) -> Result<ImportResult, String> {
+    fn commit_mined_block(
+        &self,
+        block: &Block,
+        state_root: B256,
+        laps: &mut Laps,
+    ) -> Result<CommitOutcome, String> {
+        use std::time::Duration;
         let hash = block.hash();
         let number = block.header.number;
+        let mut switch_chain = Duration::ZERO;
+        let mut on_best_block = Duration::ZERO;
 
         if self.store.has_block(hash).map_err(|e| e.to_string())? {
-            return Ok(ImportResult::Exist);
+            return Ok(CommitOutcome {
+                result: ImportResult::Exist,
+                switch_chain: laps.lap(),
+                on_best_block,
+            });
         }
 
         let parent_td = self
@@ -304,13 +339,17 @@ impl ChainAccess for StoreChainAccess {
             None => U256::ZERO,
         };
 
+        switch_chain += laps.lap();
+
         if let Some(hook) = &self.on_committed {
             hook(block);
         }
+        on_best_block += laps.lap();
 
         let result = if td > current_td {
             self.store.update_canonical_chain(hash).map_err(|e| e.to_string())?;
             self.store.set_exec_head(hash, state_root).map_err(|e| e.to_string())?;
+            switch_chain += laps.lap();
             // The trie nodes this block wrote are only durable once flushed;
             // announcing a head whose state cannot be reloaded after a restart
             // would leave the node unable to build on its own block. With
@@ -318,6 +357,7 @@ impl ChainAccess for StoreChainAccess {
             if self.flush_due() {
                 self.trie_store.flush();
             }
+            on_best_block += laps.lap();
             ImportResult::ImportedBest
         } else {
             ImportResult::ImportedNotBest
@@ -327,7 +367,7 @@ impl ChainAccess for StoreChainAccess {
             target: "rustock::mining",
             "Mined block #{} {:?} imported: {}", number, hash, result.as_str()
         );
-        Ok(result)
+        Ok(CommitOutcome { result, switch_chain, on_best_block })
     }
 }
 
@@ -353,6 +393,9 @@ pub struct MinerServer {
     rate_limit: SubmissionRateLimiter,
     /// Decides whether arriving transactions are worth a rebuild.
     rebuild_policy: RebuildPolicy,
+    /// Where the `block connect breakdown best:` line of each block this
+    /// server connects as best goes. `None`, the default, reads no clock.
+    breakdown: Option<BreakdownSink>,
 }
 
 /// rskj `SubmissionRateLimitHandler`: at most one submission per
@@ -483,6 +526,7 @@ impl MinerServer {
             sync_gate: None,
             rate_limit: SubmissionRateLimiter::disabled(),
             rebuild_policy: RebuildPolicy::new(RebuildPolicy::DEFAULT_FRACTION),
+            breakdown: None,
         }
     }
 
@@ -529,6 +573,14 @@ impl MinerServer {
     /// sync. rskj gates `MinerClientImpl.mineBlock` on it; here the gate sits
     /// on `build_work`, which every miner, in-process or merged, goes
     /// through.
+    /// Time every block this server completes and connects, and hand the
+    /// `block connect breakdown best:` line of each one connected as best to
+    /// `sink`. Same keys and scope as the import path's `--breakdown-log`.
+    pub fn with_breakdown_log(mut self, sink: BreakdownSink) -> Self {
+        self.breakdown = Some(sink);
+        self
+    }
+
     pub fn with_sync_gate(mut self, gate: Arc<dyn SyncGate>) -> Self {
         self.sync_gate = Some(gate);
         self
@@ -691,6 +743,12 @@ impl MinerServer {
         raw_coinbase: &[u8],
         merkle_proof: Vec<u8>,
     ) -> Result<SubmittedBlockInfo, SubmitError> {
+        // The clock of the connect, rskj `internalTryToConnect`'s scope:
+        // from matching the solution to its template to the block being best
+        // and durable. Reads nothing unless a breakdown sink is set.
+        let mut laps = Laps::new(self.breakdown.is_some());
+        let mut t = ConnectTimings::default();
+
         // rskj `processSolution`: the rate limit is checked first, and the
         // submission counts whether or not the work is found.
         if !self.rate_limit.is_submission_allowed() {
@@ -735,6 +793,7 @@ impl MinerServer {
                 head,
             });
         }
+        t.preamble = laps.lap();
 
         // The same rule every peer will run. Failing here means the node built
         // something it would itself reject, which is worth catching before it
@@ -747,21 +806,49 @@ impl MinerServer {
         rustock_core::validation::BitcoinTimestampRule { config: self.chain_config.clone() }
             .validate(&block.header)
             .map_err(SubmitError::SelfCheck)?;
+        t.initial_validation = laps.lap();
 
         let state_root = self
             .builder
             .load_state_root(template.parent_state_root)
             .map_err(SubmitError::Template)?;
-        let executed = self
-            .builder
-            .processor()
-            .process_and_commit(&block, &state_root, self.builder.trie_store())
+        // `process_and_commit`, in its two halves, so the receipts can be
+        // timed apart from execution. The timed processor reads the clock
+        // only when measuring; the plain one never does.
+        let processor = self.builder.processor();
+        let trie_store = self.builder.trie_store();
+        let mut process = crate::ProcessTimings::default();
+        let executed = if laps.enabled() {
+            processor.process_block_timed(&block, &state_root, trie_store, &mut process)
+        } else {
+            processor.process_block(&block, &state_root, trie_store)
+        }
+        .map_err(|e| SubmitError::Execution(e.to_string()))?;
+        laps.lap();
+        t.initial_validation += process.pre_validation;
+        t.execute = process.execute;
+        t.post_execute_validation = process.post_validation;
+        processor
+            .commit_receipts(&block, &executed)
             .map_err(|e| SubmitError::Execution(e.to_string()))?;
+        t.save_receipts = laps.lap();
 
-        let result = self
+        let outcome = self
             .chain
-            .commit_mined_block(&block, executed.state_root_hash)
+            .commit_mined_block(&block, executed.state_root_hash, &mut laps)
             .map_err(SubmitError::Storage)?;
+        t.switch_chain = outcome.switch_chain;
+        t.on_best_block = outcome.on_best_block;
+        t.total = laps.total();
+
+        if let (Some(sink), ImportResult::ImportedBest) = (&self.breakdown, outcome.result) {
+            sink(&t.breakdown_line(
+                block.header.number,
+                block.hash(),
+                block.transactions.len(),
+                block.header.gas_used,
+            ));
+        }
 
         // The chain moved, so the work on offer is stale whatever happens next.
         if let Err(e) = self.build_work() {
@@ -769,7 +856,7 @@ impl MinerServer {
         }
 
         Ok(SubmittedBlockInfo {
-            block_imported_result: result,
+            block_imported_result: outcome.result,
             block_hash: block.hash(),
             block_included_height: block.header.number,
         })
