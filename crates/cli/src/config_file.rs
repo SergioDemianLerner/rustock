@@ -79,6 +79,12 @@ pub struct ChainSection {
     pub consensus_rules: Option<std::collections::BTreeMap<String, i64>>,
     pub min_gas_limit: Option<u64>,
     pub max_gas_limit: Option<u64>,
+    /// rskj `blockchain.config.hardforkActivationHeights`, as `name = height`
+    /// (-1 takes the upgrade off the ladder).
+    pub hardforks: Option<std::collections::BTreeMap<String, i64>>,
+    /// Take the settings above on mainnet and testnet too, for a copy of the
+    /// chain run under rules it has not activated. `genesis` stays refused.
+    pub allow_overrides: Option<bool>,
 }
 
 /// Prometheus metrics. Separate from `[rpc]` because the listener is: a
@@ -474,6 +480,8 @@ pub const CONFIGURABLE: &[&str] = &[
     "account_tx_rate_limit_max_accounts",
     "account_tx_rate_limit_quota_multiplier",
     "account_tx_rate_limit_gas_per_second_percent",
+    "hardfork",
+    "allow_chain_overrides",
     "log_level",
     "log_to_stdout",
     // Read parallelism is read by the snap-sync client and the trie store

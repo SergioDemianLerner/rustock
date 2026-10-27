@@ -162,8 +162,29 @@ rustock --network-id 33 \
 it, hash included, along with rskj's regtest federation. `--consensus-rule` is
 rskj's `blockchain.config.consensusRules` (today `rskip97`), and
 `--skip-pow-validation` is its `miner.server.skipPowValidation`, for chains
-mined without real merged mining. The same settings go in a `[chain]` section
-of the `--config` file. All of them are refused on mainnet and testnet.
+mined without real merged mining. `--hardfork name=height` is rskj's
+`blockchain.config.hardforkActivationHeights`, by rskj's names. The same
+settings go in a `[chain]` section of the `--config` file. All of them are
+refused on mainnet and testnet.
+
+`--allow-chain-overrides` lifts that refusal for everything but `--genesis`,
+for a copy of mainnet or testnet run under rules the chain has not activated
+(blocks mined on a snapshot of mainnet's state with reed810 scheduled, say):
+
+```bash
+rustock --network-id 30 --allow-chain-overrides \
+  --hardfork reed810=9002504 --hardfork tbd1000=9002504 \
+  --consensus-rule rskip351=9002504 --consensus-rule rskip535=9002504 \
+  --skip-pow-validation ...
+```
+
+The overrides reach everything that reads the schedule: header decoding and
+hashing, difficulty, execution, REMASC and the Bridge. Names the node reads at
+one fixed height per chain (`bahamas`, `afterBridgeSync`, `hop401`) are
+accepted at that height only; `orchid060` and `tbd1000` are accepted and
+change nothing, and the node says so (`tbd1000` only turns on RSKIP-559,
+pegout sorting in the Bridge, which it does not implement). A node started
+this way must not follow the real network.
 
 Blocks rskj exported with its `ExportBlocks` tool (`number,hash,td,rlp` per
 line, plain or gzipped) can then be imported from an empty data directory:

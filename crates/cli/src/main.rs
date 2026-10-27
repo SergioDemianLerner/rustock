@@ -1296,6 +1296,25 @@ struct Args {
     #[arg(long, value_name = "GAS")]
     max_gas_limit: Option<u64>,
 
+    /// Regtest: schedule an rskj network upgrade, as `name=height` (`-1`
+    /// takes it off the ladder), like rskj's
+    /// `blockchain.config.hardforkActivationHeights`. Repeatable. Names are
+    /// rskj's, orchid to vetiver900. bahamas, afterBridgeSync and hop401 are
+    /// accepted at the height this node already reads them at; orchid060 and
+    /// tbd1000 are accepted and change nothing (tbd1000 only turns on
+    /// RSKIP-559, pegout sorting in the Bridge, which this node does not
+    /// implement).
+    #[arg(long, value_name = "NAME=HEIGHT")]
+    hardfork: Vec<String>,
+
+    /// Take --hardfork, --consensus-rule, --skip-pow-validation and the
+    /// gas-limit bounds on mainnet and testnet too, for replaying blocks
+    /// mined on a copy of the chain under rules it has not activated. Never
+    /// for a node that follows the real network. --genesis stays refused:
+    /// a genesis file would make this another chain.
+    #[arg(long, default_value_t = false)]
+    allow_chain_overrides: bool,
+
     /// Import the blocks of an rskj `ExportBlocks` file (`number,hash,td,rlp`
     /// per line, plain or .gz) on top of this node's best block, through the
     /// validation and execution follow mode uses, then exit. Stops with a
@@ -1338,6 +1357,12 @@ fn apply_file_config(
     apply(matches, "consensus_rule", rules.as_ref(), &mut a.consensus_rule);
     apply_opt(matches, "min_gas_limit", f.chain.min_gas_limit.as_ref(), &mut a.min_gas_limit);
     apply_opt(matches, "max_gas_limit", f.chain.max_gas_limit.as_ref(), &mut a.max_gas_limit);
+    let hardforks = f.chain.hardforks.as_ref().map(|r| {
+        r.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>()
+    });
+    apply(matches, "hardfork", hardforks.as_ref(), &mut a.hardfork);
+    apply(matches, "allow_chain_overrides", f.chain.allow_overrides.as_ref(),
+        &mut a.allow_chain_overrides);
     apply(matches, "data_dir", f.node.data_dir.as_ref(), &mut a.data_dir);
     apply(matches, "network_id", f.node.network_id.as_ref(), &mut a.network_id);
     apply_opt(matches, "secret_key", f.node.secret_key.as_ref(), &mut a.secret_key);
@@ -2487,7 +2512,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         tracing::info!("Account tx rate limiting disabled");
     }
 
-    let hardfork_cfg = rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
+    let (hardfork_cfg, _) = hardfork_config(&config)?;
     let btc_block_cache = if args.btc_block_cache_entries > 0 {
         let cache = Arc::new(rustock_execution::BtcBlockCache::new(
             args.btc_block_cache_entries,
@@ -3560,38 +3585,84 @@ fn run_import_blocks(
     Ok(())
 }
 
+/// The execution ladder for `config`: the chain's own, with the operator's
+/// `--hardfork` and `--consensus-rule` overrides applied. Also returns the
+/// names accepted without effect.
+fn hardfork_config(
+    config: &ChainConfig,
+) -> Result<(rustock_execution::RskHardforkConfig, Vec<String>)> {
+    rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64)
+        .with_rskj_overrides(&config.hardfork_overrides, &config.consensus_rule_overrides)
+        .map_err(anyhow::Error::msg)
+}
+
+/// `name=height` as rskj's config writes it, `-1` for never.
+fn parse_rskj_height(flag: &str, spec: &str) -> Result<(String, Option<u64>)> {
+    let (name, height) = spec
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("{flag} {spec:?}: expected name=height"))?;
+    let height: i64 = height
+        .trim()
+        .parse()
+        .with_context(|| format!("{flag} {spec:?}: height"))?;
+    Ok((name.trim().to_string(), u64::try_from(height).ok()))
+}
+
 /// Apply the regtest chain options (`--genesis`, `--skip-pow-validation`,
-/// `--consensus-rule`, `--min-gas-limit`, `--max-gas-limit`). Refused on
-/// mainnet and testnet, whose rules are not the operator's to change.
+/// `--consensus-rule`, `--hardfork`, `--min-gas-limit`, `--max-gas-limit`).
+/// Refused on mainnet and testnet, whose rules are not the operator's to
+/// change, unless `--allow-chain-overrides` says this is a copy of the
+/// chain; `--genesis` is refused there regardless.
 fn apply_chain_options(mut config: ChainConfig, args: &Args) -> Result<ChainConfig> {
     let any = args.genesis.is_some()
         || args.skip_pow_validation
         || !args.consensus_rule.is_empty()
+        || !args.hardfork.is_empty()
         || args.min_gas_limit.is_some()
         || args.max_gas_limit.is_some();
     if !any {
         return Ok(config);
     }
+    let real_chain = matches!(config.chain_id, 30 | 31);
     anyhow::ensure!(
-        !matches!(config.chain_id, 30 | 31),
-        "--genesis, --skip-pow-validation, --consensus-rule and the gas-limit bounds \
-         are regtest options"
+        !real_chain || args.allow_chain_overrides,
+        "--genesis, --skip-pow-validation, --consensus-rule, --hardfork and the gas-limit \
+         bounds are regtest options; --allow-chain-overrides takes all but --genesis on \
+         a copy of mainnet or testnet"
     );
+    anyhow::ensure!(
+        !(real_chain && args.genesis.is_some()),
+        "--genesis is a regtest option: a genesis file would make this another chain"
+    );
+    if real_chain {
+        warn!(
+            "Chain overrides accepted on chain id {}: this node runs a schedule of its own \
+             and must not follow the real network",
+            config.chain_id
+        );
+    }
+    // reference.conf: `rskip97 = orchid`. Where the chain keeps that
+    // (mainnet), moving orchid moves it, unless --consensus-rule says.
+    let orchid_before = config.activation_heights.orchid;
+    for spec in &args.hardfork {
+        let (name, height) = parse_rskj_height("--hardfork", spec)?;
+        config.activation_heights.set_rskj_hardfork(&name, height);
+        config.hardfork_overrides.push((name, height));
+    }
+    if config.activation_heights.rskip97 == Some(orchid_before) {
+        config.activation_heights.rskip97 = Some(config.activation_heights.orchid);
+    }
     for rule in &args.consensus_rule {
-        let (name, height) = rule
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("--consensus-rule {rule:?}: expected name=height"))?;
-        let height: i64 = height
-            .trim()
-            .parse()
-            .with_context(|| format!("--consensus-rule {rule:?}: height"))?;
-        let height = u64::try_from(height).ok();
-        match name.trim() {
+        let (name, height) = parse_rskj_height("--consensus-rule", rule)?;
+        match name.as_str() {
             "rskip97" => config.activation_heights.rskip97 = height,
-            other => anyhow::bail!(
-                "--consensus-rule: {other} is not supported (supported: rskip97)"
-            ),
+            _ => config.consensus_rule_overrides.push((name, height)),
         }
+    }
+    // Judged now, so a name the ladder refuses stops the node here.
+    let (_, unmodelled) = hardfork_config(&config)?;
+    for name in unmodelled {
+        info!("Hardfork {name}: accepted, nothing in this node reads it");
     }
     if let Some(gas) = args.min_gas_limit {
         config.min_gas_limit = gas;
@@ -3714,7 +3785,7 @@ fn build_genesis_state(config: &ChainConfig, trie_store: &dyn TrieStore) -> Resu
             // where every upgrade in this list is at height 0 (regtest.conf),
             // so every one of these precompiles is created at genesis. The
             // execution ladder says the same: it starts at the last upgrade.
-            let ladder = rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
+            let (ladder, _) = hardfork_config(config)?;
             let height = match upgrade {
                 _ if config.genesis_spec.is_some() => {
                     (ladder.active_upgrade(0) >= upgrade).then_some(0)
@@ -5017,6 +5088,96 @@ mod genesis_tests {
 
         let mainnet = Args::parse_from(["rustock-cli", "--skip-pow-validation"]);
         assert!(apply_chain_options(ChainConfig::mainnet(), &mainnet).is_err());
+    }
+
+    fn mainnet_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["rustock-cli", "--network-id", "30"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    /// The flags the lab passes for perf-lab's mainnet seed: mainnet's
+    /// schedule, reed810 and its rules moved to #9,002,504, rskip536 at
+    /// vetiver900, no proof of work, 25M gas.
+    const SEED_FLAGS: &[&str] = &[
+        "--allow-chain-overrides",
+        "--hardfork", "bahamas=3397", "--hardfork", "afterBridgeSync=370000",
+        "--hardfork", "orchid=729000", "--hardfork", "orchid060=1052700",
+        "--hardfork", "wasabi100=1591000", "--hardfork", "twoToThree=2018000",
+        "--hardfork", "papyrus200=2392700", "--hardfork", "iris300=3614800",
+        "--hardfork", "hop400=4598500", "--hardfork", "hop401=4976300",
+        "--hardfork", "fingerroot500=5468000", "--hardfork", "arrowhead600=6223700",
+        "--hardfork", "arrowhead631=6549300", "--hardfork", "lovell700=7338024",
+        "--hardfork", "reed800=8052200", "--hardfork", "reed810=9002504",
+        "--hardfork", "vetiver900=8804200", "--hardfork", "tbd1000=9002504",
+        "--consensus-rule", "rskipUMM=2392700", "--consensus-rule", "rskip351=9002504",
+        "--consensus-rule", "rskip535=9002504", "--consensus-rule", "rskip536=8804200",
+        "--skip-pow-validation",
+        "--min-gas-limit", "3000000", "--max-gas-limit", "18446744073709551615",
+    ];
+
+    /// Without the opt-in, mainnet is mainnet: every override refused, and a
+    /// node started with none has mainnet's heights and ladder exactly.
+    #[test]
+    fn mainnet_without_the_opt_in_is_untouched() {
+        let refused = mainnet_args(&["--hardfork", "reed810=9002504"]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &refused).is_err());
+        let refused = mainnet_args(&["--consensus-rule", "rskip535=9002504"]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &refused).is_err());
+
+        let plain = apply_chain_options(ChainConfig::mainnet(), &mainnet_args(&[])).unwrap();
+        let mainnet = ChainConfig::mainnet();
+        assert_eq!(plain.activation_heights.orchid, mainnet.activation_heights.orchid);
+        assert_eq!(plain.activation_heights.rskip97, Some(729_000));
+        assert_eq!(plain.activation_heights.rskip144, None);
+        assert_eq!((plain.min_gas_limit, plain.max_gas_limit), (5000, 1_000_000_000));
+        assert!(!plain.skip_pow_validation);
+        assert!(plain.hardfork_overrides.is_empty());
+        let (ladder, unmodelled) = hardfork_config(&plain).unwrap();
+        assert!(unmodelled.is_empty());
+        assert!(!ladder.has_rskip144(9_003_580));
+        assert!(!ladder.has_rskip351(9_003_580));
+        assert_eq!(
+            ladder.active_upgrade(9_003_580),
+            rustock_execution::hardfork::RskNetworkUpgrade::Vetiver900
+        );
+    }
+
+    #[test]
+    fn the_seed_schedule_applies_on_mainnet_with_the_opt_in() {
+        let config = apply_chain_options(ChainConfig::mainnet(), &mainnet_args(SEED_FLAGS)).unwrap();
+        assert_eq!(config.chain_id, 30);
+        assert_eq!(config.activation_heights.rskip144, Some(9_002_504));
+        assert_eq!(config.activation_heights.orchid, 729_000);
+        assert_eq!(config.activation_heights.rskip97, Some(729_000));
+        assert_eq!(config.activation_heights.papyrus200, 2_392_700);
+        assert!(config.skip_pow_validation);
+        assert_eq!((config.min_gas_limit, config.max_gas_limit), (3_000_000, u64::MAX));
+        assert!(config.genesis_spec.is_none(), "mainnet's genesis stays");
+        let (ladder, unmodelled) = hardfork_config(&config).unwrap();
+        assert_eq!(unmodelled, vec!["orchid060".to_string(), "tbd1000".to_string()]);
+        assert!(!ladder.has_rskip144(9_002_503));
+        assert!(ladder.has_rskip144(9_003_580));
+        assert!(ladder.has_rskip351(9_003_580));
+        assert!(!ladder.has_rskip535(9_002_503));
+        assert!(ladder.has_rskip535(9_003_580));
+        assert!(ladder.has_rskip536(8_804_200));
+        assert_eq!(
+            ladder.active_upgrade(9_003_580),
+            rustock_execution::hardfork::RskNetworkUpgrade::Vetiver900
+        );
+
+        // A genesis file would change the chain: refused even with the opt-in.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rskj-regtest-genesis.json");
+        let with_genesis = mainnet_args(&["--allow-chain-overrides", "--genesis", path]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &with_genesis).is_err());
+        // A rung this node reads at one height cannot be moved.
+        let moved = mainnet_args(&["--allow-chain-overrides", "--hardfork", "hop401=1"]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &moved).is_err());
+        // Moving orchid moves rskip97 with it, as reference.conf ties them.
+        let orchid = mainnet_args(&["--allow-chain-overrides", "--hardfork", "orchid=100"]);
+        let config = apply_chain_options(ChainConfig::mainnet(), &orchid).unwrap();
+        assert_eq!(config.activation_heights.rskip97, Some(100));
     }
 
     /// Testnet's genesis state root, published in rskj's

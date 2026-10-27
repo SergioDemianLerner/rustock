@@ -52,6 +52,8 @@ fn test_chain_config() -> Arc<ChainConfig> {
         },
         genesis_spec: None,
         skip_pow_validation: false,
+        hardfork_overrides: Vec::new(),
+        consensus_rule_overrides: Vec::new(),
     })
 }
 

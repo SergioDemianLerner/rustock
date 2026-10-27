@@ -78,6 +78,24 @@ impl ActivationHeights {
         ACTIVATIONS.get_or_init(Self::mainnet)
     }
 
+    /// Set the height this struct carries for an rskj upgrade name, for the
+    /// names it carries: `orchid`, `wasabi100`, `papyrus200`, `iris300`,
+    /// `fingerroot500`, and `reed810`, which is RSKIP-144's height. `None`
+    /// is rskj's `-1`. Any other name is the execution ladder's to judge and
+    /// is left alone here.
+    pub fn set_rskj_hardfork(&mut self, name: &str, height: Option<u64>) {
+        let never = u64::MAX;
+        match name {
+            "orchid" => self.orchid = height.unwrap_or(never),
+            "wasabi100" => self.wasabi100 = height.unwrap_or(never),
+            "papyrus200" => self.papyrus200 = height.unwrap_or(never),
+            "iris300" => self.iris300 = height.unwrap_or(never),
+            "fingerroot500" => self.fingerroot500 = height.unwrap_or(never),
+            "reed810" => self.rskip144 = height,
+            _ => {}
+        }
+    }
+
     pub fn mainnet() -> Self {
         Self {
             orchid: 729_000,
@@ -160,6 +178,15 @@ pub struct ChainConfig {
     /// replaying a regtest chain mined without real proof of work; off by
     /// default, and refused on mainnet and testnet.
     pub skip_pow_validation: bool,
+    /// rskj `blockchain.config.hardforkActivationHeights` overrides, by
+    /// rskj's names, `None` for `-1`. The heights this struct carries are
+    /// already set from them; the execution ladder applies them itself.
+    /// Empty on every built-in chain.
+    pub hardfork_overrides: Vec<(String, Option<u64>)>,
+    /// rskj `consensusRules` overrides for the execution ladder (`rskip351`,
+    /// `rskip535`, `rskip536`, `rskipUMM`). `rskip97` is not here: it is
+    /// applied to `activation_heights` directly.
+    pub consensus_rule_overrides: Vec<(String, Option<u64>)>,
 }
 
 impl ChainConfig {
@@ -178,6 +205,8 @@ impl ChainConfig {
             activation_heights: ActivationHeights::mainnet(),
             genesis_spec: None,
             skip_pow_validation: false,
+            hardfork_overrides: Vec::new(),
+            consensus_rule_overrides: Vec::new(),
         }
     }
 
@@ -196,6 +225,8 @@ impl ChainConfig {
             activation_heights: ActivationHeights::testnet(),
             genesis_spec: None,
             skip_pow_validation: false,
+            hardfork_overrides: Vec::new(),
+            consensus_rule_overrides: Vec::new(),
         }
     }
 
@@ -214,6 +245,8 @@ impl ChainConfig {
             activation_heights: ActivationHeights::regtest(),
             genesis_spec: None,
             skip_pow_validation: false,
+            hardfork_overrides: Vec::new(),
+            consensus_rule_overrides: Vec::new(),
         }
     }
 

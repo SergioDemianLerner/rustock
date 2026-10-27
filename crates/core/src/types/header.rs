@@ -1310,6 +1310,38 @@ mod versioned_wire_header_tests {
         assert_eq!(alloy_primitives::hex::encode(&buf), V2_SHORT_WIRE);
     }
 
+    /// The schedule perf-lab's mainnet seed runs under puts RSKIP-144 at
+    /// #9,002,504. Above it, a V2 header with one trailing item carries
+    /// edges (rskj in the base-event recovery window); under mainnet's own
+    /// schedule the same bytes carry a base event. The override reaches the
+    /// decoder through `rskip144`, the way regtest's does.
+    #[test]
+    fn a_reed810_override_turns_a_lone_trailing_item_into_edges() {
+        let mut h = decode(V2_SHORT_WIRE);
+        h.number = 9_003_580;
+        h.cached_hash = None;
+        let v = h.version_fields.as_mut().unwrap();
+        assert_eq!((v.version, v.base_event.as_ref()), (2, None));
+        v.edges = Some(vec![]);
+        let mut buf = Vec::new();
+        h.encode(&mut buf);
+
+        let mut seed = crate::config::ActivationHeights::mainnet();
+        seed.set_rskj_hardfork("reed810", Some(9_002_504));
+        assert_eq!(seed.rskip144, Some(9_002_504));
+        let under_seed = Header::decode_with_activations(&mut buf.as_slice(), &seed).unwrap();
+        let v = under_seed.version_fields.as_ref().unwrap();
+        assert_eq!(v.edges.as_deref(), Some(&[][..]));
+        assert_eq!(v.base_event, None);
+
+        let mainnet = crate::config::ActivationHeights::mainnet();
+        assert_eq!(mainnet.rskip144, None);
+        let under_mainnet = Header::decode_with_activations(&mut buf.as_slice(), &mainnet).unwrap();
+        let v = under_mainnet.version_fields.as_ref().unwrap();
+        assert_eq!(v.edges, None);
+        assert_eq!(v.base_event.as_ref().map(|b| b.len()), Some(0));
+    }
+
     /// A version-0 header must stay untouched by any of this: mainnet is
     /// entirely V0, so a decoder that invented version fields for it would
     /// change hashes on a chain that has none.
