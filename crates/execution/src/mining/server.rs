@@ -316,7 +316,7 @@ impl ChainAccess for StoreChainAccess {
             .total_difficulty(block.header.parent_hash)
             .map_err(|e| e.to_string())?
             .unwrap_or(U256::ZERO);
-        let td = parent_td + block.header.difficulty;
+        let td = parent_td + cumulative_difficulty(block);
 
         // Deliberately not `put_block`: that writes the canonical
         // `number -> hash` pointer unconditionally, which would hand the
@@ -888,6 +888,18 @@ impl MinerServer {
     pub fn coinbase_hash(compressed: &[u8]) -> [u8; 32] {
         compute_coinbase_hash(compressed)
     }
+}
+
+/// What a block adds to the chain's total difficulty: its own and its
+/// uncles', as rskj's `Block.getCumulativeDifficulty` counts it and the
+/// sync path's header-and-body accounting does. Counting the header alone
+/// leaves the stored total short by every uncle, which an rskj export of
+/// the same chain shows at the first block with one.
+pub fn cumulative_difficulty(block: &Block) -> U256 {
+    block
+        .ommers
+        .iter()
+        .fold(block.header.difficulty, |total, uncle| total.saturating_add(uncle.difficulty))
 }
 
 /// The 32 bytes following the last `RSKBLOCK:` in a coinbase: the key a

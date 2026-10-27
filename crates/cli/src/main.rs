@@ -1339,6 +1339,22 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     import_blocks: Option<std::path::PathBuf>,
 
+    /// Write the canonical chain, from --export-from to --export-to, to this
+    /// file in rskj's `ExportBlocks` format (`number,hash,td,rlp` per line;
+    /// gzip when the name ends in .gz), then exit. What rskj's
+    /// `ConnectBlocks` and this node's --import-blocks read.
+    #[arg(long, value_name = "FILE")]
+    export_blocks: Option<std::path::PathBuf>,
+
+    /// With --export-blocks: the first block to write (default 1).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    export_from: u64,
+
+    /// With --export-blocks: the last block to write (default: the best
+    /// block).
+    #[arg(long, value_name = "N")]
+    export_to: Option<u64>,
+
     /// With --import-blocks: blocks between trie flushes (rskj's
     /// `blockchain.flushNumberOfBlocks`).
     #[arg(long, value_name = "N", default_value_t = rustock_sync::import::DEFAULT_IMPORT_FLUSH_EVERY)]
@@ -1802,6 +1818,11 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         rustock_execution::supply::per_transaction_enabled(),
         rustock_execution::supply::per_block_enabled()
     );
+
+    if let Some(path) = &args.export_blocks {
+        let store = BlockStore::open(&args.data_dir)?;
+        return run_export_blocks(&store, path, args.export_from, args.export_to);
+    }
 
     if args.build_bridge_index {
         let store = Arc::new(BlockStore::open(&args.data_dir)?);
@@ -3731,6 +3752,71 @@ fn parse_rskj_height(flag: &str, spec: &str) -> Result<(String, Option<u64>)> {
         .parse()
         .with_context(|| format!("{flag} {spec:?}: height"))?;
     Ok((name.trim().to_string(), u64::try_from(height).ok()))
+}
+
+/// `--export-blocks`: write the canonical chain from `from` to `to` (the best
+/// block when unset) as rskj's `ExportBlocks` does, one block per line.
+fn run_export_blocks(
+    store: &BlockStore,
+    path: &std::path::Path,
+    from: u64,
+    to: Option<u64>,
+) -> Result<()> {
+    use std::io::Write;
+    let best = match store.head()? {
+        Some(hash) => store
+            .header(hash)?
+            .ok_or_else(|| anyhow::anyhow!("head header {hash} missing"))?
+            .number,
+        None => anyhow::bail!("the store has no head block; nothing to export"),
+    };
+    let to = to.unwrap_or(best);
+    anyhow::ensure!(
+        to <= best,
+        "--export-to {to} is above the best block #{best}"
+    );
+    anyhow::ensure!(from <= to, "--export-from {from} is above --export-to {to}");
+
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    let mut out: Box<dyn Write> = if path.extension().is_some_and(|e| e == "gz") {
+        Box::new(std::io::BufWriter::new(flate2::write::GzEncoder::new(
+            file,
+            flate2::Compression::default(),
+        )))
+    } else {
+        Box::new(std::io::BufWriter::new(file))
+    };
+
+    info!("Exporting blocks #{from} to #{to} to {}", path.display());
+    let started = std::time::Instant::now();
+    for number in from..=to {
+        let hash = store
+            .canonical_hash(number)?
+            .ok_or_else(|| anyhow::anyhow!("no canonical block at #{number}"))?;
+        let block = store
+            .block(hash)?
+            .ok_or_else(|| anyhow::anyhow!("block #{number} {hash} is not in the store"))?;
+        anyhow::ensure!(
+            block.header.number == number,
+            "the canonical index names {hash} at #{number}, but the header says #{}",
+            block.header.number
+        );
+        let td = store
+            .total_difficulty(hash)?
+            .ok_or_else(|| anyhow::anyhow!("block #{number} {hash} has no total difficulty"))?;
+        writeln!(out, "{}", rustock_sync::import::encode_export_line(hash, td, &block))?;
+    }
+    out.flush()?;
+    info!(
+        "Exported {} blocks in {:.1}s",
+        to - from + 1,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// Apply the regtest chain options (`--genesis`, `--skip-pow-validation`,

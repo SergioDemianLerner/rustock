@@ -2443,3 +2443,25 @@ fn without_a_breakdown_sink_nothing_is_written_and_mining_is_unchanged() {
     assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
     assert_eq!(info.block_included_height, 21);
 }
+
+/// A block's contribution to the total difficulty counts its uncles, as
+/// rskj's `getCumulativeDifficulty` does; the stored totals, and so an
+/// export, go wrong at the first block with one otherwise.
+#[test]
+fn cumulative_difficulty_counts_the_uncles() {
+    let parent = B256::repeat_byte(0x01);
+    let mut header = header_at(5, parent, B256::ZERO);
+    header.difficulty = U256::from(1_000);
+    let mut uncle_a = header_at(4, parent, B256::ZERO);
+    uncle_a.difficulty = U256::from(300);
+    let mut uncle_b = header_at(4, parent, B256::ZERO);
+    uncle_b.difficulty = U256::from(20);
+    let block = rustock_core::Block {
+        header: header.clone(),
+        transactions: Vec::new(),
+        ommers: vec![uncle_a, uncle_b],
+    };
+    assert_eq!(cumulative_difficulty(&block), U256::from(1_320));
+    let alone = rustock_core::Block { header, transactions: Vec::new(), ommers: Vec::new() };
+    assert_eq!(cumulative_difficulty(&alone), U256::from(1_000));
+}

@@ -210,7 +210,7 @@ impl BlockImporter {
         t.execute = process.execute;
         t.post_execute_validation = process.post_validation;
 
-        let td = self.best_td + header.difficulty;
+        let td = self.best_td + rustock_execution::mining::cumulative_difficulty(&block);
         self.store
             .store_headers_batch(&[(header, td)], Some(self.best_hash), self.best_td)?;
         self.store
@@ -316,6 +316,71 @@ pub fn decode_block(mut rlp: &[u8]) -> anyhow::Result<Block> {
     })
 }
 
+/// Encode a block as rskj's `Block.getEncoded()` does, the inverse of
+/// [`decode_block`]: `RLP([header, transactions, uncles])` with the header
+/// in its full wire form (version fields and all) and each transaction in
+/// the bytes it was received or built with (`rlp_for_trie`, which is what
+/// its hash and the transactions root are computed over; rskj keeps a zero
+/// gas price as a literal `00` byte there, which re-encoding would
+/// canonicalise away).
+pub fn encode_block(block: &Block) -> Vec<u8> {
+    use alloy_rlp::Encodable;
+    let mut header = Vec::new();
+    block.header.encode(&mut header);
+    let mut transactions = Vec::new();
+    for tx in &block.transactions {
+        transactions.extend_from_slice(&tx.rlp_for_trie());
+    }
+    let mut uncles = Vec::new();
+    for uncle in &block.ommers {
+        uncle.encode(&mut uncles);
+    }
+    let list = |payload: &[u8], out: &mut Vec<u8>| {
+        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(out);
+        out.extend_from_slice(payload);
+    };
+    let mut body = header;
+    list(&transactions, &mut body);
+    list(&uncles, &mut body);
+    let mut out = Vec::with_capacity(body.len() + 4);
+    list(&body, &mut out);
+    out
+}
+
+/// Write one line of rskj's `ExportBlocks` format, the inverse of
+/// [`parse_export_line`]: `number,hashHex,totalDifficultyHex,blockRlpHex`,
+/// as `co.rsk.cli.tools.ExportBlocks.exportBlocks` writes it. The hash is
+/// the one the block is stored under; the total difficulty is
+/// `BigInteger.toByteArray()` (a leading zero byte when the top bit is set,
+/// `00` for zero); the RLP is [`encode_block`].
+pub fn encode_export_line(hash: B256, total_difficulty: U256, block: &Block) -> String {
+    let rlp = encode_block(block);
+    format!(
+        "{},{},{},{}",
+        block.header.number,
+        alloy_primitives::hex::encode(hash),
+        alloy_primitives::hex::encode(java_big_integer_bytes(total_difficulty)),
+        alloy_primitives::hex::encode(rlp)
+    )
+}
+
+/// `BigInteger.toByteArray()` of a non-negative value: the shortest
+/// two's-complement big-endian form, so a leading zero byte keeps a value
+/// whose top bit is set positive, and zero is one zero byte.
+fn java_big_integer_bytes(value: U256) -> Vec<u8> {
+    if value.is_zero() {
+        return vec![0];
+    }
+    let be = value.to_be_bytes::<32>();
+    let start = be.iter().position(|b| *b != 0).unwrap_or(31);
+    let mut out = Vec::with_capacity(33 - start);
+    if be[start] & 0x80 != 0 {
+        out.push(0);
+    }
+    out.extend_from_slice(&be[start..]);
+    out
+}
+
 /// Parse one `ExportBlocks` line. `Ok(None)` for a line rskj's
 /// `ConnectBlocks` skips (fewer than four fields). The decoded block must
 /// have the number and hash the line states.
@@ -357,6 +422,74 @@ mod tests {
     fn short_lines_are_skipped_like_rskj_connect_blocks() {
         assert!(parse_export_line("").unwrap().is_none());
         assert!(parse_export_line("1,abc,01").unwrap().is_none());
+    }
+
+    #[test]
+    fn total_difficulty_is_written_as_java_writes_a_big_integer() {
+        let hex = |v: u64| alloy_primitives::hex::encode(java_big_integer_bytes(U256::from(v)));
+        assert_eq!(hex(0), "00");
+        assert_eq!(hex(1), "01");
+        assert_eq!(hex(0x7f), "7f");
+        assert_eq!(hex(0x80), "0080");
+        assert_eq!(hex(0x1ffe_0000), "1ffe0000");
+        assert_eq!(hex(0xff00_0000), "00ff000000");
+    }
+
+    /// A block built here, written and read back, is the same block on the
+    /// same line; and a line that names the wrong hash is refused.
+    #[test]
+    fn an_exported_line_parses_back_to_the_same_block() {
+        let header = Header {
+            parent_hash: B256::repeat_byte(0x11),
+            ommers_hash: B256::repeat_byte(0x22),
+            beneficiary: alloy_primitives::Address::repeat_byte(0x33),
+            state_root: B256::repeat_byte(0x44),
+            transactions_root: B256::repeat_byte(0x55),
+            receipts_root: B256::repeat_byte(0x66),
+            logs_bloom: Default::default(),
+            extension_data: None,
+            difficulty: U256::from(0x8000_0000u64),
+            number: 42,
+            gas_limit: U256::from(6_800_000),
+            gas_used: 0,
+            timestamp: 1_700_000_000,
+            extra_data: alloy_primitives::Bytes::new(),
+            paid_fees: U256::ZERO,
+            minimum_gas_price: U256::ZERO,
+            uncle_count: 0,
+            umm_root: None,
+            version_fields: None,
+            bitcoin_merged_mining_header: Some(alloy_primitives::Bytes::from(vec![0u8; 80])),
+            bitcoin_merged_mining_merkle_proof: None,
+            bitcoin_merged_mining_coinbase_transaction: None,
+            cached_hash: None,
+            cached_hash_for_merged_mining: None,
+        };
+        let block = Block {
+            header,
+            transactions: Vec::new(),
+            ommers: Vec::new(),
+        };
+        let hash = block.header.hash();
+        let line = encode_export_line(hash, U256::from(0x8000_0001u64), &block);
+        assert!(line.starts_with(&format!(
+            "42,{},0080000001,f9",
+            alloy_primitives::hex::encode(hash)
+        )));
+
+        let parsed = parse_export_line(&line).unwrap().unwrap();
+        assert_eq!(parsed.number, 42);
+        assert_eq!(parsed.hash, hash);
+        assert_eq!(parsed.block.header.hash(), hash);
+        assert_eq!(parsed.block.header.number, 42);
+        assert_eq!(parsed.block.header.difficulty, U256::from(0x8000_0000u64));
+        assert_eq!(
+            encode_export_line(parsed.hash, U256::from(0x8000_0001u64), &parsed.block),
+            line
+        );
+
+        let wrong = encode_export_line(B256::repeat_byte(0xee), U256::ONE, &block);
+        assert!(parse_export_line(&wrong).is_err());
     }
 
     #[test]

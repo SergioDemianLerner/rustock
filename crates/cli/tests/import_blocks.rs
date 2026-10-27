@@ -124,3 +124,62 @@ fn a_block_that_does_not_connect_stops_the_import() {
     );
     assert!(stderr.contains("check parent"), "{stderr}");
 }
+
+/// `--export-blocks` after an import reproduces rskj's file byte for byte:
+/// the hash, the total difficulty and rskj's full block encoding, versioned
+/// headers included. A range writes only that range.
+#[test]
+fn an_export_after_an_import_reproduces_rskjs_file() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Path::new(DATA).join("rskj-regtest-ecdsa-1-15.txt.gz");
+    let out = import(&fixture, dir.path());
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let mut expected = String::new();
+    flate2::read::MultiGzDecoder::new(std::fs::File::open(&fixture).unwrap())
+        .read_to_string(&mut expected)
+        .unwrap();
+    let expected: Vec<&str> = expected.lines().collect();
+    assert_eq!(expected.len(), 15);
+
+    let export = |from: &str, to: Option<&str>, name: &str| -> String {
+        let file = dir.path().join(name);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rustock-cli"));
+        cmd.args(["--network-id", "33", "--no-rpc", "--log-to-stdout"])
+            .arg("--data-dir")
+            .arg(dir.path().join("db"))
+            .args(["--trie-backend", "external", "--trie-dir"])
+            .arg(dir.path().join("trie"))
+            .arg("--export-blocks")
+            .arg(&file)
+            .args(["--export-from", from]);
+        if let Some(to) = to {
+            cmd.args(["--export-to", to]);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if name.ends_with(".gz") {
+            let mut text = String::new();
+            flate2::read::MultiGzDecoder::new(std::fs::File::open(&file).unwrap())
+                .read_to_string(&mut text)
+                .unwrap();
+            text
+        } else {
+            std::fs::read_to_string(&file).unwrap()
+        }
+    };
+
+    // The whole chain, to the best block.
+    let all = export("1", None, "all.txt");
+    assert_eq!(all.lines().collect::<Vec<_>>(), expected);
+    // A range, and gzip output.
+    let some = export("5", Some("9"), "some.txt.gz");
+    assert_eq!(some.lines().collect::<Vec<_>>(), &expected[4..9]);
+}
