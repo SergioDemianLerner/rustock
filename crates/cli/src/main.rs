@@ -1210,6 +1210,16 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gas_estimator_binary_search: bool,
 
+    /// Transactions one sender may have in the pool ahead of its state nonce
+    /// (rskj `transaction.accountSlots`). A transaction with a nonce at or
+    /// past the state nonce plus this is refused as "nonce too high".
+    ///
+    /// rskj's default too. A load generator that signs bursts per account
+    /// (rsk-perf-lab's k6 suite runs rskj with 500) needs more, or its
+    /// later nonces are refused while the earlier ones wait for a block.
+    #[arg(long, default_value_t = 16)]
+    account_slots: u64,
+
     /// Rate-limit accounts that broadcast transactions consuming large amounts
     /// of shared resources (rskj `transaction.accountTxRateLimit.enabled`).
     ///
@@ -2425,6 +2435,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None => Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone())),
     };
     let pool_config = rustock_sync::txpool::PoolConfig {
+        account_slots: args.account_slots,
         quota: rustock_sync::quota::QuotaConfig {
             enabled: args.account_tx_rate_limit,
             cleaner_period_minutes: args.account_tx_rate_limit_cleaner_period,
@@ -5027,6 +5038,16 @@ mod log_timezone_tests {
         // And the default is still UTC when the flag is absent.
         let args = super::Args::try_parse_from(["rustock-cli"]).unwrap();
         assert_eq!(args.log_timezone, "utc");
+    }
+
+    #[test]
+    fn account_slots_default_to_rskj_s_and_take_a_value() {
+        use clap::Parser;
+        let args = super::Args::try_parse_from(["rustock-cli"]).unwrap();
+        assert_eq!(args.account_slots, 16);
+        let args =
+            super::Args::try_parse_from(["rustock-cli", "--account-slots", "500"]).unwrap();
+        assert_eq!(args.account_slots, 500);
     }
 
     #[test]
