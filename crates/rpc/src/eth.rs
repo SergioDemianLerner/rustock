@@ -118,8 +118,23 @@ fn head_minimum_times_multiplier(minimum: &alloy_primitives::U256) -> alloy_prim
         / alloy_primitives::U256::from(GAS_PRICE_MULTIPLIER_DEN)
 }
 
-/// rskj `GasPriceTracker.BLOCK_PRICE_MULTIPLIER`, 1.1 as a ratio. The same
-/// multiplier the tracker floors its percentile with.
+/// 1.1 as an exact ratio, so `x * 11 / 10` with truncation rather than a
+/// float.
+///
+/// Two constants in rskj hold this value and both are 1.1, which is why one
+/// pair serves here. They are not the same setting:
+///
+/// * `GasPriceTracker.DEFAULT_GAS_PRICE_MULTIPLIER` floors the percentile.
+/// * `EthereumImpl.minGasPriceMultiplier` scales the head's minimum on the
+///   branch below. It comes from the `gasPriceMultiplier` config key, whose
+///   default in `reference.conf` is 1.1 -- so an rskj operator can retune it
+///   and this node cannot. A divergence only reachable by changing that
+///   setting, and recorded here rather than discovered later.
+///
+/// Duplicated from `rustock_sync::gas_price`, which has the same pair, and
+/// deliberately: `rpc` does not depend on `sync` -- that is what
+/// `GasPriceSource` exists to avoid -- so sharing them would mean adding the
+/// dependency this trait was written to prevent.
 const GAS_PRICE_MULTIPLIER_NUM: u64 = 11;
 const GAS_PRICE_MULTIPLIER_DEN: u64 = 10;
 
