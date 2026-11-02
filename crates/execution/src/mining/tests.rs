@@ -1426,6 +1426,12 @@ mod partitioned_templates {
         assert_eq!(edges, vec![3], "all three in the first parallel sublist");
 
         let processor = BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store);
+        // Both halves. `process_block` executes and checks the roots;
+        // `validate_block` runs the consensus body rules, which it does not.
+        // A miner test that calls only the first cannot see a block it
+        // sealed being refused for its contents -- which is how the RSKIP252
+        // gap survived.
+        processor.validate_block(&template.block).expect("the body rules accept it");
         let parent_state = builder.load_state_root(parent.state_root).unwrap();
         processor
             .process_block(&template.block, &parent_state, trie_store)
@@ -1461,6 +1467,12 @@ mod partitioned_templates {
         );
 
         let processor = BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store);
+        // Both halves. `process_block` executes and checks the roots;
+        // `validate_block` runs the consensus body rules, which it does not.
+        // A miner test that calls only the first cannot see a block it
+        // sealed being refused for its contents -- which is how the RSKIP252
+        // gap survived.
+        processor.validate_block(&template.block).expect("the body rules accept it");
         let parent_state = builder.load_state_root(parent.state_root).unwrap();
         processor
             .process_block(&template.block, &parent_state, trie_store)
@@ -1668,6 +1680,149 @@ mod rskip252_cap {
         assert!(
             mined.contains(&U256::from(26_065_600u64)),
             "with no minimum there is nothing to be 100x of: {mined:?}"
+        );
+    }
+}
+
+// ── The miner's uncles, through the importer ──────────────────────────
+
+/// Every other miner test mines with an empty uncle list, so
+/// `UnclesValidationRule` has never had anything to say about a block this
+/// node sealed. That is the same shape as the RSKIP-252 gap: the importer
+/// enforces a rule, the miner tests run the importer, and the fixture makes
+/// the rule vacuous -- so the rule passes without being exercised and a
+/// miner-side mistake would not be caught.
+///
+/// `select_uncles` is tested on its own and does return losing siblings.
+/// What was missing is the other half: that a block *carrying* one survives
+/// the validator a peer would run.
+mod mining_with_uncles {
+    use super::*;
+    use crate::mining::template::{PendingTransaction, PendingTransactionSource};
+    use crate::mining::uncles::select_uncles;
+
+    struct NoTransactions;
+    impl PendingTransactionSource for NoTransactions {
+        fn pending(&self) -> Vec<PendingTransaction> {
+            Vec::new()
+        }
+    }
+
+    /// Put a losing sibling of the head into the store: findable by height,
+    /// never named by the canonical pointer. That is what makes it an uncle
+    /// rather than an ancestor or a stranger.
+    fn orphan_sibling_of_head(store: &BlockStore, head: &Header, tag: u8) -> Header {
+        let mut orphan = head.clone();
+        orphan.beneficiary = Address::repeat_byte(tag);
+        orphan.cached_hash = None;
+        orphan.cached_hash_for_merged_mining = None;
+        let hash = orphan.hash();
+        store.put_header_with_hash(hash, &orphan).unwrap();
+        store.put_body(hash, &[], &[]).unwrap();
+        store.put_total_difficulty(hash, U256::from(orphan.number + 1)).unwrap();
+        orphan
+    }
+
+    #[test]
+    fn a_block_sealed_with_an_uncle_is_one_the_importer_accepts() {
+        let (builder, parent, _keys, trie_store, store) =
+            super::partitioned_templates::fixture_for_cap_test(1);
+
+        let orphan = orphan_sibling_of_head(&store, &parent, 0xAA);
+        assert_ne!(
+            store.canonical_hash(orphan.number).unwrap(),
+            Some(orphan.hash()),
+            "the premise: the sibling lost, so it is not canonical"
+        );
+
+        // The miner offers what the chain actually holds, rather than a
+        // hand-made list -- if `select_uncles` and the validator disagree,
+        // that disagreement is what this test is for.
+        let offered = select_uncles(&store, parent.number + 1, parent.hash());
+        assert_eq!(offered.len(), 1, "the losing sibling must be on offer: {offered:?}");
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), offered.clone(), &NoTransactions)
+            .expect("the template builds");
+
+        assert_eq!(
+            template.block.ommers.len(),
+            1,
+            "the uncle must survive into the sealed block, not be dropped silently"
+        );
+        assert_eq!(template.block.ommers[0].hash(), orphan.hash());
+
+        // The assertion that matters, and the one no miner test has made:
+        // a block carrying an uncle passes the validator a peer would run.
+        // `validate_block`, not just `process_block`. The two are different
+        // halves: `process_block` executes and checks the roots, while the
+        // consensus *body* rules -- including the uncle rule -- live behind
+        // `validate_block_rules`, which only the sync path calls. A miner
+        // test that runs execution alone never sees them.
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store);
+        processor
+            .validate_block(&template.block)
+            .expect("a block this miner seals with an uncle must pass the body rules");
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("and must execute");
+    }
+
+    /// Proof that the rule above is not merely passing, but biting.
+    ///
+    /// The RSKIP-252 lesson is that a validator run over a fixture it has
+    /// nothing to say about looks exactly like a validator that approves.
+    /// So: hand the miner an uncle that is plainly inadmissible -- the
+    /// canonical parent, which is an ancestor and never an uncle -- and
+    /// require the importer to refuse the result. If this passes, the
+    /// positive test above is evidence of something.
+    #[test]
+    fn the_importer_rejects_a_block_whose_uncle_is_inadmissible() {
+        let (builder, parent, _keys, trie_store, store) =
+            super::partitioned_templates::fixture_for_cap_test(1);
+
+        // An ancestor, not a sibling. `select_uncles` would never offer it.
+        let template = builder
+            .build(std::slice::from_ref(&parent), vec![parent.clone()], &NoTransactions)
+            .expect("the miner builds whatever it is handed");
+        assert_eq!(template.block.ommers.len(), 1, "the premise: the block carries it");
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store);
+        let _ = trie_store;
+        let outcome = processor.validate_block(&template.block);
+        assert!(
+            outcome.is_err(),
+            "an ancestor offered as an uncle must be refused -- if this is accepted, \
+             the uncle rule is not being applied to mined blocks at all"
+        );
+    }
+
+    /// The header must commit to the uncles it carries. A miner that listed
+    /// uncles without updating `ommers_hash` would seal a block whose own
+    /// header contradicts its body.
+    #[test]
+    fn the_header_commits_to_the_uncles_it_carries() {
+        let (builder, parent, _keys, _trie_store, store) =
+            super::partitioned_templates::fixture_for_cap_test(1);
+        let _ = orphan_sibling_of_head(&store, &parent, 0xBB);
+        let offered = select_uncles(&store, parent.number + 1, parent.hash());
+
+        let with = builder
+            .build(std::slice::from_ref(&parent), offered, &NoTransactions)
+            .expect("builds with an uncle");
+        let without = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &NoTransactions)
+            .expect("builds without one");
+
+        assert_ne!(
+            with.block.header.ommers_hash, without.block.header.ommers_hash,
+            "carrying an uncle has to change the commitment"
+        );
+        assert_eq!(
+            with.block.header.ommers_hash,
+            crate::processor::compute_ommers_hash(&with.block.ommers),
+            "and the commitment has to be of the uncles actually carried"
         );
     }
 }
