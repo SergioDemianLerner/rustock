@@ -169,6 +169,12 @@ impl SenderCache {
         use std::sync::atomic::Ordering::Relaxed;
         self.hits.fetch_add(hit, Relaxed);
         self.misses.fetch_add(miss, Relaxed);
+        // Also to the process-wide counters, so the hit rate is visible on
+        // the metrics endpoint. The pair above stays because it is per
+        // instance and the tests need it; these are the ones an operator can
+        // actually see.
+        rustock_core::metrics::SENDER_CACHE_HITS.add(hit);
+        rustock_core::metrics::SENDER_CACHE_MISSES.add(miss);
         out
     }
 
@@ -293,5 +299,46 @@ mod tests {
         .join();
         c.put_many(Origin::Pool, [(hash(9), addr(9))]);
         assert_eq!(c.get_many(&[hash(9)]), vec![Some(addr(9))]);
+    }
+}
+
+#[cfg(test)]
+mod exposition {
+    use super::*;
+
+    /// The cache was merged on by default and running on mainnet with no
+    /// exposition at all, so its hit rate -- the only number that says
+    /// whether it is worth keeping -- could not be read from the node. This
+    /// pins that it reaches the scrape.
+    ///
+    /// Asserts on deltas, not absolutes: the counters are process-wide and
+    /// every other test in this binary feeds the same pair.
+    #[test]
+    fn hits_and_misses_reach_the_metrics_endpoint() {
+        let before = (
+            rustock_core::metrics::SENDER_CACHE_HITS.get(),
+            rustock_core::metrics::SENDER_CACHE_MISSES.get(),
+        );
+
+        let c = SenderCache::new(8, 8);
+        c.put_many(Origin::Pool, [(B256::repeat_byte(1), Address::repeat_byte(1))]);
+        c.get_many(&[B256::repeat_byte(1), B256::repeat_byte(2), B256::repeat_byte(3)]);
+
+        let after = (
+            rustock_core::metrics::SENDER_CACHE_HITS.get(),
+            rustock_core::metrics::SENDER_CACHE_MISSES.get(),
+        );
+        assert_eq!(after.0 - before.0, 1, "one hit must reach the exposition");
+        assert_eq!(after.1 - before.1, 2, "and both misses");
+    }
+
+    /// A metric declared but left out of `encode_all` does not appear, which
+    /// is the failure that makes a dashboard quietly wrong.
+    #[test]
+    fn both_counters_are_actually_exported() {
+        let scrape = rustock_core::metrics::gather();
+        for name in ["rustock_sender_cache_hits_total", "rustock_sender_cache_misses_total"] {
+            assert!(scrape.contains(name), "{name} is declared but not exported");
+        }
     }
 }
