@@ -96,7 +96,9 @@ pub fn debug_trace_transaction(id: Value, params: &Value, state: &RpcState) -> J
     else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid transaction hash");
     };
-    let Some((block_hash, index)) = state.store.tx_location(tx_hash).ok().flatten() else {
+    let Some((block_hash, index)) =
+        crate::helpers::canonical_tx_location(&state.store, tx_hash)
+    else {
         return JsonRpcResponse::success(id, Value::Null);
     };
 

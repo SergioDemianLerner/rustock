@@ -291,6 +291,44 @@ fn tx_to_json(tx: &rustock_core::Transaction, block_hash: &B256, block_number: u
     })
 }
 
+/// Where a transaction is, **if the block holding it is still canonical**.
+///
+/// `tx_location` answers from `CF_TX_INDEX`, which
+/// `BlockProcessor::process_block` writes for *every* block it executes,
+/// canonical or not — and which has no delete path at all. So after a reorg
+/// the orphaned block is still in storage with its receipts, and the index
+/// still points at it.
+///
+/// Reading that index without this check is how `eth_getTransactionReceipt`
+/// came to report `status: 1` for a transaction whose effects are gone,
+/// naming a block no longer on the chain. The answer is indistinguishable
+/// from a good one, which is what makes it worth a helper rather than a
+/// comment: a caller cannot defend against it, and the next method to read
+/// the index would have had to remember.
+///
+/// rskj does the same check, in `Web3Impl.eth_getTransactionByHash`:
+///
+/// ```java
+/// Block mainBlock = blockchain.getBlockByNumber(block.getNumber());
+/// if (!block.getHash().equals(mainBlock.getHash())) {
+///     return null;   // need to return txes only from main chain
+/// }
+/// ```
+///
+/// This is the read-side guard. It does not fix the cause — the index still
+/// accumulates entries for abandoned blocks — but it is wanted regardless,
+/// because a reorg can land between the lookup and the answer however the
+/// index is maintained. See #343.
+pub fn canonical_tx_location(
+    store: &rustock_storage::BlockStore,
+    tx_hash: B256,
+) -> Option<(B256, u32)> {
+    let (block_hash, index) = store.tx_location(tx_hash).ok().flatten()?;
+    let number = store.header(block_hash).ok().flatten()?.number;
+    let canonical = store.canonical_hash(number).ok().flatten()?;
+    (canonical == block_hash).then_some((block_hash, index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
