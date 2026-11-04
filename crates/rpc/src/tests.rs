@@ -5947,3 +5947,104 @@ async fn get_proof_rejects_a_missing_slot_array() {
     .await;
     assert!(resp.error.is_some(), "the slot array is required, even when empty");
 }
+
+// ===== A transaction whose block stopped being canonical (#343) =====
+
+/// Reorg the chain under an indexed transaction: keep the block and its
+/// receipts in storage, as a real node does, but point the canonical hash at
+/// a sibling. That is exactly the state `evm_revert` and a merge-mining
+/// reorg both leave behind, because `CF_TX_INDEX` is written for every block
+/// executed and has no delete path.
+fn orphan_the_block_holding(state: &RpcState, block_hash: B256) -> B256 {
+    let header = state.store.header(block_hash).unwrap().unwrap();
+    let mut sibling = header.clone();
+    sibling.beneficiary = Address::repeat_byte(0x5B);
+    sibling.cached_hash = None;
+    sibling.cached_hash_for_merged_mining = None;
+    let sibling_hash = sibling.hash();
+    assert_ne!(sibling_hash, block_hash, "the sibling must be a different block");
+
+    state.store.put_header_with_hash(sibling_hash, &sibling).unwrap();
+    state.store.put_canonical_hash(header.number, sibling_hash).unwrap();
+    state.store.set_head(sibling_hash).unwrap();
+    sibling_hash
+}
+
+/// The reported bug: a receipt for a transaction whose block is gone, with
+/// `status: 1`, naming the abandoned block.
+///
+/// A caller is told the transaction succeeded when its effects are not in
+/// the chain, and the answer is shaped exactly like a good one. rskj answers
+/// `null`.
+#[tokio::test]
+async fn a_receipt_is_null_once_its_block_stops_being_canonical() {
+    let (state, _tmp, tx_hash) = setup_state_with_tx();
+    let hash_str = format!("{tx_hash:#x}");
+
+    // Before: the receipt is there, which is the premise.
+    let before = dispatch_for_test(
+        &state,
+        make_request("eth_getTransactionReceipt", json!([hash_str])),
+    ).await.result.unwrap();
+    assert_eq!(before["status"], json!("0x1"), "the fixture must produce a real receipt");
+
+    let block_hash = state.store.tx_location(tx_hash).unwrap().unwrap().0;
+    orphan_the_block_holding(&state, block_hash);
+
+    // The index still points at the orphan -- the cause is untouched by this
+    // fix, and saying so here keeps the test honest about what it covers.
+    assert_eq!(
+        state.store.tx_location(tx_hash).unwrap().unwrap().0,
+        block_hash,
+        "the index still names the abandoned block; only the read is guarded"
+    );
+
+    let after = dispatch_for_test(
+        &state,
+        make_request("eth_getTransactionReceipt", json!([hash_str])),
+    ).await.result.unwrap();
+    assert_eq!(
+        after,
+        Value::Null,
+        "a receipt from an abandoned block must be null, not a stale success"
+    );
+}
+
+/// Every reader of the transaction index, not only the one that was
+/// reported. Each resolved a hash to a block and then trusted it.
+#[tokio::test]
+async fn every_index_reader_refuses_an_abandoned_block() {
+    let (state, _tmp, tx_hash) = setup_state_with_tx();
+    let hash_str = format!("{tx_hash:#x}");
+
+    let block_hash = state.store.tx_location(tx_hash).unwrap().unwrap().0;
+    orphan_the_block_holding(&state, block_hash);
+
+    for method in [
+        "eth_getTransactionReceipt",
+        "eth_getTransactionByHash",
+        "rsk_getRawTransactionReceiptByHash",
+    ] {
+        let r = dispatch_for_test(&state, make_request(method, json!([hash_str]))).await;
+        assert_eq!(
+            r.result.unwrap_or(Value::Null),
+            Value::Null,
+            "{method} returned something for a transaction in an abandoned block"
+        );
+    }
+}
+
+/// The guard must be narrow. A transaction in the canonical chain still
+/// answers -- a check that refused everything would pass the test above and
+/// break the node.
+#[tokio::test]
+async fn a_canonical_transaction_still_answers() {
+    let (state, _tmp, tx_hash) = setup_state_with_tx();
+    let hash_str = format!("{tx_hash:#x}");
+
+    for method in ["eth_getTransactionReceipt", "eth_getTransactionByHash"] {
+        let r = dispatch_for_test(&state, make_request(method, json!([hash_str])))
+            .await.result.unwrap();
+        assert_ne!(r, Value::Null, "{method} must still answer for a canonical block");
+    }
+}

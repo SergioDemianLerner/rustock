@@ -177,22 +177,14 @@ pub fn rsk_get_raw_transaction_receipt_by_hash(
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid transaction hash");
     };
 
-    let Ok(Some((block_hash, index))) = store.tx_location(tx_hash) else {
+    // This method had the only canonicality check in the tree, and its
+    // comment said `tx_location` "indexes the canonical chain". It does not:
+    // it indexes every block ever executed and never forgets one. The check
+    // was what made this method correct while five others were wrong, and it
+    // now lives in `canonical_tx_location` so there is one of it. See #343.
+    let Some((block_hash, index)) = crate::helpers::canonical_tx_location(store, tx_hash) else {
         return JsonRpcResponse::success(id, Value::Null);
     };
-
-    // `tx_location` indexes the canonical chain, which is rskj's
-    // `getInMainChain`; re-checking the canonical pointer keeps that true if
-    // the index is ever widened to cover forks.
-    let on_main_chain = store
-        .header(block_hash)
-        .ok()
-        .flatten()
-        .and_then(|h| store.canonical_hash(h.number).ok().flatten())
-        .is_some_and(|canonical| canonical == block_hash);
-    if !on_main_chain {
-        return JsonRpcResponse::success(id, Value::Null);
-    }
 
     let Ok(Some(receipts)) = store.receipts(block_hash) else {
         return JsonRpcResponse::success(id, Value::Null);

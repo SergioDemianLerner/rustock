@@ -48,7 +48,9 @@ pub fn trace_transaction(id: Value, params: &Value, state: &RpcState) -> JsonRpc
     else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid transaction hash");
     };
-    let Some((block_hash, index)) = state.store.tx_location(tx_hash).ok().flatten() else {
+    let Some((block_hash, index)) =
+        crate::helpers::canonical_tx_location(&state.store, tx_hash)
+    else {
         return JsonRpcResponse::success(id, Value::Null);
     };
 
@@ -112,7 +114,9 @@ pub fn trace_get(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid position");
     };
 
-    let Some((block_hash, _)) = state.store.tx_location(tx_hash).ok().flatten() else {
+    let Some((block_hash, _)) =
+        crate::helpers::canonical_tx_location(&state.store, tx_hash)
+    else {
         return JsonRpcResponse::success(id, Value::Null);
     };
     match block_traces(state, block_hash, None) {
