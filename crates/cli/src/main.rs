@@ -2308,13 +2308,24 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         info!("Sender cache disabled (--sigcache=false); every sender is recovered");
     }
 
+    // The checks that read the chain's activations and constants, as rskj's
+    // TxPendingValidator does: the RSKIP252 per-transaction price cap, the
+    // sublist gas limit under RSKIP144, the free Bridge transactions.
+    // The same ladder `hardfork_cfg` below is built from, needed earlier
+    // because the pool is constructed before it.
+    let hardfork_cfg_for_pool =
+        rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
     let mut pool_builder = rustock_sync::TransactionPool::new(
         pool_config,
         config.chain_id.into(),
         store.clone(),
         trie_store_for_pool.clone(),
     )
-    .with_gas_price_tracker(gas_price_tracker.clone());
+    .with_gas_price_tracker(gas_price_tracker.clone())
+    .with_chain_rules(rustock_sync::txpool::ChainRules::for_chain(
+        hardfork_cfg_for_pool,
+        config.min_sequential_set_gas_limit,
+    ));
     if let Some(cache) = &sender_cache {
         pool_builder = pool_builder.with_sender_cache(cache.clone());
     }

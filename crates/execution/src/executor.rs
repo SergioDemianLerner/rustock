@@ -273,17 +273,8 @@ impl RskExecutor {
             crate::hardfork::RSK_MAINNET_CHAIN_ID => crate::remasc::RemascConfig::mainnet(),
             _ => crate::remasc::RemascConfig::regtest(),
         };
-        let bridge_constants = match hardfork_cfg.chain_id {
-            crate::hardfork::RSK_TESTNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::testnet(),
-            crate::hardfork::RSK_MAINNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::mainnet(),
-            _ => crate::bridge::constants::BridgeConstants::regtest(),
-        };
-        let free_bridge_senders = bridge_constants
-            .genesis_federation_public_keys
-            .iter()
-            .chain(bridge_constants.authorized_free_tx_keys.iter())
-            .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
-            .collect();
+        let bridge_constants = bridge_constants_for(hardfork_cfg.chain_id);
+        let free_bridge_senders = free_bridge_senders(&bridge_constants);
         Self {
             hardfork_cfg,
             block_store,
@@ -311,12 +302,7 @@ impl RskExecutor {
         mut self,
         constants: crate::bridge::constants::BridgeConstants,
     ) -> Self {
-        self.free_bridge_senders = constants
-            .genesis_federation_public_keys
-            .iter()
-            .chain(constants.authorized_free_tx_keys.iter())
-            .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
-            .collect();
+        self.free_bridge_senders = free_bridge_senders(&constants);
         self.bridge_constants = constants;
         self
     }
@@ -2239,6 +2225,29 @@ pub enum ExecutionError {
     /// state is written; see `crate::supply`.
     #[error("transaction {index} of block #{number} created {created} wei of rBTC")]
     SupplyCreated { number: u64, index: usize, created: alloy_primitives::U256 },
+}
+
+/// The Bridge constants a chain id selects: testnet's, mainnet's, or
+/// regtest's for anything else.
+pub fn bridge_constants_for(chain_id: u64) -> crate::bridge::constants::BridgeConstants {
+    match chain_id {
+        crate::hardfork::RSK_TESTNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::testnet(),
+        crate::hardfork::RSK_MAINNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::mainnet(),
+        _ => crate::bridge::constants::BridgeConstants::regtest(),
+    }
+}
+
+/// The senders whose transactions to the Bridge are free before
+/// `areBridgeTxsPaid`: the genesis federation and the authorized free-tx
+/// keys (rskj `BridgeUtils.isFreeBridgeTx`). Shared by the executor and the
+/// transaction pool, which must agree on what costs nothing.
+pub fn free_bridge_senders(constants: &crate::bridge::constants::BridgeConstants) -> Vec<Address> {
+    constants
+        .genesis_federation_public_keys
+        .iter()
+        .chain(constants.authorized_free_tx_keys.iter())
+        .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
+        .collect()
 }
 
 /// Derives an RSK address from a secp256k1 public key in SEC1 hex

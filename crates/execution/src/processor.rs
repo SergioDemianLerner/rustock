@@ -737,11 +737,7 @@ impl BlockProcessor {
     /// Shared with the miner, which applies the same cap when it selects
     /// transactions (rskj `MinerUtils.isHighGasPriced`).
     pub fn rskip252_height(&self) -> u64 {
-        match self.hardfork_cfg.chain_id {
-            crate::hardfork::RSK_MAINNET_CHAIN_ID => 5_468_000,
-            crate::hardfork::RSK_TESTNET_CHAIN_ID => 4_015_800,
-            _ => 0,
-        }
+        rskip252_height_for(self.hardfork_cfg.chain_id)
     }
 
     /// RSKIP110 (`wasabi100`) for this chain.
@@ -2900,5 +2896,16 @@ mod sender_cache_integration {
         let p = processor(Some(cache.clone()));
         assert_eq!(p.recover_senders(&txs, 33).unwrap(), want);
         assert_eq!(p.recover_senders(&txs, 33).unwrap(), want, "and again from the cache");
+    }
+}
+
+/// RSKIP252 (`fingerroot500`) for a chain id: mainnet's and testnet's
+/// heights, genesis anywhere else. The block rule, the miner's selection
+/// and the pool's per-transaction cap all read it.
+pub fn rskip252_height_for(chain_id: u64) -> u64 {
+    match chain_id {
+        crate::hardfork::RSK_MAINNET_CHAIN_ID => 5_468_000,
+        crate::hardfork::RSK_TESTNET_CHAIN_ID => 4_015_800,
+        _ => 0,
     }
 }
