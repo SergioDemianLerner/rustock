@@ -30,7 +30,7 @@ Gaps where the code differs from rskj, in order of weight:
 2. The future-timestamp bound was 15 s on every chain; rskj uses 60 s on mainnet, 540 s on testnet and none on regtest. The minimum gas limit was 5,000 against rskj's 3,000,000. Both fixed the same day.
 3. A pending transaction the EVM refused aborted the whole template instead of being dropped and evicted (`BlockToMineBuilderInvalidTxEvictionTest`), and the miner never consulted sync state (`MinerManagerTest.mineBlockWhileSyncingBlocks`). Both fixed the same day.
 4. Pool admission lacked the 80x per-transaction price cap, the sublist gas limit under RSKIP144, the canonical-nonce check and the free-bridge exemption (`co.rsk.net.handler.txvalidator`). Fixed the same day; the sublist bound is tested at `gas_limit_is_bounded_by_the_larger_sublist_under_rskip144`.
-5. Miner behaviours rskj has and rustock does not: submission rate limit, duplicate submission answered OK, template rebuilt on new block and new transactions, the extraData format, the minimum gas price target, eviction of underpriced transactions.
+5. Miner behaviours rskj had and rustock did not: submission rate limit, duplicate submission answered OK, template rebuilt on new block and new transactions, the extraData format, the minimum gas price target, eviction of underpriced transactions. All six fixed the same day.
 
 ## co.rsk.validators
 
@@ -185,41 +185,41 @@ Paths: rustock = `clients/rustock/crates/...`, rskj = `clients/rskj/rskj-core/sr
 | rskj test | verdict | rustock test or reason | code check (gaps only) |
 |---|---|---|---|
 | MinerServerTest.gasUnitInDollarsIsInitializedOkAtConstructor | gap | (name is misleading: asserts `notify==true` on work rebuilt on a *different parent*). `notify_is_reported_once` (execution/src/mining/tests.rs:917) only checks the first notify and its clearing | implemented: `should_notify` returns true when `last_parent != parent_hash` (execution/src/mining/server.rs:469-476) |
-| MinerServerTest.secondBuildBlockToMineTurnsNotifyFlagOff | gap | rebuild on same parent -> same merged-mining hash, `notify==false`; no rustock test checks notify after a same-parent rebuild (`work_handed_out_earlier_can_still_be_answered` tests.rs:874 rebuilds but ignores notify) | implemented: same parent and fees not > 110% of last notified -> false (server.rs:474-475). Minor: rustock templates on the same parent differ by timestamp (tests.rs:878 comment), rskj's fixed MinerClock yields the identical hash |
-| MinerServerTest.submitTwoBitcoinBlocksAtSameTimeWithoutRateLimit | gap | rskj: second submit of the same solution returns status `OK`. rustock test `a_repeated_solution_reports_the_block_as_already_present` (tests.rs:818) asserts the opposite (an error) | differs: `complete_and_import` refuses with `ParentNoLongerHead` once the head moved (server.rs:572-578); rskj answers OK/EXIST. mnr_submit* for a duplicate therefore errors on rustock |
-| MinerServerTest.submitTwoBitcoinBlocksAtSameTimeWithRateLimit | gap | no test | NOT implemented: no submission rate limiter anywhere (`grep rate_limit\|submission` in execution/src/mining/ and rpc/src/mnr.rs: nothing); submit path server.rs:558-656 has no throttle |
-| MinerServerTest.extraDataNotInitializedWithClientData | gap | no test; `extra_data_rule_caps_at_32_bytes` (core/src/validation/block_rules.rs) is the validation rule, not the miner | differs: rustock puts the raw `--mining-extra-data` bytes in the header (template.rs:230, cli/src/main.rs:3239-3251); no RLP list `[version=1, "<ver>-<commit>", client]` |
-| MinerServerTest.extraDataWithClientData | gap | no test | differs: same as above; no version/identity items, no `setExtraData` |
-| MinerServerTest.extraDataWithClientDataMoreThan32Bytes | gap | no test | differs: >32 bytes is a startup error (cli/src/main.rs:3240-3245), not truncated to fit 32 |
-| MinerServerTest.onBestBlockBuildBlockToMine | gap | no test | NOT implemented: no best-block listener; the template is rebuilt only on a timer (`mining_refresh_secs`, cli/src/main.rs:3312-3331) and after the node's own submission (server.rs:647-649) |
-| MinerServerTest.onNewTxBuildBlockToMine | gap | no test | NOT implemented: no pending-tx event -> rebuild; `AutoMiner` polls `pool_status` (rpc/src/evm.rs:371-377) but never calls `build_work` on arrival |
-| MinerServerTest.rebuildsOnlyOnceArrivingFeesAreMaterialAgainstTheCandidate | gap | no test | NOT implemented: no arriving-fee accumulator / minFeesRatio threshold; only the post-build 10% notify threshold exists (server.rs:474) |
-| MinerServerTest.rebuildsOnEveryBatchWhenThereIsNoCandidateToCompareAgainst | gap | no test | NOT implemented (same: no tx-batch rebuild path) |
+| MinerServerTest.secondBuildBlockToMineTurnsNotifyFlagOff | covered | `second_build_block_to_mine_turns_notify_flag_off` (mining/tests.rs) | |
+| MinerServerTest.submitTwoBitcoinBlocksAtSameTimeWithoutRateLimit | covered | `submit_two_bitcoin_blocks_at_same_time_without_rate_limit` (mining/tests.rs) | |
+| MinerServerTest.submitTwoBitcoinBlocksAtSameTimeWithRateLimit | covered | `submit_two_bitcoin_blocks_at_same_time_with_rate_limit` (mining/tests.rs) | |
+| MinerServerTest.extraDataNotInitializedWithClientData | covered | `extra_data_not_initialized_with_client_data` (mining/extra_data.rs) | |
+| MinerServerTest.extraDataWithClientData | covered | `extra_data_with_client_data` (mining/extra_data.rs) | |
+| MinerServerTest.extraDataWithClientDataMoreThan32Bytes | covered | `extra_data_with_client_data_more_than_32_bytes` (mining/extra_data.rs) | |
+| MinerServerTest.onBestBlockBuildBlockToMine | covered | `on_best_block_build_block_to_mine` (mining/tests.rs) | |
+| MinerServerTest.onNewTxBuildBlockToMine | covered | `on_new_tx_build_block_to_mine` (mining/tests.rs) | |
+| MinerServerTest.rebuildsOnlyOnceArrivingFeesAreMaterialAgainstTheCandidate | covered | `rebuilds_only_once_arriving_fees_are_material_against_the_candidate` (mining/tests.rs) | |
+| MinerServerTest.rebuildsOnEveryBatchWhenThereIsNoCandidateToCompareAgainst | covered | `rebuilds_on_every_batch_when_there_is_no_candidate_to_compare_against` (mining/tests.rs) | |
 | MinerServerTest.onNewTxEventsAreThrottledWhenBuildQueueIsBacklogged | not applicable | Java single-thread executor coalescing; rustock has no event-driven rebuild at all (see rows above) | |
 | MinerUtilsTest.getAllTransactionsTest | covered | `transactions_are_ordered_by_price_but_never_out_of_nonce_order` (execution/src/mining/tests.rs:658): two txs of one sender both kept, nonce order | |
 | MinerUtilsTest.validTransactionRepositoryNonceTest | covered | `filter_transactions_skips_a_sender_past_a_nonce_gap_but_not_past_a_mined_leftover` (tests.rs:733): expected nonce read from state via `nonce_of` | |
 | MinerUtilsTest.validTransactionAccWrapNonceTest | covered | same test: nonce 1 then 2 accepted after the in-block `next_nonce` map advances | |
 | MinerUtilsTest.invalidNonceTransactionTest | covered | same test: wrong nonce skipped, sender's later txs blocked only by a gap; nothing is evicted | |
-| MinerUtilsTest.invalidGasPriceTransactionTest | gap | no filter test with a price below the block minimum (the `filter_transactions_*` tests use min 2 with prices 199/201) | implemented (skip): `candidate.tx.gas_price < minimum_gas_price -> continue` (template.rs:539-541). Differs on the second assertion: rskj also evicts it from the pool (`txsToRemove`); rustock does not remove it, relying on admission (`PoolError::GasPriceTooLow`, sync/src/txpool.rs:59, test_low_gas_price_rejected :1608). A tx admitted before a 1%/block MGP rise stays in the pool |
+| MinerUtilsTest.invalidGasPriceTransactionTest | covered | `invalid_gas_price_transaction_test`, `an_underpriced_pending_transaction_is_evicted` (mining/tests.rs) | |
 | MinerUtilsTest.harmfulTransactionTest | not applicable | null gasPrice cannot exist with rustock's `U256` field | |
 | MinerUtilsTest.filterTransactions_whenRskip252DisabledThenTxIncludedRegardlessGasPrice | covered | `filter_transactions_when_rskip252_disabled_then_tx_included_regardless_gas_price` (tests.rs:710) | |
 | MinerUtilsTest.filterTransactions_whenRskip252EnabledThenTxWithMoreGasPriceThanCapExcluded | covered | `filter_transactions_when_rskip252_enabled_then_tx_with_more_gas_price_than_cap_excluded` (tests.rs:696) | |
 | MinerUtilsTest.getAllTransactionsCheckOrderTest | covered | `transactions_are_ordered_by_price_but_never_out_of_nonce_order` + `transaction_ordering_is_stable_for_equal_prices` (tests.rs:658, 677); same-nonce higher-price-first is in `order_by_price_sender_and_nonce` (template.rs:585-589) though not asserted on its own | |
 | MinerUtilsTest.getAllTransactions_withNonCanonicalNonce_discardsAndReturnsValidTxs | gap | no miner-level test | implemented at a different layer: a nonce wider than 8 bytes fails RLP decode (`decode_u64_lenient` -> `Overflow`, core/src/rlp_compat.rs:78-80) so it never reaches the pool; leading-zero nonces are deliberately tolerated (rlp_compat.rs:3-5), which rskj's canonical check would discard |
 | MinerUtilsTest.getAllTransactions_allValid_noDiscarding | covered | `filter_transactions_skips_a_sender_past_a_nonce_gap_but_not_past_a_mined_leftover` / `transactions_are_ordered_...` (all valid txs kept) | |
-| MinimumGasPriceCalculatorTest.increaseMgp | gap | no test of `next_minimum_gas_price` (only `a_template_inherits_gas_limit_and_minimum_gas_price` tests.rs:638, the no-target case) | implemented: `target.clamp(parent-1%, parent+1%)` (template.rs:734-746). BUT not wired: `MiningConfig` is built with `..Default::default()` so `min_gas_price_target` is always `None` (cli/src/main.rs:3247-3251, template.rs:47) and the miner never moves the MGP toward a configured target (rskj `miner.minGasPrice`) |
-| MinimumGasPriceCalculatorTest.decreaseMGP | gap | no test | implemented: lower bound `parent - 1%` (template.rs:742-743); same wiring caveat |
-| MinimumGasPriceCalculatorTest.mgpOnRage | gap | no test | implemented: in-range target returned as-is (template.rs:744) |
-| MinimumGasPriceCalculatorTest.previousMgpEqualsTarget | gap | no test | implemented (template.rs:744) |
-| MinimumGasPriceCalculatorTest.previousValueIsZero | gap | no test | implemented: delta floored to 1 wei when 1% rounds to 0 (template.rs:738-740) |
-| MinimumGasPriceCalculatorTest.previousValueIsSmallTargetIsZero | gap | no test | implemented: 1 -> 0 via `saturating_sub(1)` (template.rs:742) |
-| MinimumGasPriceCalculatorTest.cantGetMGPtoBeNegative | gap | no test | implemented by type: `U256` is unsigned, `saturating_sub` (template.rs:742) |
-| SubmissionRateLimitHandlerTest.ofMiningConfig_WhenRateLimitIsZero_ThenHandlerShouldBeDisabled | gap | no test | NOT implemented: no `workSubmissionRateLimitInMills` config and no handler (no match for rate limit in execution/src/mining/, rpc/src/mnr.rs, cli mining args main.rs:3232-3331) |
-| SubmissionRateLimitHandlerTest.ofMiningConfig_WhenRateLimitIsNegative_ThenHandlerShouldBeDisabled | gap | no test | NOT implemented (same) |
-| SubmissionRateLimitHandlerTest.ofMiningConfig_WhenRateLimitIsPositive_ThenHandlerShouldBeEnabled | gap | no test | NOT implemented (same) |
-| SubmissionRateLimitHandlerTest.isSubmissionAllowed_WhenDisabled_ThenShouldReturnTrue | gap | no test | NOT implemented (same; every submission is accepted, server.rs:504-556) |
-| SubmissionRateLimitHandlerTest.isSubmissionAllowed_WhenEnabledAndLimitNotExceeded_ThenShouldReturnTrue | gap | no test | NOT implemented (same) |
-| SubmissionRateLimitHandlerTest.isSubmissionAllowed_WhenEnabledAndLimitExceeded_ThenShouldReturnFalse | gap | no test | NOT implemented (same) |
+| MinimumGasPriceCalculatorTest.increaseMgp | covered | `increase_mgp` (mining/tests.rs) | |
+| MinimumGasPriceCalculatorTest.decreaseMGP | covered | `decrease_mgp` (mining/tests.rs) | |
+| MinimumGasPriceCalculatorTest.mgpOnRage | covered | `mgp_on_range` (mining/tests.rs) | |
+| MinimumGasPriceCalculatorTest.previousMgpEqualsTarget | covered | `previous_mgp_equals_target` (mining/tests.rs) | |
+| MinimumGasPriceCalculatorTest.previousValueIsZero | covered | `previous_value_is_zero` (mining/tests.rs) | |
+| MinimumGasPriceCalculatorTest.previousValueIsSmallTargetIsZero | covered | `previous_value_is_small_target_is_zero` (mining/tests.rs) | |
+| MinimumGasPriceCalculatorTest.cantGetMGPtoBeNegative | covered | `cant_get_mgp_to_be_negative` (mining/tests.rs); the target is unsigned here | |
+| SubmissionRateLimitHandlerTest.ofMiningConfig_WhenRateLimitIsZero_ThenHandlerShouldBeDisabled | covered | `of_mining_config_when_rate_limit_is_zero_then_handler_should_be_disabled` (mining/tests.rs) | |
+| SubmissionRateLimitHandlerTest.ofMiningConfig_WhenRateLimitIsNegative_ThenHandlerShouldBeDisabled | covered | `of_mining_config_when_rate_limit_is_zero_then_handler_should_be_disabled` (mining/tests.rs); the window is unsigned here | |
+| SubmissionRateLimitHandlerTest.ofMiningConfig_WhenRateLimitIsPositive_ThenHandlerShouldBeEnabled | covered | `of_mining_config_when_rate_limit_is_positive_then_handler_should_be_enabled` (mining/tests.rs) | |
+| SubmissionRateLimitHandlerTest.isSubmissionAllowed_WhenDisabled_ThenShouldReturnTrue | covered | `is_submission_allowed_when_disabled_then_should_return_true` (mining/tests.rs) | |
+| SubmissionRateLimitHandlerTest.isSubmissionAllowed_WhenEnabledAndLimitNotExceeded_ThenShouldReturnTrue | covered | `is_submission_allowed_when_enabled_and_limit_not_exceeded_then_should_return_true` (mining/tests.rs) | |
+| SubmissionRateLimitHandlerTest.isSubmissionAllowed_WhenEnabledAndLimitExceeded_ThenShouldReturnFalse | covered | `is_submission_allowed_when_enabled_and_limit_exceeded_then_should_return_false` (mining/tests.rs) | |
 | TimedMinerClientMiningTest.minesBlockSuccessfully | covered | `a_timed_miner_mines_blocks_on_its_own` (tests.rs:1901): get work + submit through the server | |
 | TimedMinerClientMiningTest.handlesMiningErrorsGracefully | gap | no test that a failing `mine_block` keeps the miner running | implemented: `Err(e) => warn!` and the loop continues (execution/src/mining/timed.rs:296-299) |
 | TimedMinerClientMiningTest.stopsMiningWhenStopped | covered | `a_timed_miner_mines_blocks_on_its_own`: `mined()` unchanged 400 ms after `stop()` | |

@@ -287,6 +287,11 @@ pub struct TransactionPool {
     /// The chain's activations and constants, for the checks that depend on
     /// them. `None` keeps the plain checks.
     chain_rules: Option<ChainRules>,
+    /// Told of every transaction admitted: rskj's
+    /// `onPendingTransactionsReceived`, which the miner listens to. A slot
+    /// rather than a builder argument because the miner is built after the
+    /// pool.
+    on_added: RwLock<Option<Arc<dyn Fn(&Transaction) + Send + Sync>>>,
 }
 
 /// What passed through the pool since the last time anyone asked.
@@ -358,7 +363,13 @@ impl TransactionPool {
             gas_price: None,
             sender_cache: None,
             chain_rules: None,
+            on_added: RwLock::new(None),
         }
+    }
+
+    /// Call `listener` with every transaction admitted from now on.
+    pub fn set_on_added(&self, listener: Arc<dyn Fn(&Transaction) + Send + Sync>) {
+        *self.on_added.write().unwrap() = Some(listener);
     }
 
     /// Apply the checks that depend on the chain's activations and
@@ -654,6 +665,11 @@ impl TransactionPool {
         }
 
         debug!(tx_hash = %hash, sender = %sender, nonce = tx.nonce, "Transaction added to pool");
+        drop(inner);
+        let listener = self.on_added.read().unwrap().clone();
+        if let Some(listener) = listener {
+            listener(&tx);
+        }
         Ok(hash)
     }
 

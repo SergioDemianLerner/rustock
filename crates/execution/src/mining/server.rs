@@ -89,6 +89,10 @@ pub enum SubmitError {
     /// `hasBetterBlockToSync()`: a node still catching up does not mine.
     #[error("not mining: the node has a better block to sync")]
     Syncing,
+    /// rskj `SubmissionRateLimitHandler`: "Cannot publish block, block
+    /// submission rate limit exceeded".
+    #[error("cannot publish block, block submission rate limit exceeded")]
+    RateLimited,
     #[error("compressing the coinbase: {0}")]
     Compression(#[from] CoinbaseCompressionError),
     #[error("building the merkle proof: {0}")]
@@ -111,6 +115,8 @@ pub trait ChainAccess: Send + Sync {
     fn mainchain(&self, limit: usize) -> Result<Vec<Header>, String>;
     /// Hash of the block whose state the trie store currently holds.
     fn executed_head(&self) -> Result<Option<B256>, String>;
+    /// Whether a block with this hash is already stored.
+    fn has_block(&self, hash: B256) -> Result<bool, String>;
     /// Uncles to include in a block mined on `parent_hash`.
     fn select_uncles(&self, block_number: u64, parent_hash: B256) -> Result<Vec<Header>, String>;
     /// Store a fully executed block and make it the head if it wins.
@@ -170,6 +176,10 @@ impl ChainAccess for StoreChainAccess {
             return Err("the head block's header is missing from the store".to_string());
         }
         Ok(chain)
+    }
+
+    fn has_block(&self, hash: B256) -> Result<bool, String> {
+        self.store.header(hash).map(|h| h.is_some()).map_err(|e| e.to_string())
     }
 
     fn executed_head(&self) -> Result<Option<B256>, String> {
@@ -273,6 +283,108 @@ pub struct MinerServer {
     state: Mutex<ServerState>,
     /// Whether the node is still catching up. `None` never is.
     sync_gate: Option<Arc<dyn SyncGate>>,
+    /// rskj `SubmissionRateLimitHandler`. Disabled unless configured.
+    rate_limit: SubmissionRateLimiter,
+    /// Decides whether arriving transactions are worth a rebuild.
+    rebuild_policy: RebuildPolicy,
+}
+
+/// rskj `SubmissionRateLimitHandler`: at most one submission per
+/// `miner.server.workSubmissionRateLimitInMills`. Zero (rskj's default)
+/// disables it.
+pub struct SubmissionRateLimiter {
+    window_ms: u64,
+    last_submitted_at: Mutex<u64>,
+    clock: Box<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl SubmissionRateLimiter {
+    /// rskj `ofMiningConfig`: enabled when the window is positive.
+    pub fn new(window_ms: u64) -> Self {
+        Self::with_clock(window_ms, Box::new(now_millis))
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(0)
+    }
+
+    /// With a clock of the caller's, for tests (rskj's `TimeProvider`).
+    pub fn with_clock(window_ms: u64, clock: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        Self { window_ms, last_submitted_at: Mutex::new(0), clock }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.window_ms > 0
+    }
+
+    pub fn is_submission_allowed(&self) -> bool {
+        if !self.is_enabled() {
+            return true;
+        }
+        let now = (self.clock)();
+        now.saturating_sub(*self.last_submitted_at.lock().expect("rate limit lock")) >= self.window_ms
+    }
+
+    pub fn on_submit(&self) {
+        *self.last_submitted_at.lock().expect("rate limit lock") = (self.clock)();
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// rskj `MinerServerImpl.NewBlockTxListener.isWorthRebuilding`: rebuilding
+/// the candidate re-executes every transaction in it, so arriving
+/// transactions trigger one only once their fees, accumulated since the
+/// last rebuild, reach `fraction` of what the candidate already pays. With
+/// no candidate to compare against, any arrival is worth it. Skipping a
+/// rebuild only delays a transaction: the next best block rebuilds
+/// unconditionally, and so does the refresh timer.
+pub struct RebuildPolicy {
+    /// rskj `miner.server.rebuildFeeFraction`, 0.1 by default.
+    fraction: f64,
+    fees_since_last_build: Mutex<U256>,
+}
+
+impl RebuildPolicy {
+    pub const DEFAULT_FRACTION: f64 = 0.1;
+
+    pub fn new(fraction: f64) -> Self {
+        Self { fraction, fees_since_last_build: Mutex::new(U256::ZERO) }
+    }
+
+    /// rskj `resetAccumulatedFees`.
+    pub fn reset(&self) {
+        *self.fees_since_last_build.lock().expect("rebuild policy lock") = U256::ZERO;
+    }
+
+    /// rskj `isWorthRebuilding`: `candidate_fees` is what the current
+    /// candidate pays its miner, `None` when there is none.
+    pub fn worth_rebuilding(&self, candidate_fees: Option<U256>, arrivals: &[rustock_core::Transaction]) -> bool {
+        let mut accumulated = self.fees_since_last_build.lock().expect("rebuild policy lock");
+        let Some(candidate) = candidate_fees.filter(|f| !f.is_zero()) else {
+            *accumulated = U256::ZERO;
+            return true;
+        };
+        for tx in arrivals {
+            *accumulated += tx.gas_price.saturating_mul(tx.gas_limit);
+        }
+        // rskj: `new BigDecimal(candidate).multiply(fraction).toBigInteger()`,
+        // the product truncated.
+        let threshold = {
+            let scaled = (self.fraction * 1_000_000.0).round() as u64;
+            candidate.saturating_mul(U256::from(scaled)) / U256::from(1_000_000u64)
+        };
+        if *accumulated < threshold {
+            return false;
+        }
+        *accumulated = U256::ZERO;
+        true
+    }
 }
 
 /// What the miner asks before building work: rskj
@@ -303,7 +415,48 @@ impl MinerServer {
                 last_fees_with_notify: U256::ZERO,
             }),
             sync_gate: None,
+            rate_limit: SubmissionRateLimiter::disabled(),
+            rebuild_policy: RebuildPolicy::new(RebuildPolicy::DEFAULT_FRACTION),
         }
+    }
+
+    /// rskj `miner.server.workSubmissionRateLimitInMills`: refuse a
+    /// submission within `window_ms` of the previous one. Zero disables.
+    pub fn with_submission_rate_limit(mut self, window_ms: u64) -> Self {
+        self.rate_limit = SubmissionRateLimiter::new(window_ms);
+        self
+    }
+
+    /// The rate limiter with a clock of the caller's, for tests.
+    pub fn with_submission_rate_limiter(mut self, limiter: SubmissionRateLimiter) -> Self {
+        self.rate_limit = limiter;
+        self
+    }
+
+    /// rskj `NewBlockTxListener.onBestBlock`: a new parent invalidates the
+    /// candidate outright, so rebuild, and start the fee accumulator over.
+    pub fn on_best_block(&self) -> Result<MinerWork, SubmitError> {
+        self.rebuild_policy.reset();
+        self.build_work()
+    }
+
+    /// rskj `NewBlockTxListener.onPendingTransactionsReceived`: rebuild
+    /// when the arrivals are worth it (see [`RebuildPolicy`]). `None` when
+    /// they were not.
+    pub fn on_pending_transactions_received(
+        &self,
+        transactions: &[rustock_core::Transaction],
+    ) -> Option<Result<MinerWork, SubmitError>> {
+        let candidate_fees = self
+            .state
+            .lock()
+            .expect("miner state lock")
+            .current
+            .as_ref()
+            .map(|w| w.fees_paid_to_miner);
+        self.rebuild_policy
+            .worth_rebuilding(candidate_fees, transactions)
+            .then(|| self.build_work())
     }
 
     /// Refuse to build work while `gate` says there is a better block to
@@ -472,16 +625,17 @@ impl MinerServer {
         raw_coinbase: &[u8],
         merkle_proof: Vec<u8>,
     ) -> Result<SubmittedBlockInfo, SubmitError> {
+        // rskj `processSolution`: the rate limit is checked first, and the
+        // submission counts whether or not the work is found.
+        if !self.rate_limit.is_submission_allowed() {
+            warn!(target: "rustock::mining", "Cannot publish block, block submission rate limit exceeded");
+            return Err(SubmitError::RateLimited);
+        }
+        self.rate_limit.on_submit();
+
         let work_hash = extract_merged_mining_hash(raw_coinbase)?;
         let template = self.take_template(work_hash)?;
 
-        let head = self.chain.executed_head().map_err(SubmitError::Storage)?;
-        if head != Some(template.parent_hash()) {
-            return Err(SubmitError::ParentNoLongerHead {
-                parent: template.parent_hash(),
-                head,
-            });
-        }
 
         let compressed = compress_coinbase(raw_coinbase, true)?;
 
@@ -495,6 +649,26 @@ impl MinerServer {
             Some(Bytes::from(compressed));
         block.header.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(merkle_proof));
         debug_assert_eq!(hash_before, block.header.hash_for_merged_mining());
+
+        // The same solution submitted twice: rskj's `addNewMinedBlock`
+        // answers `EXIST` and the submission is `OK`. Checked before the
+        // parent, which the first submission moved.
+        let completed_hash = block.hash();
+        if self.chain.has_block(completed_hash).map_err(SubmitError::Storage)? {
+            return Ok(SubmittedBlockInfo {
+                block_imported_result: ImportResult::Exist,
+                block_hash: completed_hash,
+                block_included_height: block.header.number,
+            });
+        }
+
+        let head = self.chain.executed_head().map_err(SubmitError::Storage)?;
+        if head != Some(template.parent_hash()) {
+            return Err(SubmitError::ParentNoLongerHead {
+                parent: template.parent_hash(),
+                head,
+            });
+        }
 
         // The same rule every peer will run. Failing here means the node built
         // something it would itself reject, which is worth catching before it

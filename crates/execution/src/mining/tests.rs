@@ -583,9 +583,10 @@ fn filter_transactions_when_rskip252_enabled_then_tx_with_more_gas_price_than_ca
     let over = pending_tx(Address::repeat_byte(0xB2), 0, 201, 2);
     let ordered = super::template::order_by_price_sender_and_nonce_for_test(vec![under.clone(), over]);
 
-    let kept = super::template::filter_candidates(ordered, min, true, |_| 0);
+    let (kept, to_remove) = super::template::filter_candidates(ordered, min, true, |_| 0);
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].tx.gas_price, under.tx.gas_price);
+    assert_eq!(to_remove, vec![B256::repeat_byte(2)], "the over-cap one is for the pool to drop");
 }
 
 /// rskj `MinerUtilsTest.filterTransactions_whenRskip252DisabledThenTxIncludedRegardlessGasPrice`:
@@ -597,8 +598,9 @@ fn filter_transactions_when_rskip252_disabled_then_tx_included_regardless_gas_pr
     let over = pending_tx(Address::repeat_byte(0xB2), 0, 200 + 1_000_000_000_000, 2);
     let ordered = super::template::order_by_price_sender_and_nonce_for_test(vec![under, over]);
 
-    let kept = super::template::filter_candidates(ordered, min, false, |_| 0);
+    let (kept, to_remove) = super::template::filter_candidates(ordered, min, false, |_| 0);
     assert_eq!(kept.len(), 2);
+    assert!(to_remove.is_empty());
 }
 
 /// `TxGasPriceCap.isSurpassed` has no cap when the block's minimum is zero,
@@ -607,8 +609,18 @@ fn filter_transactions_when_rskip252_disabled_then_tx_included_regardless_gas_pr
 #[test]
 fn filter_transactions_has_no_cap_when_the_minimum_is_zero() {
     let ordered = vec![pending_tx(Address::repeat_byte(0xA1), 0, 1_000_000, 1)];
-    let kept = super::template::filter_candidates(ordered, U256::ZERO, true, |_| 0);
+    let (kept, _) = super::template::filter_candidates(ordered, U256::ZERO, true, |_| 0);
     assert_eq!(kept.len(), 1);
+}
+
+/// rskj `MinerUtilsTest.invalidGasPriceTransactionTest`: a transaction under
+/// the block's minimum is not a candidate, and goes to `txsToRemove`.
+#[test]
+fn invalid_gas_price_transaction_test() {
+    let ordered = vec![pending_tx(Address::repeat_byte(0xA1), 0, 1, 1)];
+    let (kept, to_remove) = super::template::filter_candidates(ordered, U256::from(2), true, |_| 0);
+    assert!(kept.is_empty());
+    assert_eq!(to_remove, vec![B256::repeat_byte(1)]);
 }
 
 /// rskj `MinerUtils.filterTransactions`: a nonce gap blocks the sender's
@@ -626,9 +638,11 @@ fn filter_transactions_skips_a_sender_past_a_nonce_gap_but_not_past_a_mined_left
         pending_tx(b, 1, 100, 4),
         pending_tx(b, 2, 100, 5),
     ]);
-    let kept = super::template::filter_candidates(ordered, U256::ZERO, true, |s| u64::from(*s == a));
+    let (kept, to_remove) =
+        super::template::filter_candidates(ordered, U256::ZERO, true, |s| u64::from(*s == a));
     let nonces: Vec<u64> = kept.iter().map(|p| p.tx.nonce).collect();
     assert_eq!(nonces, vec![1, 2]);
+    assert!(to_remove.is_empty(), "a nonce out of sequence stays in the pool");
 }
 
 fn pending_tx(sender: Address, nonce: u64, gas_price: u64, seed: u8) -> PendingTransaction {
@@ -698,23 +712,170 @@ fn a_solution_completes_a_block_and_is_imported() {
 /// Submitting the same solution twice is a race, not an error: two workers of
 /// the same pool can both report it. The second must say so rather than claim
 /// the work was never handed out.
+/// rskj `MinerServerTest.submitTwoBitcoinBlocksAtSameTimeWithoutRateLimit`:
+/// the same solution twice is `OK` both times, the second reporting the
+/// block as already there (`addNewMinedBlock` answers `EXIST`), not as an
+/// error about a parent the first submission moved.
 #[test]
-fn a_repeated_solution_reports_the_block_as_already_present() {
+fn submit_two_bitcoin_blocks_at_same_time_without_rate_limit() {
     let fx = fixture(20);
     let work = fx.server.get_work().unwrap();
     let raw = bitcoin::consensus::serialize(&solve(&work));
 
-    assert_eq!(
-        fx.server.submit_bitcoin_block(&raw).unwrap().block_imported_result,
-        ImportResult::ImportedBest
+    let first = fx.server.submit_bitcoin_block(&raw).unwrap();
+    assert_eq!(first.block_imported_result, ImportResult::ImportedBest);
+    let second = fx.server.submit_bitcoin_block(&raw).unwrap();
+    assert_eq!(second.block_imported_result, ImportResult::Exist);
+    assert_eq!(second.block_hash, first.block_hash);
+    assert_eq!(second.block_included_height, first.block_included_height);
+}
+
+// ── rskj SubmissionRateLimitHandlerTest ───────────────────────────────
+
+fn limiter_with_clock(window_ms: u64) -> (SubmissionRateLimiter, Arc<std::sync::atomic::AtomicU64>) {
+    let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let c = clock.clone();
+    let limiter = SubmissionRateLimiter::with_clock(
+        window_ms,
+        Box::new(move || c.load(std::sync::atomic::Ordering::Relaxed)),
     );
-    // The head moved, so the work is now for a parent that is no longer the
-    // executed head -- which is exactly what a duplicate looks like from here.
-    let err = fx.server.submit_bitcoin_block(&raw).unwrap_err();
-    assert!(
-        matches!(err, SubmitError::ParentNoLongerHead { .. }),
-        "unexpected error: {err}"
-    );
+    (limiter, clock)
+}
+
+/// rskj `ofMiningConfig_WhenRateLimitIsZero_ThenHandlerShouldBeDisabled` and
+/// `..._WhenRateLimitIsNegative_...`: the window is unsigned here, so zero is
+/// the one disabling value.
+#[test]
+fn of_mining_config_when_rate_limit_is_zero_then_handler_should_be_disabled() {
+    assert!(!SubmissionRateLimiter::new(0).is_enabled());
+    assert!(!SubmissionRateLimiter::disabled().is_enabled());
+}
+
+/// rskj `ofMiningConfig_WhenRateLimitIsPositive_ThenHandlerShouldBeEnabled`.
+#[test]
+fn of_mining_config_when_rate_limit_is_positive_then_handler_should_be_enabled() {
+    assert!(SubmissionRateLimiter::new(1).is_enabled());
+}
+
+/// rskj `isSubmissionAllowed_WhenDisabled_ThenShouldReturnTrue`.
+#[test]
+fn is_submission_allowed_when_disabled_then_should_return_true() {
+    let (limiter, _) = limiter_with_clock(0);
+    assert!(limiter.is_submission_allowed());
+    limiter.on_submit();
+    assert!(limiter.is_submission_allowed());
+}
+
+/// rskj `isSubmissionAllowed_WhenEnabledAndLimitNotExceeded_ThenShouldReturnTrue`.
+#[test]
+fn is_submission_allowed_when_enabled_and_limit_not_exceeded_then_should_return_true() {
+    let (limiter, clock) = limiter_with_clock(1);
+    clock.store(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(limiter.is_submission_allowed());
+    clock.store(2, std::sync::atomic::Ordering::Relaxed);
+    limiter.on_submit();
+    clock.store(3, std::sync::atomic::Ordering::Relaxed);
+    assert!(limiter.is_submission_allowed());
+}
+
+/// rskj `isSubmissionAllowed_WhenEnabledAndLimitExceeded_ThenShouldReturnFalse`.
+#[test]
+fn is_submission_allowed_when_enabled_and_limit_exceeded_then_should_return_false() {
+    let (limiter, clock) = limiter_with_clock(1);
+    clock.store(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(limiter.is_submission_allowed());
+    clock.store(2, std::sync::atomic::Ordering::Relaxed);
+    limiter.on_submit();
+    assert!(!limiter.is_submission_allowed());
+}
+
+// ── rskj MinerServerTest: rebuild triggers and notify ─────────────────
+
+/// rskj `secondBuildBlockToMineTurnsNotifyFlagOff`: rebuilding on the same
+/// parent hands out the same work, no longer flagged for notification.
+#[test]
+fn second_build_block_to_mine_turns_notify_flag_off() {
+    let fx = fixture(20);
+    let work = fx.server.get_work().unwrap();
+    assert!(work.notify);
+    fx.server.build_work().unwrap();
+    let again = fx.server.get_work().unwrap();
+    assert_eq!(again.block_hash_for_merged_mining, work.block_hash_for_merged_mining);
+    assert!(!again.notify);
+}
+
+/// rskj `rebuildsOnlyOnceArrivingFeesAreMaterialAgainstTheCandidate`: a
+/// candidate paying 1000 and a fraction of 0.1; arrivals of 40 each
+/// trigger a rebuild on the third, and the accumulator starts over.
+#[test]
+fn rebuilds_only_once_arriving_fees_are_material_against_the_candidate() {
+    let policy = RebuildPolicy::new(0.1);
+    let candidate = Some(U256::from(1_000));
+    let paying_40 = [pending_tx(Address::repeat_byte(0xA1), 0, 40, 1).tx];
+    // `pending_tx` declares 21,000 gas; rskj's `txPaying` is price times
+    // limit, so make the limit one.
+    let mut tx = paying_40[0].clone();
+    tx.gas_limit = U256::from(1);
+    let paying_40 = [tx];
+
+    assert!(!policy.worth_rebuilding(candidate, &paying_40), "40 of the 100 needed");
+    assert!(!policy.worth_rebuilding(candidate, &paying_40), "80 is still below");
+    assert!(policy.worth_rebuilding(candidate, &paying_40), "crossing 100 triggers");
+    assert!(!policy.worth_rebuilding(candidate, &paying_40), "and resets the accumulator");
+}
+
+/// rskj `rebuildsOnEveryBatchWhenThereIsNoCandidateToCompareAgainst`.
+#[test]
+fn rebuilds_on_every_batch_when_there_is_no_candidate_to_compare_against() {
+    let policy = RebuildPolicy::new(0.1);
+    let any = [pending_tx(Address::repeat_byte(0xA1), 0, 1, 1).tx];
+    assert!(policy.worth_rebuilding(None, &any));
+    assert!(policy.worth_rebuilding(Some(U256::ZERO), &any), "a candidate paying nothing counts as none");
+}
+
+// ── rskj MinimumGasPriceCalculatorTest ────────────────────────────────
+
+/// rskj `increaseMgp`: 1000 toward 2000 steps to 1010.
+#[test]
+fn increase_mgp() {
+    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(2000))), U256::from(1010));
+}
+
+/// rskj `decreaseMGP`: 1000 toward 900 steps to 990.
+#[test]
+fn decrease_mgp() {
+    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(900))), U256::from(990));
+}
+
+/// rskj `mgpOnRage`: a target inside the 1% band is reached at once.
+#[test]
+fn mgp_on_range() {
+    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(995))), U256::from(995));
+}
+
+/// rskj `previousMgpEqualsTarget`.
+#[test]
+fn previous_mgp_equals_target() {
+    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(1000))), U256::from(1000));
+}
+
+/// rskj `previousValueIsZero`: 1% of nothing is one wei.
+#[test]
+fn previous_value_is_zero() {
+    assert_eq!(next_minimum_gas_price(U256::ZERO, Some(U256::from(1000))), U256::from(1));
+}
+
+/// rskj `previousValueIsSmallTargetIsZero`: one wei can step down to zero.
+#[test]
+fn previous_value_is_small_target_is_zero() {
+    assert_eq!(next_minimum_gas_price(U256::from(1), Some(U256::ZERO)), U256::ZERO);
+}
+
+/// rskj `cantGetMGPtoBeNegative`: a negative target has no counterpart in
+/// an unsigned type; what is checked is that nothing steps below zero.
+#[test]
+fn cant_get_mgp_to_be_negative() {
+    assert_eq!(next_minimum_gas_price(U256::ZERO, Some(U256::ZERO)), U256::ZERO);
 }
 
 /// A coinbase tagged with a hash this node never handed out cannot be matched
@@ -1304,7 +1465,7 @@ mod partitioned_templates {
         fn pending(&self) -> Vec<PendingTransaction> {
             self.txs.lock().unwrap().clone()
         }
-        fn remove_invalid(&self, hashes: &[B256]) {
+        fn remove_transactions(&self, hashes: &[B256]) {
             self.evictions.lock().unwrap().push(hashes.to_vec());
             self.txs.lock().unwrap().retain(|p| !hashes.contains(&p.hash));
         }
@@ -1808,6 +1969,22 @@ mod partitioned_templates {
         assert_eq!(template.block.transactions.len(), 2, "one transfer and REMASC");
         assert!(pool.evictions().is_empty());
         assert_eq!(pool.pending().len(), 2);
+    }
+
+    /// rskj `MinerUtilsTest.invalidGasPriceTransactionTest`, through the
+    /// template: a pending transaction under the block's minimum is left out
+    /// and the pool is told to drop it, as `txsToRemove` has it.
+    #[test]
+    fn an_underpriced_pending_transaction_is_evicted() {
+        let (builder, parent, keys, _, _) =
+            fixture_with_forks_priced(2, RskHardforkConfig::all_active(33), 100);
+        let cheap = transfer_with(&keys[0], Address::repeat_byte(0xE5), 0, 33, 99, 21_000);
+        let fair = transfer_with(&keys[1], Address::repeat_byte(0xE6), 0, 33, 100, 21_000);
+        let pool = Pool(vec![cheap.clone(), fair.clone()]);
+        let template = builder.build(std::slice::from_ref(&parent), Vec::new(), &pool).expect("builds");
+        assert_eq!(template.block.transactions.len(), 2, "the fair one and REMASC");
+        assert_eq!(pool.evictions(), vec![vec![cheap.hash]]);
+        assert_eq!(pool.pending().len(), 1);
     }
 
 }

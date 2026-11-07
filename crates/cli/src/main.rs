@@ -113,7 +113,7 @@ impl rustock_execution::mining::PendingTransactionSource for PoolTxSource {
             .collect()
     }
 
-    fn remove_invalid(&self, hashes: &[alloy_primitives::B256]) {
+    fn remove_transactions(&self, hashes: &[alloy_primitives::B256]) {
         self.0.remove_by_hashes(hashes);
     }
 }
@@ -955,9 +955,30 @@ struct Args {
     #[arg(long, value_name = "ADDRESS")]
     mining_coinbase: Option<String>,
 
-    /// Bytes to put in each mined block's `extraData`, at most 32.
+    /// Client string for each mined block's `extraData`, as rskj's
+    /// `miner.extraData`: the field is RLP `[1, "<version>-<commit>",
+    /// <this>]`, and this is cut so the whole field stays within 32 bytes.
     #[arg(long, default_value = "")]
     mining_extra_data: String,
+
+    /// Minimum gas price to steer mined blocks toward, in wei, as rskj's
+    /// `miner.minGasPrice`: one RSKIP-09 step (1% of the parent's) per
+    /// block. Absent, each block inherits its parent's.
+    #[arg(long, value_name = "WEI")]
+    mining_min_gas_price: Option<u64>,
+
+    /// Refuse a merged-mining submission within this many milliseconds of
+    /// the previous one, as rskj's `miner.server.workSubmissionRateLimitInMills`.
+    /// Zero, the default, disables it.
+    #[arg(long, default_value_t = 0, value_name = "MILLIS")]
+    mining_submission_rate_limit_ms: u64,
+
+    /// Rebuild the template when transactions worth at least a tenth of the
+    /// candidate's fees have arrived, as rskj's
+    /// `miner.server.updateWorkOnNewTransaction`. Off by default, as there;
+    /// the refresh timer and every new best block rebuild regardless.
+    #[arg(long, default_value_t = false)]
+    mining_update_work_on_new_transaction: bool,
 
     /// Seconds between rebuilds of the block template handed to miners.
     ///
@@ -1395,6 +1416,11 @@ fn apply_file_config(
     apply(matches, "mining_extra_data", f.mining.extra_data.as_ref(), &mut a.mining_extra_data);
     apply(matches, "mining_refresh_secs", f.mining.refresh_secs.as_ref(),
         &mut a.mining_refresh_secs);
+    apply_opt(matches, "mining_min_gas_price", f.mining.min_gas_price.as_ref(), &mut a.mining_min_gas_price);
+    apply(matches, "mining_submission_rate_limit_ms", f.mining.submission_rate_limit_ms.as_ref(),
+        &mut a.mining_submission_rate_limit_ms);
+    apply(matches, "mining_update_work_on_new_transaction",
+        f.mining.update_work_on_new_transaction.as_ref(), &mut a.mining_update_work_on_new_transaction);
 
     apply(matches, "account_tx_rate_limit", f.account_tx_rate_limit.enabled.as_ref(),
         &mut a.account_tx_rate_limit);
@@ -2871,7 +2897,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         sync_handler.attach_snap_server(snap_server);
     }
 
+    let best_block_listeners = rustock_sync::BestBlockListeners::new();
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
+        .with_best_block_listeners(best_block_listeners.clone())
         .with_tx_pool(pool.clone())
         .with_block_processor(block_processor, trie_store_for_exec, initial_state_root)
         .with_gas_price_tracker(gas_price_tracker.clone())
@@ -3161,17 +3189,26 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             })?,
             None => anyhow::bail!("--mine requires --mining-coinbase: a miner must say where its rewards go"),
         };
-        let extra_data = args.mining_extra_data.clone().into_bytes();
-        if extra_data.len() > 32 {
-            anyhow::bail!(
-                "--mining-extra-data is {} bytes; the header field holds at most 32",
-                extra_data.len()
+        // rskj `MinerServerImpl.buildExtraData`: the node's identity, then
+        // the operator's string cut to fit.
+        let identity = format!(
+            "{}-{}",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("RUSTOCK_GIT_COMMIT").unwrap_or("unknown")
+        );
+        let extra_data =
+            rustock_execution::mining::extra_data::build(&identity, args.mining_extra_data.as_bytes());
+        if args.mining_extra_data.len() > extra_data.len() {
+            info!(
+                "--mining-extra-data cut to fit the 32-byte extraData field, after the node identity {identity}"
             );
         }
 
         let mining_config = rustock_execution::MiningConfig {
             coinbase_address,
-            extra_data: alloy_primitives::Bytes::from(extra_data),
+            extra_data,
+            // rskj `miner.minGasPrice`, through `MinimumGasPriceCalculator`.
+            min_gas_price_target: args.mining_min_gas_price.map(alloy_primitives::U256::from),
             ..Default::default()
         };
         let builder = rustock_execution::BlockTemplateBuilder::new(
@@ -3203,8 +3240,39 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             Arc::new(PoolTxSource(pool.clone())),
             config.clone(),
         )
-        .with_sync_gate(PeerSyncGate::spawn(store.clone(), peer_store.clone())));
+        .with_sync_gate(PeerSyncGate::spawn(store.clone(), peer_store.clone()))
+        .with_submission_rate_limit(args.mining_submission_rate_limit_ms));
         info!("Mining enabled; rewards to {coinbase_address}");
+
+        // rskj `NewBlockTxListener.onBestBlock`: every block the sync
+        // service executes as best invalidates the candidate, so rebuild.
+        // Off the sync thread: a rebuild executes every pending transaction.
+        {
+            let server = server.clone();
+            best_block_listeners.add(Arc::new(move |_header: &rustock_core::Header| {
+                let server = server.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = server.on_best_block() {
+                        debug!(target: "rustock::mining", "No new work on best block: {e}");
+                    }
+                });
+            }));
+        }
+        // rskj `NewBlockTxListener.onPendingTransactionsReceived`, behind
+        // `updateWorkOnNewTransaction`: arrivals worth a tenth of the
+        // candidate's fees rebuild it.
+        if args.mining_update_work_on_new_transaction {
+            let server = server.clone();
+            pool.set_on_added(Arc::new(move |tx: &rustock_core::Transaction| {
+                let server = server.clone();
+                let tx = tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(Err(e)) = server.on_pending_transactions_received(&[tx]) {
+                        debug!(target: "rustock::mining", "No new work on new transaction: {e}");
+                    }
+                });
+            }));
+        }
 
         // Rebuild the template on a timer. Nothing else does: the sync service
         // owns the execution loop and does not know the miner exists, so

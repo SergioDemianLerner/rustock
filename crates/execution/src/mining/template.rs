@@ -122,13 +122,16 @@ pub struct PendingTransaction {
 pub trait PendingTransactionSource: Send + Sync {
     fn pending(&self) -> Vec<PendingTransaction>;
 
-    /// Transactions the EVM refused to run while building a template:
-    /// a nonce the state no longer expects, a balance that no longer covers
-    /// them, too little intrinsic gas. rskj's `BlockToMineBuilder` removes
-    /// them from the pool (`BlockResult.getInvalidTransactions`); a pool
-    /// that does not would hand them back on every rebuild. The default
-    /// does nothing, which is right for a source that is not a pool.
-    fn remove_invalid(&self, _hashes: &[B256]) {}
+    /// Transactions the builder found unusable, which rskj's
+    /// `BlockToMineBuilder` removes from the pool
+    /// (`transactionPool.removeTransactions`): those `filterTransactions`
+    /// set aside as priced under the block's minimum or over the RSKIP252
+    /// cap, and those the EVM refused to run (`getInvalidTransactions`): a
+    /// nonce the state no longer expects, a balance that no longer covers
+    /// them, too little intrinsic gas. A pool that does not would hand them
+    /// back on every rebuild. The default does nothing, which is right for
+    /// a source that is not a pool.
+    fn remove_transactions(&self, _hashes: &[B256]) {}
 }
 
 /// Nothing to mine but the REMASC transaction. Useful on regtest and in tests,
@@ -198,7 +201,18 @@ impl BlockTemplateBuilder {
         let minimum_gas_price =
             next_minimum_gas_price(parent.minimum_gas_price, self.mining_config.min_gas_price_target);
 
-        let candidates = self.select_transactions(pending, &state_root, minimum_gas_price, number);
+        let (candidates, to_remove) =
+            self.select_transactions(pending, &state_root, minimum_gas_price, number);
+        // rskj `BlockToMineBuilder.build`: `removePendingTransactions(txsToRemove)`
+        // right after the filter, before anything executes.
+        if !to_remove.is_empty() {
+            tracing::debug!(
+                target: "rustock::mining",
+                "Removing {} transaction(s) from the pool: priced outside what the block may carry",
+                to_remove.len()
+            );
+            pending.remove_transactions(&to_remove);
+        }
         let has_candidates = !candidates.is_empty();
         // Kept by position, so a candidate the probe refuses can be named
         // back to the pool.
@@ -292,7 +306,7 @@ impl BlockTemplateBuilder {
                     "Evicting {} invalid transaction(s) from the pool: the EVM refused them while building the template",
                     hashes.len()
                 );
-                pending.remove_invalid(&hashes);
+                pending.remove_transactions(&hashes);
             }
             partitioned
         } else {
@@ -501,14 +515,15 @@ impl BlockTemplateBuilder {
     /// rskj `BlockToMineBuilder.getTransactions` with
     /// `MinerUtils.filterTransactions`: every pending transaction that passes
     /// is a candidate; which ones fit the block is decided by executing them
-    /// (see `probe_and_partition`), not here.
+    /// (see `probe_and_partition`), not here. The second element is rskj's
+    /// `txsToRemove`: what the pool should drop.
     fn select_transactions(
         &self,
         pending: &dyn PendingTransactionSource,
         state_root: &TrieNode,
         minimum_gas_price: U256,
         number: u64,
-    ) -> Vec<PendingTransaction> {
+    ) -> (Vec<PendingTransaction>, Vec<B256>) {
         let ordered = order_by_price_sender_and_nonce(pending.pending());
         let rskip252 = number >= self.processor.rskip252_height();
         filter_candidates(ordered, minimum_gas_price, rskip252, |sender| {
@@ -525,10 +540,12 @@ impl BlockTemplateBuilder {
 /// 100 times the block's minimum once RSKIP252 is active (`isHighGasPriced`,
 /// `TxGasPriceCap.FOR_BLOCK`): the block would fail `BlockTxsMaxGasPriceRule`
 /// on every peer, and the one case the cap short-circuits -- a zero minimum --
-/// is the one where there is no cap to exceed. And a nonce that is not the
-/// next one the sender's account expects. Only a gap blocks the sender's
-/// later transactions; a nonce below the expected one is a mined leftover and
-/// the next may still be wanted.
+/// is the one where there is no cap to exceed. Both of those go to
+/// `txsToRemove`, the second element: rskj drops them from the pool, since a
+/// later block is no likelier to carry them. And a nonce that is not the
+/// next one the sender's account expects, which stays in the pool. Only a
+/// gap blocks the sender's later transactions; a nonce below the expected
+/// one is a mined leftover and the next may still be wanted.
 ///
 /// `nonce_of` reads the sender's nonce from the state the block builds on,
 /// once per sender.
@@ -537,7 +554,7 @@ pub(crate) fn filter_candidates(
     minimum_gas_price: U256,
     rskip252_active: bool,
     mut nonce_of: impl FnMut(&Address) -> u64,
-) -> Vec<PendingTransaction> {
+) -> (Vec<PendingTransaction>, Vec<B256>) {
     let cap = (rskip252_active && !minimum_gas_price.is_zero()).then(|| {
         minimum_gas_price.saturating_mul(U256::from(
             rustock_core::validation::block_rules::BlockTxsMaxGasPriceRule::FOR_BLOCK_MULTIPLIER,
@@ -547,12 +564,15 @@ pub(crate) fn filter_candidates(
     let mut next_nonce: HashMap<Address, u64> = HashMap::new();
     let mut gapped: std::collections::HashSet<Address> = std::collections::HashSet::new();
     let mut selected = Vec::new();
+    let mut to_remove = Vec::new();
 
     for candidate in ordered {
         if candidate.tx.gas_price < minimum_gas_price {
+            to_remove.push(candidate.hash);
             continue;
         }
         if cap.is_some_and(|cap| candidate.tx.gas_price > cap) {
+            to_remove.push(candidate.hash);
             continue;
         }
         if gapped.contains(&candidate.sender) {
@@ -573,7 +593,7 @@ pub(crate) fn filter_candidates(
         selected.push(candidate);
     }
 
-    selected
+    (selected, to_remove)
 }
 
 /// rskj `PendingState.sortByPriceTakingIntoAccountSenderAndNonce`: cluster by
@@ -744,7 +764,7 @@ fn next_gas_limit(parent: &Header, target: Option<U256>) -> U256 {
 /// child may move the minimum gas price by at most 1% of the parent's, or by
 /// one wei when 1% rounds to nothing. The parent's own value is always in
 /// range, so `None` -- inherit -- is always valid.
-fn next_minimum_gas_price(parent_price: U256, target: Option<U256>) -> U256 {
+pub fn next_minimum_gas_price(parent_price: U256, target: Option<U256>) -> U256 {
     let Some(target) = target else {
         return parent_price;
     };
