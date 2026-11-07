@@ -473,6 +473,11 @@ impl MinerServer {
         MergedMiningRule { config: self.chain_config.clone() }
             .validate(&block.header)
             .map_err(SubmitError::SelfCheck)?;
+        // RSKIP179: a solution found in a Bitcoin block timestamped five
+        // minutes or more from the template is one every peer rejects.
+        rustock_core::validation::BitcoinTimestampRule { config: self.chain_config.clone() }
+            .validate(&block.header)
+            .map_err(SubmitError::SelfCheck)?;
 
         let state_root = self
             .builder

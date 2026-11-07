@@ -26,7 +26,7 @@ consensus rules. Keep the table current: a port that adds a test flips its row t
 
 Gaps where the code differs from rskj, in order of weight:
 
-1. RSKIP179, the Bitcoin-to-RSK timestamp link, is not enforced (`BlockTimeStampValidationRuleTest`).
+1. RSKIP179, the Bitcoin-to-RSK timestamp link, was not enforced (`BlockTimeStampValidationRuleTest`); fixed the same day, `BitcoinTimestampRule`.
 2. The future-timestamp bound is 15 s on every chain; rskj uses 60 s on mainnet, 540 s on testnet and none on regtest. The minimum gas limit is 5,000 against rskj's 3,000,000.
 3. A pending transaction the EVM refuses aborts the whole template instead of being dropped and evicted (`BlockToMineBuilderInvalidTxEvictionTest`), and the miner never consults sync state (`MinerManagerTest.mineBlockWhileSyncingBlocks`).
 4. Pool admission lacks the 80x per-transaction price cap, the sublist gas limit under RSKIP144, the canonical-nonce check and the free-bridge exemption (`co.rsk.net.handler.txvalidator`).
@@ -49,7 +49,7 @@ Paths: rskj tests `rskj-core/src/test/java/co/rsk/validators/`; rustock files re
 | BlockRootValidationRuleTest.calculatedRootMatchesHelperForBothFlags | covered | `the_derived_body_matches_the_committed_transactions_root` (crates/core/src/types/transaction.rs) + processor tx-root test | |
 | BlockRootValidationRuleTest.replacedTransactionsListInvalidatesCachedRoot | not applicable | Java `Block` cached-root invalidation; rustock recomputes the root each time (`processor.rs:833`) | |
 | BlockRootValidationRuleTest.mismatchedHeaderRootIsRejected | covered | `test_process_block_validates_tx_root` (processor.rs:2489, asserts `TransactionsRootMismatch`) | |
-| BlockTimeStampValidationRuleTest.timestampsAreCloseEnough | gap | no test; RSKIP179 (BTC header time vs RSK timestamp within `maxTimestampsDiffInSecs`) | NOT implemented: no reference to RSKIP179 / btc timestamp anywhere in `crates/` (grep `RSKIP179|MaxTimestampsDiff` empty); `TimestampRule` (`header_rules.rs:48-76`) and `MergedMiningRule` (`merged_mining.rs:33`) never compare the bitcoin header's `time` with `header.timestamp` |
+| BlockTimeStampValidationRuleTest.timestampsAreCloseEnough | covered | `timestamps_are_close_enough` (tests.rs), with `bitcoin_timestamp_is_not_checked_before_rskip179`, `a_header_without_a_decodable_bitcoin_header_fails_rskip179`, `testnet_widens_the_window_from_rskip297` | |
 | BlockTimeStampValidationRuleTest.blockInThePast | covered | `test_timestamp_rule` (tests.rs; static check runs inside `validate_with_parent`, `header_rules.rs:67`) | |
 | BlockTimeStampValidationRuleTest.blockInTheFutureLimit | gap | no test for the future bound | implemented but DIFFERS: `header_rules.rs:55` rejects `timestamp > now + max_future_offset`, wired with **15 s** (`crates/core/src/validation/mod.rs:202`); rskj uses `Constants.newBlockMaxSecondsInTheFuture` = **60** on mainnet (`org/ethereum/config/Constants.java:272`), `NEW_BLOCK_MAX_SECONDS_IN_THE_FUTURE` on testnet, 0 (disabled) on regtest (`Constants.java:318`). rustock is stricter: a block 16-60 s ahead of local clock is rejected by rustock, accepted by rskj |
 | BlockTimeStampValidationRuleTest.blockInTheFuture | gap | same | same as above (`header_rules.rs:55`; offset 15 vs 60) |
