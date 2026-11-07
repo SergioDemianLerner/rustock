@@ -810,6 +810,49 @@ impl RskExecutor {
         .map(|(result, _)| result)
     }
 
+    /// Execute a block the miner is assembling, dropping what does not fit.
+    ///
+    /// rskj's `BlockToMineBuilder` executes its candidates through
+    /// `BlockExecutor.executeAndFill`, which discards an invalid transaction
+    /// instead of failing the block, and a transaction is invalid when its
+    /// gas limit does not fit in the block's limit minus the gas **used** so
+    /// far (`TransactionExecutor.gasIsValid`). That is the rule this applies:
+    /// a candidate that does not fit is skipped without running, and so is
+    /// every later candidate from the same sender, whose nonce can no longer
+    /// match (rskj executes those and discards them on the nonce check; the
+    /// outcome is the same).
+    ///
+    /// Returns the result of the transactions that ran, in order, and the
+    /// indices into `transactions` of those that were dropped. `tx_results`
+    /// has one entry per transaction that ran, so a caller pairs them up by
+    /// removing the dropped indices first.
+    ///
+    /// Always one run over the whole list: the miner partitions from what
+    /// this reports and the block it publishes is executed again as it will
+    /// be validated.
+    pub fn execute_block_for_mining(
+        &self,
+        header: &Header,
+        transactions: &[(rustock_core::Transaction, Address)],
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+    ) -> Result<(BlockExecutionResult, Vec<usize>), ExecutionError> {
+        let mut dropped = Vec::new();
+        let (result, _) = self.run_sublist(
+            header,
+            transactions,
+            0..transactions.len(),
+            state_root,
+            trie_store,
+            crate::tracer::RskTracer::new(0),
+            TracedTxs::None,
+            U256::ZERO,
+            true,
+            Some(&mut dropped),
+        )?;
+        Ok((result, dropped))
+    }
+
     /// Execute a block, recording the call tree of **every** transaction.
     ///
     /// This is what the `trace_*` namespace needs, and it is one block pass:
@@ -946,6 +989,7 @@ impl RskExecutor {
                 traced,
                 U256::ZERO,
                 true,
+                None,
             );
         }
 
@@ -1004,6 +1048,7 @@ impl RskExecutor {
             TracedTxs::None,
             U256::ZERO,
             true,
+            None,
         )?;
         let base_root = crate::state::apply_state_changes(
             state_root,
@@ -1071,6 +1116,7 @@ impl RskExecutor {
                             traced,
                             U256::ZERO,
                             false,
+                            None,
                         );
                         let keys = crate::collision::finish();
                         let records = crate::silent::finish();
@@ -1150,6 +1196,7 @@ impl RskExecutor {
             traced,
             fees_carried,
             false,
+            None,
         )?;
         let sequential_us = at_sequential.elapsed().as_micros() as u64;
 
@@ -1231,6 +1278,11 @@ impl RskExecutor {
         // later sublist -- rskj's `maintainPrecompiledContractStorageRoots`
         // runs once, on the block's own repository, before any sublist.
         run_maintenance: bool,
+        // `discard_unfitting`: the miner's mode. A transaction whose gas
+        // limit does not fit in what the block has left is skipped and its
+        // index recorded here, instead of failing the run as it does when
+        // validating. See `execute_block_for_mining`.
+        mut discard_unfitting: Option<&mut Vec<usize>>,
     ) -> Result<
         (BlockExecutionResult, std::collections::BTreeMap<usize, crate::tracer::ProgramTrace>),
         ExecutionError,
@@ -1320,6 +1372,18 @@ impl RskExecutor {
         // its fees once on its own account and again when the sequential
         // sublist settles the block's total.
         let ends_the_block = range.end == transactions.len();
+        // Whether this run is the whole block as one, with nothing before or
+        // after it. Only then is the block's gas limit the container a
+        // transaction has to fit in (see the fit rule below); a sublist's
+        // container is the sublist's own limit, which this run does not know.
+        let whole_block = run_maintenance && ends_the_block;
+        let block_gas_limit = header.gas_limit.saturating_to::<u64>();
+        // Mining mode only: senders with a dropped transaction. Their later
+        // ones cannot execute (the nonce is now out of sequence) and rskj's
+        // `executeAndFill` discards them on the nonce check; dropping them
+        // here spares the run from executing what is known to fail.
+        let mut dropped_senders: std::collections::HashSet<Address> =
+            std::collections::HashSet::new();
 
         let mut total_gas = 0u64;
         let mut total_fees = fees_carried;
@@ -1384,6 +1448,49 @@ impl RskExecutor {
             // RSKIP-144: everything this transaction touches belongs to the
             // sublist that runs it. Inert unless the block declares edges.
             crate::collision::begin_transaction(i);
+
+            // rskj `TransactionExecutor.gasIsValid`: a transaction's gas
+            // **limit** must fit in the container's limit minus the gas
+            // **used** before it. The two quantities differ on purpose -- a
+            // sender's over-provisioned limit costs the block nothing once
+            // the transaction has run -- and the rule is consensus: in rskj a
+            // transaction that does not fit is invalid, and a block carrying
+            // one is rejected ("Too much gas used in this block"). Mining
+            // mode drops it instead, as rskj's `executeAndFill` does.
+            //
+            // REMASC declares no gas and is exempt by construction. Checked
+            // only when this run's container is the block itself: a sublist
+            // run is measured against the sublist's limit, which the
+            // partition validator enforces separately.
+            if !Self::is_remasc_tx(tx) && (whole_block || discard_unfitting.is_some()) {
+                let tx_gas_limit = tx.gas_limit.saturating_to::<u64>();
+                let fits = total_gas.saturating_add(tx_gas_limit) <= block_gas_limit;
+                let sender_dropped = dropped_senders.contains(sender);
+                if !fits || sender_dropped {
+                    if let Some(dropped) = discard_unfitting.as_deref_mut() {
+                        debug!(
+                            tx_index = i,
+                            tx_gas_limit,
+                            available = block_gas_limit.saturating_sub(total_gas),
+                            sender_dropped,
+                            "mining: dropping a transaction that does not fit the block"
+                        );
+                        dropped.push(i);
+                        dropped_senders.insert(*sender);
+                        {
+                            use revm::context_interface::ContextTr;
+                            evm.ctx.chain_mut().raw_storage.discard_tx();
+                        }
+                        continue;
+                    }
+                    return Err(ExecutionError::Evm(format!(
+                        "Too much gas used in this block: available in block: {} tx sent: {}",
+                        block_gas_limit.saturating_sub(total_gas),
+                        tx_gas_limit
+                    )));
+                }
+            }
+
             if Self::is_remasc_tx(tx) {
                 debug!(tx_index = i, "executing REMASC system call");
                 if traced.includes(i) {

@@ -573,6 +573,63 @@ fn transaction_ordering_is_stable_for_equal_prices() {
     assert_eq!(key(&first), key(&second));
 }
 
+/// rskj `MinerUtilsTest.filterTransactions_whenRskip252EnabledThenTxWithMoreGasPriceThanCapExcluded`:
+/// minimum 2, cap 200; one transaction at 199 stays, one at 201 goes.
+#[test]
+fn filter_transactions_when_rskip252_enabled_then_tx_with_more_gas_price_than_cap_excluded() {
+    let min = U256::from(2);
+    let under = pending_tx(Address::repeat_byte(0xA1), 0, 199, 1);
+    let over = pending_tx(Address::repeat_byte(0xB2), 0, 201, 2);
+    let ordered = super::template::order_by_price_sender_and_nonce_for_test(vec![under.clone(), over]);
+
+    let kept = super::template::filter_candidates(ordered, min, true, |_| 0);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].gas_price, under.tx.gas_price);
+}
+
+/// rskj `MinerUtilsTest.filterTransactions_whenRskip252DisabledThenTxIncludedRegardlessGasPrice`:
+/// before RSKIP252 there is no cap, and a price a trillion over it is fine.
+#[test]
+fn filter_transactions_when_rskip252_disabled_then_tx_included_regardless_gas_price() {
+    let min = U256::from(2);
+    let under = pending_tx(Address::repeat_byte(0xA1), 0, 199, 1);
+    let over = pending_tx(Address::repeat_byte(0xB2), 0, 200 + 1_000_000_000_000, 2);
+    let ordered = super::template::order_by_price_sender_and_nonce_for_test(vec![under, over]);
+
+    let kept = super::template::filter_candidates(ordered, min, false, |_| 0);
+    assert_eq!(kept.len(), 2);
+}
+
+/// `TxGasPriceCap.isSurpassed` has no cap when the block's minimum is zero,
+/// as on regtest: 100 times nothing is nothing, and rskj short-circuits
+/// rather than reject everything priced above zero.
+#[test]
+fn filter_transactions_has_no_cap_when_the_minimum_is_zero() {
+    let ordered = vec![pending_tx(Address::repeat_byte(0xA1), 0, 1_000_000, 1)];
+    let kept = super::template::filter_candidates(ordered, U256::ZERO, true, |_| 0);
+    assert_eq!(kept.len(), 1);
+}
+
+/// rskj `MinerUtils.filterTransactions`: a nonce gap blocks the sender's
+/// later transactions, a nonce below the expected one does not.
+#[test]
+fn filter_transactions_skips_a_sender_past_a_nonce_gap_but_not_past_a_mined_leftover() {
+    let a = Address::repeat_byte(0xA1);
+    let b = Address::repeat_byte(0xB2);
+    let ordered = super::template::order_by_price_sender_and_nonce_for_test(vec![
+        // `a` expects nonce 1: nonce 0 is a mined leftover, 1 and 2 are wanted.
+        pending_tx(a, 0, 100, 1),
+        pending_tx(a, 1, 100, 2),
+        pending_tx(a, 2, 100, 3),
+        // `b` expects nonce 0: 1 is a gap, and 2 is behind it.
+        pending_tx(b, 1, 100, 4),
+        pending_tx(b, 2, 100, 5),
+    ]);
+    let kept = super::template::filter_candidates(ordered, U256::ZERO, true, |s| u64::from(*s == a));
+    let nonces: Vec<u64> = kept.iter().map(|tx| tx.nonce).collect();
+    assert_eq!(nonces, vec![1, 2]);
+}
+
 fn pending_tx(sender: Address, nonce: u64, gas_price: u64, seed: u8) -> PendingTransaction {
     PendingTransaction {
         tx: rustock_core::Transaction {
@@ -1219,7 +1276,7 @@ mod uncle_tests {
 
 mod partitioned_templates {
     use super::*;
-    use crate::mining::template::{PendingTransaction, PendingTransactionSource};
+    use crate::mining::template::{PendingTransaction, PendingTransactionSource, is_remasc};
     use k256::ecdsa::SigningKey;
     use rustock_core::Transaction;
     use sha3::Digest;
@@ -1245,10 +1302,24 @@ mod partitioned_templates {
 
     /// A plain transfer from `from` to `to`, signed.
     fn transfer(from: &SigningKey, to: Address, nonce: u64, chain_id: u64) -> PendingTransaction {
+        transfer_with(from, to, nonce, chain_id, 1, 21_000)
+    }
+
+    /// A plain transfer at a given gas price and declared gas limit. The
+    /// limit is what the sender *declares*; a transfer uses 21,000 whatever
+    /// it declares, which is what the packing tests turn on.
+    fn transfer_with(
+        from: &SigningKey,
+        to: Address,
+        nonce: u64,
+        chain_id: u64,
+        gas_price: u64,
+        gas_limit: u64,
+    ) -> PendingTransaction {
         let mut tx = Transaction {
             nonce,
-            gas_price: U256::from(1),
-            gas_limit: U256::from(21_000),
+            gas_price: U256::from(gas_price),
+            gas_limit: U256::from(gas_limit),
             to: Bytes::copy_from_slice(to.as_slice()),
             value: U256::from(1_000),
             input: Bytes::new(),
@@ -1303,6 +1374,18 @@ mod partitioned_templates {
         senders: u8,
         hardfork_cfg: RskHardforkConfig,
     ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
+        fixture_with_forks_priced(senders, hardfork_cfg, 0)
+    }
+
+    /// `fixture_with_forks` on a chain whose blocks carry `minimum_gas_price`,
+    /// which the template inherits -- the RSKIP252 cap is 100 times it, and
+    /// there is no cap at zero.
+    #[allow(clippy::type_complexity)]
+    fn fixture_with_forks_priced(
+        senders: u8,
+        hardfork_cfg: RskHardforkConfig,
+        minimum_gas_price: u64,
+    ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let store = Arc::new(BlockStore::open(dir.path()).unwrap());
         let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
@@ -1335,6 +1418,7 @@ mod partitioned_templates {
             let mut header = header_at(number, parent_hash, state_root);
             header.difficulty = U256::from(2);
             header.gas_limit = U256::from(10_000_000u64);
+            header.minimum_gas_price = U256::from(minimum_gas_price);
             let hash = header.hash();
             store.put_header_with_hash(hash, &header).unwrap();
             store.put_canonical_hash(number, hash).unwrap();
@@ -1501,6 +1585,122 @@ mod partitioned_templates {
             .process_block(&template.block, &parent_state, trie_store)
             .expect("the block validates");
     }
+
+    // ── packing by gas used, and the RSKIP252 cap ─────────────────────
+
+    /// Ten transfers, each declaring 3 M gas and using 21,000, on a 10 M
+    /// block. By declared limits three fit; by gas used, which is rskj's
+    /// rule (`TransactionExecutor.gasIsValid` against the gas used so far),
+    /// all ten do. Checked on a chain without RSKIP-144 and on one with it,
+    /// where the probe also feeds the partitioner and a dropped index
+    /// would misalign the footprints.
+    #[test]
+    fn a_block_is_filled_by_gas_used_not_by_declared_limits() {
+        for forks in [RskHardforkConfig::all_active(33), RskHardforkConfig::all_active_parallel(33)] {
+            let (builder, parent, keys, trie_store, store) = fixture_with_forks(10, forks.clone());
+            let chain_id = 33;
+            let pool = Pool(
+                keys.iter()
+                    .enumerate()
+                    .map(|(i, k)| {
+                        transfer_with(k, Address::repeat_byte(0xD0 + i as u8), 0, chain_id, 1, 3_000_000)
+                    })
+                    .collect(),
+            );
+
+            let template = builder
+                .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+                .expect("the template builds");
+            assert_eq!(
+                template.block.transactions.len(),
+                11,
+                "ten transfers and REMASC: declared limits sum to 30 M, gas used to 210,000"
+            );
+            assert_eq!(template.block.header.gas_used, 10 * 21_000);
+
+            let processor = BlockProcessor::new(forks, store);
+            let parent_state = builder.load_state_root(parent.state_root).unwrap();
+            processor
+                .process_block(&template.block, &parent_state, trie_store)
+                .expect("a block this miner built must be one this node would accept");
+        }
+    }
+
+    /// The rule is a limit on the declared gas against what is left, not on
+    /// the sum of what is used: a transaction declaring more than the block
+    /// has left is dropped however little it would use, and so are the same
+    /// sender's later ones, whose nonce can no longer follow.
+    #[test]
+    fn a_transaction_that_does_not_fit_is_dropped_with_its_senders_successors() {
+        let (builder, parent, keys, trie_store, store) =
+            fixture_with_forks(2, RskHardforkConfig::all_active(33));
+        let chain_id = 33;
+        let (first, second) = (&keys[0], &keys[1]);
+        let pool = Pool(vec![
+            // Best price, goes first, leaves 10 M - 21,000 of room.
+            transfer_with(first, Address::repeat_byte(0xE1), 0, chain_id, 10, 9_990_000),
+            // Declares more than that: dropped without running.
+            transfer_with(second, Address::repeat_byte(0xE2), 0, chain_id, 5, 9_990_000),
+            // Would fit on its own, but its nonce follows a dropped one.
+            transfer_with(second, Address::repeat_byte(0xE3), 1, chain_id, 5, 21_000),
+        ]);
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+        let senders: Vec<Address> = template
+            .block
+            .transactions
+            .iter()
+            .filter(|tx| !is_remasc(tx))
+            .map(|tx| tx.recover_sender(chain_id).unwrap())
+            .collect();
+        assert_eq!(senders, vec![address_of(first)], "only the first sender's transfer is in");
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active(33), store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("the block validates");
+    }
+
+    /// rskj `MinerUtilsTest.filterTransactions_whenRskip252EnabledThenTxWithMoreGasPriceThanCapExcluded`,
+    /// through the whole template: on a chain whose minimum is 100, a
+    /// transfer paying 10,000 (the cap) is mined and one paying 10,001 is
+    /// not -- and the block passes the rule an rskj peer applies on import.
+    #[test]
+    fn a_transaction_over_the_rskip252_cap_is_left_out_of_the_template() {
+        let (builder, parent, keys, trie_store, store) =
+            fixture_with_forks_priced(2, RskHardforkConfig::all_active(33), 100);
+        let chain_id = 33;
+        let pool = Pool(vec![
+            transfer_with(&keys[0], Address::repeat_byte(0xF1), 0, chain_id, 10_001, 21_000),
+            transfer_with(&keys[1], Address::repeat_byte(0xF2), 0, chain_id, 10_000, 21_000),
+        ]);
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+        assert_eq!(template.block.header.minimum_gas_price, U256::from(100));
+        let prices: Vec<U256> = template
+            .block
+            .transactions
+            .iter()
+            .filter(|tx| !is_remasc(tx))
+            .map(|tx| tx.gas_price)
+            .collect();
+        assert_eq!(prices, vec![U256::from(10_000)], "at the cap is in, over it is out");
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active(33), store);
+        processor
+            .validate_block_rules(&template.block, Some(&parent))
+            .expect("the block passes BlockTxsMaxGasPriceRule");
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("and executes");
+    }
+
 }
 
 // ── RSKIP-252: the miner's own price ceiling ──────────────────────────
