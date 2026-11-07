@@ -121,6 +121,14 @@ pub struct PendingTransaction {
 /// sync crate, which depends on this one.
 pub trait PendingTransactionSource: Send + Sync {
     fn pending(&self) -> Vec<PendingTransaction>;
+
+    /// Transactions the EVM refused to run while building a template:
+    /// a nonce the state no longer expects, a balance that no longer covers
+    /// them, too little intrinsic gas. rskj's `BlockToMineBuilder` removes
+    /// them from the pool (`BlockResult.getInvalidTransactions`); a pool
+    /// that does not would hand them back on every rebuild. The default
+    /// does nothing, which is right for a source that is not a pool.
+    fn remove_invalid(&self, _hashes: &[B256]) {}
 }
 
 /// Nothing to mine but the REMASC transaction. Useful on regtest and in tests,
@@ -190,8 +198,12 @@ impl BlockTemplateBuilder {
         let minimum_gas_price =
             next_minimum_gas_price(parent.minimum_gas_price, self.mining_config.min_gas_price_target);
 
-        let mut transactions = self.select_transactions(pending, &state_root, minimum_gas_price, number);
-        let has_candidates = !transactions.is_empty();
+        let candidates = self.select_transactions(pending, &state_root, minimum_gas_price, number);
+        let has_candidates = !candidates.is_empty();
+        // Kept by position, so a candidate the probe refuses can be named
+        // back to the pool.
+        let candidate_hashes: Vec<B256> = candidates.iter().map(|c| c.hash).collect();
+        let mut transactions: Vec<Transaction> = candidates.into_iter().map(|c| c.tx).collect();
         // Not appended by the executor: REMASC is an ordinary entry in the
         // block's transaction list, recognised by shape. A template without it
         // executes to a different state root, and the failure reads as an
@@ -264,10 +276,24 @@ impl BlockTemplateBuilder {
         // Skipped on an idle chain: REMASC alone always fits and has nothing
         // to partition, and the final execution below is the one that counts.
         let partitioned = if has_candidates {
-            let (kept, partitioned) =
+            let (kept, partitioned, invalid) =
                 self.probe_and_partition(number, gas_limit, transactions, &header, &state_root)?;
             transactions = kept;
             header.transactions_root = ordered_tx_trie_root(&transactions, rskip126);
+            // rskj `BlockToMineBuilder.build`: "Evicting {} invalid
+            // transaction(s) from pool after exception during block
+            // execution". Done here, on the source, because the probe
+            // only knows positions.
+            if !invalid.is_empty() {
+                let hashes: Vec<B256> =
+                    invalid.iter().filter_map(|&i| candidate_hashes.get(i).copied()).collect();
+                tracing::warn!(
+                    target: "rustock::mining",
+                    "Evicting {} invalid transaction(s) from the pool: the EVM refused them while building the template",
+                    hashes.len()
+                );
+                pending.remove_invalid(&hashes);
+            }
             partitioned
         } else {
             None
@@ -325,12 +351,15 @@ impl BlockTemplateBuilder {
     ///
     /// `transactions` is the selection in price order, REMASC last. The
     /// first element of the result is what survived: every candidate the
-    /// executor dropped for not fitting the block's remaining gas (see
-    /// [`crate::RskExecutor::execute_block_for_mining`]) is gone, in the
+    /// executor dropped, for not fitting the block's remaining gas or for
+    /// being refused by the EVM (see
+    /// [`crate::RskExecutor::execute_block_for_mining`]), is gone, in the
     /// order the rest already had. The second is the partition, `None` when
     /// the block declares none: RSKIP-144 inactive, or the partition came
     /// out all-sequential, which rskj spells as an empty edges array and we
-    /// spell as no extension at all.
+    /// spell as no extension at all. The third is the indices, into
+    /// `transactions`, of the candidates the EVM refused: the pool should
+    /// hear about those.
     ///
     /// The placement is an approximation on purpose: a transaction is placed
     /// from an execution against the accumulating sequential state, while
@@ -344,7 +373,7 @@ impl BlockTemplateBuilder {
         transactions: Vec<Transaction>,
         header: &Header,
         state_root: &TrieNode,
-    ) -> Result<(Vec<Transaction>, Option<Partitioned>), TemplateError> {
+    ) -> Result<(Vec<Transaction>, Option<Partitioned>, Vec<usize>), TemplateError> {
         let rskip144 = self.hardfork_cfg.has_rskip144(number);
         let chain_id = self.hardfork_cfg.chain_id;
         let with_senders: Vec<(Transaction, Address)> = transactions
@@ -371,25 +400,27 @@ impl BlockTemplateBuilder {
         if !dropped.is_empty() {
             tracing::debug!(
                 target: "rustock::mining",
-                dropped = dropped.len(),
-                kept = transactions.len() - dropped.len(),
-                "transactions left out of the template for not fitting the block's gas"
+                unfitting = dropped.unfitting.len(),
+                invalid = dropped.invalid.len(),
+                kept = transactions.len() - dropped.unfitting.len() - dropped.invalid.len(),
+                "transactions left out of the template"
             );
         }
+        let invalid = dropped.invalid.clone();
 
         // What ran, with each transaction's probe index: `tx_results` is one
         // per executed transaction, `touched` is keyed by the probe index.
         let kept: Vec<(usize, Transaction, Address)> = with_senders
             .into_iter()
             .enumerate()
-            .filter(|(i, _)| !dropped.contains(i))
+            .filter(|(i, _)| !dropped.contains(*i))
             .map(|(i, (tx, sender))| (i, tx, sender))
             .collect();
         debug_assert_eq!(kept.len(), executed.tx_results.len(), "one result per executed transaction");
         let kept_transactions: Vec<Transaction> = kept.iter().map(|(_, tx, _)| tx.clone()).collect();
 
         if !rskip144 {
-            return Ok((kept_transactions, None));
+            return Ok((kept_transactions, None, invalid));
         }
         let touched = touched.unwrap_or_default();
 
@@ -440,7 +471,7 @@ impl BlockTemplateBuilder {
 
         let edges = partitioner.edges();
         if edges.is_empty() {
-            return Ok((kept_transactions, None));
+            return Ok((kept_transactions, None, invalid));
         }
 
         let order = partitioner.transactions_in_order();
@@ -449,7 +480,7 @@ impl BlockTemplateBuilder {
             transactions: order.iter().map(|&i| kept_transactions[i].clone()).collect(),
             edges,
         };
-        Ok((kept_transactions, Some(partitioned)))
+        Ok((kept_transactions, Some(partitioned), invalid))
     }
 
     /// Reload the parent's state root from the trie store.
@@ -477,7 +508,7 @@ impl BlockTemplateBuilder {
         state_root: &TrieNode,
         minimum_gas_price: U256,
         number: u64,
-    ) -> Vec<Transaction> {
+    ) -> Vec<PendingTransaction> {
         let ordered = order_by_price_sender_and_nonce(pending.pending());
         let rskip252 = number >= self.processor.rskip252_height();
         filter_candidates(ordered, minimum_gas_price, rskip252, |sender| {
@@ -506,7 +537,7 @@ pub(crate) fn filter_candidates(
     minimum_gas_price: U256,
     rskip252_active: bool,
     mut nonce_of: impl FnMut(&Address) -> u64,
-) -> Vec<Transaction> {
+) -> Vec<PendingTransaction> {
     let cap = (rskip252_active && !minimum_gas_price.is_zero()).then(|| {
         minimum_gas_price.saturating_mul(U256::from(
             rustock_core::validation::block_rules::BlockTxsMaxGasPriceRule::FOR_BLOCK_MULTIPLIER,
@@ -539,7 +570,7 @@ pub(crate) fn filter_candidates(
         }
 
         next_nonce.insert(candidate.sender, expected + 1);
-        selected.push(candidate.tx);
+        selected.push(candidate);
     }
 
     selected

@@ -112,6 +112,64 @@ impl rustock_execution::mining::PendingTransactionSource for PoolTxSource {
             })
             .collect()
     }
+
+    fn remove_invalid(&self, hashes: &[alloy_primitives::B256]) {
+        self.0.remove_by_hashes(hashes);
+    }
+}
+
+/// rskj `BlockSyncService.hasBetterBlockToSync`: the last block number a
+/// peer announced is at least `longSyncLimit` (24, `reference.conf`) past
+/// the node's best. The peer store is async; a task keeps the announced
+/// number in `last_known` so the miner's thread can read it.
+struct PeerSyncGate {
+    store: Arc<rustock_storage::BlockStore>,
+    last_known: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl PeerSyncGate {
+    /// rskj `reference.conf` `sync.longSyncLimit`.
+    const LONG_SYNC_LIMIT: u64 = 24;
+
+    fn spawn(
+        store: Arc<rustock_storage::BlockStore>,
+        peer_store: Arc<rustock_networking::peers::PeerStore>,
+    ) -> Arc<Self> {
+        let last_known = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let shared = last_known.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let best = peer_store.best_peer().await.map(|(_, m)| m.best_number).unwrap_or(0);
+                // The CURRENT best peer, not the highest ever seen. A
+                // high-water mark would be a remote off-switch for mining:
+                // peer-announced heights are unauthenticated, so one peer
+                // claiming 2^60 once would leave the gate shut for the life
+                // of the process and the node would never mine again. rskj
+                // reads the sync service's present view for the same reason.
+                // With no peers this is 0, which opens the gate -- correct,
+                // since nothing is being announced to catch up to.
+                shared.store(best, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        Arc::new(Self { store, last_known })
+    }
+}
+
+impl rustock_execution::mining::SyncGate for PeerSyncGate {
+    fn has_better_block_to_sync(&self) -> bool {
+        let best = self
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| self.store.header(hash).ok().flatten())
+            .map(|h| h.number)
+            .unwrap_or(0);
+        self.last_known.load(std::sync::atomic::Ordering::Relaxed)
+            >= best.saturating_add(Self::LONG_SYNC_LIMIT)
+    }
 }
 
 #[derive(Parser, Debug, PartialEq, serde::Serialize)]
@@ -3133,7 +3191,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             chain,
             Arc::new(PoolTxSource(pool.clone())),
             config.clone(),
-        ));
+        )
+        .with_sync_gate(PeerSyncGate::spawn(store.clone(), peer_store.clone())));
         info!("Mining enabled; rewards to {coinbase_address}");
 
         // Rebuild the template on a timer. Nothing else does: the sync service

@@ -600,26 +600,58 @@ impl TransactionPool {
             let mut buf = Vec::new();
             tx.encode(&mut buf);
             let hash = tx_hash(&buf);
-            if let Some(sender) = inner.by_hash.remove(&hash) {
+            if Self::remove_by_hash(&mut inner, &hash, tx.nonce) {
                 removed += 1;
-                if let Some(map) = inner.pending.get_mut(&sender) {
-                    map.remove(&tx.nonce);
-                    if map.is_empty() {
-                        inner.pending.remove(&sender);
-                    }
-                }
-                if let Some(map) = inner.queued.get_mut(&sender) {
-                    map.remove(&tx.nonce);
-                    if map.is_empty() {
-                        inner.queued.remove(&sender);
-                    }
-                }
             }
         }
         drop(inner);
         if removed > 0 {
             self.stats.write().unwrap().mined += removed;
         }
+    }
+
+    /// Remove transactions the miner found invalid while building a
+    /// template: rskj `BlockToMineBuilder.removePendingTransactions` on
+    /// `BlockResult.getInvalidTransactions()`. Returns how many were there.
+    pub fn remove_by_hashes(&self, hashes: &[B256]) -> usize {
+        let mut inner = self.inner.write().unwrap();
+        let mut removed = 0;
+        for hash in hashes {
+            let nonce = inner
+                .by_hash
+                .get(hash)
+                .and_then(|sender| {
+                    inner.pending.get(sender).or_else(|| inner.queued.get(sender)).and_then(|m| {
+                        m.iter().find(|(_, p)| p.hash == *hash).map(|(n, _)| *n)
+                    })
+                });
+            if let Some(nonce) = nonce {
+                if Self::remove_by_hash(&mut inner, hash, nonce) {
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
+    /// Drop one transaction by hash from every index. True if it was there.
+    fn remove_by_hash(inner: &mut PoolInner, hash: &B256, nonce: u64) -> bool {
+        let Some(sender) = inner.by_hash.remove(hash) else {
+            return false;
+        };
+        if let Some(map) = inner.pending.get_mut(&sender) {
+            map.remove(&nonce);
+            if map.is_empty() {
+                inner.pending.remove(&sender);
+            }
+        }
+        if let Some(map) = inner.queued.get_mut(&sender) {
+            map.remove(&nonce);
+            if map.is_empty() {
+                inner.queued.remove(&sender);
+            }
+        }
+        true
     }
 
     /// Evict transactions older than the configured thresholds.
@@ -1812,6 +1844,31 @@ mod tests {
         let (p, q) = pool.status();
         assert_eq!(p, 1);
         assert_eq!(q, 1);
+    }
+
+    /// rskj `BlockToMineBuilder.removePendingTransactions` on
+    /// `BlockResult.getInvalidTransactions()`: the miner names the hashes
+    /// it refused, and they leave the pool; unknown hashes are ignored.
+    #[test]
+    fn remove_by_hashes_drops_what_the_miner_refused_and_nothing_else() {
+        let balance = U256::from(10u64).pow(U256::from(18));
+        let (pool, key, _addr) = setup_pool_with_account(balance, 0);
+        let mut hashes = Vec::new();
+        for nonce in 0..3 {
+            let mut tx = make_tx(nonce, 59_240_000);
+            sign_tx(&mut tx, &key, 33);
+            let raw = encode_tx(&tx);
+            hashes.push(tx_hash(&raw));
+            pool.add_transaction(&raw).expect("admitted");
+        }
+        assert_eq!(pool.pending_transactions().len(), 3);
+
+        let removed = pool.remove_by_hashes(&[hashes[1], B256::repeat_byte(0x77)]);
+        assert_eq!(removed, 1, "one known hash, one unknown");
+        let left: Vec<B256> = pool.pending_transactions().iter().map(|p| p.hash).collect();
+        assert!(!left.contains(&hashes[1]), "the refused one is gone");
+        assert!(left.contains(&hashes[0]) && left.contains(&hashes[2]), "the others stay");
+        assert_eq!(pool.remove_by_hashes(&[hashes[1]]), 0, "and it is not there to remove twice");
     }
 
     // ========== Invalid signature ==========

@@ -35,6 +35,31 @@ pub struct TxExecutionResult {
     pub reached_sequential_only: bool,
 }
 
+/// What the miner's execution mode left out of the block, by index into the
+/// transaction list it was given. See [`RskExecutor::execute_block_for_mining`].
+#[derive(Debug, Default)]
+pub struct MiningDrops {
+    /// Did not fit in the block's remaining gas, or followed a dropped
+    /// transaction of the same sender. Still a fine transaction for a later
+    /// block; the pool keeps it.
+    pub unfitting: Vec<usize>,
+    /// Refused by the EVM before it ran: a nonce the state does not expect,
+    /// a balance that no longer covers it, too little intrinsic gas. rskj
+    /// collects these as `BlockResult.getInvalidTransactions()` and the
+    /// miner removes them from the pool.
+    pub invalid: Vec<usize>,
+}
+
+impl MiningDrops {
+    pub fn is_empty(&self) -> bool {
+        self.unfitting.is_empty() && self.invalid.is_empty()
+    }
+    /// Whether `index` was dropped for either reason.
+    pub fn contains(&self, index: usize) -> bool {
+        self.unfitting.contains(&index) || self.invalid.contains(&index)
+    }
+}
+
 /// Result of executing an entire block.
 #[derive(Debug)]
 pub struct BlockExecutionResult {
@@ -822,10 +847,16 @@ impl RskExecutor {
     /// match (rskj executes those and discards them on the nonce check; the
     /// outcome is the same).
     ///
-    /// Returns the result of the transactions that ran, in order, and the
-    /// indices into `transactions` of those that were dropped. `tx_results`
-    /// has one entry per transaction that ran, so a caller pairs them up by
-    /// removing the dropped indices first.
+    /// A candidate the EVM refuses before running it -- rskj's
+    /// `executeTransaction() == false`, or an exception it collects in
+    /// `invalidTransactions` -- is dropped the same way and reported apart,
+    /// so the miner can remove it from the pool as `BlockToMineBuilder`
+    /// does. Only a database error still fails the run: that is the node's
+    /// problem, not the transaction's.
+    ///
+    /// Returns the result of the transactions that ran, in order, and what
+    /// was dropped. `tx_results` has one entry per transaction that ran, so
+    /// a caller pairs them up by removing the dropped indices first.
     ///
     /// Always one run over the whole list: the miner partitions from what
     /// this reports and the block it publishes is executed again as it will
@@ -836,8 +867,8 @@ impl RskExecutor {
         transactions: &[(rustock_core::Transaction, Address)],
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
-    ) -> Result<(BlockExecutionResult, Vec<usize>), ExecutionError> {
-        let mut dropped = Vec::new();
+    ) -> Result<(BlockExecutionResult, MiningDrops), ExecutionError> {
+        let mut dropped = MiningDrops::default();
         let (result, _) = self.run_sublist(
             header,
             transactions,
@@ -1279,10 +1310,11 @@ impl RskExecutor {
         // runs once, on the block's own repository, before any sublist.
         run_maintenance: bool,
         // `discard_unfitting`: the miner's mode. A transaction whose gas
-        // limit does not fit in what the block has left is skipped and its
-        // index recorded here, instead of failing the run as it does when
-        // validating. See `execute_block_for_mining`.
-        mut discard_unfitting: Option<&mut Vec<usize>>,
+        // limit does not fit in what the block has left, or that the EVM
+        // refuses to run, is skipped and its index recorded here, instead
+        // of failing the run as it does when validating. See
+        // `execute_block_for_mining`.
+        mut discard_unfitting: Option<&mut MiningDrops>,
     ) -> Result<
         (BlockExecutionResult, std::collections::BTreeMap<usize, crate::tracer::ProgramTrace>),
         ExecutionError,
@@ -1475,7 +1507,7 @@ impl RskExecutor {
                             sender_dropped,
                             "mining: dropping a transaction that does not fit the block"
                         );
-                        dropped.push(i);
+                        dropped.unfitting.push(i);
                         dropped_senders.insert(*sender);
                         {
                             use revm::context_interface::ContextTr;
@@ -1888,15 +1920,38 @@ impl RskExecutor {
                 // for every other -- and `run` is the same code path an EVM
                 // built without an inspector takes, because revm carries the
                 // inspector as a field that only `inspect_run` consults.
-                let out = if traced.includes(i) {
+                let out: Result<_, revm::context::result::EVMError<_>> = if traced.includes(i) {
                     use revm::inspector::InspectorHandler;
                     handler.inspect_run(&mut evm)
                 } else {
                     handler.run(&mut evm)
                 };
-                out.map_err(|e: revm::context::result::EVMError<_>| {
-                    ExecutionError::Evm(format!("{e:?}"))
-                })?
+                match out {
+                    Ok(result) => result,
+                    // The miner's mode: a transaction the EVM would not run
+                    // is dropped, not fatal. revm's `catch_error` has
+                    // already discarded the transaction's own journal
+                    // (`JournalTr::discard_tx`), so the block's state is as
+                    // it was before this transaction; the raw-storage
+                    // overlay is wound back the same way. A database error
+                    // is the node's, and still fails the run.
+                    Err(e)
+                        if discard_unfitting.is_some()
+                            && !matches!(e, revm::context::result::EVMError::Database(_)) =>
+                    {
+                        debug!(tx_index = i, error = ?e, "mining: dropping a transaction the EVM refused");
+                        if let Some(drops) = discard_unfitting.as_deref_mut() {
+                            drops.invalid.push(i);
+                        }
+                        dropped_senders.insert(*sender);
+                        {
+                            use revm::context_interface::ContextTr;
+                            evm.ctx.chain_mut().raw_storage.discard_tx();
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(ExecutionError::Evm(format!("{e:?}"))),
+                }
             };
 
             let success = result.is_success();

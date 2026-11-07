@@ -85,6 +85,10 @@ pub enum SubmitError {
     UnknownWork { hash: B256 },
     #[error("the parent of this work ({parent}) is no longer the executed head ({head:?}); the chain moved on")]
     ParentNoLongerHead { parent: B256, head: Option<B256> },
+    /// rskj `MinerClientImpl.mineBlock` returns false while
+    /// `hasBetterBlockToSync()`: a node still catching up does not mine.
+    #[error("not mining: the node has a better block to sync")]
+    Syncing,
     #[error("compressing the coinbase: {0}")]
     Compression(#[from] CoinbaseCompressionError),
     #[error("building the merkle proof: {0}")]
@@ -267,6 +271,17 @@ pub struct MinerServer {
     pending: Arc<dyn PendingTransactionSource>,
     chain_config: Arc<ChainConfig>,
     state: Mutex<ServerState>,
+    /// Whether the node is still catching up. `None` never is.
+    sync_gate: Option<Arc<dyn SyncGate>>,
+}
+
+/// What the miner asks before building work: rskj
+/// `NodeBlockProcessor.hasBetterBlockToSync`, which is
+/// `BlockSyncService`'s "the last block number a peer announced is at least
+/// `longSyncLimit` past our best". A node that far behind mines on a stale
+/// head and every block it seals is orphaned on arrival.
+pub trait SyncGate: Send + Sync {
+    fn has_better_block_to_sync(&self) -> bool;
 }
 
 impl MinerServer {
@@ -287,8 +302,19 @@ impl MinerServer {
                 last_parent: None,
                 last_fees_with_notify: U256::ZERO,
             }),
+            sync_gate: None,
         }
     }
+
+    /// Refuse to build work while `gate` says there is a better block to
+    /// sync. rskj gates `MinerClientImpl.mineBlock` on it; here the gate sits
+    /// on `build_work`, which every miner, in-process or merged, goes
+    /// through.
+    pub fn with_sync_gate(mut self, gate: Arc<dyn SyncGate>) -> Self {
+        self.sync_gate = Some(gate);
+        self
+    }
+
 
     /// The address block rewards are paid to.
     pub fn coinbase_address(&self) -> alloy_primitives::Address {
@@ -299,6 +325,9 @@ impl MinerServer {
     /// on offer. Called when the chain advances, when the pool changes, and
     /// on a timer -- and by `get_work` when there is nothing to hand out yet.
     pub fn build_work(&self) -> Result<MinerWork, SubmitError> {
+        if self.sync_gate.as_ref().is_some_and(|g| g.has_better_block_to_sync()) {
+            return Err(SubmitError::Syncing);
+        }
         let mainchain = self
             .chain
             .mainchain(crate::mining::fork_detection::REQUIRED_MAINCHAIN_BLOCKS)

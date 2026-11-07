@@ -585,7 +585,7 @@ fn filter_transactions_when_rskip252_enabled_then_tx_with_more_gas_price_than_ca
 
     let kept = super::template::filter_candidates(ordered, min, true, |_| 0);
     assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].gas_price, under.tx.gas_price);
+    assert_eq!(kept[0].tx.gas_price, under.tx.gas_price);
 }
 
 /// rskj `MinerUtilsTest.filterTransactions_whenRskip252DisabledThenTxIncludedRegardlessGasPrice`:
@@ -627,7 +627,7 @@ fn filter_transactions_skips_a_sender_past_a_nonce_gap_but_not_past_a_mined_left
         pending_tx(b, 2, 100, 5),
     ]);
     let kept = super::template::filter_candidates(ordered, U256::ZERO, true, |s| u64::from(*s == a));
-    let nonces: Vec<u64> = kept.iter().map(|tx| tx.nonce).collect();
+    let nonces: Vec<u64> = kept.iter().map(|p| p.tx.nonce).collect();
     assert_eq!(nonces, vec![1, 2]);
 }
 
@@ -1282,12 +1282,31 @@ mod partitioned_templates {
     use rustock_core::Transaction;
     use sha3::Digest;
 
-    /// A pool that hands out exactly what it was given.
-    struct Pool(Vec<PendingTransaction>);
+    /// A pool that hands out exactly what it was given, minus what the
+    /// builder told it to evict, and remembers every eviction call.
+    struct RecordingPool {
+        txs: std::sync::Mutex<Vec<PendingTransaction>>,
+        evictions: std::sync::Mutex<Vec<Vec<B256>>>,
+    }
 
-    impl PendingTransactionSource for Pool {
+    #[allow(non_snake_case)]
+    fn Pool(txs: Vec<PendingTransaction>) -> RecordingPool {
+        RecordingPool { txs: std::sync::Mutex::new(txs), evictions: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    impl RecordingPool {
+        fn evictions(&self) -> Vec<Vec<B256>> {
+            self.evictions.lock().unwrap().clone()
+        }
+    }
+
+    impl PendingTransactionSource for RecordingPool {
         fn pending(&self) -> Vec<PendingTransaction> {
-            self.0.clone()
+            self.txs.lock().unwrap().clone()
+        }
+        fn remove_invalid(&self, hashes: &[B256]) {
+            self.evictions.lock().unwrap().push(hashes.to_vec());
+            self.txs.lock().unwrap().retain(|p| !hashes.contains(&p.hash));
         }
     }
 
@@ -1700,6 +1719,95 @@ mod partitioned_templates {
         processor
             .process_block(&template.block, &parent_state, trie_store)
             .expect("and executes");
+    }
+
+
+    // ── invalid pending transactions: dropped and evicted ────────────
+
+    /// A transfer the EVM refuses before running it: the value is more than
+    /// the sender holds (the fixture funds 1 RBTC).
+    fn unaffordable_transfer(from: &SigningKey, nonce: u64, chain_id: u64) -> PendingTransaction {
+        let mut ptx = transfer(from, Address::repeat_byte(0xEE), nonce, chain_id);
+        ptx.tx.value = U256::from(10u64).pow(U256::from(18)) * U256::from(2);
+        sign(&mut ptx.tx, from, chain_id);
+        ptx.hash = B256::from_slice(&sha3::Keccak256::digest(ptx.tx.rlp_for_trie()));
+        ptx
+    }
+
+    /// rskj `BlockToMineBuilderEvictionEndToEndTest.build_whenTxExecutionThrowsError_doesNotPropagateAndEvictsTxFromPool`
+    /// and `BlockToMineBuilderInvalidTxEvictionTest.build_whenBlockResultHasInvalidTxs_shouldEvictThemFromPool`:
+    /// the template builds without the refused transaction, the other
+    /// sender's transfer is mined, and the pool is told to remove it.
+    #[test]
+    fn build_when_tx_execution_throws_error_does_not_propagate_and_evicts_tx_from_pool() {
+        let (builder, parent, keys, trie_store, store) =
+            fixture_with_forks(2, RskHardforkConfig::all_active(33));
+        let chain_id = 33;
+        let bad = unaffordable_transfer(&keys[0], 0, chain_id);
+        let good = transfer(&keys[1], Address::repeat_byte(0xE9), 0, chain_id);
+        let pool = Pool(vec![bad.clone(), good.clone()]);
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds although one candidate is invalid");
+        let mined: Vec<Address> = template
+            .block
+            .transactions
+            .iter()
+            .filter(|tx| !is_remasc(tx))
+            .map(|tx| tx.recover_sender(chain_id).unwrap())
+            .collect();
+        assert_eq!(mined, vec![good.sender], "the good transfer is in, the refused one is not");
+        assert_eq!(pool.evictions(), vec![vec![bad.hash]], "the pool is told exactly which one");
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active(33), store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("the block validates");
+    }
+
+    /// rskj `BlockToMineBuilderInvalidTxEvictionTest.build_whenBlockResultHasNoInvalidTxs_shouldNotEvictFromPool`.
+    #[test]
+    fn build_when_block_result_has_no_invalid_txs_should_not_evict_from_pool() {
+        let (builder, parent, keys, _, _) = fixture_with_forks(1, RskHardforkConfig::all_active(33));
+        let pool = Pool(vec![transfer(&keys[0], Address::repeat_byte(0xE8), 0, 33)]);
+        builder.build(std::slice::from_ref(&parent), Vec::new(), &pool).expect("builds");
+        assert!(pool.evictions().is_empty(), "nothing to evict, nothing said");
+    }
+
+    /// rskj `BlockToMineBuilderEvictionEndToEndTest.build_afterErrorTxEvicted_subsequentBuildProducesBlockAndIsNotRePoisoned`:
+    /// once evicted the transaction is gone, and the next build sees a clean
+    /// pool.
+    #[test]
+    fn build_after_error_tx_evicted_subsequent_build_produces_block_and_is_not_re_poisoned() {
+        let (builder, parent, keys, _, _) = fixture_with_forks(1, RskHardforkConfig::all_active(33));
+        let bad = unaffordable_transfer(&keys[0], 0, 33);
+        let pool = Pool(vec![bad.clone()]);
+
+        let first = builder.build(std::slice::from_ref(&parent), Vec::new(), &pool).expect("first");
+        assert_eq!(first.block.transactions.len(), 1, "REMASC only");
+        assert_eq!(pool.evictions(), vec![vec![bad.hash]]);
+
+        let second = builder.build(std::slice::from_ref(&parent), Vec::new(), &pool).expect("second");
+        assert_eq!(second.block.transactions.len(), 1);
+        assert_eq!(pool.evictions().len(), 1, "the pool no longer serves it, so nothing more to evict");
+        assert!(pool.pending().is_empty());
+    }
+
+    /// A transaction dropped for not fitting is not invalid: the pool keeps
+    /// it for a later block, and the builder says nothing to the pool.
+    #[test]
+    fn an_unfitting_transaction_is_not_evicted() {
+        let (builder, parent, keys, _, _) = fixture_with_forks(2, RskHardforkConfig::all_active(33));
+        let pool = Pool(vec![
+            transfer_with(&keys[0], Address::repeat_byte(0xE1), 0, 33, 10, 9_990_000),
+            transfer_with(&keys[1], Address::repeat_byte(0xE2), 0, 33, 5, 9_990_000),
+        ]);
+        let template = builder.build(std::slice::from_ref(&parent), Vec::new(), &pool).expect("builds");
+        assert_eq!(template.block.transactions.len(), 2, "one transfer and REMASC");
+        assert!(pool.evictions().is_empty());
+        assert_eq!(pool.pending().len(), 2);
     }
 
 }
