@@ -203,7 +203,8 @@ impl HeaderVerifier {
             .with_static_rule(BitcoinTimestampRule { config: config.clone() })
             .with_static_rule(block_rules::ExtraDataRule::default())
             .with_parent_rule(BlockNumberRule)
-            .with_parent_rule(TimestampRule::new(15)) // 15s drift
+            // rskj `newBlockMaxSecondsInTheFuture`; zero turns the rule off.
+            .with_parent_rule(TimestampRule::new(config.max_future_block_time))
             .with_parent_rule(BlockParentGasLimitRule { config: config.clone() })
             .with_parent_rule(block_rules::PrevMinGasPriceRule)
             .with_parent_rule(DifficultyRule { config })

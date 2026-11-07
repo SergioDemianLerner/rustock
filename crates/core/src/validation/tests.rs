@@ -486,3 +486,109 @@ fn testnet_widens_the_window_from_rskip297() {
     header.number = mainnet.config.activation_heights.hop400;
     assert!(mainnet.validate(&header).is_err());
 }
+
+// ── rskj BlockTimeStampValidationRuleTest, the clock and the parent ───
+
+/// The rskj fixture: `validPeriod` 540, the clock at 10,000 s.
+const VALID_PERIOD: u64 = 540;
+const NOW: u64 = 10_000;
+
+fn at(timestamp: u64) -> Header {
+    create_dummy_header(10, timestamp, B256::ZERO)
+}
+
+/// rskj `blockInThePast`.
+#[test]
+fn block_in_the_past() {
+    let rule = TimestampRule::new(VALID_PERIOD);
+    assert!(rule.validate_at(NOW, &at(NOW - 1_000)).is_ok());
+}
+
+/// rskj `blockInTheFutureLimit`: exactly the period ahead is still valid.
+#[test]
+fn block_in_the_future_limit() {
+    let rule = TimestampRule::new(VALID_PERIOD);
+    assert!(rule.validate_at(NOW, &at(NOW + VALID_PERIOD)).is_ok());
+}
+
+/// rskj `blockInTheFuture`: twice the period ahead is not.
+#[test]
+fn block_in_the_future() {
+    let rule = TimestampRule::new(VALID_PERIOD);
+    assert!(matches!(
+        rule.validate_at(NOW, &at(NOW + 2 * VALID_PERIOD)),
+        Err(ValidationError::TimestampInFuture { current: NOW, got }) if got == NOW + 2 * VALID_PERIOD
+    ));
+}
+
+/// rskj `blockTimeLowerThanParentBlockHeaderTime`, `...Equals...`,
+/// `...GreaterThan...`: strictly after the parent, or invalid.
+#[test]
+fn block_time_against_the_parents() {
+    let rule = TimestampRule::new(VALID_PERIOD);
+    let header = at(NOW);
+    assert!(matches!(
+        rule.validate_with_parent_at(NOW, &header, &at(NOW + 1_000)),
+        Err(ValidationError::TimestampOlderThanParent { .. })
+    ));
+    assert!(matches!(
+        rule.validate_with_parent_at(NOW, &header, &at(NOW)),
+        Err(ValidationError::TimestampOlderThanParent { .. })
+    ));
+    assert!(rule.validate_with_parent_at(NOW, &header, &at(NOW - 1_000)).is_ok());
+}
+
+/// rskj `validPeriodLength == 0`, regtest's setting: the rule is off, the
+/// parent comparison with it.
+#[test]
+fn a_zero_period_turns_the_timestamp_rule_off() {
+    let rule = TimestampRule::new(0);
+    assert!(rule.validate_at(NOW, &at(NOW + 1_000_000)).is_ok());
+    assert!(rule.validate_with_parent_at(NOW, &at(NOW), &at(NOW + 1_000)).is_ok());
+}
+
+/// rskj `Constants`: `newBlockMaxSecondsInTheFuture` per network, and
+/// `getMinGasLimit()` on all of them.
+#[test]
+fn the_chain_configs_carry_rskj_constants() {
+    use crate::config::ChainConfig;
+    assert_eq!(ChainConfig::mainnet().max_future_block_time, 60);
+    assert_eq!(ChainConfig::testnet().max_future_block_time, 540);
+    assert_eq!(ChainConfig::regtest().max_future_block_time, 0);
+    for config in [ChainConfig::mainnet(), ChainConfig::testnet(), ChainConfig::regtest()] {
+        assert_eq!(config.min_gas_limit, 3_000_000);
+    }
+}
+
+// ── rskj GasLimitRuleTests ────────────────────────────────────────────
+
+fn gas_limit_rule() -> GasLimitBoundsRule {
+    GasLimitBoundsRule { min_gas_limit: 3_000_000, max_gas_limit: u64::MAX }
+}
+
+fn with_gas_limit(gas_limit: u64) -> Header {
+    let mut header = create_dummy_header(10, 1_000, B256::ZERO);
+    header.gas_limit = U256::from(gas_limit);
+    header
+}
+
+/// rskj `gasLimitGreaterThanMinimumGasLimit`.
+#[test]
+fn gas_limit_greater_than_minimum_gas_limit() {
+    assert!(gas_limit_rule().validate(&with_gas_limit(3_000_000 + 1)).is_ok());
+}
+
+/// rskj `gasLimitEqualMinimumGasLimit`.
+#[test]
+fn gas_limit_equal_minimum_gas_limit() {
+    assert!(gas_limit_rule().validate(&with_gas_limit(3_000_000)).is_ok());
+}
+
+/// rskj `gasLimitLessThanMinimumGasLimit`.
+#[test]
+fn gas_limit_less_than_minimum_gas_limit() {
+    assert!(matches!(
+        gas_limit_rule().validate(&with_gas_limit(3_000_000 - 1)),
+        Err(ValidationError::GasLimitOutOfBounds { min: 3_000_000, got: 2_999_999, .. })
+    ));
+}

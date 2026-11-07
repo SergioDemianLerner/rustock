@@ -27,7 +27,7 @@ consensus rules. Keep the table current: a port that adds a test flips its row t
 Gaps where the code differs from rskj, in order of weight:
 
 1. RSKIP179, the Bitcoin-to-RSK timestamp link, was not enforced (`BlockTimeStampValidationRuleTest`); fixed the same day, `BitcoinTimestampRule`.
-2. The future-timestamp bound is 15 s on every chain; rskj uses 60 s on mainnet, 540 s on testnet and none on regtest. The minimum gas limit is 5,000 against rskj's 3,000,000.
+2. The future-timestamp bound was 15 s on every chain; rskj uses 60 s on mainnet, 540 s on testnet and none on regtest. The minimum gas limit was 5,000 against rskj's 3,000,000. Both fixed the same day.
 3. A pending transaction the EVM refuses aborts the whole template instead of being dropped and evicted (`BlockToMineBuilderInvalidTxEvictionTest`), and the miner never consults sync state (`MinerManagerTest.mineBlockWhileSyncingBlocks`).
 4. Pool admission lacks the 80x per-transaction price cap, the sublist gas limit under RSKIP144, the canonical-nonce check and the free-bridge exemption (`co.rsk.net.handler.txvalidator`).
 5. Miner behaviours rskj has and rustock does not: submission rate limit, duplicate submission answered OK, template rebuilt on new block and new transactions, the extraData format, the minimum gas price target, eviction of underpriced transactions.
@@ -50,15 +50,15 @@ Paths: rskj tests `rskj-core/src/test/java/co/rsk/validators/`; rustock files re
 | BlockRootValidationRuleTest.replacedTransactionsListInvalidatesCachedRoot | not applicable | Java `Block` cached-root invalidation; rustock recomputes the root each time (`processor.rs:833`) | |
 | BlockRootValidationRuleTest.mismatchedHeaderRootIsRejected | covered | `test_process_block_validates_tx_root` (processor.rs:2489, asserts `TransactionsRootMismatch`) | |
 | BlockTimeStampValidationRuleTest.timestampsAreCloseEnough | covered | `timestamps_are_close_enough` (tests.rs), with `bitcoin_timestamp_is_not_checked_before_rskip179`, `a_header_without_a_decodable_bitcoin_header_fails_rskip179`, `testnet_widens_the_window_from_rskip297` | |
-| BlockTimeStampValidationRuleTest.blockInThePast | covered | `test_timestamp_rule` (tests.rs; static check runs inside `validate_with_parent`, `header_rules.rs:67`) | |
-| BlockTimeStampValidationRuleTest.blockInTheFutureLimit | gap | no test for the future bound | implemented but DIFFERS: `header_rules.rs:55` rejects `timestamp > now + max_future_offset`, wired with **15 s** (`crates/core/src/validation/mod.rs:202`); rskj uses `Constants.newBlockMaxSecondsInTheFuture` = **60** on mainnet (`org/ethereum/config/Constants.java:272`), `NEW_BLOCK_MAX_SECONDS_IN_THE_FUTURE` on testnet, 0 (disabled) on regtest (`Constants.java:318`). rustock is stricter: a block 16-60 s ahead of local clock is rejected by rustock, accepted by rskj |
-| BlockTimeStampValidationRuleTest.blockInTheFuture | gap | same | same as above (`header_rules.rs:55`; offset 15 vs 60) |
-| BlockTimeStampValidationRuleTest.blockTimeLowerThanParentBlockTime | covered | `test_timestamp_rule` (999 < 1000 -> `TimestampOlderThanParent`) | |
-| BlockTimeStampValidationRuleTest.blockTimeLowerThanParentBlockHeaderTime | covered | `test_timestamp_rule` | |
-| BlockTimeStampValidationRuleTest.blockTimeGreaterThanParentBlockTime | covered | `test_timestamp_rule` (1001 > 1000 ok) | |
-| BlockTimeStampValidationRuleTest.blockTimeGreaterThanParentBlockHeaderTime | covered | `test_timestamp_rule` | |
-| BlockTimeStampValidationRuleTest.blockTimeEqualsParentBlockTime | gap | no test for the equal-timestamp case | implemented: `header_rules.rs:68` uses `header.timestamp <= parent.timestamp` -> `TimestampOlderThanParent` |
-| BlockTimeStampValidationRuleTest.blockTimeEqualsParentBlockHeaderTime | gap | same | same (`header_rules.rs:68`) |
+| BlockTimeStampValidationRuleTest.blockInThePast | covered | `block_in_the_past` (tests.rs) | |
+| BlockTimeStampValidationRuleTest.blockInTheFutureLimit | covered | `block_in_the_future_limit` (tests.rs) | |
+| BlockTimeStampValidationRuleTest.blockInTheFuture | covered | `block_in_the_future` (tests.rs) | |
+| BlockTimeStampValidationRuleTest.blockTimeLowerThanParentBlockTime | covered | `block_time_against_the_parents` (tests.rs) | |
+| BlockTimeStampValidationRuleTest.blockTimeLowerThanParentBlockHeaderTime | covered | `block_time_against_the_parents` (tests.rs) | |
+| BlockTimeStampValidationRuleTest.blockTimeGreaterThanParentBlockTime | covered | `block_time_against_the_parents` (tests.rs) | |
+| BlockTimeStampValidationRuleTest.blockTimeGreaterThanParentBlockHeaderTime | covered | `block_time_against_the_parents` (tests.rs) | |
+| BlockTimeStampValidationRuleTest.blockTimeEqualsParentBlockTime | covered | `block_time_against_the_parents` (tests.rs) | |
+| BlockTimeStampValidationRuleTest.blockTimeEqualsParentBlockHeaderTime | covered | `block_time_against_the_parents` (tests.rs) | |
 | BlockTxsMaxGasPriceRuleTest.isValid_whenRskip252DisabledThenBlockValidRegardlessGasPrice | covered | `block_txs_max_gas_price_enforces_the_100x_cap_from_rskip252` (block_rules.rs; pre-fingerroot500 block accepted) | |
 | BlockTxsMaxGasPriceRuleTest.isValid_whenRskip252EnabledThenBlockInvalidDueToTxWithMoreGasPriceThanCap | covered | same test (10_001 > 100x100 rejected) | |
 | BlockTxsValidationRuleTest.validNonceSame | gap | no block-level nonce test | implemented via revm: `execute_tx_inner` runs the default revm handler (`crates/execution/src/executor.rs:335-430`), whose state validation rejects `NonceTooLow/NonceTooHigh`; the `EVMError` is mapped at `executor.rs:422` to `ExecutionError::Evm` and surfaces as `ProcessError::Execution` (`processor.rs:22`), failing the block. No `disable_nonce_check` anywhere in `crates/execution` |
@@ -80,9 +80,9 @@ Paths: rskj tests `rskj-core/src/test/java/co/rsk/validators/`; rustock files re
 | ForkDetectionDataRuleTest.invalidForRskip110ActiveAndForkDetectionDataButMissingBlocksForCalculation | gap | same | implemented: `fork_detection.rs:117-121` (short view -> `calculate` returns `None` -> `ForkDetectionDataUnreadable`) |
 | ForkDetectionDataRuleTest.validForRskip110ActiveAndForkDetectionData | gap | same | implemented: `fork_detection.rs:116-126` (expected == got -> Ok) |
 | ForkDetectionDataRuleTest.invalidForRskip110ActiveAndForkDetectionDataBecauseDataDoesNotMatch | gap | same | implemented: `fork_detection.rs:123-125` -> `ForkDetectionDataMismatch` |
-| GasLimitRuleTests.gasLimitGreaterThanMinimumGasLimit | gap | no test references `GasLimitBoundsRule`/`GasLimitOutOfBounds` | implemented but DIFFERS: `header_rules.rs:97-109` rejects `gas_limit < min_gas_limit`, but `min_gas_limit = 5000` on every network (`crates/core/src/config.rs:189,209`), whereas rskj `Constants.getMinGasLimit()` = **3_000_000** (`Constants.java:202-204`). rustock accepts a header with gas limit in [5000, 3_000_000) that rskj rejects |
-| GasLimitRuleTests.gasLimitEqualMinimumGasLimit | gap | same | same (`header_rules.rs:100`, inclusive bound ok; constant differs) |
-| GasLimitRuleTests.gasLimitLessThanMinimumGasLimit | gap | same | same (constant 5000 vs 3_000_000) |
+| GasLimitRuleTests.gasLimitGreaterThanMinimumGasLimit | covered | `gas_limit_greater_than_minimum_gas_limit` (tests.rs) | |
+| GasLimitRuleTests.gasLimitEqualMinimumGasLimit | covered | `gas_limit_equal_minimum_gas_limit` (tests.rs) | |
+| GasLimitRuleTests.gasLimitLessThanMinimumGasLimit | covered | `gas_limit_less_than_minimum_gas_limit` (tests.rs) | |
 | PrevMinGasPriceValidatorTest.noParentBlock | not applicable | rustock's `ParentHeaderValidator` always receives a parent; a missing parent is rejected earlier by the sync pipeline | |
 | PrevMinGasPriceValidatorTest.genesisBlock | gap | `prev_min_gas_price_allows_one_percent_either_way` does not cover number 0 | implemented: `block_rules.rs:166-168` returns Ok for `header.number == 0` |
 | PrevMinGasPriceValidatorTest.noMinGasPrice | not applicable | `minimum_gas_price` is a non-null `U256` in rustock | |
