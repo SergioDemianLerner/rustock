@@ -68,6 +68,7 @@
 # Exit once synced, reporting the elapsed time -- an unambiguous end time for
 # a measurement, rather than a log line to scrape.
 # exit_when_synced = false          # default
+# account_slots = 16                # default — transactions one sender may queue past its nonce (rskj transaction.accountSlots)
 
 [rpc]
 # host = "127.0.0.1"                # default

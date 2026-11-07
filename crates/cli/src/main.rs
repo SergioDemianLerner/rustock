@@ -1520,6 +1520,7 @@ fn apply_file_config(
     apply(matches, "freezer", f.prune.freezer.as_ref(), &mut a.freezer);
     apply(matches, "dev_rpc", f.rpc.dev.as_ref(), &mut a.dev_rpc);
     apply(matches, "sigcache", f.node.sigcache.as_ref(), &mut a.sigcache);
+    apply(matches, "account_slots", f.node.account_slots.as_ref(), &mut a.account_slots);
     apply(
         matches,
         "rpc_logs_max_blocks",

@@ -116,6 +116,7 @@ pub struct NodeSection {
     /// do not each recover the same signature. On by default; `false` turns
     /// it off and every sender is recomputed.
     pub sigcache: Option<bool>,
+    pub account_slots: Option<u64>,
     /// Catch up with new blocks. `false` serves what is held and nothing more.
     pub follow_up: Option<bool>,
     /// Behave as though the canonical chain ends at this height. Requires
@@ -471,6 +472,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "checkpoint_bound_work",
     "rpc_logs_max_blocks",
     "sigcache",
+    "account_slots",
     "gas_estimator_binary_search",
     "dev_rpc",
     "mine",
