@@ -1,0 +1,280 @@
+//! Did a PowPeg functionary ever submit a signature the Bridge refused?
+//!
+//! # There is no "invalid signature" event, and that shapes everything
+//!
+//! The obvious plan -- look for the event the Bridge emits when a signature
+//! fails -- does not work, because no such event exists. `addSignature`
+//! verifies every signature against its input's sighash
+//! (`apply_signatures_to_tx`, rskj `BridgeSupport.processSigning`) and on the
+//! first one that does not verify it simply **returns without applying
+//! anything**. The call succeeds, consumes its gas, changes no state and logs
+//! nothing. A malformed DER signature does revert; a well-formed signature
+//! over the wrong sighash does not.
+//!
+//! What does exist is `add_signature`, and RSKIP326 (fingerroot500,
+//! mainnet #5,468,000) changed when it fires:
+//!
+//! - **from #5,468,000**: only once a signature has actually been applied. So
+//!   a successful `addSignature` call with **no** `add_signature` event is a
+//!   call that applied nothing -- which is the observable footprint of a
+//!   refused signature.
+//! - **before #5,468,000**: the event fires *before* verification, for every
+//!   caller who is a federation member. It cannot distinguish a good
+//!   signature from a bad one, so that range is reported as
+//!   indeterminate-from-events rather than silently called clean.
+//!
+//! # How it scans
+//!
+//! No execution and no trie. Each worker takes a stripe of heights, reads the
+//! body straight from the block store, and keeps the transactions sent to the
+//! Bridge whose selector is `addSignature`. The `add_signature` events come
+//! from the Bridge event index in one prefix scan, so matching a call to its
+//! event is a hash lookup rather than a receipt walk.
+//!
+//! Whether the caller was a functionary at that height comes from the
+//! interval database `federation_intervals` writes -- the federation is not
+//! in state this node still holds for most of the chain.
+//!
+//! Usage:
+//!   powpeg_signature_audit <data-dir> <federations.json> [from] [to] [threads]
+
+use rustock_storage::BlockStore;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
+/// `addSignature(bytes,bytes[],bytes)`.
+const ADD_SIGNATURE_SELECTOR: [u8; 4] = [0xf1, 0x0b, 0x9c, 0x59];
+/// RSKIP326 (fingerroot500) on mainnet: where `add_signature` stops firing
+/// for signatures that were not applied.
+const RSKIP326_MAINNET: u64 = 5_468_000;
+const SOLIDITY_ADD_SIGNATURE: &str = "add_signature(bytes32,address,bytes)";
+/// `legacy_topic("add_signature_topic")`: the ASCII name right-aligned in 32
+/// bytes, which is how the pre-RSKIP146 events are keyed.
+const LEGACY_ADD_SIGNATURE: &str =
+    "0x000000000000000000000000006164645f7369676e61747572655f746f706963";
+
+fn abi_bytes(data: &[u8], head_index: usize) -> Option<Vec<u8>> {
+    let w = data.get(head_index * 32..head_index * 32 + 32)?;
+    let off = u64::from_be_bytes(w[24..32].try_into().ok()?) as usize;
+    let len = u64::from_be_bytes(data.get(off + 24..off + 32)?.try_into().ok()?) as usize;
+    Some(data.get(off + 32..off + 32 + len)?.to_vec())
+}
+
+fn hexs(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[derive(Debug, Clone)]
+struct Call {
+    block: u64,
+    tx_index: u32,
+    tx_hash: alloy_primitives::B256,
+    federator_key: Vec<u8>,
+    /// The pegout being signed: `addSignature`'s third argument.
+    rsk_tx_hash: Vec<u8>,
+    succeeded: bool,
+}
+
+/// Which keys could sign over which heights.
+struct Federations {
+    intervals: Vec<(u64, u64, HashSet<String>)>,
+}
+
+impl Federations {
+    fn load(path: &str) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let mut intervals = Vec::new();
+        for chunk in text.split("{\"from\":").skip(1) {
+            let num = |k: &str| -> Option<u64> {
+                let i = chunk.find(k)? + k.len();
+                let rest = &chunk[i..];
+                let end = rest.find(|c: char| !c.is_ascii_digit() && c != ' ').unwrap_or(rest.len());
+                rest[..end].trim().parse().ok()
+            };
+            let from: u64 = chunk[..chunk.find(',').unwrap_or(0)].trim().parse().unwrap_or(0);
+            let to = num("\"to\": ").unwrap_or(u64::MAX);
+            let keys: HashSet<String> = chunk
+                .split("\"keys\": [")
+                .nth(1)
+                .map(|k| {
+                    k[..k.find(']').unwrap_or(k.len())]
+                        .split(',')
+                        .map(|s| s.trim().trim_matches('"').to_string())
+                        .filter(|s| s.len() == 66)
+                        .collect()
+                })
+                .unwrap_or_default();
+            intervals.push((from, to, keys));
+        }
+        anyhow::ensure!(!intervals.is_empty(), "no intervals in {path}");
+        Ok(Self { intervals })
+    }
+
+    fn is_functionary(&self, block: u64, key_hex: &str) -> bool {
+        self.intervals
+            .iter()
+            .find(|(f, t, _)| block >= *f && block <= *t)
+            .is_some_and(|(_, _, keys)| keys.contains(key_hex))
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let mut a = std::env::args().skip(1);
+    let dir = a.next().expect("usage: powpeg_signature_audit <data-dir> <federations.json> [from] [to] [threads]");
+    let feds_path = a.next().expect("federations.json (from federation_intervals)");
+    let from: u64 = a.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let store = Arc::new(BlockStore::open_read_only(&dir)?);
+    let head = store
+        .head()?
+        .and_then(|h| store.header(h).ok().flatten())
+        .map(|h| h.number)
+        .unwrap_or(0);
+    let to: u64 = a.next().and_then(|s| s.parse().ok()).unwrap_or(head);
+    let threads: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let feds = Arc::new(Federations::load(&feds_path)?);
+    let bridge = rustock_execution::precompiles::BRIDGE_ADDR;
+
+    // Every add_signature event, by (block, tx_index). One prefix scan each.
+    let mut emitted: HashSet<(u64, u32)> = HashSet::new();
+    for topic in [
+        alloy_primitives::keccak256(SOLIDITY_ADD_SIGNATURE.as_bytes()),
+        LEGACY_ADD_SIGNATURE.parse()?,
+    ] {
+        for (b, tx, _l, _h, _t, _d) in store.scan_bridge_events(topic, 0, u64::MAX)? {
+            emitted.insert((b, tx));
+        }
+    }
+    eprintln!("add_signature events indexed: {}", emitted.len());
+
+    // When each pegout became fully signed. `release_btc(bytes32 indexed
+    // releaseRskTxHash, bytes)` fires once the last signature lands and the
+    // entry leaves `pegoutsWaitingForSignatures`, so this says when a pegout
+    // stopped being signable -- which is what separates a refused signature
+    // from a functionary that simply arrived late.
+    let mut released: HashMap<String, u64> = HashMap::new();
+    for topic in [
+        alloy_primitives::keccak256("release_btc(bytes32,bytes)".as_bytes()),
+    ] {
+        for (b, _tx, _l, _h, topics, _d) in store.scan_bridge_events(topic, 0, u64::MAX)? {
+            if let Some(t1) = topics.get(1) {
+                released.entry(hexs(&t1.0)).and_modify(|e| *e = (*e).min(b)).or_insert(b);
+            }
+        }
+    }
+    eprintln!("pegouts with a release_btc: {}", released.len());
+    eprintln!("scanning #{from}..#{to} on {threads} threads for addSignature calls");
+
+    // Stripes: worker i takes every `threads`-th block from `from + i`, so the
+    // workers stay spread over the key space instead of queueing on one region.
+    let found: Vec<Call> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                scope.spawn(move || {
+                    let mut out = Vec::new();
+                    let mut n = from + i as u64;
+                    while n <= to {
+                        if let Ok(Some(hash)) = store.canonical_hash(n) {
+                            if let Ok(Some((txs, _))) = store.body(hash) {
+                                let receipts = store.receipts(hash).ok().flatten();
+                                for (idx, tx) in txs.iter().enumerate() {
+                                    if tx.to.as_ref() != bridge.as_slice() {
+                                        continue;
+                                    }
+                                    if tx.input.len() < 4
+                                        || tx.input[..4] != ADD_SIGNATURE_SELECTOR
+                                    {
+                                        continue;
+                                    }
+                                    let key = abi_bytes(&tx.input[4..], 0).unwrap_or_default();
+                                    let pegout =
+                                        abi_bytes(&tx.input[4..], 2).unwrap_or_default();
+                                    out.push(Call {
+                                        block: n,
+                                        tx_index: idx as u32,
+                                        tx_hash: tx.tx_hash(),
+                                        federator_key: key,
+                                        rsk_tx_hash: pegout,
+                                        succeeded: receipts
+                                            .as_ref()
+                                            .and_then(|r| r.get(idx))
+                                            .map(|r| r.status)
+                                            .unwrap_or(false),
+                                    });
+                                }
+                            }
+                        }
+                        n += threads as u64;
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut calls = found;
+    calls.sort_by_key(|c| (c.block, c.tx_index));
+    println!("\naddSignature calls found: {}", calls.len());
+
+    let (mut reverted, mut not_functionary, mut applied) = (0usize, 0usize, 0usize);
+    let mut silent_post: Vec<&Call> = Vec::new();
+    let mut late_post = 0usize;
+    let mut silent_pre: Vec<&Call> = Vec::new();
+    let mut per_key: BTreeMap<String, usize> = BTreeMap::new();
+
+    for c in &calls {
+        let key_hex = hexs(&c.federator_key);
+        if !c.succeeded {
+            reverted += 1;
+            continue;
+        }
+        if !feds.is_functionary(c.block, &key_hex) {
+            not_functionary += 1;
+            continue;
+        }
+        if emitted.contains(&(c.block, c.tx_index)) {
+            applied += 1;
+        } else if c.block >= RSKIP326_MAINNET {
+            // Was the pegout still waiting when this call arrived? If it had
+            // already been released, the signature had nothing to apply to
+            // and the silence is a race between functionaries, not a fault.
+            let finished_earlier = released
+                .get(&hexs(&c.rsk_tx_hash))
+                .is_some_and(|rb| *rb <= c.block);
+            if finished_earlier {
+                late_post += 1;
+            } else {
+                silent_post.push(c);
+                *per_key.entry(key_hex).or_default() += 1;
+            }
+        } else {
+            silent_pre.push(c);
+        }
+    }
+
+    println!("  reverted (malformed DER and the like):       {reverted}");
+    println!("  caller not a functionary at that height:     {not_functionary}");
+    println!("  signature applied (add_signature emitted):   {applied}");
+    println!("  pegout already released, call arrived late:  {late_post}");
+    println!("  functionary call, NO event, >= RSKIP326:     {}  <-- signature not applied", silent_post.len());
+    println!("  functionary call, NO event, <  RSKIP326:     {}  (event fires pre-verification; indeterminate)", silent_pre.len());
+
+    if !silent_post.is_empty() {
+        println!("\nFunctionary calls from #{RSKIP326_MAINNET} on, against a pegout still waiting, that applied nothing:");
+        for c in silent_post.iter().take(100) {
+            println!(
+                "  #{:<9} tx{:<3} 0x{}  key {}",
+                c.block,
+                c.tx_index,
+                hexs(&c.tx_hash.0[..8]),
+                &hexs(&c.federator_key)[..16]
+            );
+        }
+        println!("\nby functionary key:");
+        for (k, n) in &per_key {
+            println!("  {}…  {n}", &k[..16]);
+        }
+    }
+    Ok(())
+}
