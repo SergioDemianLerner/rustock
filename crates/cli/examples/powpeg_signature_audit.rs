@@ -271,7 +271,21 @@ fn main() -> anyhow::Result<()> {
     calls.sort_by_key(|c| (c.block, c.tx_index));
     println!("\naddSignature calls found: {}", calls.len());
 
+    // A federator that has already signed a pegout applies nothing when it
+    // sends the same signature again: `apply_signatures_to_tx` stops at the
+    // first input this key has already signed, so `applied` is false and no
+    // event fires. That is a retry, not a refusal, and the signers do it
+    // constantly. Recognised without state: if an earlier call from the same
+    // key for the same pegout DID emit `add_signature`, this one is a repeat.
+    let mut already_signed: HashSet<(String, String)> = HashSet::new();
+    for c in &calls {
+        if emitted.contains(&(c.block, c.tx_index)) {
+            already_signed.insert((hexs(&c.rsk_tx_hash), hexs(&c.federator_key)));
+        }
+    }
+
     let (mut reverted, mut not_functionary, mut applied) = (0usize, 0usize, 0usize);
+    let mut repeat_post = 0usize;
     let mut silent_post: Vec<&Call> = Vec::new();
     let mut late_post = 0usize;
     let mut silent_pre: Vec<&Call> = Vec::new();
@@ -296,8 +310,12 @@ fn main() -> anyhow::Result<()> {
             let finished_earlier = released
                 .get(&hexs(&c.rsk_tx_hash))
                 .is_some_and(|rb| *rb <= c.block);
+            let repeat = already_signed
+                .contains(&(hexs(&c.rsk_tx_hash), key_hex.clone()));
             if finished_earlier {
                 late_post += 1;
+            } else if repeat {
+                repeat_post += 1;
             } else {
                 silent_post.push(c);
                 *per_key.entry(key_hex).or_default() += 1;
@@ -311,12 +329,29 @@ fn main() -> anyhow::Result<()> {
     println!("  caller not a functionary at that height:     {not_functionary}");
     println!("  signature applied (add_signature emitted):   {applied}");
     println!("  pegout already released, call arrived late:  {late_post}");
+    println!("  same federator had already signed this pegout: {repeat_post}");
     println!("  functionary call, NO event, >= RSKIP326:     {}  <-- signature not applied", silent_post.len());
     println!("  functionary call, NO event, <  RSKIP326:     {}  (event fires pre-verification; indeterminate)", silent_pre.len());
 
     if !silent_post.is_empty() {
         println!("\nFunctionary calls from #{RSKIP326_MAINNET} on, against a pegout still waiting, that applied nothing:");
-        for c in silent_post.iter().take(100) {
+        if let Ok(mut f) = std::fs::File::create("powpeg_unexplained.csv") {
+            use std::io::Write;
+            let _ = writeln!(f, "block,tx_index,tx_hash,federator_key,rsk_tx_hash");
+            for c in &silent_post {
+                let _ = writeln!(
+                    f,
+                    "{},{},0x{},{},{}",
+                    c.block,
+                    c.tx_index,
+                    hexs(&c.tx_hash.0),
+                    hexs(&c.federator_key),
+                    hexs(&c.rsk_tx_hash)
+                );
+            }
+            println!("(full list written to powpeg_unexplained.csv)");
+        }
+        for c in silent_post.iter().take(40) {
             println!(
                 "  #{:<9} tx{:<3} 0x{}  key {}",
                 c.block,
