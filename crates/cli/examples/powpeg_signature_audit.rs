@@ -164,35 +164,81 @@ fn main() -> anyhow::Result<()> {
     eprintln!("pegouts with a release_btc: {}", released.len());
     eprintln!("scanning #{from}..#{to} on {threads} threads for addSignature calls");
 
-    // Stripes: worker i takes every `threads`-th block from `from + i`, so the
-    // workers stay spread over the key space instead of queueing on one region.
+    // Contiguous ranges, one per worker, rather than interleaved strides.
+    // The body is keyed by hash so neither layout helps there, but
+    // `canonical_hash` is keyed by height: a worker walking a contiguous run
+    // of heights hits the same SST blocks repeatedly, where a strided one
+    // touches a different block every step.
+    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let total = to.saturating_sub(from) + 1;
+    let started = std::time::Instant::now();
+
     let found: Vec<Call> = std::thread::scope(|scope| {
+        let reporter = {
+            let done = Arc::clone(&done);
+            scope.spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    let d = done.load(Relaxed);
+                    if d >= total {
+                        return;
+                    }
+                    let secs = started.elapsed().as_secs_f64().max(0.001);
+                    let rate = d as f64 / secs;
+                    let left = (total - d) as f64 / rate.max(1.0);
+                    eprintln!(
+                        "  {:>5.1}%  {d}/{total} blocks  {:.0} blk/s  eta {:.0}m",
+                        100.0 * d as f64 / total as f64,
+                        rate,
+                        left / 60.0
+                    );
+                }
+            })
+        };
+
+        let span = total.div_ceil(threads as u64);
         let handles: Vec<_> = (0..threads)
             .map(|i| {
                 let store = Arc::clone(&store);
+                let done = Arc::clone(&done);
                 scope.spawn(move || {
-                    let mut out = Vec::new();
-                    let mut n = from + i as u64;
-                    while n <= to {
-                        if let Ok(Some(hash)) = store.canonical_hash(n) {
-                            if let Ok(Some((txs, _))) = store.body(hash) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let lo = from + i as u64 * span;
+                    let hi = (lo + span - 1).min(to);
+                    let mut out: Vec<Call> = Vec::new();
+                    let mut since_report = 0u64;
+                    for n in lo..=hi {
+                        let Ok(Some(hash)) = store.canonical_hash(n) else {
+                            continue;
+                        };
+                        if let Ok(Some((txs, _))) = store.body(hash) {
+                            // Find the calls first. The receipts are read only
+                            // when there is one to attach a status to: about
+                            // 26,000 blocks in 9.4 million carry an
+                            // `addSignature`, so fetching them for every block
+                            // was most of the I/O and nearly all of it wasted.
+                            let mut hits: Vec<(usize, Vec<u8>, Vec<u8>)> = Vec::new();
+                            for (idx, tx) in txs.iter().enumerate() {
+                                if tx.to.as_ref() != bridge.as_slice() {
+                                    continue;
+                                }
+                                if tx.input.len() < 4 || tx.input[..4] != ADD_SIGNATURE_SELECTOR {
+                                    continue;
+                                }
+                                hits.push((
+                                    idx,
+                                    abi_bytes(&tx.input[4..], 0).unwrap_or_default(),
+                                    abi_bytes(&tx.input[4..], 2).unwrap_or_default(),
+                                ));
+                            }
+                            if !hits.is_empty() {
                                 let receipts = store.receipts(hash).ok().flatten();
-                                for (idx, tx) in txs.iter().enumerate() {
-                                    if tx.to.as_ref() != bridge.as_slice() {
-                                        continue;
-                                    }
-                                    if tx.input.len() < 4
-                                        || tx.input[..4] != ADD_SIGNATURE_SELECTOR
-                                    {
-                                        continue;
-                                    }
-                                    let key = abi_bytes(&tx.input[4..], 0).unwrap_or_default();
-                                    let pegout =
-                                        abi_bytes(&tx.input[4..], 2).unwrap_or_default();
+                                for (idx, key, pegout) in hits {
                                     out.push(Call {
                                         block: n,
                                         tx_index: idx as u32,
-                                        tx_hash: tx.tx_hash(),
+                                        tx_hash: txs[idx].tx_hash(),
                                         federator_key: key,
                                         rsk_tx_hash: pegout,
                                         succeeded: receipts
@@ -204,13 +250,21 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        n += threads as u64;
+                        since_report += 1;
+                        if since_report == 2_000 {
+                            done.fetch_add(since_report, Relaxed);
+                            since_report = 0;
+                        }
                     }
+                    done.fetch_add(since_report, Relaxed);
                     out
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        let calls: Vec<Call> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        done.store(total, std::sync::atomic::Ordering::Relaxed);
+        let _ = reporter.join();
+        calls
     });
 
     let mut calls = found;
