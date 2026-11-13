@@ -77,4 +77,19 @@ pub enum SyncEvent {
         blocks: Vec<Block>,
         difficulties: Vec<U256>,
     },
+    /// A peer's answer to a unitrie proof request.
+    ///
+    /// Nothing here is believed on arrival. The paths run deepest first and
+    /// mean nothing until they have been hashed up to the state root of a
+    /// header this node validated itself -- see
+    /// `rustock_trie::proof::verify_path`. An empty path is the peer's claim
+    /// that the trie does not hold the key, and is checked as a claim, not
+    /// accepted as an absence.
+    TrieProofResponse {
+        peer: B512,
+        id: u64,
+        block_number: u64,
+        account_proof: Vec<alloy_primitives::Bytes>,
+        storage_proofs: Vec<Vec<alloy_primitives::Bytes>>,
+    },
 }

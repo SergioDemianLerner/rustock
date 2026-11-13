@@ -5,6 +5,7 @@ pub mod key_mapper;
 pub mod node;
 pub mod orchid_converter;
 pub mod path;
+pub mod proof;
 pub mod shared_path;
 pub mod snapshot;
 pub mod snapshot_proof;
