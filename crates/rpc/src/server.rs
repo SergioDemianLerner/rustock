@@ -28,6 +28,29 @@ pub trait TxSubmitter: Send + Sync {
     async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> Result<alloy_primitives::B256, String>;
 }
 
+/// Fetching a unitrie proof from a peer, for a node that holds no state of
+/// its own.
+///
+/// A light client follows headers and never executes a block, so it cannot
+/// answer `eth_getProof` from a local trie -- there is none. It asks a peer
+/// instead, and then checks the answer against the state root in the header
+/// it already validated. This trait is the asking half; the checking happens
+/// in `crate::proof`, which is where the header is.
+///
+/// Returned nodes are **unverified**. An implementation that cannot name the
+/// root it would verify against must not pretend to verify.
+#[async_trait::async_trait]
+pub trait ProofFetcher: Send + Sync {
+    /// Raw unitrie node messages: the account path, then one path per
+    /// requested storage key, in order.
+    async fn fetch_proof(
+        &self,
+        block_number: u64,
+        address: alloy_primitives::Address,
+        storage_keys: Vec<alloy_primitives::B256>,
+    ) -> Result<(Vec<alloy_primitives::Bytes>, Vec<Vec<alloy_primitives::Bytes>>), String>;
+}
+
 /// What `eth_gasPrice` needs, without the RPC crate depending on sync.
 pub trait GasPriceSource: Send + Sync {
     /// rskj `GasPriceTracker.getGasPrice()`.
@@ -78,6 +101,10 @@ pub struct RpcState {
     pub config: Arc<ChainConfig>,
     pub tx_submitter: Option<Arc<dyn TxSubmitter>>,
     pub trie_store: Option<Arc<dyn TrieStore>>,
+    /// Set on a light client, which has no `trie_store` to read and must ask
+    /// a peer instead. When both are present the local trie wins: it needs
+    /// no network round trip and no verification.
+    pub proof_fetcher: Option<Arc<dyn ProofFetcher>>,
     pub hardfork_cfg: Option<RskHardforkConfig>,
     pub filter_store: Arc<logs::FilterStore>,
     pub tx_pool: Option<Arc<dyn TxPoolReader>>,
@@ -348,7 +375,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_coinbase" => eth::eth_coinbase(id, &state.miner),
         "eth_getBlockByHash" => eth::eth_get_block_by_hash(id, params, &state.store, crate::helpers::chain_id_of(state)),
         "eth_getBlockByNumber" => eth::eth_get_block_by_number(id, params, &state.store, crate::helpers::chain_id_of(state)),
-        "eth_getProof" => proof::eth_get_proof(id, params, state),
+        "eth_getProof" => proof::eth_get_proof(id, params, state).await,
         "eth_getBlockTransactionCountByHash" => eth::eth_get_block_transaction_count_by_hash(id, params, &state.store),
         "eth_getBlockTransactionCountByNumber" => eth::eth_get_block_transaction_count_by_number(id, params, &state.store),
         "eth_getUncleCountByBlockHash" => eth::eth_get_uncle_count_by_block_hash(id, params, &state.store),

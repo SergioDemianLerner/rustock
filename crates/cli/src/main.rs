@@ -53,6 +53,35 @@ impl rustock_rpc::server::TxSubmitter for TxRelaySubmitter {
     }
 }
 
+/// A light client's route to state: ask a peer, then verify.
+///
+/// The bridge lives here rather than in sync because sync does not depend on
+/// rpc. It returns the peer's nodes unchecked on purpose -- `rustock_rpc`'s
+/// proof module holds the headers and is the only place that can name the
+/// root a proof must hash up to.
+struct PeerProofFetcher(rustock_sync::proof_client::ProofClient);
+
+#[async_trait::async_trait]
+impl rustock_rpc::server::ProofFetcher for PeerProofFetcher {
+    async fn fetch_proof(
+        &self,
+        block_number: u64,
+        address: alloy_primitives::Address,
+        storage_keys: Vec<alloy_primitives::B256>,
+    ) -> Result<
+        (Vec<alloy_primitives::Bytes>, Vec<Vec<alloy_primitives::Bytes>>),
+        String,
+    > {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+        let proof = self
+            .0
+            .fetch(block_number, address, storage_keys, DEADLINE)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((proof.account_proof, proof.storage_proofs))
+    }
+}
+
 struct PoolAdapter(Arc<rustock_sync::TransactionPool>);
 
 /// The gas-price tracker, as `eth_gasPrice` needs it.
@@ -3581,6 +3610,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             config: config.clone(),
             tx_submitter: Some(Arc::new(TxRelaySubmitter(tx_relay.clone()))),
             trie_store: Some(trie_store),
+            // This node holds its own trie, so it answers eth_getProof from
+            // it and never asks a peer. The fetcher is for a light client,
+            // which has no trie to read.
+            proof_fetcher: None,
             hardfork_cfg: Some(hardfork_cfg),
             filter_store: Arc::new(rustock_rpc::logs::FilterStore::new()),
             tx_pool: Some(Arc::new(PoolAdapter(pool.clone()))),
