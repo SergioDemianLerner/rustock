@@ -568,6 +568,17 @@ pub struct SyncService {
     /// Carries the peer each request was sent to, so the answer can be
     /// matched against it.
     pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header, Instant, B512)>,
+    /// Unitrie proof requests this node is waiting on, by request id.
+    ///
+    /// A light client's RPC caller is blocked on one of these, so the entry
+    /// carries the channel that wakes it. Nothing arriving here is trusted:
+    /// the caller verifies the nodes against the state root in a header it
+    /// validated itself before any of it reaches the user.
+    pub(crate) pending_proofs: HashMap<u64, crate::proof_client::PendingProof>,
+    /// Proof requests arriving from the RPC layer, when this node serves a
+    /// light client's `eth_getProof` by asking a peer. `None` on a node that
+    /// answers from its own trie and never needs to ask.
+    pub(crate) proof_rx: Option<mpsc::Receiver<crate::proof_client::ProofCommand>>,
     /// Blocks whose body was derived from the header rather than requested.
     /// Counted so the saving can be checked against an offline prediction.
     pub(crate) derived_bodies: u64,
@@ -704,6 +715,8 @@ impl SyncService {
             violation_since: None,
             follow_gap_since: None,
             pending_follow_bodies: HashMap::new(),
+            pending_proofs: HashMap::new(),
+            proof_rx: None,
             derived_bodies: 0,
             underivable: std::collections::HashSet::new(),
             follow_buffer: BTreeMap::new(),
@@ -1066,6 +1079,18 @@ impl SyncService {
                 _ = timer.tick() => {
                     self.on_tick().await;
                 }
+                // `async { None }` when nothing can send, so the branch is
+                // simply never ready rather than closing the loop.
+                cmd = async {
+                    match self.proof_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(cmd) = cmd {
+                        self.send_trie_proof_request(cmd).await;
+                    }
+                }
                 event = self.event_rx.recv() => {
                     self.wire_queue_depth
                         .store(self.event_rx.len(), std::sync::atomic::Ordering::Relaxed);
@@ -1089,6 +1114,17 @@ impl SyncService {
                 }
             }
         }
+    }
+
+    /// Let this node fetch unitrie proofs from peers on an RPC caller's
+    /// behalf, returning the handle the RPC layer holds.
+    ///
+    /// Only a node that cannot answer from its own trie needs this. A full
+    /// node reads the account itself and never asks anybody.
+    pub fn with_proof_fetching(&mut self) -> crate::proof_client::ProofClient {
+        let (tx, rx) = mpsc::channel(64);
+        self.proof_rx = Some(rx);
+        crate::proof_client::ProofClient::new(tx)
     }
 
     /// Attach a trie store without a block processor, for tests that exercise
@@ -3394,10 +3430,24 @@ impl SyncService {
                     );
                     return;
                 }
+                // Not chain data this node would adopt: it is an answer to
+                // something this node asked for on a caller's behalf, and
+                // dropping it would hang that caller rather than protect
+                // anything.
+                SyncEvent::TrieProofResponse { .. } => {}
             }
         }
 
         match event {
+            SyncEvent::TrieProofResponse {
+                peer,
+                id,
+                block_number,
+                account_proof,
+                storage_proofs,
+            } => {
+                self.on_trie_proof_response(peer, id, block_number, account_proof, storage_proofs);
+            }
             SyncEvent::BlockHashResponse { hash, .. } => {
                 self.on_block_hash_response(hash).await;
             }
@@ -4364,6 +4414,79 @@ impl SyncService {
                     .insert(req_id, (hash, header.clone(), Instant::now(), *peer));
             }
         }
+    }
+
+    /// Match a peer's proof answer to the caller waiting on it.
+    ///
+    /// Nothing is verified here, by design: this layer does not hold the
+    /// headers, and a check that cannot name the root it is checking against
+    /// looks like a guarantee without being one. The caller has the header
+    /// and does the checking.
+    pub(crate) fn on_trie_proof_response(
+        &mut self,
+        peer: B512,
+        id: u64,
+        block_number: u64,
+        account_proof: Vec<alloy_primitives::Bytes>,
+        storage_proofs: Vec<Vec<alloy_primitives::Bytes>>,
+    ) {
+        let Some(pending) = self.pending_proofs.remove(&id) else {
+            trace!(
+                target: "rustock::sync",
+                "a trie proof arrived for request {id}, which nothing is waiting on"
+            );
+            return;
+        };
+        // An answer from a peer other than the one asked is not usable: ids
+        // are random, but accepting any sender would let an unasked peer race
+        // the real one and have its answer taken instead.
+        if pending.peer != peer {
+            trace!(
+                target: "rustock::sync",
+                "discarding a trie proof for {id} from a peer that was not asked"
+            );
+            self.pending_proofs.insert(id, pending);
+            return;
+        }
+        let _ = pending.reply.send(crate::proof_client::RawProof {
+            peer,
+            block_number,
+            account_proof,
+            storage_proofs,
+        });
+    }
+
+    /// Send one caller's proof request to a peer.
+    pub(crate) async fn send_trie_proof_request(
+        &mut self,
+        cmd: crate::proof_client::ProofCommand,
+    ) {
+        // Served from whichever peer this node is connected to. A light
+        // client should spread these around and retry elsewhere on a bad
+        // answer, but the answer is verified against the caller's own header
+        // either way, so a bad peer costs a round trip rather than a wrong
+        // result.
+        let peers: Vec<B512> = self.peer_store.peers().await;
+        let Some(peer) = peers.first().copied() else {
+            // Dropping `cmd.reply` wakes the caller with Unavailable, which
+            // is the truth: there is nobody to ask.
+            trace!(target: "rustock::sync", "no peer to ask for a trie proof");
+            return;
+        };
+        let (id, msg) = crate::proof_client::create_trie_proof_request(
+            cmd.block_number,
+            cmd.address,
+            cmd.storage_keys,
+        );
+        self.peer_store.send_to_peer(&peer, msg).await;
+        self.pending_proofs.insert(
+            id,
+            crate::proof_client::PendingProof {
+                reply: cmd.reply,
+                sent: Instant::now(),
+                peer,
+            },
+        );
     }
 
     /// Send body requests for pending headers up to a bounded window, assigning
