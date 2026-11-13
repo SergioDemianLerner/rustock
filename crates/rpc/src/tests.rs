@@ -54,6 +54,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -623,6 +624,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: Some(Arc::new(MockSubmitter)),
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -678,6 +680,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: Some(Arc::new(MockSubmitter)),
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -766,6 +769,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -906,6 +910,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -1011,6 +1016,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -1204,6 +1210,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -1576,6 +1583,7 @@ async fn test_receipt_dto_failed_status() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -2437,6 +2445,7 @@ fn setup_state_with_receipts(
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -2711,6 +2720,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -3714,6 +3724,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -4205,6 +4216,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -6027,4 +6039,146 @@ async fn get_proof_rejects_a_missing_slot_array() {
     )
     .await;
     assert!(resp.error.is_some(), "the slot array is required, even when empty");
+}
+
+// ===== eth_getProof on a light client =====
+//
+// A node with no trie of its own asks a peer and checks the answer against
+// the state root of a header it validated itself. These tests take a real
+// proof out of a real trie, hand it to a node that has been stripped of that
+// trie, and then try to fool it.
+
+mod light_proof_tests {
+    use super::*;
+    use rustock_trie::{account_key, TrieKeySlice, TrieNode, TrieStore};
+    use std::sync::Arc;
+
+    /// A peer, honest or otherwise.
+    struct FakePeer {
+        account_proof: Vec<alloy_primitives::Bytes>,
+        storage_proofs: Vec<Vec<alloy_primitives::Bytes>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::server::ProofFetcher for FakePeer {
+        async fn fetch_proof(
+            &self,
+            _block_number: u64,
+            _address: Address,
+            _storage_keys: Vec<B256>,
+        ) -> Result<(Vec<alloy_primitives::Bytes>, Vec<Vec<alloy_primitives::Bytes>>), String>
+        {
+            Ok((self.account_proof.clone(), self.storage_proofs.clone()))
+        }
+    }
+
+    fn path_for(root: &TrieNode, store: &dyn TrieStore, key: &[u8]) -> Vec<alloy_primitives::Bytes> {
+        root.nodes_on_path(&TrieKeySlice::from_key(key), store)
+            .map(|nodes| {
+                nodes.iter().map(|n| alloy_primitives::Bytes::from(n.to_message(store))).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A full node's state, with the trie taken away and a peer put in its
+    /// place -- which is what a light client is.
+    fn light_node(peer: FakePeer) -> (crate::server::RpcState, tempfile::TempDir, Address) {
+        let (mut state, tmp, addr, _root) = setup_proof_state();
+        let trie_store = state.trie_store.clone().unwrap();
+        let header = crate::state::resolve_header("latest", &state.store).unwrap();
+        let root_bytes = trie_store.get(header.state_root.as_slice()).unwrap();
+        let _ = TrieNode::from_message(&root_bytes, &*trie_store);
+
+        state.trie_store = None;
+        state.proof_fetcher = Some(Arc::new(peer));
+        (state, tmp, addr)
+    }
+
+    fn honest_peer() -> (FakePeer, Address) {
+        let (state, _tmp, addr, _) = setup_proof_state();
+        let trie_store = state.trie_store.clone().unwrap();
+        let header = crate::state::resolve_header("latest", &state.store).unwrap();
+        let root_bytes = trie_store.get(header.state_root.as_slice()).unwrap();
+        let root = TrieNode::from_message(&root_bytes, &*trie_store);
+        let peer = FakePeer {
+            account_proof: path_for(&root, &*trie_store, &account_key(&addr)),
+            storage_proofs: Vec::new(),
+        };
+        std::mem::forget(_tmp);
+        (peer, addr)
+    }
+
+    #[tokio::test]
+    async fn an_honest_peer_gives_the_light_client_a_verified_balance() {
+        let (peer, _) = honest_peer();
+        let (state, _tmp, addr) = light_node(peer);
+
+        let req = make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"]));
+        let r = dispatch_for_test(&state, req).await;
+        let r = r.result.expect("an honest proof must be accepted");
+
+        assert_eq!(r["balance"], json!("0xf4240"), "1,000,000, proved rather than taken on trust");
+        assert_eq!(r["nonce"], json!("0x7"));
+        assert!(!r["accountProof"].as_array().unwrap().is_empty());
+    }
+
+    /// The attack the whole verification exists to stop. Every node here is
+    /// genuine and correctly linked; it is simply not this account's path.
+    /// Accepting it would report somebody else's balance as yours.
+    #[tokio::test]
+    async fn a_proof_for_a_different_account_is_refused() {
+        let (mut peer, _) = honest_peer();
+        // Keep only the root: a well-formed start that does not reach the
+        // key, which is what any substituted path looks like.
+        let last = peer.account_proof.last().cloned().unwrap();
+        peer.account_proof = vec![last];
+
+        let (state, _tmp, addr) = light_node(peer);
+        let req = make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"]));
+        let r = dispatch_for_test(&state, req).await;
+
+        assert!(r.result.is_none(), "an unprovable answer must not be returned as a balance");
+        let err = r.error.expect("and must be an error");
+        assert!(
+            err.message.contains("does not check out"),
+            "the error should say the proof failed, got {:?}",
+            err.message
+        );
+    }
+
+    /// Silence must not read as a zero balance, or any peer could erase any
+    /// account by sending nothing.
+    #[tokio::test]
+    async fn an_empty_proof_is_an_error_and_not_a_zero_balance() {
+        let peer = FakePeer { account_proof: Vec::new(), storage_proofs: Vec::new() };
+        let (state, _tmp, addr) = light_node(peer);
+
+        let req = make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"]));
+        let r = dispatch_for_test(&state, req).await;
+
+        assert!(
+            r.result.is_none(),
+            "an empty proof must not be reported as an account with nothing in it"
+        );
+        assert!(r.error.is_some());
+    }
+
+    /// A tampered node changes its own hash, so it stops being the child its
+    /// parent names.
+    #[tokio::test]
+    async fn a_tampered_node_is_refused() {
+        let (mut peer, _) = honest_peer();
+        let leaf = peer.account_proof[0].to_vec();
+        let mut forged = leaf.clone();
+        let n = forged.len();
+        forged[n - 1] ^= 0xFF; // change the balance's last byte
+        peer.account_proof[0] = alloy_primitives::Bytes::from(forged);
+
+        let (state, _tmp, addr) = light_node(peer);
+        let req = make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"]));
+        let r = dispatch_for_test(&state, req).await;
+
+        assert!(r.result.is_none(), "a forged balance must not be served");
+        assert!(r.error.is_some());
+    }
 }
