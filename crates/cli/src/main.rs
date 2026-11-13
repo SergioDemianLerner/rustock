@@ -528,6 +528,31 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_peg_event_recording: bool,
 
+    /// Run as an SPV client: answer state queries by asking a peer and
+    /// checking the proof, rather than by reading a local trie.
+    ///
+    /// Not to be confused with `node-light.example.toml`, which configures a
+    /// pruned *full* node -- that one executes every block and reads its own
+    /// trie on a few gigabytes. This one executes nothing and has no trie.
+    ///
+    /// A light client follows headers and never executes a block, so it has
+    /// no state of its own. `eth_getProof` goes out over the wire and the
+    /// answer is verified against the state root of a header this node
+    /// validated itself -- a peer that lies costs a round trip, not a wrong
+    /// balance.
+    ///
+    /// This is what makes the account modification witness usable: a wallet
+    /// reads `lastModifiedBlock` from a proof and walks an account's history
+    /// backwards one proven hop per modified block, which is the only way to
+    /// follow native rBTC, since a value transfer emits no log and sets no
+    /// bloom bit.
+    ///
+    /// Today this switches the *state* path only -- the node still syncs and
+    /// executes as it otherwise would. Following headers alone is a larger
+    /// change and is not done here.
+    #[arg(long, default_value_t = false)]
+    spv: bool,
+
     /// Where those records go. Defaults to `<data-dir>/peg-events`.
     ///
     /// A database of its own, not a column family of the node's: these events
@@ -1559,6 +1584,7 @@ fn apply_file_config(
 
     apply(matches, "read_threads", f.trie.read_threads.as_ref(), &mut a.read_threads);
 
+    apply(matches, "spv", f.spv.enabled.as_ref(), &mut a.spv);
     apply(matches, "no_peg_event_recording", f.peg_events.disabled.as_ref(), &mut a.no_peg_event_recording);
     apply_opt(matches, "peg_events_dir", f.peg_events.dir.as_ref(), &mut a.peg_events_dir);
     apply(matches, "prune_keep_depth", f.prune.keep_depth.as_ref(), &mut a.prune_keep_depth);
@@ -3146,6 +3172,20 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     // answers with the live backlog.
     // Shared with the prune sweep below. Closed until the sync service has
     // determined what this node is doing.
+    // A light client answers state queries by asking a peer, so the service
+    // needs a way to carry those requests and match the answers. A full node
+    // reads its own trie and never asks, so this stays off.
+    let proof_fetcher: Option<Arc<dyn rustock_rpc::server::ProofFetcher>> = if args.spv {
+        let client = sync_service.with_proof_fetching();
+        info!(
+            "SPV mode: state queries will be fetched from peers and verified against \
+             this node's own validated headers"
+        );
+        Some(Arc::new(PeerProofFetcher(client)))
+    } else {
+        None
+    };
+
     let prune_gate = sync_service.prune_gate();
     let wire_queue_depth = sync_service.wire_queue_depth();
 
@@ -3609,11 +3649,13 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             peer_store: peer_store.clone(),
             config: config.clone(),
             tx_submitter: Some(Arc::new(TxRelaySubmitter(tx_relay.clone()))),
-            trie_store: Some(trie_store),
-            // This node holds its own trie, so it answers eth_getProof from
-            // it and never asks a peer. The fetcher is for a light client,
-            // which has no trie to read.
-            proof_fetcher: None,
+            // A light client has no state of its own to consult, so the
+            // trie is withheld from the RPC layer even when one exists on
+            // disk: leaving it in place would let `eth_getProof` quietly
+            // answer from local state and never exercise the proof path,
+            // which is the one a real light client depends on.
+            trie_store: if args.spv { None } else { Some(trie_store) },
+            proof_fetcher: proof_fetcher.clone(),
             hardfork_cfg: Some(hardfork_cfg),
             filter_store: Arc::new(rustock_rpc::logs::FilterStore::new()),
             tx_pool: Some(Arc::new(PoolAdapter(pool.clone()))),

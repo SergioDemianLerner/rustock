@@ -210,6 +210,12 @@ backend = "epoch"                   # light: bounds state size. This setting ALO
 # disabled = false                 # default — recording is on
 # dir = "..."                       # default: unset — <data-dir>/peg-events
 
+# SPV client. Not what this profile is: a light NODE still executes every
+# block and reads its own trie, which is why it keeps state at all. An SPV
+# client executes nothing and has no trie. Left off here.
+[spv]
+# enabled = false                   # default — read the local trie
+
 [prune]
 blocks = true                       # light: run sweeps. Default false -- pruning discards
 

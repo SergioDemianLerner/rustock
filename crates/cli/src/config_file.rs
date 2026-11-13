@@ -64,6 +64,8 @@ pub struct FileConfig {
     pub metrics: MetricsSection,
     #[serde(default)]
     pub chain: ChainSection,
+    #[serde(default)]
+    pub spv: SpvSection,
 }
 
 /// Regtest chain settings, for a chain that has to match one an rskj node
@@ -261,7 +263,22 @@ pub struct CheckpointSection {
 /// `registerFlyoverBtcTransaction` calls no event logger at any height, so
 /// every Flyover peg-in is absent from the receipts and therefore from
 /// `bridge_events`, which is built from them. Recording keeps a store of the
-/// complement current as blocks arrive.
+/// Running as an SPV client.
+///
+/// Deliberately not called "light": `node-light.example.toml` already uses
+/// that word for a pruned full node that keeps current state on a few
+/// gigabytes. That node executes every block and reads its own trie. This
+/// one executes nothing and has no trie at all. Sharing a name would invite
+/// an operator to turn on the wrong one.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpvSection {
+    /// Answer state queries by asking a peer and verifying the proof,
+    /// instead of reading a local trie.
+    pub enabled: Option<bool>,
+}
+
+/// Reconstructed peg events, kept current as blocks arrive.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PegEventsSection {
@@ -456,6 +473,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "rpc_admin",
     "wallet_file",
     "no_rpc",
+    "spv",
     "no_peg_event_recording",
     "peg_events_dir",
     "ws",
