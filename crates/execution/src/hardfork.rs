@@ -89,6 +89,14 @@ pub enum ConsensusRule {
     Rskip351,
     Rskip535,
     Rskip536,
+    /// The account modification witness: `lastModifiedBlock` and
+    /// `intraBlockCount` on the account record, and the embedding bound
+    /// raised from 44 to 52 so the longer record does not evict account
+    /// leaves. Drafted as
+    /// `/home/paseo/doc/RSKIP-account-modification-witness.md`; it has no
+    /// number yet, so it is scheduled on no network and is reachable only by
+    /// an explicit `consensusRules` entry.
+    AccountWitness,
 }
 
 impl ConsensusRule {
@@ -98,6 +106,7 @@ impl ConsensusRule {
             "rskip351" => Self::Rskip351,
             "rskip535" => Self::Rskip535,
             "rskip536" => Self::Rskip536,
+            "rskipAccountWitness" => Self::AccountWitness,
             _ => return None,
         })
     }
@@ -805,6 +814,33 @@ impl RskHardforkConfig {
         }
         self.activation_height(RskNetworkUpgrade::Reed810)
             .is_some_and(|h| block_number >= h)
+    }
+
+    /// The account modification witness (RSKIP draft, unnumbered).
+    ///
+    /// Unlike every other rule here this one falls back to **off** rather
+    /// than to a network upgrade, because it is scheduled on no network yet.
+    /// A chain turns it on with a `rskipAccountWitness` entry in
+    /// `consensusRules`, which is how regtest enables it for the
+    /// light-client integration tests.
+    pub fn has_account_witness(&self, block_number: u64) -> bool {
+        self.rule_override(ConsensusRule::AccountWitness)
+            .is_some_and(|height| height.is_some_and(|h| block_number >= h))
+    }
+
+    /// The unitrie node embedding bound in force at this height.
+    ///
+    /// Part of the same rule: the witness fields add about five bytes to an
+    /// account record, and 92% of embeddable account nodes measured on
+    /// mainnet sit in the 40-44 byte band, so without the raise they would
+    /// be evicted from embedding at roughly 68 bytes and one extra trie node
+    /// each.
+    pub fn max_embedded_node_size(&self, block_number: u64) -> usize {
+        if self.has_account_witness(block_number) {
+            rustock_trie::WITNESS_MAX_EMBEDDED_NODE_SIZE
+        } else {
+            rustock_trie::LEGACY_MAX_EMBEDDED_NODE_SIZE
+        }
     }
 
     /// RSKIP535: the `baseEvent` header-extension field, which makes the

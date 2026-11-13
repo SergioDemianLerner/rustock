@@ -22,4 +22,7 @@ pub use key_mapper::{
 pub use node::{empty_trie_hash, NodeRef, Resolution, TrieNode};
 pub use orchid_converter::orchid_state_root;
 pub use path::TrieKeySlice;
-pub use store::{MemoryTrieStore, OverlayTrieStore, TrieStore};
+pub use store::{
+    EmbeddingBound, MemoryTrieStore, OverlayTrieStore, TrieStore, LEGACY_MAX_EMBEDDED_NODE_SIZE,
+    WITNESS_MAX_EMBEDDED_NODE_SIZE,
+};

@@ -43,6 +43,19 @@ pub fn apply_state_changes(
     state: &EvmState,
     markers: &ContractMarkers,
 ) -> TrieNode {
+    apply_state_changes_with_witness(root, store, state, markers, None)
+}
+
+/// [`apply_state_changes`], writing the account modification witness when
+/// the rule is active. `witness` is `None` before activation, and then this
+/// produces byte-identical records to the pre-rule encoder.
+pub fn apply_state_changes_with_witness(
+    root: &TrieNode,
+    store: &dyn TrieStore,
+    state: &EvmState,
+    markers: &ContractMarkers,
+    witness: Option<&crate::witness::WitnessContext<'_>>,
+) -> TrieNode {
     let mut new_root = root.clone();
 
     // Writes are collected and applied in one descent at the end;
@@ -72,7 +85,13 @@ pub fn apply_state_changes(
             continue;
         }
 
-        batch.push(account_info_entry(addr, account));
+        batch.push(account_info_entry_with_witness(
+            addr,
+            account,
+            witness,
+            Some(root),
+            Some(store),
+        ));
 
         if account.status.contains(AccountStatus::Created) {
             // rskj calls `setupContract` (which writes the storage-prefix
@@ -203,8 +222,64 @@ fn apply_batch(
 }
 
 fn account_info_entry(addr: &Address, account: &revm::state::Account) -> (Vec<u8>, Vec<u8>) {
-    let acct = AccountState::new(U256::from(account.info.nonce), account.info.balance);
-    (account_key(addr), acct.encode())
+    account_info_entry_with_witness(addr, account, None, None, None)
+}
+
+/// The account record to write, carrying the modification witness when the
+/// rule is active.
+///
+/// An account this block *changed* takes `(block, count - 1)`. An account
+/// merely touched keeps whatever witness it already had, which costs a read
+/// of the existing record -- without it the write would silently reset the
+/// witness to zero and the account's history would appear to begin again.
+/// That read is confined to touched-but-unchanged accounts; a changed one is
+/// overwritten and never needs it.
+fn account_info_entry_with_witness(
+    addr: &Address,
+    account: &revm::state::Account,
+    witness: Option<&crate::witness::WitnessContext<'_>>,
+    root: Option<&TrieNode>,
+    store: Option<&dyn TrieStore>,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut acct = AccountState::new(U256::from(account.info.nonce), account.info.balance);
+    let key = account_key(addr);
+
+    if let Some(w) = witness {
+        let n = w.counts.get(addr).copied().unwrap_or(0);
+        let prev = root.zip(store).and_then(|(root, store)| {
+            root.get(&TrieKeySlice::from_key(&key), store)
+                .and_then(|b| AccountState::decode(&b).ok())
+        });
+        match (n, prev) {
+            // Touched but unchanged: carry the existing witness forward.
+            // Without this the write resets it and the account's history
+            // appears to begin again.
+            (0, prev) => {
+                if let Some(prev) = prev {
+                    acct.last_modified_block = prev.last_modified_block;
+                    acct.intra_block_count = prev.intra_block_count;
+                }
+            }
+            // Already modified earlier in this same block, by an earlier
+            // sublist. A block whose sublists run separately commits each
+            // one's changes in turn, so this function runs more than once
+            // per block and must add rather than overwrite -- otherwise the
+            // sequential sublist's write would erase the parallel ones'
+            // count and report one modification where there were several.
+            (n, Some(prev)) if prev.last_modified_block == w.block => {
+                acct.intra_block_count = prev.intra_block_count + n;
+                acct.last_modified_block = w.block;
+            }
+            // First modification in this block: n changes means n - 1
+            // beyond the first.
+            (n, _) => {
+                acct.last_modified_block = w.block;
+                acct.intra_block_count = n - 1;
+            }
+        }
+    }
+
+    (key, acct.encode())
 }
 
 /// The write a storage slot asks for, or `None` when it asks for a
@@ -622,5 +697,121 @@ mod tests {
             root2.compute_hash(&store),
             "applying same state changes should produce same trie hash"
         );
+    }
+}
+
+#[cfg(test)]
+mod witness_application_tests {
+    use super::*;
+    use crate::witness::{ModificationCounts, WitnessContext};
+    use revm::state::{Account, AccountInfo, AccountStatus};
+    use rustock_trie::MemoryTrieStore;
+
+    fn touched(nonce: u64, balance: u64) -> Account {
+        Account {
+            info: AccountInfo { nonce, balance: U256::from(balance), ..Default::default() },
+            status: AccountStatus::Touched,
+            ..Default::default()
+        }
+    }
+
+    fn read_back(root: &TrieNode, store: &dyn TrieStore, addr: &Address) -> AccountState {
+        let raw = root
+            .get(&TrieKeySlice::from_key(&account_key(addr)), store)
+            .expect("account must exist");
+        AccountState::decode(&raw).expect("account must decode")
+    }
+
+    fn apply(
+        root: &TrieNode,
+        store: &dyn TrieStore,
+        addr: &Address,
+        acct: Account,
+        block: u64,
+        count: u64,
+    ) -> TrieNode {
+        let mut state = EvmState::default();
+        state.insert(*addr, acct);
+        let counts: ModificationCounts =
+            if count == 0 { ModificationCounts::new() } else { [(*addr, count)].into_iter().collect() };
+        let ctx = WitnessContext { block, counts: &counts };
+        apply_state_changes_with_witness(root, store, &state, &ContractMarkers::default(), Some(&ctx))
+    }
+
+    #[test]
+    fn a_changed_account_records_the_block_and_the_count() {
+        let store = MemoryTrieStore::new();
+        let addr = Address::repeat_byte(1);
+
+        let root = apply(&TrieNode::empty(), &store, &addr, touched(1, 500), 7, 1);
+        let a = read_back(&root, &store, &addr);
+        assert_eq!(a.last_modified_block, 7);
+        assert_eq!(a.intra_block_count, 0, "one modification means none beyond the first");
+
+        // Three modifications in one block.
+        let root = apply(&root, &store, &addr, touched(2, 900), 9, 3);
+        let a = read_back(&root, &store, &addr);
+        assert_eq!(a.last_modified_block, 9);
+        assert_eq!(a.intra_block_count, 2);
+    }
+
+    /// An account a block merely touched must keep the witness it had. If the
+    /// write reset it, the account's history would appear to begin again and
+    /// a light client walking backwards would stop early.
+    #[test]
+    fn a_touched_but_unchanged_account_keeps_its_witness() {
+        let store = MemoryTrieStore::new();
+        let addr = Address::repeat_byte(2);
+
+        let root = apply(&TrieNode::empty(), &store, &addr, touched(1, 500), 7, 1);
+        let root = apply(&root, &store, &addr, touched(1, 500), 11, 0);
+
+        let a = read_back(&root, &store, &addr);
+        assert_eq!(a.last_modified_block, 7, "a touch is not a modification");
+        assert_eq!(a.intra_block_count, 0);
+    }
+
+    /// A block whose sublists run separately commits each one's changes in
+    /// turn, so this function runs more than once per block. The second run
+    /// must add to the count rather than overwrite it.
+    #[test]
+    fn counts_from_successive_sublists_accumulate_within_one_block() {
+        let store = MemoryTrieStore::new();
+        let addr = Address::repeat_byte(3);
+
+        // Parallel sublist: one modification at block 20.
+        let root = apply(&TrieNode::empty(), &store, &addr, touched(1, 100), 20, 1);
+        assert_eq!(read_back(&root, &store, &addr).intra_block_count, 0);
+
+        // Sequential sublist, same block: two more.
+        let root = apply(&root, &store, &addr, touched(3, 300), 20, 2);
+        let a = read_back(&root, &store, &addr);
+        assert_eq!(a.last_modified_block, 20);
+        assert_eq!(
+            a.intra_block_count, 2,
+            "three modifications in one block means two beyond the first"
+        );
+    }
+
+    /// With no witness context the encoder must produce exactly the record it
+    /// produced before the rule existed.
+    #[test]
+    fn without_the_rule_the_record_is_unchanged() {
+        let store = MemoryTrieStore::new();
+        let addr = Address::repeat_byte(4);
+
+        let mut state = EvmState::default();
+        state.insert(addr, touched(5, 1234));
+        let root = apply_state_changes_with_witness(
+            &TrieNode::empty(),
+            &store,
+            &state,
+            &ContractMarkers::default(),
+            None,
+        );
+        let a = read_back(&root, &store, &addr);
+        assert_eq!(a.last_modified_block, 0);
+        assert_eq!(a.intra_block_count, 0);
+        assert_eq!(a.encode(), AccountState::new(U256::from(5), U256::from(1234)).encode());
     }
 }

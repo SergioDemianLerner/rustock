@@ -6,9 +6,46 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// The embedding bound before RSKIP-TBD raises it.
+pub const LEGACY_MAX_EMBEDDED_NODE_SIZE: usize = 44;
+
+/// The embedding bound from RSKIP-TBD onward: 44 plus the largest growth the
+/// witness fields can inflict on an account record -- one byte for a
+/// `stateFlags` that must now be emitted even when zero, five for a
+/// `lastModifiedBlock` once block numbers exceed 16,777,215, and two for an
+/// `intraBlockCount` that reaches three digits.
+pub const WITNESS_MAX_EMBEDDED_NODE_SIZE: usize = 52;
+
 pub trait TrieStore: Send + Sync {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
     fn put(&self, key: &[u8], value: &[u8]);
+
+    /// The largest node that may be embedded in its parent rather than
+    /// stored under its own hash.
+    ///
+    /// This lives on the store because the store is the one thing already
+    /// threaded through every call that decides embedding -- `to_message`,
+    /// `message_length`, `collect_for_save` -- so putting it here raises the
+    /// bound without touching a single call site.
+    ///
+    /// It is a per-height value, not a constant, because RSKIP-TBD raises it
+    /// from 44 to 52 so that the two witness fields added to the account
+    /// record do not evict account leaves from embedding. Measured on
+    /// mainnet, 92% of embeddable account nodes sit in the 40-44 byte band
+    /// and would otherwise be pushed out, at roughly 68 bytes and one extra
+    /// trie node each.
+    ///
+    /// The raise needs no migration. A child's embedded status is recorded
+    /// in its parent's flags byte and is authoritative on read, so a node
+    /// written under either bound stays readable; the size test runs once
+    /// per child, when that child is written, and an unmodified child is
+    /// carried through by reference rather than re-measured. The new bound
+    /// therefore reaches a node only when that node is next rewritten --
+    /// the same laziness the witness fields have, so both halves of the
+    /// rule land on an account at the same moment.
+    fn max_embedded_node_size(&self) -> usize {
+        LEGACY_MAX_EMBEDDED_NODE_SIZE
+    }
 
     /// Write many entries at once.
     ///
@@ -427,6 +464,177 @@ mod overlay_clear_tests {
             o.get(b"carried").as_deref(),
             Some(&b"C"[..]),
             "a spilled write must survive clear_overlay"
+        );
+    }
+}
+
+/// A store that delegates everything but reports a different embedding
+/// bound.
+///
+/// The bound is a per-height consensus value once RSKIP-TBD activates, and
+/// the store is the only thing already threaded through every call that
+/// decides embedding -- `to_message`, `message_length`, `collect_for_save`.
+/// Wrapping for the duration of one block therefore sets the bound for all
+/// of them without a global, which also keeps tests at different heights
+/// from interfering when they run in parallel.
+///
+/// Every call that participates in computing a state root for a block must
+/// use the same wrapper: applying changes, hashing, and saving alike. Mixing
+/// a wrapped and an unwrapped store within one block would produce a root
+/// neither bound agrees with.
+pub struct EmbeddingBound<'a> {
+    inner: &'a dyn TrieStore,
+    bound: usize,
+}
+
+impl<'a> EmbeddingBound<'a> {
+    pub fn new(inner: &'a dyn TrieStore, bound: usize) -> Self {
+        Self { inner, bound }
+    }
+}
+
+impl TrieStore for EmbeddingBound<'_> {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.inner.get(key)
+    }
+    fn put(&self, key: &[u8], value: &[u8]) {
+        self.inner.put(key, value)
+    }
+    fn max_embedded_node_size(&self) -> usize {
+        self.bound
+    }
+    fn put_many(&self, entries: &[(Vec<u8>, Vec<u8>)]) {
+        self.inner.put_many(entries)
+    }
+    fn flush(&self) {
+        self.inner.flush()
+    }
+    fn get_many(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        self.inner.get_many(keys)
+    }
+    fn get_many_sorted(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        self.inner.get_many_sorted(keys)
+    }
+    fn collected_below(&self) -> Option<u64> {
+        self.inner.collected_below()
+    }
+}
+
+#[cfg(test)]
+mod embedding_threshold_tests {
+    use super::*;
+    use crate::{TrieKeySlice, TrieNode};
+
+    /// A store that delegates to a `MemoryTrieStore` but reports whichever
+    /// embedding bound the test asks for, standing in for the activation
+    /// height the execution layer supplies in production.
+    struct Bounded {
+        inner: MemoryTrieStore,
+        bound: usize,
+    }
+
+    impl TrieStore for Bounded {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.inner.get(key)
+        }
+        fn put(&self, key: &[u8], value: &[u8]) {
+            self.inner.put(key, value)
+        }
+        fn max_embedded_node_size(&self) -> usize {
+            self.bound
+        }
+    }
+
+    fn key(bits: &[u8]) -> TrieKeySlice {
+        TrieKeySlice::from_key(bits)
+    }
+
+    /// Two 31-byte keys differing in the very first bit, so the root
+    /// branches at once and each leaf carries a 247-bit shared path -- the
+    /// shape a real account leaf has, and the reason account nodes sit near
+    /// the bound at all.
+    const KEY_A: [u8; 31] = [0x00; 31];
+    fn key_b() -> [u8; 31] {
+        let mut k = [0x00u8; 31];
+        k[0] = 0x80;
+        k
+    }
+
+    /// 1 (flags) + 32 (247-bit shared path) + 14 = 47: above the old bound,
+    /// below the new one.
+    fn banded_value() -> Vec<u8> {
+        vec![0xAB; 14]
+    }
+
+    fn left_is_embedded(node: &TrieNode, store: &dyn TrieStore) -> bool {
+        node.to_message(store)[0] & 0b0000_0010 != 0
+    }
+
+    /// RSKIP-TBD test case 7, and the property the whole lazy activation
+    /// rests on.
+    ///
+    /// A child stored separately under the 44-byte bound must stay stored
+    /// separately after the raise to 52, for as long as nothing rewrites the
+    /// child itself -- even though its size now falls under the new bound.
+    /// If it silently re-embedded when a *sibling* changed, the state root
+    /// would depend on which nodes an implementation happened to have in
+    /// memory, and two nodes could not agree.
+    #[test]
+    fn an_unmodified_child_keeps_its_embedded_status_across_the_raise() {
+        let mid = banded_value();
+
+        let old = Bounded { inner: MemoryTrieStore::new(), bound: LEGACY_MAX_EMBEDDED_NODE_SIZE };
+        let mut root = TrieNode::empty();
+        root = root.put(&key(&KEY_A), &mid, &old);
+        root = root.put(&key(&key_b()), &[0x01][..], &old);
+
+        // The fixture must actually be in the band, or the test is vacuous.
+        assert!(
+            !left_is_embedded(&root, &old),
+            "fixture leaf should be too big to embed at {LEGACY_MAX_EMBEDDED_NODE_SIZE}"
+        );
+        root.save(&old, true);
+        let root_hash = root.compute_hash(&old);
+
+        // Reload under the raised bound and rewrite only the *sibling*.
+        let new = Bounded { inner: old.inner, bound: WITNESS_MAX_EMBEDDED_NODE_SIZE };
+        let reloaded = TrieNode::from_message(&new.get(root_hash.as_slice()).unwrap(), &new);
+        let after_sibling = reloaded.put(&key(&key_b()), &[0x02][..], &new);
+
+        assert_eq!(
+            after_sibling.get(&key(&KEY_A), &new).as_deref(),
+            Some(&mid[..]),
+            "the untouched child must still be reachable"
+        );
+        assert!(
+            !left_is_embedded(&after_sibling, &new),
+            "an unmodified child must not be re-embedded by the raise alone"
+        );
+
+        // Rewriting the child itself is what lets the new bound apply.
+        let after_child = after_sibling.put(&key(&KEY_A), &mid, &new);
+        assert!(
+            left_is_embedded(&after_child, &new),
+            "rewriting the child is what applies the new bound to it"
+        );
+    }
+
+    /// The bound is read from the store rather than compiled in, so two
+    /// stores disagreeing about it produce different node hashes for the
+    /// same content. That is the hardfork, and it should be visible.
+    #[test]
+    fn the_same_content_hashes_differently_under_the_two_bounds() {
+        let build = |bound: usize| {
+            let s = Bounded { inner: MemoryTrieStore::new(), bound };
+            let mut r = TrieNode::empty();
+            r = r.put(&key(&KEY_A), &banded_value(), &s);
+            r = r.put(&key(&key_b()), &[0x01][..], &s);
+            r.compute_hash(&s)
+        };
+        assert_ne!(
+            build(LEGACY_MAX_EMBEDDED_NODE_SIZE),
+            build(WITNESS_MAX_EMBEDDED_NODE_SIZE),
+            "raising the bound must change the root for a node in the band"
         );
     }
 }

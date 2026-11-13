@@ -15,7 +15,8 @@ use crate::shared_path;
 use crate::store::TrieStore;
 use crate::varint;
 
-const MAX_EMBEDDED_NODE_SIZE: usize = 44;
+// The embedding bound is a property of the store, not a constant: RSKIP-TBD
+// raises it at activation. See `TrieStore::max_embedded_node_size`.
 
 pub(crate) fn keccak(data: &[u8]) -> B256 {
     B256::from_slice(&Keccak256::digest(data))
@@ -413,7 +414,7 @@ impl TrieNode {
     }
 
     pub fn is_embeddable(&self, store: &dyn TrieStore) -> bool {
-        self.is_terminal() && self.message_length(store) <= MAX_EMBEDDED_NODE_SIZE
+        self.is_terminal() && self.message_length(store) <= store.max_embedded_node_size()
     }
 
     pub fn message_length(&self, store: &dyn TrieStore) -> usize {

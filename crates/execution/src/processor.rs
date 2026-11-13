@@ -11,7 +11,7 @@ use tracing::debug;
 
 use crate::executor::RskExecutor;
 use crate::hardfork::RskHardforkConfig;
-use crate::state::apply_state_changes;
+use crate::state::apply_state_changes_with_witness;
 use rustock_core::validation::ValidationError;
 
 #[derive(Debug, thiserror::Error)]
@@ -378,6 +378,17 @@ impl BlockProcessor {
         // is started only for a block that actually splits, so every block
         // mainnet has produced -- reed810 is unscheduled there, and the field
         // is absent or empty throughout -- pays nothing for it.
+        // The account modification witness counts per transaction, which is
+        // the finest granularity available without hooking revm's journal
+        // per frame: the merged `EvmState` this block produces cannot tell a
+        // credit and a debit that cancel from nothing having happened, and
+        // counting there would reproduce inside a block exactly the netting
+        // blindness the witness exists to remove across blocks.
+        let count_witness = self.hardfork_cfg.has_account_witness(header.number);
+        if count_witness {
+            crate::witness::start();
+        }
+
         let check_collisions =
             self.hardfork_cfg.has_rskip144(header.number) && !sublist_starts.is_empty();
         if check_collisions {
@@ -513,22 +524,43 @@ impl BlockProcessor {
         // sublist's changes are committed in sublist order, because that
         // ordering is what gives the sequential sublist a state to start
         // from. Re-applying the merged result here would not reproduce it.
+        // Always taken, so a block that turned the rule off mid-run leaves
+        // nothing behind for the next one to pick up.
+        let witness_counts = crate::witness::finish();
+        let witness = count_witness.then(|| crate::witness::WitnessContext {
+            block: header.number,
+            counts: &witness_counts,
+        });
+
+        // Every call that contributes to this block's state root sees the
+        // same embedding bound: applying, hashing and saving alike. Mixing a
+        // wrapped and an unwrapped store within one block would produce a
+        // root neither bound agrees with. Reads are unaffected -- a node
+        // records its children's embedded status in its own flags byte, so
+        // decoding never consults the bound.
+        let bounded = rustock_trie::EmbeddingBound::new(
+            trie_store.as_ref(),
+            self.hardfork_cfg.max_embedded_node_size(header.number),
+        );
+        let trie: &dyn TrieStore = &bounded;
+
         let mut new_state_root = match exec_result.applied_root.take() {
             Some(root) => root,
-            None => apply_state_changes(
+            None => apply_state_changes_with_witness(
                 state_root,
-                trie_store.as_ref(),
+                trie,
                 &exec_result.state_changes,
                 &exec_result.markers,
+                witness.as_ref(),
             ),
         };
-        let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
+        let state_root_hash = new_state_root.compute_hash(trie);
         if let Some(slot) = save_out {
             let started = std::time::Instant::now();
-            new_state_root.save(trie_store.as_ref(), true);
+            new_state_root.save(trie, true);
             *slot += started.elapsed();
         } else {
-            new_state_root.save(trie_store.as_ref(), true);
+            new_state_root.save(trie, true);
         }
         // Reload the root lazily: children become hash references resolved on
         // demand, so subsequent blocks only walk their dirty paths instead of

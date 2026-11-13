@@ -134,6 +134,11 @@ struct SublistRun {
     keys: Option<crate::collision::CollisionTracker>,
     /// Likewise for the silent bridge-decision records.
     records: Vec<crate::silent::SilentRecord>,
+    /// Likewise for the account modification counts. These are applied with
+    /// this sublist's state changes rather than folded into the block's,
+    /// because a split block commits each sublist in turn and each commit
+    /// must carry its own counts.
+    counts: crate::witness::ModificationCounts,
 }
 
 /// Fold one sublist's marker writes into the block's.
@@ -1052,6 +1057,9 @@ impl RskExecutor {
         ExecutionError,
     > {
         let store = trie_store.as_ref();
+        // A split block commits in stages, and each stage applies the counts
+        // belonging to it. Read once here so every stage agrees.
+        let counting_witness = crate::witness::is_counting();
 
         let at_maintenance = std::time::Instant::now();
         // 1. Block-level maintenance, on no sublist's account.
@@ -1067,11 +1075,19 @@ impl RskExecutor {
             true,
             None,
         )?;
-        let base_root = crate::state::apply_state_changes(
+        // Drained rather than finished: the sequential sublist counts on
+        // this same thread afterwards, and must not re-apply these.
+        let maintenance_counts = crate::witness::drain();
+        let maintenance_witness = counting_witness.then(|| crate::witness::WitnessContext {
+            block: header.number,
+            counts: &maintenance_counts,
+        });
+        let base_root = crate::state::apply_state_changes_with_witness(
             state_root,
             store,
             &maintenance.state_changes,
             &maintenance.markers,
+            maintenance_witness.as_ref(),
         );
         let maintenance_us = at_maintenance.elapsed().as_micros() as u64;
 
@@ -1123,6 +1139,9 @@ impl RskExecutor {
                         if recording_silent {
                             crate::silent::start();
                         }
+                        if counting_witness {
+                            crate::witness::start();
+                        }
                         let run = self.run_sublist(
                             header,
                             transactions,
@@ -1137,8 +1156,14 @@ impl RskExecutor {
                         );
                         let keys = crate::collision::finish();
                         let records = crate::silent::finish();
-                        let outcome = run
-                            .map(|(result, traces)| SublistRun { result, traces, keys, records });
+                        let counts = crate::witness::finish();
+                        let outcome = run.map(|(result, traces)| SublistRun {
+                            result,
+                            traces,
+                            keys,
+                            records,
+                            counts,
+                        });
                         *slots_ref[index].lock().expect("sublist slot") = Some(outcome);
                     }
                 });
@@ -1178,11 +1203,23 @@ impl RskExecutor {
                     }
                     crate::silent::absorb(run.records);
                     if failure.is_none() {
-                        root = crate::state::apply_state_changes(
+                        // The witness travels with the sublist that produced
+                        // it. Applying without it would not merely skip the
+                        // update -- it would rewrite every account this
+                        // sublist touched with zeroed witness fields, erasing
+                        // the history of accounts the sublist only read from.
+                        let witness = counting_witness.then(|| {
+                            crate::witness::WitnessContext {
+                                block: header.number,
+                                counts: &run.counts,
+                            }
+                        });
+                        root = crate::state::apply_state_changes_with_witness(
                             &root,
                             store,
                             &run.result.state_changes,
                             &run.result.markers,
+                            witness.as_ref(),
                         );
                         runs.push((run.result, run.traces));
                     }
@@ -1218,11 +1255,17 @@ impl RskExecutor {
         let sequential_us = at_sequential.elapsed().as_micros() as u64;
 
         let at_final = std::time::Instant::now();
-        let final_root = crate::state::apply_state_changes(
+        let sequential_counts = crate::witness::drain();
+        let sequential_witness = counting_witness.then(|| crate::witness::WitnessContext {
+            block: header.number,
+            counts: &sequential_counts,
+        });
+        let final_root = crate::state::apply_state_changes_with_witness(
             &root,
             store,
             &sequential_result.state_changes,
             &sequential_result.markers,
+            sequential_witness.as_ref(),
         );
         commit_us += at_final.elapsed().as_micros() as u64;
 
@@ -1605,6 +1648,11 @@ impl RskExecutor {
                     let st = &evm.ctx.journal_mut().inner.state;
                     Self::check_tx_supply(st, supply_tid, header.number, i, U256::ZERO, settled_now)?;
                 }
+                if crate::witness::is_counting() {
+                    use revm::context_interface::ContextTr;
+                    let st = &evm.ctx.journal_mut().inner.state;
+                    crate::witness::note_transaction(st, supply_tid);
+                }
                 // RSKIP-144: what this transaction read and wrote, attributed
                 // to its sublist. Inert unless the block declares sublist
                 // edges.
@@ -1819,6 +1867,11 @@ impl RskExecutor {
                     let st = &evm.ctx.journal_mut().inner.state;
                     Self::check_tx_supply(st, supply_tid, header.number, i, withheld_now, U256::ZERO)?;
                 }
+                if crate::witness::is_counting() {
+                    use revm::context_interface::ContextTr;
+                    let st = &evm.ctx.journal_mut().inner.state;
+                    crate::witness::note_transaction(st, supply_tid);
+                }
                 // RSKIP-144: what this transaction read and wrote, attributed to
                 // its sublist. Inert unless the block declares sublist edges.
                 if crate::collision::is_recording() {
@@ -2005,6 +2058,11 @@ impl RskExecutor {
                 use revm::context_interface::ContextTr;
                 let st = &evm.ctx.journal_mut().inner.state;
                 Self::check_tx_supply(st, supply_tid, header.number, i, withheld_now, U256::ZERO)?;
+            }
+            if crate::witness::is_counting() {
+                use revm::context_interface::ContextTr;
+                let st = &evm.ctx.journal_mut().inner.state;
+                crate::witness::note_transaction(st, supply_tid);
             }
             // RSKIP-144: what this transaction read and wrote, attributed to
             // its sublist. Inert unless the block declares sublist edges.

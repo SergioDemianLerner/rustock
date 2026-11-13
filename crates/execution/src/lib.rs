@@ -39,6 +39,7 @@ pub use processor::{BlockProcessor, ProcessError, ProcessTimings, ProcessedBlock
 pub use remasc::RemascConfig;
 pub mod tracer;
 pub mod supply;
+pub mod witness;
 pub use state::apply_state_changes;
 
 /// A context for reading Bridge state at a committed state root.
