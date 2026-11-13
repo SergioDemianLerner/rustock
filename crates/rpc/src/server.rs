@@ -139,6 +139,15 @@ pub struct RpcState {
     pub wallet: Option<Arc<crate::wallet::Wallet>>,
     /// Administrative methods are refused unless the operator enabled them.
     pub admin_enabled: bool,
+    /// Whether `rsk_lastAccountChange` is served.
+    ///
+    /// Off by default. The method bisects an account's trie leaf across
+    /// history, so one call is ten to twenty-four state lookups — and on a
+    /// node that answers from peers, as many round trips. That cost is
+    /// invisible at the call site, which makes it a poor thing to expose to
+    /// the open internet by default: a client in a loop amplifies into real
+    /// traffic without ever looking like it is doing so.
+    pub account_search_enabled: bool,
     /// Burial depth used when an admin collection request names no block.
     pub gc_burial: u64,
     /// States a forced collection must keep beyond the collection root --
@@ -376,6 +385,12 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_getBlockByHash" => eth::eth_get_block_by_hash(id, params, &state.store, crate::helpers::chain_id_of(state)),
         "eth_getBlockByNumber" => eth::eth_get_block_by_number(id, params, &state.store, crate::helpers::chain_id_of(state)),
         "eth_getProof" => proof::eth_get_proof(id, params, state).await,
+        // Reported as unknown rather than refused, for the reason the
+        // administrative methods are: a node that does not serve this should
+        // look the same as one that never had it.
+        "rsk_lastAccountChange" if !state.account_search_enabled => {
+            JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found")
+        }
         "rsk_lastAccountChange" => {
             crate::witness_search::rsk_last_account_change(id, params, state).await
         }

@@ -66,6 +66,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -636,6 +637,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -692,6 +694,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -781,6 +784,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -922,6 +926,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -1028,6 +1033,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -1222,6 +1228,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -1595,6 +1602,7 @@ async fn test_receipt_dto_failed_status() {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -2457,6 +2465,7 @@ fn setup_state_with_receipts(
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -2732,6 +2741,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -3736,6 +3746,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -4228,6 +4239,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -6272,6 +6284,7 @@ mod witness_search_tests {
             auto_miner: None,
             wallet: None,
             admin_enabled: false,
+            account_search_enabled: true,
             gc_burial: 4000,
             gc_pins: None,
             snapshots: None,
@@ -6402,8 +6415,40 @@ mod witness_search_tests {
         );
     }
 
-    /// The caller can bound the search, and is told when the answer lies
-    /// outside the bound rather than being handed a null that reads as
+    /// The default is off, and a node that does not serve this looks like a
+    /// node that never had it.
+    ///
+    /// Reported as unknown rather than forbidden, for the reason the
+    /// administrative methods are: "method not found" tells a scanner
+    /// nothing about what this node could be made to do.
+    #[tokio::test]
+    async fn the_search_is_not_served_unless_it_is_switched_on() {
+        let mut f = chain(20, &[5]);
+        f.state.account_search_enabled = false;
+
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x14"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await;
+        assert!(r.result.is_none(), "the method must not answer when it is off");
+        let err = r.error.expect("and must refuse");
+        assert_eq!(
+            err.message, "Method not found",
+            "a disabled method must be indistinguishable from an absent one"
+        );
+
+        // And on, it answers -- so the test above is measuring the switch.
+        f.state.account_search_enabled = true;
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x14"]),
+        );
+        assert!(dispatch_for_test(&f.state, req).await.result.is_some());
+    }
+
+    /// The caller can bound the search, and is told when the answer is older
+    /// than the bound rather than being handed a null that reads as
     /// "never changed".
     #[tokio::test]
     async fn a_bounded_search_says_when_the_answer_is_older_than_the_range() {

@@ -1342,6 +1342,21 @@ struct Args {
     #[arg(long)]
     rpc_admin: bool,
 
+    /// Serve `rsk_lastAccountChange`, which finds the block an account last
+    /// changed in by bisecting its trie leaf across history.
+    ///
+    /// Off by default, because the cost is invisible at the call site. One
+    /// call is ten to twenty-four state lookups; on a node that answers from
+    /// peers it is that many round trips. A client in a loop amplifies into
+    /// real traffic without ever looking as though it is.
+    ///
+    /// It is also answerable only over state the node still holds. On a
+    /// pruning or epoch node the search is bounded to that window by
+    /// default, so enabling it on one does not make the whole chain
+    /// searchable.
+    #[arg(long, default_value_t = false)]
+    rpc_account_search: bool,
+
     /// Private keys this node may sign with, one 32-byte hex key per line.
     ///
     /// Off by default, and the only way the node ever holds a key for
@@ -1504,6 +1519,7 @@ fn apply_file_config(
     apply(matches, "rpc_host", f.rpc.host.as_ref(), &mut a.rpc_host);
     apply(matches, "rpc_port", f.rpc.port.as_ref(), &mut a.rpc_port);
     apply(matches, "rpc_admin", f.rpc.admin.as_ref(), &mut a.rpc_admin);
+    apply(matches, "rpc_account_search", f.rpc.account_search.as_ref(), &mut a.rpc_account_search);
     apply_opt(matches, "wallet_file", f.rpc.wallet_file.as_ref(), &mut a.wallet_file);
     apply(matches, "no_rpc", f.rpc.disabled.as_ref(), &mut a.no_rpc);
     apply(matches, "ws", f.rpc.ws.as_ref(), &mut a.ws);
@@ -3697,6 +3713,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             },
             wallet: wallet.clone(),
             admin_enabled: args.rpc_admin,
+            account_search_enabled: args.rpc_account_search,
             gc_burial: args.gc_burial,
             gc_pins: {
                 // Recomputed per cycle, because the checkpoint moves. Empty

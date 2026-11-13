@@ -149,6 +149,9 @@ pub struct RpcSection {
     pub logs_max_blocks: Option<u64>,
     /// Enable the `evm_*` development-chain namespace. Off by default.
     pub dev: Option<bool>,
+    /// Serve `rsk_lastAccountChange`. Off by default: one call is a
+    /// bisection, so it costs ten to twenty-four state lookups.
+    pub account_search: Option<bool>,
     /// Fall back to the pre-exactimator gas estimator: a binary search over
     /// roughly two dozen executions. The single-pass estimator is the
     /// default; this exists so an operator who suspects it can compare
@@ -471,6 +474,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "metrics_host",
     "metrics_port",
     "rpc_admin",
+    "rpc_account_search",
     "wallet_file",
     "no_rpc",
     "spv",
