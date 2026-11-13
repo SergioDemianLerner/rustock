@@ -138,6 +138,20 @@ pub static BODIES_DERIVED: Counter = Counter::new(
 pub static BODIES_RECEIVED: Counter =
     Counter::new("rustock_bodies_received_total", "Block bodies delivered by a peer");
 
+pub static SENDER_CACHE_HITS: Counter = Counter::new(
+    "rustock_sender_cache_hits_total",
+    "Transaction senders answered from the cache instead of recovered",
+);
+
+/// Counted with the hits so the ratio is computable from the scrape alone.
+/// A cache whose hit rate is unknown is a cache nobody can decide to keep or
+/// to drop -- which is the position this node was in while the cache ran
+/// with no exposition at all.
+pub static SENDER_CACHE_MISSES: Counter = Counter::new(
+    "rustock_sender_cache_misses_total",
+    "Transaction senders that had to be recovered because the cache did not hold them",
+);
+
 pub static HEADERS_RECEIVED: Counter =
     Counter::new("rustock_headers_received_total", "Headers delivered by a peer");
 
@@ -183,6 +197,8 @@ fn encode_all(out: &mut String) {
         &BODIES_REQUESTED,
         &BODIES_DERIVED,
         &BODIES_RECEIVED,
+        &SENDER_CACHE_HITS,
+        &SENDER_CACHE_MISSES,
         &HEADERS_RECEIVED,
         &GAS_USED,
         &TRANSACTIONS_EXECUTED,
