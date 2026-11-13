@@ -84,64 +84,113 @@ async fn record_at(state: &RpcState, address: Address, block: u64) -> Result<Rec
 
 /// What the search established.
 pub struct Found {
-    /// The block in which the account last changed, or `None` when it has
-    /// held its current record since genesis.
+    /// The block in which the account last changed, within the range
+    /// searched. `None` means it already held this record at the bottom of
+    /// the range.
     pub block: Option<u64>,
+    /// Whether `block` is the whole answer.
+    ///
+    /// `false` means the account already held its current record at the
+    /// bottom of the range, so the change that produced it is **older than
+    /// the range searched** — not that there was none. A caller that reads a
+    /// null `block` without reading this would turn "I did not look far
+    /// enough" into "this never happened", which is the one mistake that
+    /// makes a wallet silently drop a payment from its history.
+    ///
+    /// `true` with a `None` block means the range began at genesis and the
+    /// account has held this record throughout, which genuinely is "never
+    /// changed".
+    pub complete: bool,
+    pub from: u64,
+    pub to: u64,
     /// Proofs spent. Reported because the caller is paying for them, and
     /// because it is the number the consensus field reduces to one.
     pub probes: u32,
 }
 
-/// The block in which `address` last changed, at or before `hi`.
+/// The lowest block this node can still answer about.
+///
+/// A pruning or epoch store collects old state, and a probe below that floor
+/// does not come back slow — it fails. Searching from zero on such a node
+/// therefore fails on its very first probe, which is both useless and
+/// confusing, so the floor is the default bottom of the range.
+///
+/// `None` on a node with no local trie: an SPV node cannot know its peer's
+/// floor, and guessing one would only move the error.
+fn retention_floor(state: &RpcState) -> Option<u64> {
+    state.trie_store.as_ref().and_then(|t| t.collected_below())
+}
+
+/// The block in which `address` last changed, within `lo..=hi`.
 ///
 /// Bisects on "does the record at this block already equal the record at
 /// `hi`". The predicate is false below the change and true from it onward,
 /// so the smallest block satisfying it is the block the change happened in.
+///
+/// Bounding the range matters for more than cost. The search is only as good
+/// as the state its node can still reach, and a probe below that is an error
+/// rather than a slow answer — so a caller that cannot say where to stop
+/// gets a failure that looks like the method is broken.
 pub async fn find_last_change(
     state: &RpcState,
     address: Address,
+    lo: u64,
     hi: u64,
 ) -> Result<Found, String> {
+    if lo > hi {
+        return Err(format!("empty range: from #{lo} is above to #{hi}"));
+    }
+
     let mut probes = 0u32;
     let target = record_at(state, address, hi).await?;
     probes += 1;
 
-    if hi == 0 {
-        return Ok(Found { block: None, probes });
+    if lo == hi {
+        return Ok(Found { block: None, complete: lo == 0, from: lo, to: hi, probes });
     }
 
-    // Genesis already holds the current record, so nothing in range changed
-    // it. Distinguished from "changed at block 0", which cannot happen:
-    // block 0 is where every account's history begins rather than a block
-    // that modified anything.
-    let mut lo = 0u64;
-    if record_at(state, address, lo).await? == target {
-        return Ok(Found { block: None, probes: probes + 1 });
+    // The bottom of the range already holds this record, so whatever
+    // produced it happened before the range. Only when the range starts at
+    // genesis does that mean "never changed"; otherwise the caller has to
+    // look further back, and `complete` is how it is told so.
+    let mut low = lo;
+    if record_at(state, address, low).await? == target {
+        return Ok(Found {
+            block: None,
+            complete: lo == 0,
+            from: lo,
+            to: hi,
+            probes: probes + 1,
+        });
     }
     probes += 1;
 
-    // Invariant: record(lo) != target, record(hi) == target. Each step
+    // Invariant: record(low) != target, record(high) == target. Each step
     // halves the gap, so the two meet at the boundary between them.
-    let mut hi = hi;
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
+    let mut high = hi;
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
         if record_at(state, address, mid).await? == target {
-            hi = mid;
+            high = mid;
         } else {
-            lo = mid;
+            low = mid;
         }
         probes += 1;
     }
 
-    Ok(Found { block: Some(hi), probes })
+    Ok(Found { block: Some(high), complete: true, from: lo, to: hi, probes })
 }
 
-/// `rsk_lastAccountChange(address[, blockNumber])`.
+/// `rsk_lastAccountChange(address[, toBlock[, fromBlock]])`.
 ///
 /// Answers the question `lastModifiedBlock` will answer directly once
-/// RSKIP-TBD activates, so a wallet can be written against it now. The
-/// `witnessSource` field says which supplied the answer, so a wallet need
-/// never guess whether the netting caveat applies.
+/// RSKIP-TBD activates, so a wallet can be written against it now.
+///
+/// `fromBlock` bounds the search. It defaults to the lowest block this node
+/// can still reach rather than to genesis, because on a pruning or epoch
+/// node a probe below that floor fails outright — searching from zero would
+/// fail on the first probe and look like a broken method rather than a node
+/// that does not keep the state being asked about.
 pub async fn rsk_last_account_change(
     id: Value,
     params: &Value,
@@ -155,17 +204,42 @@ pub async fn rsk_last_account_change(
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid address");
     };
 
-    let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
-    let Some(header) = resolve_header(block_param, &state.store) else {
-        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    let to_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
+    let Some(to_header) = resolve_header(to_param, &state.store) else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve the upper block");
     };
 
-    match find_last_change(state, address, header.number).await {
+    let from = match params.get(2).and_then(|v| v.as_str()) {
+        Some(s) => match resolve_header(s, &state.store) {
+            Some(h) => h.number,
+            None => {
+                return JsonRpcResponse::error(id, INVALID_PARAMS, "Cannot resolve the lower block")
+            }
+        },
+        None => retention_floor(state).unwrap_or(0),
+    };
+
+    if from > to_header.number {
+        return JsonRpcResponse::error(
+            id,
+            INVALID_PARAMS,
+            format!("empty range: from #{from} is above to #{}", to_header.number),
+        );
+    }
+
+    match find_last_change(state, address, from, to_header.number).await {
         Ok(found) => JsonRpcResponse::success(
             id,
             json!({
                 "address": format!("{address:#x}"),
                 "lastModifiedBlock": found.block.map(|b| format!("{b:#x}")),
+                // False means the change is OLDER than the range searched,
+                // not that there was none. A caller reading a null block
+                // without this would turn "I did not look far enough" into
+                // "this never happened".
+                "complete": found.complete,
+                "searchedFrom": format!("{:#x}", found.from),
+                "searchedTo": format!("{:#x}", found.to),
                 "probes": found.probes,
                 // Named rather than implied. A wallet showing history to a
                 // user needs to know whether movements that cancelled out

@@ -6402,6 +6402,80 @@ mod witness_search_tests {
         );
     }
 
+    /// The caller can bound the search, and is told when the answer lies
+    /// outside the bound rather than being handed a null that reads as
+    /// "never changed".
+    #[tokio::test]
+    async fn a_bounded_search_says_when_the_answer_is_older_than_the_range() {
+        let f = chain(40, &[5, 12, 29]);
+
+        // Range that contains the change: complete, and found.
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x28", "0x14"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.unwrap();
+        assert_eq!(r["lastModifiedBlock"], json!("0x1d"), "#29");
+        assert_eq!(r["complete"], json!(true));
+        assert_eq!(r["searchedFrom"], json!("0x14"));
+
+        // Range entirely above the last change: nothing found, and the
+        // answer says so instead of claiming the account never moved.
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x28", "0x1e"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.unwrap();
+        assert!(r["lastModifiedBlock"].is_null());
+        assert_eq!(
+            r["complete"],
+            json!(false),
+            "a bounded search that found nothing must not be read as 'never changed'"
+        );
+    }
+
+    /// Only a search that reached genesis may claim the account never
+    /// changed, and it must still say so explicitly.
+    #[tokio::test]
+    async fn only_a_search_from_genesis_can_claim_never_changed() {
+        let f = chain(40, &[5]);
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", Address::repeat_byte(0x11)), "0x28", "0x0"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.unwrap();
+        assert!(r["lastModifiedBlock"].is_null());
+        assert_eq!(r["complete"], json!(true), "reached genesis, so the absence is the answer");
+    }
+
+    /// A bounded search costs less, which is the practical reason to offer
+    /// the bound at all.
+    #[tokio::test]
+    async fn bounding_the_range_costs_fewer_probes() {
+        let f = chain(1000, &[700]);
+        let probes = |r: &Value| r["probes"].as_u64().unwrap();
+
+        let wide = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x3e8", "0x0"]),
+        );
+        let wide = dispatch_for_test(&f.state, wide).await.result.unwrap();
+
+        let narrow = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x3e8", "0x280"]),
+        );
+        let narrow = dispatch_for_test(&f.state, narrow).await.result.unwrap();
+
+        assert_eq!(narrow["lastModifiedBlock"], json!("0x2bc"), "#700, same answer");
+        assert!(
+            probes(&narrow) < probes(&wide),
+            "a narrower range must cost less: {} vs {}",
+            probes(&narrow),
+            probes(&wide)
+        );
+    }
+
     /// The cost claim: logarithmic in the chain, not linear. A wallet paying
     /// per proof cares, and it is the number the consensus field reduces
     /// to one.
