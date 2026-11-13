@@ -237,6 +237,57 @@ mod tests {
         }
     }
 
+    /// The server-side counterpart: `nodes_to_divergence` supplies exactly
+    /// the nodes that let a client verify an absence, where `nodes_on_path`
+    /// supplies nothing and leaves the client taking the peer's word.
+    #[test]
+    fn divergence_nodes_prove_an_absence_and_a_bare_path_does_not() {
+        let (store, root, _) = fixture();
+        let root_hash = root.compute_hash(&store);
+        let absent = account_key(&Address::repeat_byte(0x99));
+        let slice = TrieKeySlice::from_key(&absent);
+
+        // What `nodes_on_path` offers for an absent key: nothing.
+        assert!(root.nodes_on_path(&slice, &store).is_none());
+
+        let proof: Vec<Vec<u8>> = root
+            .nodes_to_divergence(&slice, &store)
+            .expect("the walk must reach a divergence")
+            .iter()
+            .map(|n| n.to_message(&store))
+            .collect();
+
+        assert_eq!(
+            verify_path(&proof, &absent, root_hash),
+            Ok(Outcome::Absent),
+            "the divergence nodes must prove the key is not there"
+        );
+    }
+
+    /// And the same nodes must not be able to claim an absence for a key
+    /// that IS present -- otherwise a peer could erase an account by
+    /// answering with somebody else's divergence.
+    #[test]
+    fn a_divergence_proof_cannot_deny_a_key_that_exists() {
+        let (store, root, addrs) = fixture();
+        let root_hash = root.compute_hash(&store);
+        let absent = account_key(&Address::repeat_byte(0x99));
+
+        let proof: Vec<Vec<u8>> = root
+            .nodes_to_divergence(&TrieKeySlice::from_key(&absent), &store)
+            .unwrap()
+            .iter()
+            .map(|n| n.to_message(&store))
+            .collect();
+
+        let real_key = account_key(&addrs[2]);
+        match verify_path(&proof, &real_key, root_hash) {
+            Ok(Outcome::Absent) => panic!("an existing account was denied"),
+            Ok(Outcome::Value(_)) | Err(ProofError::Incomplete { .. }) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
     #[test]
     fn an_empty_proof_proves_absence_only_against_the_empty_trie() {
         let empty: Vec<Vec<u8>> = Vec::new();
