@@ -14,6 +14,7 @@ mod tracker;
 pub mod chain_activity;
 pub mod gas_price;
 pub mod invariant;
+pub mod proof_client;
 pub mod quota;
 pub mod rollback;
 pub mod snap;

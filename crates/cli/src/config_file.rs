@@ -64,6 +64,8 @@ pub struct FileConfig {
     pub metrics: MetricsSection,
     #[serde(default)]
     pub chain: ChainSection,
+    #[serde(default)]
+    pub spv: SpvSection,
 }
 
 /// Regtest chain settings, for a chain that has to match one an rskj node
@@ -147,6 +149,9 @@ pub struct RpcSection {
     pub logs_max_blocks: Option<u64>,
     /// Enable the `evm_*` development-chain namespace. Off by default.
     pub dev: Option<bool>,
+    /// Serve `rsk_lastAccountChange`. Off by default: one call is a
+    /// bisection, so it costs ten to twenty-four state lookups.
+    pub account_search: Option<bool>,
     /// Fall back to the pre-exactimator gas estimator: a binary search over
     /// roughly two dozen executions. The single-pass estimator is the
     /// default; this exists so an operator who suspects it can compare
@@ -261,7 +266,22 @@ pub struct CheckpointSection {
 /// `registerFlyoverBtcTransaction` calls no event logger at any height, so
 /// every Flyover peg-in is absent from the receipts and therefore from
 /// `bridge_events`, which is built from them. Recording keeps a store of the
-/// complement current as blocks arrive.
+/// Running as an SPV client.
+///
+/// Deliberately not called "light": `node-light.example.toml` already uses
+/// that word for a pruned full node that keeps current state on a few
+/// gigabytes. That node executes every block and reads its own trie. This
+/// one executes nothing and has no trie at all. Sharing a name would invite
+/// an operator to turn on the wrong one.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpvSection {
+    /// Answer state queries by asking a peer and verifying the proof,
+    /// instead of reading a local trie.
+    pub enabled: Option<bool>,
+}
+
+/// Reconstructed peg events, kept current as blocks arrive.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PegEventsSection {
@@ -454,8 +474,10 @@ pub const CONFIGURABLE: &[&str] = &[
     "metrics_host",
     "metrics_port",
     "rpc_admin",
+    "rpc_account_search",
     "wallet_file",
     "no_rpc",
+    "spv",
     "no_peg_event_recording",
     "peg_events_dir",
     "ws",

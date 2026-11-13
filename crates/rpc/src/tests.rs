@@ -54,6 +54,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -65,6 +66,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -623,6 +625,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: Some(Arc::new(MockSubmitter)),
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -634,6 +637,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -678,6 +682,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: Some(Arc::new(MockSubmitter)),
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -689,6 +694,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -766,6 +772,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -777,6 +784,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -906,6 +914,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -917,6 +926,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -1011,6 +1021,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -1022,6 +1033,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -1204,6 +1216,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -1215,6 +1228,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -1576,6 +1590,7 @@ async fn test_receipt_dto_failed_status() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -1587,6 +1602,7 @@ async fn test_receipt_dto_failed_status() {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -2437,6 +2453,7 @@ fn setup_state_with_receipts(
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -2448,6 +2465,7 @@ fn setup_state_with_receipts(
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -2711,6 +2729,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -2722,6 +2741,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -3714,6 +3734,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -3725,6 +3746,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -4205,6 +4227,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        proof_fetcher: None,
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
@@ -4216,6 +4239,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         auto_miner: None,
         wallet: None,
         admin_enabled: false,
+        account_search_enabled: true,
         gc_burial: 4000,
         gc_pins: None,
         snapshots: None,
@@ -6027,4 +6051,496 @@ async fn get_proof_rejects_a_missing_slot_array() {
     )
     .await;
     assert!(resp.error.is_some(), "the slot array is required, even when empty");
+}
+
+// ===== eth_getProof on a light client =====
+//
+// A node with no trie of its own asks a peer and checks the answer against
+// the state root of a header it validated itself. These tests take a real
+// proof out of a real trie, hand it to a node that has been stripped of that
+// trie, and then try to fool it.
+
+mod light_proof_tests {
+    use super::*;
+    use rustock_trie::{account_key, TrieKeySlice, TrieNode, TrieStore};
+    use std::sync::Arc;
+
+    /// A peer, honest or otherwise.
+    struct FakePeer {
+        account_proof: Vec<alloy_primitives::Bytes>,
+        storage_proofs: Vec<Vec<alloy_primitives::Bytes>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::server::ProofFetcher for FakePeer {
+        async fn fetch_proof(
+            &self,
+            _block_number: u64,
+            _address: Address,
+            _storage_keys: Vec<B256>,
+        ) -> Result<(Vec<alloy_primitives::Bytes>, Vec<Vec<alloy_primitives::Bytes>>), String>
+        {
+            Ok((self.account_proof.clone(), self.storage_proofs.clone()))
+        }
+    }
+
+    fn path_for(root: &TrieNode, store: &dyn TrieStore, key: &[u8]) -> Vec<alloy_primitives::Bytes> {
+        root.nodes_on_path(&TrieKeySlice::from_key(key), store)
+            .map(|nodes| {
+                nodes.iter().map(|n| alloy_primitives::Bytes::from(n.to_message(store))).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A full node's state, with the trie taken away and a peer put in its
+    /// place -- which is what a light client is.
+    fn light_node(peer: FakePeer) -> (crate::server::RpcState, tempfile::TempDir, Address) {
+        let (mut state, tmp, addr, _root) = setup_proof_state();
+        let trie_store = state.trie_store.clone().unwrap();
+        let header = crate::state::resolve_header("latest", &state.store).unwrap();
+        let root_bytes = trie_store.get(header.state_root.as_slice()).unwrap();
+        let _ = TrieNode::from_message(&root_bytes, &*trie_store);
+
+        state.trie_store = None;
+        state.proof_fetcher = Some(Arc::new(peer));
+        (state, tmp, addr)
+    }
+
+    fn honest_peer() -> (FakePeer, Address) {
+        let (state, _tmp, addr, _) = setup_proof_state();
+        let trie_store = state.trie_store.clone().unwrap();
+        let header = crate::state::resolve_header("latest", &state.store).unwrap();
+        let root_bytes = trie_store.get(header.state_root.as_slice()).unwrap();
+        let root = TrieNode::from_message(&root_bytes, &*trie_store);
+        let peer = FakePeer {
+            account_proof: path_for(&root, &*trie_store, &account_key(&addr)),
+            storage_proofs: Vec::new(),
+        };
+        std::mem::forget(_tmp);
+        (peer, addr)
+    }
+
+    #[tokio::test]
+    async fn an_honest_peer_gives_the_light_client_a_verified_balance() {
+        let (peer, _) = honest_peer();
+        let (state, _tmp, addr) = light_node(peer);
+
+        let req = make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"]));
+        let r = dispatch_for_test(&state, req).await;
+        let r = r.result.expect("an honest proof must be accepted");
+
+        assert_eq!(r["balance"], json!("0xf4240"), "1,000,000, proved rather than taken on trust");
+        assert_eq!(r["nonce"], json!("0x7"));
+        assert!(!r["accountProof"].as_array().unwrap().is_empty());
+    }
+
+    /// The attack the whole verification exists to stop. Every node here is
+    /// genuine and correctly linked; it is simply not this account's path.
+    /// Accepting it would report somebody else's balance as yours.
+    #[tokio::test]
+    async fn a_proof_for_a_different_account_is_refused() {
+        let (mut peer, _) = honest_peer();
+        // Keep only the root: a well-formed start that does not reach the
+        // key, which is what any substituted path looks like.
+        let last = peer.account_proof.last().cloned().unwrap();
+        peer.account_proof = vec![last];
+
+        let (state, _tmp, addr) = light_node(peer);
+        let req = make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"]));
+        let r = dispatch_for_test(&state, req).await;
+
+        assert!(r.result.is_none(), "an unprovable answer must not be returned as a balance");
+        let err = r.error.expect("and must be an error");
+        assert!(
+            err.message.contains("does not check out"),
+            "the error should say the proof failed, got {:?}",
+            err.message
+        );
+    }
+
+    /// Silence must not read as a zero balance, or any peer could erase any
+    /// account by sending nothing.
+    #[tokio::test]
+    async fn an_empty_proof_is_an_error_and_not_a_zero_balance() {
+        let peer = FakePeer { account_proof: Vec::new(), storage_proofs: Vec::new() };
+        let (state, _tmp, addr) = light_node(peer);
+
+        let req = make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"]));
+        let r = dispatch_for_test(&state, req).await;
+
+        assert!(
+            r.result.is_none(),
+            "an empty proof must not be reported as an account with nothing in it"
+        );
+        assert!(r.error.is_some());
+    }
+
+    /// A tampered node changes its own hash, so it stops being the child its
+    /// parent names.
+    #[tokio::test]
+    async fn a_tampered_node_is_refused() {
+        let (mut peer, _) = honest_peer();
+        let leaf = peer.account_proof[0].to_vec();
+        let mut forged = leaf.clone();
+        let n = forged.len();
+        forged[n - 1] ^= 0xFF; // change the balance's last byte
+        peer.account_proof[0] = alloy_primitives::Bytes::from(forged);
+
+        let (state, _tmp, addr) = light_node(peer);
+        let req = make_request("eth_getProof", json!([format!("{addr:#x}"), [], "latest"]));
+        let r = dispatch_for_test(&state, req).await;
+
+        assert!(r.result.is_none(), "a forged balance must not be served");
+        assert!(r.error.is_some());
+    }
+}
+
+// ===== rsk_lastAccountChange: emulating the witness by searching =====
+//
+// The consensus field is not on this branch. These build a small chain and
+// check the search recovers the same answers it would give.
+
+mod witness_search_tests {
+    use super::*;
+    use rustock_trie::{account_key, AccountState, MemoryTrieStore, TrieKeySlice, TrieNode, TrieStore};
+    use std::sync::Arc;
+
+    /// A chain where `watched` changes only at the listed blocks.
+    struct Fixture {
+        state: crate::server::RpcState,
+        watched: Address,
+        changed_at: Vec<u64>,
+        _tmp: tempfile::TempDir,
+    }
+
+    /// Build `length` blocks, writing a new balance for `watched` only at
+    /// `changed_at`. No execution: the point is the shape of the state over
+    /// time, and hand-building it keeps the fixture honest about which
+    /// blocks really differ.
+    fn chain(length: u64, changed_at: &[u64]) -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rustock_storage::BlockStore::open(tmp.path()).unwrap());
+        let trie = Arc::new(MemoryTrieStore::new());
+        let watched = Address::repeat_byte(0xAB);
+        let bystander = Address::repeat_byte(0xCD);
+
+        let mut root = TrieNode::empty();
+        let mut balance = 0u64;
+        let mut parent = B256::ZERO;
+
+        for number in 0..=length {
+            if changed_at.contains(&number) {
+                balance += 1000;
+                let acct = AccountState::new(U256::ZERO, U256::from(balance));
+                root = root.put(
+                    &TrieKeySlice::from_key(&account_key(&watched)),
+                    &acct.encode(),
+                    trie.as_ref(),
+                );
+            }
+            // Something else moves in every block, so a changed state root
+            // never implies the watched account changed.
+            let noise = AccountState::new(U256::from(number), U256::from(number));
+            root = root.put(
+                &TrieKeySlice::from_key(&account_key(&bystander)),
+                &noise.encode(),
+                trie.as_ref(),
+            );
+            root.save(trie.as_ref(), true);
+
+            let mut header = test_header(number);
+            header.parent_hash = parent;
+            header.state_root = root.compute_hash(trie.as_ref());
+            let hash = header.hash();
+            store.put_header(&header).unwrap();
+            store.put_header_number(hash, number).unwrap();
+            store.put_canonical_hash(number, hash).unwrap();
+            store.set_head(hash).unwrap();
+            parent = hash;
+        }
+
+        let state = state_with_trie(store.clone(), trie);
+        Fixture { state, watched, changed_at: changed_at.to_vec(), _tmp: tmp }
+    }
+
+    fn state_with_trie(
+        store: Arc<rustock_storage::BlockStore>,
+        trie: Arc<MemoryTrieStore>,
+    ) -> RpcState {
+        RpcState {
+            store,
+            peer_store: Arc::new(PeerStore::new()),
+            config: Arc::new(ChainConfig::mainnet()),
+            tx_submitter: None,
+            proof_fetcher: None,
+            trie_store: Some(trie as Arc<dyn TrieStore>),
+            hardfork_cfg: None,
+            filter_store: Arc::new(crate::logs::FilterStore::new()),
+            tx_pool: None,
+            wire_queue_depth: None,
+            gas_price: None,
+            epoch_store: None,
+            miner: None,
+            auto_miner: None,
+            wallet: None,
+            admin_enabled: false,
+            account_search_enabled: true,
+            gc_burial: 4000,
+            gc_pins: None,
+            snapshots: None,
+            gas_estimator_binary_search: false,
+            logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+            prune_keep_depth: 100_000,
+            prune_max_batch: 50_000,
+            scoring: None,
+            events: None,
+        }
+    }
+
+    async fn last_change(f: &Fixture, at: u64) -> Option<u64> {
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), format!("{at:#x}")]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.expect("search must answer");
+        assert_eq!(r["witnessSource"], json!("searched"), "the source must be named");
+        r["lastModifiedBlock"]
+            .as_str()
+            .map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_search_finds_the_block_an_account_last_changed_in() {
+        let f = chain(40, &[5, 12, 29]);
+        assert_eq!(last_change(&f, 40).await, Some(29));
+        assert_eq!(last_change(&f, 28).await, Some(12));
+        assert_eq!(last_change(&f, 11).await, Some(5));
+    }
+
+    /// Walking backwards recovers the whole history, which is what a wallet
+    /// actually does with this.
+    #[tokio::test]
+    async fn walking_backwards_recovers_every_change() {
+        let f = chain(40, &[5, 12, 29]);
+        let mut found = Vec::new();
+        let mut cursor = 40u64;
+        while let Some(b) = last_change(&f, cursor).await {
+            found.push(b);
+            if b == 0 {
+                break;
+            }
+            cursor = b - 1;
+        }
+        found.reverse();
+        assert_eq!(found, f.changed_at, "the walk must recover exactly the real changes");
+    }
+
+    /// An account that never appears has nothing to find, and the search
+    /// must say so rather than inventing a block.
+    #[tokio::test]
+    async fn an_account_that_never_changed_reports_nothing() {
+        let f = chain(40, &[5]);
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", Address::repeat_byte(0x11)), "0x28"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.unwrap();
+        assert!(r["lastModifiedBlock"].is_null(), "an untouched account has no last change");
+    }
+
+    /// The limitation, asserted rather than described, so that nobody later
+    /// "fixes" this test without understanding what it is recording.
+    ///
+    /// An account credited and then debited back to a value it already held
+    /// leaves the trie exactly as it found it. The leaf bytes match, so the
+    /// search sees no change, and reports the earlier block instead. This is
+    /// not a bug in the bisection: content addressing cannot record that
+    /// something was touched and came back, and only a field written at the
+    /// time of the modification -- the RSKIP's -- can.
+    #[tokio::test]
+    async fn a_change_that_cancels_out_is_invisible_to_the_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rustock_storage::BlockStore::open(tmp.path()).unwrap());
+        let trie = Arc::new(MemoryTrieStore::new());
+        let watched = Address::repeat_byte(0xAB);
+
+        let mut root = TrieNode::empty();
+        let mut parent = B256::ZERO;
+        // 1000 from block 2, up to 2000 at block 5, back to 1000 at block 8.
+        // Blocks 5 and 8 are real modifications that the record forgets.
+        let balances = [0u64, 0, 1000, 1000, 1000, 2000, 2000, 2000, 1000, 1000];
+        for (number, bal) in balances.iter().enumerate() {
+            let number = number as u64;
+            if *bal > 0 {
+                let acct = AccountState::new(U256::ZERO, U256::from(*bal));
+                root = root.put(
+                    &TrieKeySlice::from_key(&account_key(&watched)),
+                    &acct.encode(),
+                    trie.as_ref(),
+                );
+            }
+            let noise = AccountState::new(U256::from(number), U256::from(number));
+            root = root.put(
+                &TrieKeySlice::from_key(&account_key(&Address::repeat_byte(0xCD))),
+                &noise.encode(),
+                trie.as_ref(),
+            );
+            root.save(trie.as_ref(), true);
+
+            let mut header = test_header(number);
+            header.parent_hash = parent;
+            header.state_root = root.compute_hash(trie.as_ref());
+            let hash = header.hash();
+            store.put_header(&header).unwrap();
+            store.put_header_number(hash, number).unwrap();
+            store.put_canonical_hash(number, hash).unwrap();
+            store.set_head(hash).unwrap();
+            parent = hash;
+        }
+
+        let f = Fixture {
+            state: state_with_trie(store, trie),
+            watched,
+            changed_at: vec![],
+            _tmp: tmp,
+        };
+
+        // The truth is block 8: the balance was last written there. The
+        // search answers 2, because blocks 2 and 8 hold identical records
+        // and nothing in the state distinguishes them.
+        assert_eq!(
+            last_change(&f, 9).await,
+            Some(2),
+            "the search reports the earlier identical state, not the real last write"
+        );
+    }
+
+    /// The default is off, and a node that does not serve this looks like a
+    /// node that never had it.
+    ///
+    /// Reported as unknown rather than forbidden, for the reason the
+    /// administrative methods are: "method not found" tells a scanner
+    /// nothing about what this node could be made to do.
+    #[tokio::test]
+    async fn the_search_is_not_served_unless_it_is_switched_on() {
+        let mut f = chain(20, &[5]);
+        f.state.account_search_enabled = false;
+
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x14"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await;
+        assert!(r.result.is_none(), "the method must not answer when it is off");
+        let err = r.error.expect("and must refuse");
+        assert_eq!(
+            err.message, "Method not found",
+            "a disabled method must be indistinguishable from an absent one"
+        );
+
+        // And on, it answers -- so the test above is measuring the switch.
+        f.state.account_search_enabled = true;
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x14"]),
+        );
+        assert!(dispatch_for_test(&f.state, req).await.result.is_some());
+    }
+
+    /// The caller can bound the search, and is told when the answer is older
+    /// than the bound rather than being handed a null that reads as
+    /// "never changed".
+    #[tokio::test]
+    async fn a_bounded_search_says_when_the_answer_is_older_than_the_range() {
+        let f = chain(40, &[5, 12, 29]);
+
+        // Range that contains the change: complete, and found.
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x28", "0x14"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.unwrap();
+        assert_eq!(r["lastModifiedBlock"], json!("0x1d"), "#29");
+        assert_eq!(r["complete"], json!(true));
+        assert_eq!(r["searchedFrom"], json!("0x14"));
+
+        // Range entirely above the last change: nothing found, and the
+        // answer says so instead of claiming the account never moved.
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x28", "0x1e"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.unwrap();
+        assert!(r["lastModifiedBlock"].is_null());
+        assert_eq!(
+            r["complete"],
+            json!(false),
+            "a bounded search that found nothing must not be read as 'never changed'"
+        );
+    }
+
+    /// Only a search that reached genesis may claim the account never
+    /// changed, and it must still say so explicitly.
+    #[tokio::test]
+    async fn only_a_search_from_genesis_can_claim_never_changed() {
+        let f = chain(40, &[5]);
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", Address::repeat_byte(0x11)), "0x28", "0x0"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.unwrap();
+        assert!(r["lastModifiedBlock"].is_null());
+        assert_eq!(r["complete"], json!(true), "reached genesis, so the absence is the answer");
+    }
+
+    /// A bounded search costs less, which is the practical reason to offer
+    /// the bound at all.
+    #[tokio::test]
+    async fn bounding_the_range_costs_fewer_probes() {
+        let f = chain(1000, &[700]);
+        let probes = |r: &Value| r["probes"].as_u64().unwrap();
+
+        let wide = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x3e8", "0x0"]),
+        );
+        let wide = dispatch_for_test(&f.state, wide).await.result.unwrap();
+
+        let narrow = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x3e8", "0x280"]),
+        );
+        let narrow = dispatch_for_test(&f.state, narrow).await.result.unwrap();
+
+        assert_eq!(narrow["lastModifiedBlock"], json!("0x2bc"), "#700, same answer");
+        assert!(
+            probes(&narrow) < probes(&wide),
+            "a narrower range must cost less: {} vs {}",
+            probes(&narrow),
+            probes(&wide)
+        );
+    }
+
+    /// The cost claim: logarithmic in the chain, not linear. A wallet paying
+    /// per proof cares, and it is the number the consensus field reduces
+    /// to one.
+    #[tokio::test]
+    async fn the_search_is_logarithmic_in_the_chain_length() {
+        let f = chain(1000, &[700]);
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x3e8"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.unwrap();
+        let probes = r["probes"].as_u64().unwrap();
+        assert_eq!(
+            last_change(&f, 1000).await,
+            Some(700),
+            "and it must still be right"
+        );
+        assert!(
+            probes < 20,
+            "1000 blocks should cost about log2(1000) ~ 10 probes, took {probes}"
+        );
+    }
 }

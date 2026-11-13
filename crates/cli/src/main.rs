@@ -53,6 +53,35 @@ impl rustock_rpc::server::TxSubmitter for TxRelaySubmitter {
     }
 }
 
+/// A light client's route to state: ask a peer, then verify.
+///
+/// The bridge lives here rather than in sync because sync does not depend on
+/// rpc. It returns the peer's nodes unchecked on purpose -- `rustock_rpc`'s
+/// proof module holds the headers and is the only place that can name the
+/// root a proof must hash up to.
+struct PeerProofFetcher(rustock_sync::proof_client::ProofClient);
+
+#[async_trait::async_trait]
+impl rustock_rpc::server::ProofFetcher for PeerProofFetcher {
+    async fn fetch_proof(
+        &self,
+        block_number: u64,
+        address: alloy_primitives::Address,
+        storage_keys: Vec<alloy_primitives::B256>,
+    ) -> Result<
+        (Vec<alloy_primitives::Bytes>, Vec<Vec<alloy_primitives::Bytes>>),
+        String,
+    > {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+        let proof = self
+            .0
+            .fetch(block_number, address, storage_keys, DEADLINE)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((proof.account_proof, proof.storage_proofs))
+    }
+}
+
 struct PoolAdapter(Arc<rustock_sync::TransactionPool>);
 
 /// The gas-price tracker, as `eth_gasPrice` needs it.
@@ -498,6 +527,31 @@ struct Args {
     /// never double-count across the activation.
     #[arg(long, default_value_t = false)]
     no_peg_event_recording: bool,
+
+    /// Run as an SPV client: answer state queries by asking a peer and
+    /// checking the proof, rather than by reading a local trie.
+    ///
+    /// Not to be confused with `node-light.example.toml`, which configures a
+    /// pruned *full* node -- that one executes every block and reads its own
+    /// trie on a few gigabytes. This one executes nothing and has no trie.
+    ///
+    /// A light client follows headers and never executes a block, so it has
+    /// no state of its own. `eth_getProof` goes out over the wire and the
+    /// answer is verified against the state root of a header this node
+    /// validated itself -- a peer that lies costs a round trip, not a wrong
+    /// balance.
+    ///
+    /// This is what makes the account modification witness usable: a wallet
+    /// reads `lastModifiedBlock` from a proof and walks an account's history
+    /// backwards one proven hop per modified block, which is the only way to
+    /// follow native rBTC, since a value transfer emits no log and sets no
+    /// bloom bit.
+    ///
+    /// Today this switches the *state* path only -- the node still syncs and
+    /// executes as it otherwise would. Following headers alone is a larger
+    /// change and is not done here.
+    #[arg(long, default_value_t = false)]
+    spv: bool,
 
     /// Where those records go. Defaults to `<data-dir>/peg-events`.
     ///
@@ -1288,6 +1342,21 @@ struct Args {
     #[arg(long)]
     rpc_admin: bool,
 
+    /// Serve `rsk_lastAccountChange`, which finds the block an account last
+    /// changed in by bisecting its trie leaf across history.
+    ///
+    /// Off by default, because the cost is invisible at the call site. One
+    /// call is ten to twenty-four state lookups; on a node that answers from
+    /// peers it is that many round trips. A client in a loop amplifies into
+    /// real traffic without ever looking as though it is.
+    ///
+    /// It is also answerable only over state the node still holds. On a
+    /// pruning or epoch node the search is bounded to that window by
+    /// default, so enabling it on one does not make the whole chain
+    /// searchable.
+    #[arg(long, default_value_t = false)]
+    rpc_account_search: bool,
+
     /// Private keys this node may sign with, one 32-byte hex key per line.
     ///
     /// Off by default, and the only way the node ever holds a key for
@@ -1450,6 +1519,7 @@ fn apply_file_config(
     apply(matches, "rpc_host", f.rpc.host.as_ref(), &mut a.rpc_host);
     apply(matches, "rpc_port", f.rpc.port.as_ref(), &mut a.rpc_port);
     apply(matches, "rpc_admin", f.rpc.admin.as_ref(), &mut a.rpc_admin);
+    apply(matches, "rpc_account_search", f.rpc.account_search.as_ref(), &mut a.rpc_account_search);
     apply_opt(matches, "wallet_file", f.rpc.wallet_file.as_ref(), &mut a.wallet_file);
     apply(matches, "no_rpc", f.rpc.disabled.as_ref(), &mut a.no_rpc);
     apply(matches, "ws", f.rpc.ws.as_ref(), &mut a.ws);
@@ -1530,6 +1600,7 @@ fn apply_file_config(
 
     apply(matches, "read_threads", f.trie.read_threads.as_ref(), &mut a.read_threads);
 
+    apply(matches, "spv", f.spv.enabled.as_ref(), &mut a.spv);
     apply(matches, "no_peg_event_recording", f.peg_events.disabled.as_ref(), &mut a.no_peg_event_recording);
     apply_opt(matches, "peg_events_dir", f.peg_events.dir.as_ref(), &mut a.peg_events_dir);
     apply(matches, "prune_keep_depth", f.prune.keep_depth.as_ref(), &mut a.prune_keep_depth);
@@ -3094,14 +3165,26 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_best_block_listeners(best_block_listeners.clone())
         .with_tx_pool(pool.clone())
-        .with_block_processor(block_processor, trie_store_for_exec, initial_state_root)
         .with_gas_price_tracker(gas_price_tracker.clone())
         .with_scoring(Some(scoring.clone()))
         .with_events(events.clone())
         .with_follow_up(args.follow_up)
         .with_trie_flush_every(args.trie_flush_every)
         .with_serve_ceiling(args.simulate_height)
+        .with_spv(args.spv)
         .with_exit_when_synced(args.exit_when_synced);
+
+    // An SPV node gets no block processor at all. Withholding it is what
+    // makes "never executes" structural rather than a flag someone has to
+    // keep honouring: with no `exec_fn` the batch path already runs straight
+    // through, so there is no execution to accidentally reach.
+    if !args.spv {
+        sync_service = sync_service.with_block_processor(
+            block_processor,
+            trie_store_for_exec,
+            initial_state_root,
+        );
+    }
 
     if args.snap_sync {
         info!(
@@ -3117,6 +3200,20 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     // answers with the live backlog.
     // Shared with the prune sweep below. Closed until the sync service has
     // determined what this node is doing.
+    // A light client answers state queries by asking a peer, so the service
+    // needs a way to carry those requests and match the answers. A full node
+    // reads its own trie and never asks, so this stays off.
+    let proof_fetcher: Option<Arc<dyn rustock_rpc::server::ProofFetcher>> = if args.spv {
+        let client = sync_service.with_proof_fetching();
+        info!(
+            "SPV mode: state queries will be fetched from peers and verified against \
+             this node's own validated headers"
+        );
+        Some(Arc::new(PeerProofFetcher(client)))
+    } else {
+        None
+    };
+
     let prune_gate = sync_service.prune_gate();
     let wire_queue_depth = sync_service.wire_queue_depth();
 
@@ -3580,7 +3677,13 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             peer_store: peer_store.clone(),
             config: config.clone(),
             tx_submitter: Some(Arc::new(TxRelaySubmitter(tx_relay.clone()))),
-            trie_store: Some(trie_store),
+            // A light client has no state of its own to consult, so the
+            // trie is withheld from the RPC layer even when one exists on
+            // disk: leaving it in place would let `eth_getProof` quietly
+            // answer from local state and never exercise the proof path,
+            // which is the one a real light client depends on.
+            trie_store: if args.spv { None } else { Some(trie_store) },
+            proof_fetcher: proof_fetcher.clone(),
             hardfork_cfg: Some(hardfork_cfg),
             filter_store: Arc::new(rustock_rpc::logs::FilterStore::new()),
             tx_pool: Some(Arc::new(PoolAdapter(pool.clone()))),
@@ -3610,6 +3713,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             },
             wallet: wallet.clone(),
             admin_enabled: args.rpc_admin,
+            account_search_enabled: args.rpc_account_search,
             gc_burial: args.gc_burial,
             gc_pins: {
                 // Recomputed per cycle, because the checkpoint moves. Empty

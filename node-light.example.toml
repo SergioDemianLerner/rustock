@@ -99,6 +99,11 @@
 #                                   # fixed allowance: see
 #                                   # rustock_execution::gas_estimator.
 # dev = false                       # default — evm_* namespace: snapshot/revert/mine — development chains only
+# account_search = false           # default — rsk_lastAccountChange: finds the
+#                                  # block an account last changed in by bisecting
+#                                  # its trie leaf. OFF because one call is 10-24
+#                                  # state lookups (round trips, on an SPV node),
+#                                  # and that cost is invisible at the call site.
 # ws = false                        # default — WebSocket JSON-RPC, for eth_subscribe
 # ws_port = 4445                    # default
 # Private keys this node may sign with, one hex key per line. Off by
@@ -209,6 +214,12 @@ backend = "epoch"                   # light: bounds state size. This setting ALO
 [peg_events]
 # disabled = false                 # default — recording is on
 # dir = "..."                       # default: unset — <data-dir>/peg-events
+
+# SPV client. Not what this profile is: a light NODE still executes every
+# block and reads its own trie, which is why it keeps state at all. An SPV
+# client executes nothing and has no trie. Left off here.
+[spv]
+# enabled = false                   # default — read the local trie
 
 [prune]
 blocks = true                       # light: run sweeps. Default false -- pruning discards
