@@ -506,6 +506,13 @@ pub struct SyncService {
     /// Closure run on a blocking thread to execute a batch. Set when a block
     /// processor is attached; tests may override it to control timing/outcome.
     exec_fn: Option<ExecFn>,
+    /// Follow the chain on headers alone, never asking for a body.
+    ///
+    /// An SPV node validates headers, accumulates work from the trunk and
+    /// its uncles, and stops there. It executes nothing, so there is no
+    /// state for a body to produce and no reason to spend a round trip
+    /// fetching one.
+    pub(crate) spv: bool,
     pub(crate) last_body_height: u64,
     /// The executed head that last halted, and how many times in a row.
     ///
@@ -705,6 +712,7 @@ impl SyncService {
             executing: None,
             pending_exec: None,
             exec_fn: None,
+            spv: false,
             last_body_height: 0,
             futile_exec_halts: (0, 0),
             last_exec_height: 0,
@@ -742,6 +750,16 @@ impl SyncService {
 
     /// Attach a local block source (e.g. rskj's LevelDB) consulted for bodies
     /// before requesting them from peers.
+    /// Follow the chain on headers alone.
+    ///
+    /// Pairs with *not* installing a block processor: with no `exec_fn` the
+    /// batch path already runs straight through without executing, so this
+    /// only has to stop the bodies being asked for.
+    pub fn with_spv(mut self, spv: bool) -> Self {
+        self.spv = spv;
+        self
+    }
+
     pub fn with_block_source(mut self, source: Arc<dyn ExternalBlockSource>) -> Self {
         self.block_source = Some(source);
         self
@@ -4124,6 +4142,22 @@ impl SyncService {
             return;
         }
 
+        // An SPV node is finished with a block once its header is stored and
+        // its work counted. Asking for the body would buy nothing it can use
+        // -- it executes nothing -- and would make the node's bandwidth
+        // scale with the chain's transactions rather than with its headers,
+        // which is the whole saving.
+        if self.spv {
+            debug!(
+                target: "rustock::sync",
+                "SPV: {} header(s) up to #{} accepted without bodies",
+                pending.len(),
+                pending.last().map(|(_, h)| h.number).unwrap_or(0),
+            );
+            self.finish_batch(&pending, peer_best).await;
+            return;
+        }
+
         if missing_bodies == 0 {
             debug!(
                 target: "rustock::sync",
@@ -4398,8 +4432,20 @@ impl SyncService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn request_follow_bodies_for_test(&mut self, headers: &[Header]) {
+        self.request_follow_bodies(headers).await
+    }
+
     /// In Following mode, request bodies for newly received block headers.
     async fn request_follow_bodies(&mut self, headers: &[Header]) {
+        // The tip is followed on headers alone too. Following is where an
+        // SPV node spends nearly all its life, so a body request leaking in
+        // here would quietly undo the saving even if the initial sync was
+        // clean.
+        if self.spv {
+            return;
+        }
         let peers = self.peer_store.peers().await;
         if peers.is_empty() {
             return;
@@ -4494,6 +4540,11 @@ impl SyncService {
     /// so throughput comes from pipelining many in flight — concentrated on the
     /// peers that actually answer rather than spread evenly onto slow ones.
     pub(crate) async fn send_body_requests(&mut self) {
+        // Belt and braces beside the gate in the batch path: an SPV node
+        // must never put a body request on the wire, by any route.
+        if self.spv {
+            return;
+        }
         // Not an early return on an empty peer set. Two of the arms below need
         // no peer at all -- a body already in the store, and one derivable
         // from its header -- and returning here left a batch that needed
