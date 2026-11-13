@@ -6182,3 +6182,246 @@ mod light_proof_tests {
         assert!(r.error.is_some());
     }
 }
+
+// ===== rsk_lastAccountChange: emulating the witness by searching =====
+//
+// The consensus field is not on this branch. These build a small chain and
+// check the search recovers the same answers it would give.
+
+mod witness_search_tests {
+    use super::*;
+    use rustock_trie::{account_key, AccountState, MemoryTrieStore, TrieKeySlice, TrieNode, TrieStore};
+    use std::sync::Arc;
+
+    /// A chain where `watched` changes only at the listed blocks.
+    struct Fixture {
+        state: crate::server::RpcState,
+        watched: Address,
+        changed_at: Vec<u64>,
+        _tmp: tempfile::TempDir,
+    }
+
+    /// Build `length` blocks, writing a new balance for `watched` only at
+    /// `changed_at`. No execution: the point is the shape of the state over
+    /// time, and hand-building it keeps the fixture honest about which
+    /// blocks really differ.
+    fn chain(length: u64, changed_at: &[u64]) -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rustock_storage::BlockStore::open(tmp.path()).unwrap());
+        let trie = Arc::new(MemoryTrieStore::new());
+        let watched = Address::repeat_byte(0xAB);
+        let bystander = Address::repeat_byte(0xCD);
+
+        let mut root = TrieNode::empty();
+        let mut balance = 0u64;
+        let mut parent = B256::ZERO;
+
+        for number in 0..=length {
+            if changed_at.contains(&number) {
+                balance += 1000;
+                let acct = AccountState::new(U256::ZERO, U256::from(balance));
+                root = root.put(
+                    &TrieKeySlice::from_key(&account_key(&watched)),
+                    &acct.encode(),
+                    trie.as_ref(),
+                );
+            }
+            // Something else moves in every block, so a changed state root
+            // never implies the watched account changed.
+            let noise = AccountState::new(U256::from(number), U256::from(number));
+            root = root.put(
+                &TrieKeySlice::from_key(&account_key(&bystander)),
+                &noise.encode(),
+                trie.as_ref(),
+            );
+            root.save(trie.as_ref(), true);
+
+            let mut header = test_header(number);
+            header.parent_hash = parent;
+            header.state_root = root.compute_hash(trie.as_ref());
+            let hash = header.hash();
+            store.put_header(&header).unwrap();
+            store.put_header_number(hash, number).unwrap();
+            store.put_canonical_hash(number, hash).unwrap();
+            store.set_head(hash).unwrap();
+            parent = hash;
+        }
+
+        let state = state_with_trie(store.clone(), trie);
+        Fixture { state, watched, changed_at: changed_at.to_vec(), _tmp: tmp }
+    }
+
+    fn state_with_trie(
+        store: Arc<rustock_storage::BlockStore>,
+        trie: Arc<MemoryTrieStore>,
+    ) -> RpcState {
+        RpcState {
+            store,
+            peer_store: Arc::new(PeerStore::new()),
+            config: Arc::new(ChainConfig::mainnet()),
+            tx_submitter: None,
+            proof_fetcher: None,
+            trie_store: Some(trie as Arc<dyn TrieStore>),
+            hardfork_cfg: None,
+            filter_store: Arc::new(crate::logs::FilterStore::new()),
+            tx_pool: None,
+            wire_queue_depth: None,
+            gas_price: None,
+            epoch_store: None,
+            miner: None,
+            auto_miner: None,
+            wallet: None,
+            admin_enabled: false,
+            gc_burial: 4000,
+            gc_pins: None,
+            snapshots: None,
+            gas_estimator_binary_search: false,
+            logs_max_blocks: crate::logs::DEFAULT_MAX_BLOCK_RANGE,
+            prune_keep_depth: 100_000,
+            prune_max_batch: 50_000,
+            scoring: None,
+            events: None,
+        }
+    }
+
+    async fn last_change(f: &Fixture, at: u64) -> Option<u64> {
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), format!("{at:#x}")]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.expect("search must answer");
+        assert_eq!(r["witnessSource"], json!("searched"), "the source must be named");
+        r["lastModifiedBlock"]
+            .as_str()
+            .map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_search_finds_the_block_an_account_last_changed_in() {
+        let f = chain(40, &[5, 12, 29]);
+        assert_eq!(last_change(&f, 40).await, Some(29));
+        assert_eq!(last_change(&f, 28).await, Some(12));
+        assert_eq!(last_change(&f, 11).await, Some(5));
+    }
+
+    /// Walking backwards recovers the whole history, which is what a wallet
+    /// actually does with this.
+    #[tokio::test]
+    async fn walking_backwards_recovers_every_change() {
+        let f = chain(40, &[5, 12, 29]);
+        let mut found = Vec::new();
+        let mut cursor = 40u64;
+        while let Some(b) = last_change(&f, cursor).await {
+            found.push(b);
+            if b == 0 {
+                break;
+            }
+            cursor = b - 1;
+        }
+        found.reverse();
+        assert_eq!(found, f.changed_at, "the walk must recover exactly the real changes");
+    }
+
+    /// An account that never appears has nothing to find, and the search
+    /// must say so rather than inventing a block.
+    #[tokio::test]
+    async fn an_account_that_never_changed_reports_nothing() {
+        let f = chain(40, &[5]);
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", Address::repeat_byte(0x11)), "0x28"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.unwrap();
+        assert!(r["lastModifiedBlock"].is_null(), "an untouched account has no last change");
+    }
+
+    /// The limitation, asserted rather than described, so that nobody later
+    /// "fixes" this test without understanding what it is recording.
+    ///
+    /// An account credited and then debited back to a value it already held
+    /// leaves the trie exactly as it found it. The leaf bytes match, so the
+    /// search sees no change, and reports the earlier block instead. This is
+    /// not a bug in the bisection: content addressing cannot record that
+    /// something was touched and came back, and only a field written at the
+    /// time of the modification -- the RSKIP's -- can.
+    #[tokio::test]
+    async fn a_change_that_cancels_out_is_invisible_to_the_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rustock_storage::BlockStore::open(tmp.path()).unwrap());
+        let trie = Arc::new(MemoryTrieStore::new());
+        let watched = Address::repeat_byte(0xAB);
+
+        let mut root = TrieNode::empty();
+        let mut parent = B256::ZERO;
+        // 1000 from block 2, up to 2000 at block 5, back to 1000 at block 8.
+        // Blocks 5 and 8 are real modifications that the record forgets.
+        let balances = [0u64, 0, 1000, 1000, 1000, 2000, 2000, 2000, 1000, 1000];
+        for (number, bal) in balances.iter().enumerate() {
+            let number = number as u64;
+            if *bal > 0 {
+                let acct = AccountState::new(U256::ZERO, U256::from(*bal));
+                root = root.put(
+                    &TrieKeySlice::from_key(&account_key(&watched)),
+                    &acct.encode(),
+                    trie.as_ref(),
+                );
+            }
+            let noise = AccountState::new(U256::from(number), U256::from(number));
+            root = root.put(
+                &TrieKeySlice::from_key(&account_key(&Address::repeat_byte(0xCD))),
+                &noise.encode(),
+                trie.as_ref(),
+            );
+            root.save(trie.as_ref(), true);
+
+            let mut header = test_header(number);
+            header.parent_hash = parent;
+            header.state_root = root.compute_hash(trie.as_ref());
+            let hash = header.hash();
+            store.put_header(&header).unwrap();
+            store.put_header_number(hash, number).unwrap();
+            store.put_canonical_hash(number, hash).unwrap();
+            store.set_head(hash).unwrap();
+            parent = hash;
+        }
+
+        let f = Fixture {
+            state: state_with_trie(store, trie),
+            watched,
+            changed_at: vec![],
+            _tmp: tmp,
+        };
+
+        // The truth is block 8: the balance was last written there. The
+        // search answers 2, because blocks 2 and 8 hold identical records
+        // and nothing in the state distinguishes them.
+        assert_eq!(
+            last_change(&f, 9).await,
+            Some(2),
+            "the search reports the earlier identical state, not the real last write"
+        );
+    }
+
+    /// The cost claim: logarithmic in the chain, not linear. A wallet paying
+    /// per proof cares, and it is the number the consensus field reduces
+    /// to one.
+    #[tokio::test]
+    async fn the_search_is_logarithmic_in_the_chain_length() {
+        let f = chain(1000, &[700]);
+        let req = make_request(
+            "rsk_lastAccountChange",
+            json!([format!("{:#x}", f.watched), "0x3e8"]),
+        );
+        let r = dispatch_for_test(&f.state, req).await.result.unwrap();
+        let probes = r["probes"].as_u64().unwrap();
+        assert_eq!(
+            last_change(&f, 1000).await,
+            Some(700),
+            "and it must still be right"
+        );
+        assert!(
+            probes < 20,
+            "1000 blocks should cost about log2(1000) ~ 10 probes, took {probes}"
+        );
+    }
+}
