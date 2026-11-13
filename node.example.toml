@@ -203,6 +203,39 @@
 
 
 
+# SPV client: answer state queries by asking a peer and checking the proof,
+# instead of reading a local trie.
+#
+# Not the same thing as `node-light.example.toml`, despite the word. That is
+# a pruned FULL node: it executes every block and reads its own trie, just on
+# a few gigabytes instead of forty-five. This executes nothing and has no
+# trie at all.
+#
+# A light client follows headers and never executes a block, so it holds no
+# state. `eth_getProof` goes out over the wire, and the nodes that come back
+# are verified against the state root of a header this node validated itself
+# before any of it reaches the caller. A peer that lies costs a round trip,
+# not a wrong balance; a peer that stays silent is an error rather than an
+# account with nothing in it.
+#
+# This is what makes the account modification witness usable from a wallet.
+# `eth_getProof` reports `lastModifiedBlock`, so a wallet can walk an
+# account's history backwards -- one proven hop per block in which the
+# account actually changed -- which is the only way to follow native rBTC,
+# since a value transfer emits no log and so sets no bloom bit.
+#
+# The trie is withheld from the RPC layer even when one exists on disk.
+# Leaving it in place would let state queries quietly answer from local data
+# and never exercise the proof path, which is the one a real light client
+# depends on.
+#
+# Today this switches the state path only: the node still syncs and executes
+# as it otherwise would. Following headers alone is a larger change.
+[spv]
+# enabled = false                   # default — read the local trie
+
+
+
 # Block-history pruning: bodies, receipts, the transaction index, headers and
 # the canonical mapping, for blocks far enough behind.
 #
