@@ -3149,14 +3149,26 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_best_block_listeners(best_block_listeners.clone())
         .with_tx_pool(pool.clone())
-        .with_block_processor(block_processor, trie_store_for_exec, initial_state_root)
         .with_gas_price_tracker(gas_price_tracker.clone())
         .with_scoring(Some(scoring.clone()))
         .with_events(events.clone())
         .with_follow_up(args.follow_up)
         .with_trie_flush_every(args.trie_flush_every)
         .with_serve_ceiling(args.simulate_height)
+        .with_spv(args.spv)
         .with_exit_when_synced(args.exit_when_synced);
+
+    // An SPV node gets no block processor at all. Withholding it is what
+    // makes "never executes" structural rather than a flag someone has to
+    // keep honouring: with no `exec_fn` the batch path already runs straight
+    // through, so there is no execution to accidentally reach.
+    if !args.spv {
+        sync_service = sync_service.with_block_processor(
+            block_processor,
+            trie_store_for_exec,
+            initial_state_root,
+        );
+    }
 
     if args.snap_sync {
         info!(
