@@ -2215,6 +2215,9 @@ mod trie_proof_message_tests {
     fn the_new_types_sit_above_everything_rskj_defines() {
         assert_eq!(RskMessageType::TrieProofRequest as u8, 29);
         assert_eq!(RskMessageType::TrieProofResponse as u8, 30);
-        assert!(RSK_PROOF_VERSION > RSK_RANGE_VERSION);
+        // A const block: the ordering of subprotocol versions is a fact
+        // about the source, so it should fail to compile rather than fail a
+        // test run.
+        const { assert!(RSK_PROOF_VERSION > RSK_RANGE_VERSION) };
     }
 }
