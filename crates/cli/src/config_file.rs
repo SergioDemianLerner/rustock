@@ -57,9 +57,38 @@ pub struct FileConfig {
     #[serde(default)]
     pub snapshot: SnapshotSection,
     #[serde(default)]
+    pub peg_events: PegEventsSection,
+    #[serde(default)]
     pub checkpoint: CheckpointSection,
     #[serde(default)]
     pub metrics: MetricsSection,
+    #[serde(default)]
+    pub chain: ChainSection,
+    #[serde(default)]
+    pub spv: SpvSection,
+}
+
+/// Regtest chain settings, for a chain that has to match one an rskj node
+/// runs: its genesis file, its consensus-rule overrides, its gas-limit
+/// bounds, and whether proof of work is checked.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainSection {
+    /// An rskj genesis JSON file, used instead of the built-in regtest genesis.
+    pub genesis: Option<std::path::PathBuf>,
+    /// rskj `miner.server.skipPowValidation`.
+    pub skip_pow_validation: Option<bool>,
+    /// rskj `blockchain.config.consensusRules`, as `name = height`
+    /// (-1 disables).
+    pub consensus_rules: Option<std::collections::BTreeMap<String, i64>>,
+    pub min_gas_limit: Option<u64>,
+    pub max_gas_limit: Option<u64>,
+    /// rskj `blockchain.config.hardforkActivationHeights`, as `name = height`
+    /// (-1 takes the upgrade off the ladder).
+    pub hardforks: Option<std::collections::BTreeMap<String, i64>>,
+    /// Take the settings above on mainnet and testnet too, for a copy of the
+    /// chain run under rules it has not activated. `genesis` stays refused.
+    pub allow_overrides: Option<bool>,
 }
 
 /// Prometheus metrics. Separate from `[rpc]` because the listener is: a
@@ -91,6 +120,7 @@ pub struct NodeSection {
     /// do not each recover the same signature. On by default; `false` turns
     /// it off and every sender is recomputed.
     pub sigcache: Option<bool>,
+    pub account_slots: Option<u64>,
     /// Catch up with new blocks. `false` serves what is held and nothing more.
     pub follow_up: Option<bool>,
     /// Behave as though the canonical chain ends at this height. Requires
@@ -119,6 +149,9 @@ pub struct RpcSection {
     pub logs_max_blocks: Option<u64>,
     /// Enable the `evm_*` development-chain namespace. Off by default.
     pub dev: Option<bool>,
+    /// Serve `rsk_lastAccountChange`. Off by default: one call is a
+    /// bisection, so it costs ten to twenty-four state lookups.
+    pub account_search: Option<bool>,
     /// Fall back to the pre-exactimator gas estimator: a binary search over
     /// roughly two dozen executions. The single-pass estimator is the
     /// default; this exists so an operator who suspects it can compare
@@ -228,6 +261,36 @@ pub struct CheckpointSection {
     pub bound_work: Option<bool>,
 }
 
+/// Recording the peg events the Bridge does not emit.
+///
+/// `registerFlyoverBtcTransaction` calls no event logger at any height, so
+/// every Flyover peg-in is absent from the receipts and therefore from
+/// `bridge_events`, which is built from them. Recording keeps a store of the
+/// Running as an SPV client.
+///
+/// Deliberately not called "light": `node-light.example.toml` already uses
+/// that word for a pruned full node that keeps current state on a few
+/// gigabytes. That node executes every block and reads its own trie. This
+/// one executes nothing and has no trie at all. Sharing a name would invite
+/// an operator to turn on the wrong one.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpvSection {
+    /// Answer state queries by asking a peer and verifying the proof,
+    /// instead of reading a local trie.
+    pub enabled: Option<bool>,
+}
+
+/// Reconstructed peg events, kept current as blocks arrive.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PegEventsSection {
+    /// Turn recording off. On by default.
+    pub disabled: Option<bool>,
+    /// Where the records go. Defaults to `<data-dir>/peg-events`.
+    pub dir: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PruneSection {
@@ -268,6 +331,11 @@ pub struct MiningSection {
     pub coinbase: Option<String>,
     pub extra_data: Option<String>,
     pub refresh_secs: Option<u64>,
+    pub min_gas_price: Option<u64>,
+    pub submission_rate_limit_ms: Option<u64>,
+    pub update_work_on_new_transaction: Option<bool>,
+    pub timed: Option<String>,
+    pub flush_every: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -347,6 +415,12 @@ pub const ONE_SHOT: &[&str] = &[
     "repair_from",
     "repair_to",
     "import_blocks_db",
+    "import_blocks",
+    "export_blocks",
+    "export_from",
+    "export_to",
+    "import_flush_every",
+    "breakdown_log",
     "import_rskj",
     "import_metrics",
     "import_skip_existing",
@@ -400,8 +474,12 @@ pub const CONFIGURABLE: &[&str] = &[
     "metrics_host",
     "metrics_port",
     "rpc_admin",
+    "rpc_account_search",
     "wallet_file",
     "no_rpc",
+    "spv",
+    "no_peg_event_recording",
+    "peg_events_dir",
     "ws",
     "ws_port",
     "max_peers",
@@ -435,17 +513,25 @@ pub const CONFIGURABLE: &[&str] = &[
     "checkpoint_bound_work",
     "rpc_logs_max_blocks",
     "sigcache",
+    "account_slots",
     "gas_estimator_binary_search",
     "dev_rpc",
     "mine",
     "mining_coinbase",
     "mining_extra_data",
     "mining_refresh_secs",
+    "mining_min_gas_price",
+    "mining_submission_rate_limit_ms",
+    "mining_update_work_on_new_transaction",
+    "mine_timed",
+    "flush_every",
     "account_tx_rate_limit",
     "account_tx_rate_limit_cleaner_period",
     "account_tx_rate_limit_max_accounts",
     "account_tx_rate_limit_quota_multiplier",
     "account_tx_rate_limit_gas_per_second_percent",
+    "hardfork",
+    "allow_chain_overrides",
     "log_level",
     "log_to_stdout",
     // Read parallelism is read by the snap-sync client and the trie store
@@ -466,6 +552,11 @@ pub const CONFIGURABLE: &[&str] = &[
     "snap_peer_rate",
     "snap_total_rate",
     "alerts_config",
+    "genesis",
+    "skip_pow_validation",
+    "consensus_rule",
+    "min_gas_limit",
+    "max_gas_limit",
 ];
 
 #[cfg(test)]

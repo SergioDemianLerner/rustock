@@ -24,13 +24,22 @@ use rustock_networking::protocol::snap::{
     ChunkPayload, Refusal, SnapBlocksRequest, SnapBlocksResponse, SnapChunkRequest,
     SnapChunkResponse, SnapEntry, SnapStatusRequest, SnapStatusResponse,
 };
+use rustock_networking::protocol::rsk::{TrieProofRequest, TrieProofResponse};
 use rustock_core::Block;
 use rustock_storage::BlockStore;
 use rustock_trie::snapshot::total_size;
 use rustock_trie::snapshot_legacy::{encode_blob as encode_legacy_blob, legacy_chunk};
 use rustock_trie::snapshot_legacy::rebuild as rebuild_legacy;
 use rustock_trie::snapshot_proof::{prove_cell, verify_chunk};
-use rustock_trie::{TrieNode, TrieStore};
+use rustock_trie::{account_key, storage_key, TrieKeySlice, TrieNode, TrieStore};
+
+/// Most storage slots one request may ask to have proved.
+///
+/// Each slot is an independent path through the trie, so an unbounded list
+/// is an unbounded amount of work for one message. Twenty is far beyond what
+/// a wallet watching an account needs and small enough that a peer asking
+/// repeatedly is limited by its rate allowance rather than by this.
+const MAX_PROOF_STORAGE_KEYS: usize = 20;
 use alloy_primitives::B512;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -628,6 +637,82 @@ impl SnapServer {
             "serving {} blocks below #{}", blocks.len(), request.block_number
         );
         Some(SnapBlocksResponse { id: request.id, blocks, difficulties })
+    }
+
+    /// Serve the unitrie nodes proving an account, and any storage slots
+    /// asked for, against a block's state root.
+    ///
+    /// This is what makes a light client possible: a node that does not
+    /// execute blocks has no other route to an account's state, and the
+    /// bloom cannot help it, because a native rBTC transfer emits no log.
+    ///
+    /// The request names the block by number; this resolves it through the
+    /// canonical chain and answers from that header's own state root. A peer
+    /// gains nothing by lying about which state it served -- the nodes have
+    /// to hash up to the root the client already holds in a header it
+    /// validated itself -- so nothing here needs to be trusted, only useful.
+    ///
+    /// `None` means "this node cannot answer", which is different from an
+    /// answer saying the key is absent. A pruned node asked about an old
+    /// height returns `None` and the client asks someone else; an empty path
+    /// inside a response is a claim about the trie, and the client checks it
+    /// as one.
+    pub fn trie_proof(&self, request: &TrieProofRequest) -> Option<TrieProofResponse> {
+        if !self.config.server_enabled {
+            return None;
+        }
+        if request.storage_keys.len() > MAX_PROOF_STORAGE_KEYS {
+            trace!(
+                target: "rustock::snap",
+                "refusing a trie proof asking for {} slots", request.storage_keys.len()
+            );
+            return None;
+        }
+
+        let hash = self.store.canonical_hash(request.block_number).ok()??;
+        let header = self.store.header(hash).ok()??;
+        // Absent state is the ordinary case on a pruning node, not an error.
+        let root_bytes = self.trie.get(header.state_root.as_slice())?;
+        let root = TrieNode::from_message(&root_bytes, self.trie.as_ref());
+
+        // `nodes_to_divergence` rather than `nodes_on_path`: the two agree
+        // whenever the key is present, and when it is not this one returns
+        // the nodes down to where the search stops, which is what lets the
+        // client verify the absence instead of taking the peer's word for
+        // it. Answering an absent key with an empty array would let any peer
+        // deny any account by sending nothing.
+        //
+        // An empty array now means only one thing: this node could not walk
+        // the path at all, because its store is missing something.
+        let path = |key: Vec<u8>| -> Vec<alloy_primitives::Bytes> {
+            match root.nodes_to_divergence(&TrieKeySlice::from_key(&key), self.trie.as_ref()) {
+                Some(nodes) => nodes
+                    .iter()
+                    .map(|n| alloy_primitives::Bytes::from(n.to_message(self.trie.as_ref())))
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+
+        let account_proof = path(account_key(&request.address));
+        let storage_proofs = request
+            .storage_keys
+            .iter()
+            .map(|slot| path(storage_key(&request.address, slot)))
+            .collect();
+
+        trace!(
+            target: "rustock::snap",
+            "serving a trie proof for {} at #{} ({} account nodes, {} slots)",
+            request.address, request.block_number, account_proof.len(),
+            request.storage_keys.len()
+        );
+        Some(TrieProofResponse {
+            id: request.id,
+            block_number: request.block_number,
+            account_proof,
+            storage_proofs,
+        })
     }
 }
 

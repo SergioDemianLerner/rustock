@@ -22,6 +22,32 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// Who to tell when a block becomes the executed best block: rskj's
+/// `EthereumListener.onBestBlock`, which the miner uses to rebuild its
+/// candidate. Registered after the service starts, which is why it is a
+/// shared slot and not a builder argument: the miner is built later.
+#[derive(Default)]
+pub struct BestBlockListeners {
+    listeners: std::sync::RwLock<Vec<Arc<dyn Fn(&Header) + Send + Sync>>>,
+}
+
+impl BestBlockListeners {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn add(&self, listener: Arc<dyn Fn(&Header) + Send + Sync>) {
+        self.listeners.write().unwrap_or_else(|e| e.into_inner()).push(listener);
+    }
+
+    pub fn notify(&self, header: &Header) {
+        let listeners = self.listeners.read().unwrap_or_else(|e| e.into_inner()).clone();
+        for listener in listeners {
+            listener(header);
+        }
+    }
+}
 use tokio::task::JoinHandle;
 use tracing::{info, debug, trace, warn, error};
 
@@ -480,6 +506,13 @@ pub struct SyncService {
     /// Closure run on a blocking thread to execute a batch. Set when a block
     /// processor is attached; tests may override it to control timing/outcome.
     exec_fn: Option<ExecFn>,
+    /// Follow the chain on headers alone, never asking for a body.
+    ///
+    /// An SPV node validates headers, accumulates work from the trunk and
+    /// its uncles, and stops there. It executes nothing, so there is no
+    /// state for a body to produce and no reason to spend a round trip
+    /// fetching one.
+    pub(crate) spv: bool,
     pub(crate) last_body_height: u64,
     /// The executed head that last halted, and how many times in a row.
     ///
@@ -542,6 +575,17 @@ pub struct SyncService {
     /// Carries the peer each request was sent to, so the answer can be
     /// matched against it.
     pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header, Instant, B512)>,
+    /// Unitrie proof requests this node is waiting on, by request id.
+    ///
+    /// A light client's RPC caller is blocked on one of these, so the entry
+    /// carries the channel that wakes it. Nothing arriving here is trusted:
+    /// the caller verifies the nodes against the state root in a header it
+    /// validated itself before any of it reaches the user.
+    pub(crate) pending_proofs: HashMap<u64, crate::proof_client::PendingProof>,
+    /// Proof requests arriving from the RPC layer, when this node serves a
+    /// light client's `eth_getProof` by asking a peer. `None` on a node that
+    /// answers from its own trie and never needs to ask.
+    pub(crate) proof_rx: Option<mpsc::Receiver<crate::proof_client::ProofCommand>>,
     /// Blocks whose body was derived from the header rather than requested.
     /// Counted so the saving can be checked against an offline prediction.
     pub(crate) derived_bodies: u64,
@@ -556,6 +600,8 @@ pub struct SyncService {
     /// only consecutive, parent-linked blocks from the executed head.
     pub(crate) follow_buffer: BTreeMap<u64, (B256, Header, Vec<Transaction>, Vec<Header>)>,
     tx_pool: Option<Arc<crate::TransactionPool>>,
+    /// Told of every block this service executes as best.
+    best_block_listeners: Arc<BestBlockListeners>,
     blocks_since_flush: u64,
     /// Blocks executed per durability point while catching up. See
     /// `execution_commit`.
@@ -666,6 +712,7 @@ impl SyncService {
             executing: None,
             pending_exec: None,
             exec_fn: None,
+            spv: false,
             last_body_height: 0,
             futile_exec_halts: (0, 0),
             last_exec_height: 0,
@@ -676,10 +723,13 @@ impl SyncService {
             violation_since: None,
             follow_gap_since: None,
             pending_follow_bodies: HashMap::new(),
+            pending_proofs: HashMap::new(),
+            proof_rx: None,
             derived_bodies: 0,
             underivable: std::collections::HashSet::new(),
             follow_buffer: BTreeMap::new(),
             tx_pool: None,
+            best_block_listeners: BestBlockListeners::new(),
             blocks_since_flush: 0,
             trie_flush_every: crate::execution_commit::DEFAULT_FLUSH_EVERY,
             sidelined: HashMap::new(),
@@ -700,6 +750,16 @@ impl SyncService {
 
     /// Attach a local block source (e.g. rskj's LevelDB) consulted for bodies
     /// before requesting them from peers.
+    /// Follow the chain on headers alone.
+    ///
+    /// Pairs with *not* installing a block processor: with no `exec_fn` the
+    /// batch path already runs straight through without executing, so this
+    /// only has to stop the bodies being asked for.
+    pub fn with_spv(mut self, spv: bool) -> Self {
+        self.spv = spv;
+        self
+    }
+
     pub fn with_block_source(mut self, source: Arc<dyn ExternalBlockSource>) -> Self {
         self.block_source = Some(source);
         self
@@ -733,6 +793,13 @@ impl SyncService {
     }
 
     /// Attach a transaction pool for removing mined txs during block processing.
+    /// Share the best-block listeners, so a component built after the
+    /// service starts (the miner) can still register.
+    pub fn with_best_block_listeners(mut self, listeners: Arc<BestBlockListeners>) -> Self {
+        self.best_block_listeners = listeners;
+        self
+    }
+
     pub fn with_tx_pool(mut self, pool: Arc<crate::TransactionPool>) -> Self {
         self.tx_pool = Some(pool);
         self
@@ -1030,6 +1097,18 @@ impl SyncService {
                 _ = timer.tick() => {
                     self.on_tick().await;
                 }
+                // `async { None }` when nothing can send, so the branch is
+                // simply never ready rather than closing the loop.
+                cmd = async {
+                    match self.proof_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(cmd) = cmd {
+                        self.send_trie_proof_request(cmd).await;
+                    }
+                }
                 event = self.event_rx.recv() => {
                     self.wire_queue_depth
                         .store(self.event_rx.len(), std::sync::atomic::Ordering::Relaxed);
@@ -1053,6 +1132,17 @@ impl SyncService {
                 }
             }
         }
+    }
+
+    /// Let this node fetch unitrie proofs from peers on an RPC caller's
+    /// behalf, returning the handle the RPC layer holds.
+    ///
+    /// Only a node that cannot answer from its own trie needs this. A full
+    /// node reads the account itself and never asks anybody.
+    pub fn with_proof_fetching(&mut self) -> crate::proof_client::ProofClient {
+        let (tx, rx) = mpsc::channel(64);
+        self.proof_rx = Some(rx);
+        crate::proof_client::ProofClient::new(tx)
     }
 
     /// Attach a trie store without a block processor, for tests that exercise
@@ -3358,10 +3448,24 @@ impl SyncService {
                     );
                     return;
                 }
+                // Not chain data this node would adopt: it is an answer to
+                // something this node asked for on a caller's behalf, and
+                // dropping it would hang that caller rather than protect
+                // anything.
+                SyncEvent::TrieProofResponse { .. } => {}
             }
         }
 
         match event {
+            SyncEvent::TrieProofResponse {
+                peer,
+                id,
+                block_number,
+                account_proof,
+                storage_proofs,
+            } => {
+                self.on_trie_proof_response(peer, id, block_number, account_proof, storage_proofs);
+            }
             SyncEvent::BlockHashResponse { hash, .. } => {
                 self.on_block_hash_response(hash).await;
             }
@@ -4038,6 +4142,22 @@ impl SyncService {
             return;
         }
 
+        // An SPV node is finished with a block once its header is stored and
+        // its work counted. Asking for the body would buy nothing it can use
+        // -- it executes nothing -- and would make the node's bandwidth
+        // scale with the chain's transactions rather than with its headers,
+        // which is the whole saving.
+        if self.spv {
+            debug!(
+                target: "rustock::sync",
+                "SPV: {} header(s) up to #{} accepted without bodies",
+                pending.len(),
+                pending.last().map(|(_, h)| h.number).unwrap_or(0),
+            );
+            self.finish_batch(&pending, peer_best).await;
+            return;
+        }
+
         if missing_bodies == 0 {
             debug!(
                 target: "rustock::sync",
@@ -4312,8 +4432,20 @@ impl SyncService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn request_follow_bodies_for_test(&mut self, headers: &[Header]) {
+        self.request_follow_bodies(headers).await
+    }
+
     /// In Following mode, request bodies for newly received block headers.
     async fn request_follow_bodies(&mut self, headers: &[Header]) {
+        // The tip is followed on headers alone too. Following is where an
+        // SPV node spends nearly all its life, so a body request leaking in
+        // here would quietly undo the saving even if the initial sync was
+        // clean.
+        if self.spv {
+            return;
+        }
         let peers = self.peer_store.peers().await;
         if peers.is_empty() {
             return;
@@ -4330,11 +4462,89 @@ impl SyncService {
         }
     }
 
+    /// Match a peer's proof answer to the caller waiting on it.
+    ///
+    /// Nothing is verified here, by design: this layer does not hold the
+    /// headers, and a check that cannot name the root it is checking against
+    /// looks like a guarantee without being one. The caller has the header
+    /// and does the checking.
+    pub(crate) fn on_trie_proof_response(
+        &mut self,
+        peer: B512,
+        id: u64,
+        block_number: u64,
+        account_proof: Vec<alloy_primitives::Bytes>,
+        storage_proofs: Vec<Vec<alloy_primitives::Bytes>>,
+    ) {
+        let Some(pending) = self.pending_proofs.remove(&id) else {
+            trace!(
+                target: "rustock::sync",
+                "a trie proof arrived for request {id}, which nothing is waiting on"
+            );
+            return;
+        };
+        // An answer from a peer other than the one asked is not usable: ids
+        // are random, but accepting any sender would let an unasked peer race
+        // the real one and have its answer taken instead.
+        if pending.peer != peer {
+            trace!(
+                target: "rustock::sync",
+                "discarding a trie proof for {id} from a peer that was not asked"
+            );
+            self.pending_proofs.insert(id, pending);
+            return;
+        }
+        let _ = pending.reply.send(crate::proof_client::RawProof {
+            peer,
+            block_number,
+            account_proof,
+            storage_proofs,
+        });
+    }
+
+    /// Send one caller's proof request to a peer.
+    pub(crate) async fn send_trie_proof_request(
+        &mut self,
+        cmd: crate::proof_client::ProofCommand,
+    ) {
+        // Served from whichever peer this node is connected to. A light
+        // client should spread these around and retry elsewhere on a bad
+        // answer, but the answer is verified against the caller's own header
+        // either way, so a bad peer costs a round trip rather than a wrong
+        // result.
+        let peers: Vec<B512> = self.peer_store.peers().await;
+        let Some(peer) = peers.first().copied() else {
+            // Dropping `cmd.reply` wakes the caller with Unavailable, which
+            // is the truth: there is nobody to ask.
+            trace!(target: "rustock::sync", "no peer to ask for a trie proof");
+            return;
+        };
+        let (id, msg) = crate::proof_client::create_trie_proof_request(
+            cmd.block_number,
+            cmd.address,
+            cmd.storage_keys,
+        );
+        self.peer_store.send_to_peer(&peer, msg).await;
+        self.pending_proofs.insert(
+            id,
+            crate::proof_client::PendingProof {
+                reply: cmd.reply,
+                sent: Instant::now(),
+                peer,
+            },
+        );
+    }
+
     /// Send body requests for pending headers up to a bounded window, assigning
     /// each to the least-loaded responsive peer. RSK is one body per request,
     /// so throughput comes from pipelining many in flight — concentrated on the
     /// peers that actually answer rather than spread evenly onto slow ones.
     pub(crate) async fn send_body_requests(&mut self) {
+        // Belt and braces beside the gate in the batch path: an SPV node
+        // must never put a body request on the wire, by any route.
+        if self.spv {
+            return;
+        }
         // Not an early return on an empty peer set. Two of the arms below need
         // no peer at all -- a body already in the store, and one derivable
         // from its header -- and returning here left a batch that needed
@@ -5146,6 +5356,7 @@ impl SyncService {
                 self.credit_executed_bodies(header.number);
                 self.gas_price.on_block(header, &block.transactions);
                 self.gas_price.on_best_block(header);
+                self.best_block_listeners.notify(header);
                 self.publish_block(hash, header, &block.transactions, false);
                 self.current_state_root = Some(result.new_state_root);
                 true

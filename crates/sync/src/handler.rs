@@ -653,6 +653,26 @@ impl P2pHandler for SyncHandler {
                         s.blocks(&r).map(|m| RskSubMessage::SnapBlocksResponse(Box::new(m)))
                     });
                 }
+                // --- Unitrie proofs (light client) ---
+                RskSubMessage::TrieProofRequest(r) => {
+                    let r = r.clone();
+                    // Charged as a chunk rather than as a small message: a
+                    // proof walks the trie once per key asked about, which is
+                    // real work even though the reply is a few kilobytes.
+                    return self.serve_snap(id, Cost::Chunk, move |s| {
+                        s.trie_proof(&r).map(|m| RskSubMessage::TrieProofResponse(Box::new(m)))
+                    });
+                }
+                RskSubMessage::TrieProofResponse(r) => {
+                    let _ = self.event_tx.send(SyncEvent::TrieProofResponse {
+                        peer: id,
+                        id: r.id,
+                        block_number: r.block_number,
+                        account_proof: r.account_proof.clone(),
+                        storage_proofs: r.storage_proofs.clone(),
+                    });
+                }
+
                 RskSubMessage::SnapStatusResponse(r) => {
                     let _ = self.event_tx.send(SyncEvent::SnapStatusResponse {
                         peer: id,

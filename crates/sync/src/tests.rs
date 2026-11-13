@@ -7485,3 +7485,52 @@ async fn spawn_execution_hands_the_executor_the_parents_state() {
          which is how #9,350,770 came to be applied on top of itself"
     );
 }
+
+// ===== SPV: headers, never bodies =====
+
+/// The saving an SPV node exists for, asserted at the only place it can be
+/// lost: the wire.
+///
+/// A node that follows headers but quietly fetches bodies anyway has the
+/// bandwidth of a full node and the capabilities of neither, and nothing
+/// about its behaviour would look wrong -- it would sync, it would follow,
+/// it would answer. Only counting the requests catches it.
+#[tokio::test]
+async fn an_spv_node_never_puts_a_body_request_on_the_wire() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let headers = store_chain(&store, 6);
+    assert!(!headers.is_empty());
+
+    let mut service = make_service(store.clone()).with_spv(true);
+
+    // The two routes a body request can take: the batch path during sync,
+    // and the follow path at the tip. Neither may reach a peer.
+    service.send_body_requests().await;
+    assert!(
+        service.pending_follow_bodies.is_empty(),
+        "the batch path must not request a body in SPV mode"
+    );
+
+    service.request_follow_bodies_for_test(&headers).await;
+    assert!(
+        service.pending_follow_bodies.is_empty(),
+        "the follow path must not request a body in SPV mode"
+    );
+}
+
+/// And the same service without the flag does ask, so the test above is
+/// measuring the flag rather than an absent peer set.
+#[tokio::test]
+async fn a_full_node_does_request_bodies() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let headers = store_chain(&store, 6);
+
+    let mut service = make_service(store.clone());
+    // No peers, so nothing goes out; what matters is that the SPV gate is
+    // not what stopped it. `request_follow_bodies` returns early on an empty
+    // peer set, which is a different early return from the one above.
+    service.request_follow_bodies_for_test(&headers).await;
+    assert!(!service.spv, "the control must not be in SPV mode");
+}

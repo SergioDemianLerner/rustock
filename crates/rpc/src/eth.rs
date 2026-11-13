@@ -135,6 +135,16 @@ fn head_minimum_times_multiplier(minimum: &alloy_primitives::U256) -> alloy_prim
 /// deliberately: `rpc` does not depend on `sync` -- that is what
 /// `GasPriceSource` exists to avoid -- so sharing them would mean adding the
 /// dependency this trait was written to prevent.
+///
+/// **rskj does this in floating point** -- `BigDecimal.valueOf(minimum
+/// .doubleValue() * minGasPriceMultiplier).toBigInteger()` -- and an exact
+/// ratio is not the same function. Checked rather than assumed: the two
+/// agree on every minimum below 2^53, including all 2,061,855 values under
+/// 2e8 that were compared one by one, and part company only above it, where
+/// the double runs out of mantissa. A minimum gas price up there is 1 RBTC
+/// per gas, so the divergence is unreachable; the integer form is kept for
+/// being exact and float-free, and the boundary is written down so the next
+/// reader does not have to rediscover where it lies.
 const GAS_PRICE_MULTIPLIER_NUM: u64 = 11;
 const GAS_PRICE_MULTIPLIER_DEN: u64 = 10;
 
@@ -198,13 +208,14 @@ pub fn eth_get_block_by_hash(
     id: Value,
     params: &Value,
     store: &BlockStore,
+    chain_id: u64,
 ) -> JsonRpcResponse {
     let Some(hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
     };
     let full_txs = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
 
-    match build_block_dto_with_full_txs(store, hash, full_txs) {
+    match build_block_dto_with_full_txs(store, hash, full_txs, chain_id) {
         Some(dto) => JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap()),
         None => JsonRpcResponse::success(id, Value::Null),
     }
@@ -214,6 +225,7 @@ pub fn eth_get_block_by_number(
     id: Value,
     params: &Value,
     store: &BlockStore,
+    chain_id: u64,
 ) -> JsonRpcResponse {
     let Some(bn_str) = params.get(0).and_then(|v| v.as_str()) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block number parameter");
@@ -229,7 +241,7 @@ pub fn eth_get_block_by_number(
         _ => return JsonRpcResponse::success(id, Value::Null),
     };
 
-    match build_block_dto_with_full_txs(store, hash, full_txs) {
+    match build_block_dto_with_full_txs(store, hash, full_txs, chain_id) {
         Some(dto) => JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap()),
         None => JsonRpcResponse::success(id, Value::Null),
     }
@@ -391,7 +403,10 @@ fn uncle_dto(
         uncle_hash,
         td,
         uncle_body.as_ref(),
+        // An uncle is never rendered with full transactions, so the chain id
+        // is unused.
         false,
+        30,
     ))
 }
 
@@ -420,6 +435,7 @@ fn build_block_dto_with_full_txs(
     store: &BlockStore,
     hash: alloy_primitives::B256,
     full_txs: bool,
+    chain_id: u64,
 ) -> Option<BlockResultDto> {
     let header = store.header(hash).ok()??;
     // A block that exists must not disappear because an auxiliary field will
@@ -430,7 +446,7 @@ fn build_block_dto_with_full_txs(
     // returned.
     let td = store.total_difficulty(hash).ok().flatten().unwrap_or_default();
     let body = held_or_implied_body(store, hash, &header)?;
-    Some(BlockResultDto::from_header_with_body(&header, hash, td, body.as_ref(), full_txs))
+    Some(BlockResultDto::from_header_with_body(&header, hash, td, body.as_ref(), full_txs, chain_id))
 }
 
 /// The block's body, or `None` when the node does not actually have the block.

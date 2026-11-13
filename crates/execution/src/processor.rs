@@ -77,6 +77,25 @@ fn orchid_check_interval() -> Option<u64> {
     })
 }
 
+/// Wall time of the stages of [`BlockProcessor::process_block_timed`], in
+/// the order they run. Together they cover the whole call.
+#[derive(Debug, Default, Clone)]
+pub struct ProcessTimings {
+    /// Transactions root and ommers hash checked against the header.
+    pub pre_validation: std::time::Duration,
+    /// `execute_block`: senders recovered, transactions and REMASC executed,
+    /// state changes applied to the trie, state root hashed, trie nodes
+    /// saved, receipts and their root built.
+    pub execute: std::time::Duration,
+    /// The part of `execute` spent in `TrieNode::save`: one batch write of
+    /// the dirty trie nodes into the trie store. Lookups during execution
+    /// stay in `execute`.
+    pub trie_save: std::time::Duration,
+    /// Gas used, paid fees, state root, receipts root and logs bloom checked
+    /// against the header.
+    pub post_validation: std::time::Duration,
+}
+
 /// Result of processing a block.
 #[derive(Debug)]
 pub struct ProcessedBlock {
@@ -119,6 +138,12 @@ pub struct BlockProcessor {
     /// recovered most of this block's transactions when it admitted them.
     /// `None` disables the cache entirely and every sender is recomputed.
     sender_cache: Option<Arc<crate::sender_cache::SenderCache>>,
+    /// Where to record the peg events the Bridge does not emit.
+    ///
+    /// `None` disables recording entirely, and the cost of that is one
+    /// thread-local read per Bridge decision -- `silent::record_here` is a
+    /// no-op when no sink is open.
+    legacy_events: Option<Arc<rustock_storage::legacy_event_store::LegacyEventStore>>,
 }
 
 /// Ancestry lookups backed by the block store, for the uncle and
@@ -170,6 +195,7 @@ impl BlockProcessor {
             block_store,
             validate_fork_detection_data: false,
             sender_cache: None,
+            legacy_events: None,
         }
     }
 
@@ -177,6 +203,21 @@ impl BlockProcessor {
     /// above all. Handing the same `Arc` to both is the point: a transaction
     /// the pool admitted should not be recovered a second time when the
     /// block carrying it executes.
+    /// Records peg events the Bridge does not emit, into `store`.
+    ///
+    /// Opens the thread-local sink here, because recording is a property of
+    /// the thread that executes and this is the thread that will. Sublists
+    /// running in parallel open their own and the coordinator absorbs them
+    /// (`silent::absorb`), so a parallel block is captured whole.
+    pub fn with_legacy_event_store(
+        mut self,
+        store: Arc<rustock_storage::legacy_event_store::LegacyEventStore>,
+    ) -> Self {
+        crate::silent::start();
+        self.legacy_events = Some(store);
+        self
+    }
+
     pub fn with_sender_cache(
         mut self,
         cache: Arc<crate::sender_cache::SenderCache>,
@@ -188,6 +229,16 @@ impl BlockProcessor {
     /// The cache this processor shares, if any.
     pub fn sender_cache(&self) -> Option<&Arc<crate::sender_cache::SenderCache>> {
         self.sender_cache.as_ref()
+    }
+
+    /// Use these Bridge constants instead of the network's built-in ones
+    /// ([`RskExecutor::with_bridge_constants`]).
+    pub fn with_bridge_constants(
+        mut self,
+        constants: crate::bridge::constants::BridgeConstants,
+    ) -> Self {
+        self.executor = self.executor.with_bridge_constants(constants);
+        self
     }
 
     /// Share a BTC stored-block cache across every block this processor runs.
@@ -253,8 +304,28 @@ impl BlockProcessor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
+        self.finish_execute(block, state_root, trie_store, None)
+    }
+
+    /// [`Self::execute_block`], recording how long `TrieNode::save` took when
+    /// `save_out` is set. The clock is not read otherwise.
+    fn finish_execute(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        save_out: Option<&mut std::time::Duration>,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        // Recording is thread-local, and the thread that built this processor
+        // need not be the one executing. Opening the sink lazily here makes
+        // that irrelevant: whichever thread arrives, it records. Without it a
+        // node whose import loop runs off the main thread would record
+        // nothing and look exactly like a chain with no Flyover peg-ins.
+        if self.legacy_events.is_some() && !crate::silent::is_recording() {
+            crate::silent::start();
+        }
         let started = std::time::Instant::now();
-        let out = self.execute_block_inner(block, state_root, trie_store);
+        let out = self.execute_block_inner(block, state_root, trie_store, save_out);
         // Timed whether or not it succeeded: a block that fails still spent
         // the time, and a measurement that only counts successes reads as a
         // faster node the worse things get.
@@ -272,6 +343,7 @@ impl BlockProcessor {
         block: &Block,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
+        save_out: Option<&mut std::time::Duration>,
     ) -> Result<ProcessedBlock, ProcessError> {
         let header = &block.header;
         let chain_id = self.hardfork_cfg.chain_id;
@@ -418,6 +490,20 @@ impl BlockProcessor {
         if !supply.is_balanced() {
             crate::supply::report(header.number, &supply);
         }
+        // The same deltas, reused. A watcher that wants to know whether this
+        // block is worth re-executing can read the largest movement here
+        // instead of executing it to find out, and the deltas were computed
+        // above whether or not anyone asks. Reported only when the per-block
+        // check actually ran: with it disabled the deltas are empty, and
+        // reporting a zero would tell a consumer "nothing moved" when the
+        // truth is "nobody looked".
+        if crate::supply::per_block_enabled() && crate::supply::movement_observer_installed() {
+            crate::supply::report_movement(&crate::supply::BlockMovement {
+                block: header.number,
+                block_hash: header.hash(),
+                max_movement: crate::supply::largest_movement(&supply),
+            });
+        }
         if supply.created_supply() {
             let (_, created) = supply.net();
             return Err(ProcessError::SupplyCreated { number: header.number, created });
@@ -437,7 +523,13 @@ impl BlockProcessor {
             ),
         };
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
-        new_state_root.save(trie_store.as_ref(), true);
+        if let Some(slot) = save_out {
+            let started = std::time::Instant::now();
+            new_state_root.save(trie_store.as_ref(), true);
+            *slot += started.elapsed();
+        } else {
+            new_state_root.save(trie_store.as_ref(), true);
+        }
         // Reload the root lazily: children become hash references resolved on
         // demand, so subsequent blocks only walk their dirty paths instead of
         // re-serializing the whole accumulated trie on every state-root
@@ -621,11 +713,7 @@ impl BlockProcessor {
         block: &Block,
         parent: Option<&rustock_core::Header>,
     ) -> Result<(), ValidationError> {
-        use rustock_core::validation::block_rules::{
-            BlockTxsMaxGasPriceRule, ExtraDataRule, PrevMinGasPriceRule, RemascValidationRule,
-            TxsMinGasPriceRule,
-        };
-        use rustock_core::validation::{BlockValidator, HeaderValidator, ParentHeaderValidator};
+        use rustock_core::validation::{HeaderValidator, ParentHeaderValidator};
 
         let number = block.header.number;
 
@@ -637,22 +725,7 @@ impl BlockProcessor {
             return Ok(());
         }
 
-        // rskj TxsMinGasPriceRule -- unconditional.
-        TxsMinGasPriceRule.validate_block(block)?;
-        // rskj BlockTxsMaxGasPriceRule -- RSKIP252 (fingerroot500).
-        BlockTxsMaxGasPriceRule {
-            rskip252_height: self.rskip252_height(),
-        }
-        .validate_block(block)?;
-        // rskj RemascValidationRule -- unconditional.
-        RemascValidationRule.validate_block(block)?;
-        // rskj ExtraDataRule -- unconditional, 32 bytes.
-        ExtraDataRule::default().validate(&block.header)?;
-
-        if let Some(parent) = parent {
-            // rskj PrevMinGasPriceRule -- unconditional.
-            PrevMinGasPriceRule.validate_with_parent(&block.header, parent)?;
-        }
+        self.validate_block_body_rules(block, parent)?;
 
         // rskj BlockUnclesValidationRule. The ommers HASH is checked in
         // process_block; this decides whether the uncles are admissible.
@@ -683,6 +756,47 @@ impl BlockProcessor {
         Ok(())
     }
 
+    /// The rules of [`Self::validate_block_rules`] that read only the block
+    /// and its parent: the transaction gas price rules, REMASC's presence,
+    /// the extra data size and the minimum gas price range. No ancestry, no
+    /// merged-mining fields.
+    ///
+    /// Split out for the miner, which runs them on the block it assembled
+    /// before handing out work: these are the rules a block could break
+    /// through what it carries rather than how it was mined, and rskj never
+    /// produces such a block because `MinerUtils.filterTransactions` applies
+    /// the same price rules on the way in. A template that fails here is a
+    /// bug in the builder, caught before every peer rejects the block.
+    pub fn validate_block_body_rules(
+        &self,
+        block: &Block,
+        parent: Option<&rustock_core::Header>,
+    ) -> Result<(), ValidationError> {
+        use rustock_core::validation::block_rules::{
+            BlockTxsMaxGasPriceRule, ExtraDataRule, PrevMinGasPriceRule, RemascValidationRule,
+            TxsMinGasPriceRule,
+        };
+        use rustock_core::validation::{BlockValidator, HeaderValidator, ParentHeaderValidator};
+
+        // rskj TxsMinGasPriceRule -- unconditional.
+        TxsMinGasPriceRule.validate_block(block)?;
+        // rskj BlockTxsMaxGasPriceRule -- RSKIP252 (fingerroot500).
+        BlockTxsMaxGasPriceRule {
+            rskip252_height: self.rskip252_height(),
+        }
+        .validate_block(block)?;
+        // rskj RemascValidationRule -- unconditional.
+        RemascValidationRule.validate_block(block)?;
+        // rskj ExtraDataRule -- unconditional, 32 bytes.
+        ExtraDataRule::default().validate(&block.header)?;
+
+        if let Some(parent) = parent {
+            // rskj PrevMinGasPriceRule -- unconditional.
+            PrevMinGasPriceRule.validate_with_parent(&block.header, parent)?;
+        }
+        Ok(())
+    }
+
     /// `validate_block_rules` with the parent resolved from the block store —
     /// the shape the sync path wants, mirroring rskj `BlockValidatorImpl`,
     /// which looks the parent up the same way and returns invalid when it is
@@ -697,12 +811,11 @@ impl BlockProcessor {
     }
 
     /// RSKIP252 (`fingerroot500`) for this chain.
-    fn rskip252_height(&self) -> u64 {
-        match self.hardfork_cfg.chain_id {
-            crate::hardfork::RSK_MAINNET_CHAIN_ID => 5_468_000,
-            crate::hardfork::RSK_TESTNET_CHAIN_ID => 4_015_800,
-            _ => 0,
-        }
+    ///
+    /// Shared with the miner, which applies the same cap when it selects
+    /// transactions (rskj `MinerUtils.isHighGasPriced`).
+    pub fn rskip252_height(&self) -> u64 {
+        rskip252_height_for(self.hardfork_cfg.chain_id)
     }
 
     /// RSKIP110 (`wasabi100`) for this chain.
@@ -723,6 +836,38 @@ impl BlockProcessor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
+        self.process_block_inner(block, state_root, trie_store, None)
+    }
+
+    /// [`BlockProcessor::process_block`], adding the wall time of each of its
+    /// three stages to `timings`. Instrumentation only: the work is the same.
+    pub fn process_block_timed(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        timings: &mut ProcessTimings,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        self.process_block_inner(block, state_root, trie_store, Some(timings))
+    }
+
+    fn process_block_inner(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        mut timings: Option<&mut ProcessTimings>,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        let timed = timings.is_some();
+        // Reads the clock only when timing was asked for.
+        let mut last = timings.is_some().then(std::time::Instant::now);
+        let mut lap = |stage: fn(&mut ProcessTimings) -> &mut std::time::Duration| {
+            if let (Some(t), Some(prev)) = (timings.as_deref_mut(), last) {
+                let now = std::time::Instant::now();
+                *stage(t) += now - prev;
+                last = Some(now);
+            }
+        };
         let header = &block.header;
 
         let computed_tx_root = ordered_tx_trie_root(
@@ -744,7 +889,15 @@ impl BlockProcessor {
             });
         }
 
-        let result = self.execute_block(block, state_root, trie_store.clone())?;
+        lap(|t| &mut t.pre_validation);
+        let mut trie_save = std::time::Duration::ZERO;
+        let result = self.finish_execute(
+            block,
+            state_root,
+            trie_store.clone(),
+            timed.then_some(&mut trie_save),
+        )?;
+        lap(|t| &mut t.execute);
 
         if result.gas_used != header.gas_used {
             for (i, r) in result.receipts.iter().enumerate() {
@@ -841,6 +994,10 @@ impl BlockProcessor {
             tx_count = result.receipts.len(),
             "block processed successfully"
         );
+        lap(|t| &mut t.post_validation);
+        if let Some(t) = timings {
+            t.trie_save += trie_save;
+        }
 
         Ok(result)
     }
@@ -868,6 +1025,74 @@ impl BlockProcessor {
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
         let result = self.process_block(block, state_root, trie_store)?;
+        self.commit_receipts(block, &result)?;
+        Ok(result)
+    }
+
+    /// The commit half of [`BlockProcessor::process_and_commit`]: store the
+    /// receipts of a processed block and index its transactions and Bridge
+    /// events.
+    /// Records this block's peg events that the Bridge did not emit.
+    ///
+    /// Runs beside `index_bridge_events` deliberately: that keeps the index
+    /// of what the Bridge *did* log current as blocks arrive, and this keeps
+    /// the complement current. An index only ever rebuilt offline is stale
+    /// the moment the node advances.
+    ///
+    /// **This is a bridge until the event exists.** Flyover peg-ins are the
+    /// live case -- `registerFlyoverBtcTransaction` emits nothing at any
+    /// height, so every one is invisible in the receipts. When a future
+    /// network upgrade makes the Bridge log it, nothing here needs changing:
+    /// the gate is the per-topic `logged` flag the recording site sets, so
+    /// the moment that site starts logging it will set `logged` true and
+    /// synthesis stops on its own. The flag is what keeps the two from ever
+    /// double-counting across an activation.
+    /// Public so it can be driven without `commit_receipts`, which also
+    /// writes receipts and so cannot run against a read-only store. The node
+    /// reaches it through `commit_receipts`; a test reaches it directly.
+    pub fn record_unlogged_peg_events(&self, block: &Block) -> Result<(), ProcessError> {
+        let Some(store) = &self.legacy_events else { return Ok(()) };
+        let decisions = crate::silent::drain();
+        if decisions.is_empty() {
+            return Ok(());
+        }
+        let mut rows = Vec::new();
+        let mut log_index: u32 = 0;
+        for d in &decisions {
+            // A record that does not say whether the Bridge logged it is
+            // refused, not guessed at -- see `legacy_events::reconstructable`.
+            if !matches!(crate::bridge::legacy_events::reconstructable(d), Ok(true)) {
+                continue;
+            }
+            let tx_hash = block
+                .transactions
+                .get(d.tx_index as usize)
+                .map(|t| t.tx_hash())
+                .unwrap_or_default();
+            for e in crate::bridge::legacy_events::events_for(d) {
+                rows.push(rustock_storage::legacy_event_store::EventRow {
+                    topic0: e.topic0,
+                    block: d.block,
+                    tx_index: d.tx_index,
+                    log_index,
+                    tx_hash,
+                    topics: e.topics,
+                    data: e.data,
+                });
+                log_index += 1;
+            }
+        }
+        if !rows.is_empty() {
+            store.put_events(&rows).map_err(ProcessError::Storage)?;
+        }
+        Ok(())
+    }
+
+    pub fn commit_receipts(
+        &self,
+        block: &Block,
+        result: &ProcessedBlock,
+    ) -> Result<(), ProcessError> {
         let hash = block.hash();
         self.block_store
             .put_receipts(hash, &result.receipts)
@@ -894,7 +1119,8 @@ impl BlockProcessor {
                 crate::precompiles::BRIDGE_ADDR,
             )
             .map_err(ProcessError::Storage)?;
-        Ok(result)
+        self.record_unlogged_peg_events(block)?;
+        Ok(())
     }
 
     /// Below this many transactions, recovery stays on the calling thread.
@@ -1260,6 +1486,59 @@ mod tests {
         assert_eq!(result.receipts.len(), 1);
         assert!(result.receipts[0].status);
         assert_eq!(result.receipts[0].cumulative_gas_used, 21_000);
+    }
+
+    /// rskj `TransactionExecutor.gasIsValid`: a transaction's declared gas
+    /// limit must fit in the block's limit minus the gas used before it, or
+    /// the transaction is invalid and the block with it ("Too much gas used
+    /// in this block"). Two transfers each declaring 6,790,000 on a
+    /// 6,800,000 block: the first fits, the second does not, although
+    /// together they would *use* 42,000.
+    #[test]
+    fn a_transaction_whose_limit_exceeds_the_blocks_remaining_gas_invalidates_the_block() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let chain_id = 33u64;
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+
+        let mut root = root;
+        let mut txs = Vec::new();
+        for seed in [1u8, 2] {
+            let key = SigningKey::from_slice(&[seed; 32]).unwrap();
+            root = put_account(&root, store.as_ref(), &sender_address(&key), 0, one_rbtc);
+            let mut tx = Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(6_790_000),
+                to: Bytes::copy_from_slice(Address::repeat_byte(0xBB).as_slice()),
+                value: U256::from(1_000),
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            sign_tx(&mut tx, &key, chain_id);
+            txs.push(tx);
+        }
+
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+
+        // One alone fits, and uses 21,000.
+        let one = Block {
+            header: dummy_header(8_000_000),
+            transactions: vec![txs[0].clone()],
+            ommers: vec![],
+        };
+        let result = processor.execute_block(&one, &root, store.clone()).expect("one fits");
+        assert_eq!(result.gas_used, 21_000);
+
+        // Two do not: 21,000 used plus 6,790,000 declared is over 6,800,000.
+        let two = Block { header: dummy_header(8_000_000), transactions: txs, ommers: vec![] };
+        let err = processor.execute_block(&two, &root, store).expect_err("the second does not fit");
+        assert!(err.to_string().contains("Too much gas used in this block"), "got {err}");
     }
 
     /// A transaction that reaches the Bridge may only sit in the sequential
@@ -2808,5 +3087,16 @@ mod sender_cache_integration {
         let p = processor(Some(cache.clone()));
         assert_eq!(p.recover_senders(&txs, 33).unwrap(), want);
         assert_eq!(p.recover_senders(&txs, 33).unwrap(), want, "and again from the cache");
+    }
+}
+
+/// RSKIP252 (`fingerroot500`) for a chain id: mainnet's and testnet's
+/// heights, genesis anywhere else. The block rule, the miner's selection
+/// and the pool's per-transaction cap all read it.
+pub fn rskip252_height_for(chain_id: u64) -> u64 {
+    match chain_id {
+        crate::hardfork::RSK_MAINNET_CHAIN_ID => 5_468_000,
+        crate::hardfork::RSK_TESTNET_CHAIN_ID => 4_015_800,
+        _ => 0,
     }
 }
