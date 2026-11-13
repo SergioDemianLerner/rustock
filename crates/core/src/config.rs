@@ -33,6 +33,10 @@ pub struct ActivationHeights {
     pub iris300: u64,
     /// Fingerroot500 hardfork – enables RSKIP252 (transaction gas price cap).
     pub fingerroot500: u64,
+    /// Hop400 hardfork – enables RSKIP297, which widens the RSKIP179
+    /// Bitcoin-to-RSK timestamp window on testnet (5 minutes to 2 hours).
+    /// Read only on testnet; mainnet keeps 5 minutes at every height.
+    pub hop400: u64,
     /// Height at which RSKIP97 -- "no 10-minute difficulty drop" -- activates,
     /// or `None` where it never does.
     ///
@@ -46,6 +50,15 @@ pub struct ActivationHeights {
     /// difficulty is the 131,072 floor because its parent is genesis at
     /// timestamp 0.
     pub rskip97: Option<u64>,
+    /// Height at which RSKIP-144 (parallel transaction sublists) activates,
+    /// or `None` where it never does. rskj gates it on `reed810`.
+    ///
+    /// The header decoder needs it: after an RSKIP-351 version byte, one
+    /// trailing item is the sublist edges where RSKIP-144 is active and the
+    /// V2 base event where it is not (rskj `BlockFactory` decides by the same
+    /// activation). rskj's own regtest is the second case: `rskip144 = -1`
+    /// with `rskip535 = 1`.
+    pub rskip144: Option<u64>,
 }
 
 /// Process-wide activation heights, consulted by block-hash computation
@@ -65,6 +78,24 @@ impl ActivationHeights {
         ACTIVATIONS.get_or_init(Self::mainnet)
     }
 
+    /// Set the height this struct carries for an rskj upgrade name, for the
+    /// names it carries: `orchid`, `wasabi100`, `papyrus200`, `iris300`,
+    /// `fingerroot500`, and `reed810`, which is RSKIP-144's height. `None`
+    /// is rskj's `-1`. Any other name is the execution ladder's to judge and
+    /// is left alone here.
+    pub fn set_rskj_hardfork(&mut self, name: &str, height: Option<u64>) {
+        let never = u64::MAX;
+        match name {
+            "orchid" => self.orchid = height.unwrap_or(never),
+            "wasabi100" => self.wasabi100 = height.unwrap_or(never),
+            "papyrus200" => self.papyrus200 = height.unwrap_or(never),
+            "iris300" => self.iris300 = height.unwrap_or(never),
+            "fingerroot500" => self.fingerroot500 = height.unwrap_or(never),
+            "reed810" => self.rskip144 = height,
+            _ => {}
+        }
+    }
+
     pub fn mainnet() -> Self {
         Self {
             orchid: 729_000,
@@ -72,8 +103,11 @@ impl ActivationHeights {
             papyrus200: 2_392_700,
             iris300: 3_614_800,
             fingerroot500: 5_468_000,
+            hop400: 4_598_500,
             // reference.conf: `rskip97 = orchid`, not overridden by main.conf.
             rskip97: Some(729_000),
+            // main.conf: reed810 = -1.
+            rskip144: None,
         }
     }
 
@@ -86,8 +120,11 @@ impl ActivationHeights {
             papyrus200: 863_000,
             iris300: 2_060_500,
             fingerroot500: 4_015_800,
+            hop400: 3_103_000,
             // testnet.conf: `rskip97 = -1  # disable orchid difficulty drop`.
             rskip97: None,
+            // testnet.conf: reed810.
+            rskip144: Some(7_139_600),
         }
     }
 
@@ -98,8 +135,12 @@ impl ActivationHeights {
             papyrus200: u64::MAX,
             iris300: 0,
             fingerroot500: 0,
+            hop400: 0,
             // regtest.conf: `rskip97 = -1`, same as testnet.
             rskip97: None,
+            // regtest.conf: `rskip144 = -1`; rustock's regtest ladder does
+            // not schedule reed810 either.
+            rskip144: None,
         }
     }
 }
@@ -111,8 +152,14 @@ pub struct ChainConfig {
     pub duration_limit: u64,
     pub difficulty_divisor: U256,
     pub min_difficulty: U256,
+    /// rskj `Constants.newBlockMaxSecondsInTheFuture`: how far past the
+    /// node's clock a header may be timestamped. 60 on mainnet, 540 on
+    /// testnet, 0 on regtest, where zero turns the timestamp rule off
+    /// altogether (parent comparison included), as it does in rskj.
     pub max_future_block_time: u64,
     pub gas_limit_bound_divisor: u64,
+    /// rskj `Constants.getMinGasLimit()`: 3,000,000 on every network
+    /// (`GasLimitRule`). Every rskj genesis declares more.
     pub min_gas_limit: u64,
     pub max_gas_limit: u64,
     /// The gas the sequential sublist is guaranteed under RSKIP-144
@@ -122,6 +169,24 @@ pub struct ChainConfig {
     /// it the parallel sublists get no gas at all.
     pub min_sequential_set_gas_limit: u64,
     pub activation_heights: ActivationHeights,
+    /// A genesis read from an rskj genesis file, replacing the built-in one
+    /// (regtest only). Its state root must be filled in before the genesis
+    /// header is used; see [`crate::rskj_genesis`].
+    pub genesis_spec: Option<crate::rskj_genesis::GenesisSpec>,
+    /// Accept headers without checking their merged-mining proof of work,
+    /// as rskj does with `miner.server.skipPowValidation = true`. For
+    /// replaying a regtest chain mined without real proof of work; off by
+    /// default, and refused on mainnet and testnet.
+    pub skip_pow_validation: bool,
+    /// rskj `blockchain.config.hardforkActivationHeights` overrides, by
+    /// rskj's names, `None` for `-1`. The heights this struct carries are
+    /// already set from them; the execution ladder applies them itself.
+    /// Empty on every built-in chain.
+    pub hardfork_overrides: Vec<(String, Option<u64>)>,
+    /// rskj `consensusRules` overrides for the execution ladder (`rskip351`,
+    /// `rskip535`, `rskip536`, `rskipUMM`). `rskip97` is not here: it is
+    /// applied to `activation_heights` directly.
+    pub consensus_rule_overrides: Vec<(String, Option<u64>)>,
 }
 
 impl ChainConfig {
@@ -132,12 +197,16 @@ impl ChainConfig {
             duration_limit: 14,
             difficulty_divisor: U256::from(50),
             min_difficulty: U256::from(7_000_000_000_000_000u64), // 7e15, FALLBACK_MINING_DIFFICULTY / 2
-            max_future_block_time: 540,
+            max_future_block_time: 60,
             gas_limit_bound_divisor: 1024,
-            min_gas_limit: 5000,
+            min_gas_limit: 3_000_000,
             max_gas_limit: 1_000_000_000,
             min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::mainnet(),
+            genesis_spec: None,
+            skip_pow_validation: false,
+            hardfork_overrides: Vec::new(),
+            consensus_rule_overrides: Vec::new(),
         }
     }
 
@@ -150,10 +219,14 @@ impl ChainConfig {
             min_difficulty: U256::from(131072),
             max_future_block_time: 540,
             gas_limit_bound_divisor: 1024,
-            min_gas_limit: 5000,
+            min_gas_limit: 3_000_000,
             max_gas_limit: 1_000_000_000,
             min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::testnet(),
+            genesis_spec: None,
+            skip_pow_validation: false,
+            hardfork_overrides: Vec::new(),
+            consensus_rule_overrides: Vec::new(),
         }
     }
 
@@ -166,10 +239,14 @@ impl ChainConfig {
             min_difficulty: U256::from(1),
             max_future_block_time: 0,
             gas_limit_bound_divisor: 1024,
-            min_gas_limit: 1,
+            min_gas_limit: 3_000_000,
             max_gas_limit: 10_000_000,
             min_sequential_set_gas_limit: 6_800_000,
             activation_heights: ActivationHeights::regtest(),
+            genesis_spec: None,
+            skip_pow_validation: false,
+            hardfork_overrides: Vec::new(),
+            consensus_rule_overrides: Vec::new(),
         }
     }
 
@@ -178,6 +255,9 @@ impl ChainConfig {
     /// of the genesis difficulty includes a leading zero byte that differs
     /// from standard encoding, producing a different hash.
     pub fn known_genesis_hash(&self) -> Option<B256> {
+        if let Some(spec) = &self.genesis_spec {
+            return Some(spec.hash());
+        }
         match self.chain_id {
             30 => Some("0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0".parse().unwrap()),
             31 => Some("0xcabb7fbe88cd6d922042a32ffc08ce8b1fbb37d650b9d4e7dbfe2a7469adfa42".parse().unwrap()),
@@ -189,6 +269,10 @@ impl ChainConfig {
     pub fn genesis_header(&self) -> Header {
         let empty_list_hash: B256 = "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347".parse().unwrap();
         let empty_trie_hash: B256 = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421".parse().unwrap();
+
+        if let Some(spec) = &self.genesis_spec {
+            return spec.header();
+        }
 
         match self.chain_id {
             30 => Header {
@@ -334,6 +418,10 @@ impl ChainConfig {
         const BRIDGE: Address = address!("0000000000000000000000000000000001000006");
         // 21_000_000 RBTC = 21_000_000 * 10^18 wei
         let twenty_one_million_rbtc = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
+
+        if let Some(spec) = &self.genesis_spec {
+            return spec.alloc.clone();
+        }
 
         let bridge = GenesisAlloc {
             address: BRIDGE,

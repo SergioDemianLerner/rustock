@@ -1,5 +1,5 @@
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable, Header as RlpHeader};
-use alloy_primitives::{B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use rustock_core::{Header, Transaction};
 use rustock_core::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
 use super::snap;
@@ -158,6 +158,41 @@ pub struct BlockHeadersWithUnclesRequest {
     pub query: BlockHeadersQuery,
 }
 
+/// Ask for the unitrie nodes proving an account, and optionally some of its
+/// storage slots, against a block's state root.
+///
+/// The block is named by **number**, not by state root. A light client holds
+/// headers and can map the one to the other itself, and naming the number
+/// costs the peer nothing it does not already have. The peer gains no
+/// latitude from this: the nodes it returns have to hash up to the state root
+/// the client already holds in its own validated header, so a peer that
+/// serves a different state is caught by the check rather than believed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrieProofRequest {
+    pub id: u64,
+    pub block_number: u64,
+    pub address: Address,
+    /// Storage slots to prove alongside the account. Empty asks for the
+    /// account alone, which is what the modification witness needs.
+    pub storage_keys: Vec<B256>,
+}
+
+/// The nodes proving what [`TrieProofRequest`] asked about.
+///
+/// Each path runs **deepest first**: index 0 is the leaf, the last element is
+/// the state root. An empty path means the trie does not hold the key. It is
+/// never a truncated path -- proving absence in a radix trie needs the
+/// divergence point and its siblings, a different structure, and a shortened
+/// inclusion path would look like one without being one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrieProofResponse {
+    pub id: u64,
+    pub block_number: u64,
+    pub account_proof: Vec<Bytes>,
+    /// One path per requested storage key, in request order.
+    pub storage_proofs: Vec<Vec<Bytes>>,
+}
+
 /// One trunk header and the uncle headers it references.
 ///
 /// In RSK total difficulty advances by the trunk difficulty *plus* every
@@ -301,6 +336,12 @@ pub enum RskMessageType {
     BlockRangeUpdate = 26,
     BlockHeadersWithUnclesRequest = 27,
     BlockHeadersWithUnclesResponse = 28,
+    /// Unitrie proof request/response. Like 26-28 these are beyond anything
+    /// rskj defines, so they go only to a peer that negotiated
+    /// [`RSK_PROOF_VERSION`]; an rskj node would throw out of
+    /// `MessageType.valueOfType` and close the connection.
+    TrieProofRequest = 29,
+    TrieProofResponse = 30,
 }
 
 /// The `rsk` subprotocol version that carries the served block range.
@@ -312,6 +353,14 @@ pub enum RskMessageType {
 /// `MessageType.valueOfType` for any type it does not know, and its netty
 /// handler answers that with `ctx.close()`.
 pub const RSK_RANGE_VERSION: u64 = 63;
+
+/// The `rsk` subprotocol version that carries unitrie proofs.
+///
+/// A node negotiating `64` has agreed to answer [`TrieProofRequest`]. This is
+/// what makes a light client possible at all: without it there is no way to
+/// ask a peer for a specific Merkle branch, and a node that does not execute
+/// blocks has no other route to an account's state.
+pub const RSK_PROOF_VERSION: u64 = 64;
 
 /// The range of blocks a node can serve.
 ///
@@ -377,6 +426,8 @@ pub enum RskSubMessage {
     BlockRangeUpdate(BlockRange),
     BlockHeadersWithUnclesRequest(BlockHeadersWithUnclesRequest),
     BlockHeadersWithUnclesResponse(BlockHeadersWithUnclesResponse),
+    TrieProofRequest(TrieProofRequest),
+    TrieProofResponse(Box<TrieProofResponse>),
     Unknown(u8),
 }
 
@@ -407,6 +458,8 @@ impl RskSubMessage {
             RskSubMessage::BlockHeadersWithUnclesResponse(_) => {
                 RskMessageType::BlockHeadersWithUnclesResponse
             }
+            RskSubMessage::TrieProofRequest(_) => RskMessageType::TrieProofRequest,
+            RskSubMessage::TrieProofResponse(_) => RskMessageType::TrieProofResponse,
             RskSubMessage::Unknown(_) => RskMessageType::Status, // Not used for encoding
         }
     }
@@ -461,6 +514,52 @@ impl RskSubMessage {
                 r.id.encode(&mut params);
                 RlpHeader { list: true, payload_length: query_params.len() }.encode(&mut params);
                 params.extend_from_slice(&query_params);
+
+                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                out.extend_from_slice(&params);
+            }
+            RskSubMessage::TrieProofRequest(r) => {
+                // RLP([id, blockNumber, address, [storageKey...]])
+                let mut keys = Vec::new();
+                for k in &r.storage_keys {
+                    k.encode(&mut keys);
+                }
+
+                let mut params = Vec::new();
+                r.id.encode(&mut params);
+                r.block_number.encode(&mut params);
+                r.address.encode(&mut params);
+                RlpHeader { list: true, payload_length: keys.len() }.encode(&mut params);
+                params.extend_from_slice(&keys);
+
+                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                out.extend_from_slice(&params);
+            }
+            RskSubMessage::TrieProofResponse(r) => {
+                // RLP([id, blockNumber, [node...], [[node...], ...]])
+                let encode_path = |path: &[Bytes], into: &mut Vec<u8>| {
+                    let mut nodes = Vec::new();
+                    for n in path {
+                        n.encode(&mut nodes);
+                    }
+                    RlpHeader { list: true, payload_length: nodes.len() }.encode(into);
+                    into.extend_from_slice(&nodes);
+                };
+
+                let mut account = Vec::new();
+                encode_path(&r.account_proof, &mut account);
+
+                let mut storage = Vec::new();
+                for path in &r.storage_proofs {
+                    encode_path(path, &mut storage);
+                }
+
+                let mut params = Vec::new();
+                r.id.encode(&mut params);
+                r.block_number.encode(&mut params);
+                params.extend_from_slice(&account);
+                RlpHeader { list: true, payload_length: storage.len() }.encode(&mut params);
+                params.extend_from_slice(&storage);
 
                 RlpHeader { list: true, payload_length: params.len() }.encode(out);
                 out.extend_from_slice(&params);
@@ -969,6 +1068,69 @@ impl Decodable for RskMessage {
                     id,
                     query: BlockHeadersQuery { hash, count },
                 })
+            }
+            29 => {
+                let list_h = RlpHeader::decode(&mut body_params)?;
+                let mut list_body = &body_params[..list_h.payload_length];
+                let id = decode_u64_lenient(&mut list_body)?;
+                let block_number = decode_u64_lenient(&mut list_body)?;
+                let address = Address::decode(&mut list_body)?;
+
+                let keys_h = RlpHeader::decode(&mut list_body)?;
+                if list_body.len() < keys_h.payload_length {
+                    return Err(alloy_rlp::Error::Custom("malformed trie-proof key list"));
+                }
+                let mut keys_body = &list_body[..keys_h.payload_length];
+                let mut storage_keys = Vec::new();
+                while !keys_body.is_empty() {
+                    storage_keys.push(B256::decode(&mut keys_body)?);
+                }
+
+                RskSubMessage::TrieProofRequest(TrieProofRequest {
+                    id,
+                    block_number,
+                    address,
+                    storage_keys,
+                })
+            }
+            30 => {
+                let list_h = RlpHeader::decode(&mut body_params)?;
+                let mut list_body = &body_params[..list_h.payload_length];
+                let id = decode_u64_lenient(&mut list_body)?;
+                let block_number = decode_u64_lenient(&mut list_body)?;
+
+                fn decode_path(buf: &mut &[u8]) -> Result<Vec<Bytes>, alloy_rlp::Error> {
+                    let h = RlpHeader::decode(buf)?;
+                    if buf.len() < h.payload_length {
+                        return Err(alloy_rlp::Error::Custom("malformed trie-proof path"));
+                    }
+                    let mut body = &buf[..h.payload_length];
+                    *buf = &buf[h.payload_length..];
+                    let mut nodes = Vec::new();
+                    while !body.is_empty() {
+                        nodes.push(Bytes::decode(&mut body)?);
+                    }
+                    Ok(nodes)
+                }
+
+                let account_proof = decode_path(&mut list_body)?;
+
+                let storage_h = RlpHeader::decode(&mut list_body)?;
+                if list_body.len() < storage_h.payload_length {
+                    return Err(alloy_rlp::Error::Custom("malformed trie-proof storage list"));
+                }
+                let mut storage_body = &list_body[..storage_h.payload_length];
+                let mut storage_proofs = Vec::new();
+                while !storage_body.is_empty() {
+                    storage_proofs.push(decode_path(&mut storage_body)?);
+                }
+
+                RskSubMessage::TrieProofResponse(Box::new(TrieProofResponse {
+                    id,
+                    block_number,
+                    account_proof,
+                    storage_proofs,
+                }))
             }
             28 => {
                 let list_h = RlpHeader::decode(&mut body_params)?;
@@ -1965,5 +2127,97 @@ mod difficulty_encoding_tests {
         status.encode(&mut buf);
         let back = RskStatus::decode(&mut buf.as_slice()).expect("decodes");
         assert_eq!(back.total_difficulty, Some(td));
+    }
+}
+
+#[cfg(test)]
+mod trie_proof_message_tests {
+    use super::*;
+
+    fn roundtrip_msg(m: RskSubMessage) -> RskSubMessage {
+        let mut buf = Vec::new();
+        RskMessage::new(m).encode(&mut buf);
+        RskMessage::decode(&mut buf.as_slice()).expect("decodes").sub_message
+    }
+
+    #[test]
+    fn a_proof_request_round_trips() {
+        let req = TrieProofRequest {
+            id: 42,
+            block_number: 9_407_088,
+            address: Address::repeat_byte(0xAB),
+            storage_keys: vec![B256::repeat_byte(1), B256::repeat_byte(2)],
+        };
+        match roundtrip_msg(RskSubMessage::TrieProofRequest(req.clone())) {
+            RskSubMessage::TrieProofRequest(got) => assert_eq!(got, req),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The account-only form is what the modification witness actually uses,
+    /// so it must survive an empty storage list rather than require a dummy.
+    #[test]
+    fn a_request_with_no_storage_keys_round_trips() {
+        let req = TrieProofRequest {
+            id: 1,
+            block_number: 7,
+            address: Address::ZERO,
+            storage_keys: Vec::new(),
+        };
+        match roundtrip_msg(RskSubMessage::TrieProofRequest(req.clone())) {
+            RskSubMessage::TrieProofRequest(got) => assert_eq!(got, req),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_proof_response_round_trips() {
+        let resp = TrieProofResponse {
+            id: 42,
+            block_number: 9_407_088,
+            account_proof: vec![
+                Bytes::from(vec![0x50, 0x5c, 0xc0]),
+                Bytes::from(vec![0x20; 70]),
+            ],
+            storage_proofs: vec![
+                vec![Bytes::from(vec![0x01, 0x02])],
+                vec![Bytes::from(vec![0x03]), Bytes::from(vec![0x04, 0x05])],
+            ],
+        };
+        match roundtrip_msg(RskSubMessage::TrieProofResponse(Box::new(resp.clone()))) {
+            RskSubMessage::TrieProofResponse(got) => assert_eq!(*got, resp),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// An absent key is an empty path, and must not be confused with a
+    /// response that carries no storage section at all.
+    #[test]
+    fn an_absent_key_round_trips_as_an_empty_path() {
+        let resp = TrieProofResponse {
+            id: 9,
+            block_number: 1,
+            account_proof: Vec::new(),
+            storage_proofs: vec![Vec::new()],
+        };
+        match roundtrip_msg(RskSubMessage::TrieProofResponse(Box::new(resp.clone()))) {
+            RskSubMessage::TrieProofResponse(got) => {
+                assert_eq!(*got, resp);
+                assert!(got.account_proof.is_empty());
+                assert_eq!(got.storage_proofs.len(), 1, "the slot was asked about");
+                assert!(got.storage_proofs[0].is_empty(), "and the trie does not hold it");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_new_types_sit_above_everything_rskj_defines() {
+        assert_eq!(RskMessageType::TrieProofRequest as u8, 29);
+        assert_eq!(RskMessageType::TrieProofResponse as u8, 30);
+        // A const block: the ordering of subprotocol versions is a fact
+        // about the source, so it should fail to compile rather than fail a
+        // test run.
+        const { assert!(RSK_PROOF_VERSION > RSK_RANGE_VERSION) };
     }
 }

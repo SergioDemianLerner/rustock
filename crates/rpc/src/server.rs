@@ -28,6 +28,29 @@ pub trait TxSubmitter: Send + Sync {
     async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> Result<alloy_primitives::B256, String>;
 }
 
+/// Fetching a unitrie proof from a peer, for a node that holds no state of
+/// its own.
+///
+/// A light client follows headers and never executes a block, so it cannot
+/// answer `eth_getProof` from a local trie -- there is none. It asks a peer
+/// instead, and then checks the answer against the state root in the header
+/// it already validated. This trait is the asking half; the checking happens
+/// in `crate::proof`, which is where the header is.
+///
+/// Returned nodes are **unverified**. An implementation that cannot name the
+/// root it would verify against must not pretend to verify.
+#[async_trait::async_trait]
+pub trait ProofFetcher: Send + Sync {
+    /// Raw unitrie node messages: the account path, then one path per
+    /// requested storage key, in order.
+    async fn fetch_proof(
+        &self,
+        block_number: u64,
+        address: alloy_primitives::Address,
+        storage_keys: Vec<alloy_primitives::B256>,
+    ) -> Result<(Vec<alloy_primitives::Bytes>, Vec<Vec<alloy_primitives::Bytes>>), String>;
+}
+
 /// What `eth_gasPrice` needs, without the RPC crate depending on sync.
 pub trait GasPriceSource: Send + Sync {
     /// rskj `GasPriceTracker.getGasPrice()`.
@@ -78,6 +101,10 @@ pub struct RpcState {
     pub config: Arc<ChainConfig>,
     pub tx_submitter: Option<Arc<dyn TxSubmitter>>,
     pub trie_store: Option<Arc<dyn TrieStore>>,
+    /// Set on a light client, which has no `trie_store` to read and must ask
+    /// a peer instead. When both are present the local trie wins: it needs
+    /// no network round trip and no verification.
+    pub proof_fetcher: Option<Arc<dyn ProofFetcher>>,
     pub hardfork_cfg: Option<RskHardforkConfig>,
     pub filter_store: Arc<logs::FilterStore>,
     pub tx_pool: Option<Arc<dyn TxPoolReader>>,
@@ -95,9 +122,11 @@ pub struct RpcState {
     /// Absent, the `mnr_*` namespace answers as it always did.
     pub miner: Option<Arc<dyn mnr::MiningService>>,
     /// Drives `evm_startMining`. Present whenever `miner` is, since it
-    /// is that miner with a loop around it; `evm_mine` reaches the miner
-    /// directly and does not need this.
-    pub auto_miner: Option<Arc<crate::evm::AutoMiner>>,
+    /// is that miner with a loop around it: the pool-polling
+    /// [`AutoMiner`](crate::evm::AutoMiner), or the timed miner when the
+    /// node was started with one. `evm_mine` reaches the miner directly
+    /// and does not need this.
+    pub auto_miner: Option<Arc<dyn crate::evm::BackgroundMiner>>,
     /// Keys the operator supplied with `--wallet-file`, and the only keys
     /// this node will ever sign with.
     ///
@@ -110,6 +139,15 @@ pub struct RpcState {
     pub wallet: Option<Arc<crate::wallet::Wallet>>,
     /// Administrative methods are refused unless the operator enabled them.
     pub admin_enabled: bool,
+    /// Whether `rsk_lastAccountChange` is served.
+    ///
+    /// Off by default. The method bisects an account's trie leaf across
+    /// history, so one call is ten to twenty-four state lookups — and on a
+    /// node that answers from peers, as many round trips. That cost is
+    /// invisible at the call site, which makes it a poor thing to expose to
+    /// the open internet by default: a client in a loop amplifies into real
+    /// traffic without ever looking like it is doing so.
+    pub account_search_enabled: bool,
     /// Burial depth used when an admin collection request names no block.
     pub gc_burial: u64,
     /// States a forced collection must keep beyond the collection root --
@@ -202,7 +240,118 @@ async fn handle_rpc(
     }
 }
 
+/// How many CPU-bound RPC calls may execute at once.
+///
+/// These run on the blocking pool, so the async runtime survives them — but
+/// the machine's cores do not multiply. A batch of several hundred `eth_call`s
+/// would otherwise start several hundred blocking threads, and the node still
+/// has a chain to follow. Small on purpose.
+const HEAVY_CONCURRENCY_DEFAULT: usize = 2;
+
+/// How long a caller waits for a slot before being told the node is busy.
+const HEAVY_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long one call may run before the caller is released.
+///
+/// This frees the *caller*, not the thread: a `spawn_blocking` task cannot be
+/// cancelled, so the work finishes in its own time while the connection and
+/// the response slot are returned. That is the point — the node stays
+/// answerable while a pathological call drains.
+const HEAVY_DEADLINE_DEFAULT: u64 = 15;
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(default)
+}
+
+/// Slots for CPU-bound calls. Tunable with `RUSTOCK_RPC_HEAVY_CONCURRENCY`.
+static HEAVY_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| {
+        tokio::sync::Semaphore::new(env_usize(
+            "RUSTOCK_RPC_HEAVY_CONCURRENCY",
+            HEAVY_CONCURRENCY_DEFAULT,
+        ))
+    });
+
+/// Methods that execute EVM code and so have no useful bound on their cost.
+///
+/// `eth_call` reaches the Bridge precompiles, and some of those are not
+/// bounded by the gas they charge: `getBtcBlockchainBlockHashAtDepth` bills a
+/// flat 20,000 while, on a cache miss, walking one stored block per unit of
+/// depth — a quarter of a million reads at the depths a chain extractor asks
+/// for. Run inline on a runtime worker, a few hundred of those in one batch
+/// stop every timer, the accept loop and block following along with them.
+/// (Mainnet, 2026-11-08: the node went silent mid-batch and did not recover.)
+fn is_heavy(method: &str) -> bool {
+    matches!(method, "eth_call" | "eth_estimateGas")
+}
+
+/// Runs a CPU-bound call off the async runtime, under a concurrency limit and
+/// a deadline.
+///
+/// Three separate protections, because they fail differently. `spawn_blocking`
+/// keeps the call off the worker threads, so the runtime keeps scheduling
+/// whatever else it has to do. The semaphore keeps a batch from converting
+/// itself into hundreds of threads competing with block execution for four
+/// cores. The deadline keeps a caller from holding a connection open on a call
+/// that will not finish soon.
+///
+/// What none of them do is make the call itself cheaper. That belongs in the
+/// Bridge, and cannot be done here: the same walk is reached from
+/// `getBtcTransactionConfirmations`, which is transaction-callable, so
+/// shortening it is a consensus change and has to be argued against mainnet
+/// history rather than patched in the RPC layer.
+async fn dispatch_heavy(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
+    let id = req.id.clone().unwrap_or(Value::Null);
+
+    let permit = match tokio::time::timeout(HEAVY_QUEUE_WAIT, HEAVY_SLOTS.acquire()).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => {
+            return JsonRpcResponse::error(id, INTERNAL_ERROR, "RPC executor unavailable")
+        }
+        Err(_) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                "node busy: too many concurrent eth_call/eth_estimateGas; retry with a smaller batch",
+            )
+        }
+    };
+
+    let st = state.clone();
+    let method = req.method.clone();
+    let params = req.params.clone();
+    let call_id = id.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        // Held for the duration of the call, released when the work really
+        // ends — not when the caller gives up. Otherwise a timed-out call
+        // would free a slot while still burning a core.
+        let _permit = permit;
+        if method == "eth_call" {
+            call::eth_call(call_id, &params, &st)
+        } else {
+            call::eth_estimate_gas(call_id, &params, &st)
+        }
+    });
+
+    let deadline = std::time::Duration::from_secs(
+        env_usize("RUSTOCK_RPC_HEAVY_DEADLINE_SECS", HEAVY_DEADLINE_DEFAULT as usize) as u64,
+    );
+    match tokio::time::timeout(deadline, join).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(_)) => JsonRpcResponse::error(id, INTERNAL_ERROR, "call failed"),
+        Err(_) => JsonRpcResponse::error(
+            id,
+            INTERNAL_ERROR,
+            "call exceeded the node's execution deadline",
+        ),
+    }
+}
+
 async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
+    if is_heavy(&req.method) {
+        return dispatch_heavy(state, req).await;
+    }
+
     let id = req.id.unwrap_or(Value::Null);
     let params = &req.params;
 
@@ -233,9 +382,18 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_pendingTransactions" => eth::eth_pending_transactions(id),
         "eth_bridgeState" => eth::eth_bridge_state(id, state),
         "eth_coinbase" => eth::eth_coinbase(id, &state.miner),
-        "eth_getBlockByHash" => eth::eth_get_block_by_hash(id, params, &state.store),
-        "eth_getBlockByNumber" => eth::eth_get_block_by_number(id, params, &state.store),
-        "eth_getProof" => proof::eth_get_proof(id, params, state),
+        "eth_getBlockByHash" => eth::eth_get_block_by_hash(id, params, &state.store, crate::helpers::chain_id_of(state)),
+        "eth_getBlockByNumber" => eth::eth_get_block_by_number(id, params, &state.store, crate::helpers::chain_id_of(state)),
+        "eth_getProof" => proof::eth_get_proof(id, params, state).await,
+        // Reported as unknown rather than refused, for the reason the
+        // administrative methods are: a node that does not serve this should
+        // look the same as one that never had it.
+        "rsk_lastAccountChange" if !state.account_search_enabled => {
+            JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found")
+        }
+        "rsk_lastAccountChange" => {
+            crate::witness_search::rsk_last_account_change(id, params, state).await
+        }
         "eth_getBlockTransactionCountByHash" => eth::eth_get_block_transaction_count_by_hash(id, params, &state.store),
         "eth_getBlockTransactionCountByNumber" => eth::eth_get_block_transaction_count_by_number(id, params, &state.store),
         "eth_getUncleCountByBlockHash" => eth::eth_get_uncle_count_by_block_hash(id, params, &state.store),
@@ -439,4 +597,54 @@ pub async fn dispatch_rpc(state: &RpcState, req: JsonRpcRequest) -> JsonRpcRespo
 #[cfg(test)]
 pub(crate) async fn dispatch_for_test(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
     dispatch(state, req).await
+}
+
+#[cfg(test)]
+mod heavy_dispatch_tests {
+    use super::*;
+
+    /// The two methods that execute EVM code, and nothing else. Widening this
+    /// is a deliberate act: every method named here gives up a runtime worker
+    /// for a blocking-pool thread and a semaphore slot.
+    #[test]
+    fn only_the_evm_executing_methods_are_heavy() {
+        assert!(is_heavy("eth_call"));
+        assert!(is_heavy("eth_estimateGas"));
+        for m in [
+            "eth_blockNumber",
+            "eth_getBalance",
+            "eth_getBlockByNumber",
+            "net_peerCount",
+            "eth_sendRawTransaction",
+        ] {
+            assert!(!is_heavy(m), "{m} must not be routed through the blocking pool");
+        }
+    }
+
+    /// A zero or unparseable override must not be taken literally.
+    ///
+    /// `Semaphore::new(0)` hands out no permits ever, so every `eth_call`
+    /// would wait out the queue timeout and fail. A typo in an environment
+    /// variable would then look exactly like the outage this guards against.
+    #[test]
+    fn a_zero_or_junk_override_falls_back_to_the_default() {
+        let key = "RUSTOCK_RPC_TEST_ONLY_LIMIT";
+        for bad in ["0", "", "-1", "two", "   "] {
+            std::env::set_var(key, bad);
+            assert_eq!(env_usize(key, 7), 7, "{bad:?} must not survive as a limit");
+        }
+        std::env::set_var(key, "5");
+        assert_eq!(env_usize(key, 7), 5, "a sane value is honoured");
+        std::env::remove_var(key);
+    }
+
+    /// The default has to leave the machine able to follow the chain. Four
+    /// cores, and block execution needs one of them.
+    #[test]
+    fn the_default_concurrency_leaves_room_for_block_execution() {
+        assert!(
+            (1..=4).contains(&HEAVY_CONCURRENCY_DEFAULT),
+            "a large default would reproduce the incident with extra steps"
+        );
+    }
 }

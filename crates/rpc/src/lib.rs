@@ -10,6 +10,7 @@ pub mod metrics_server;
 pub mod admin;
 pub mod net;
 pub mod proof;
+pub mod witness_search;
 pub mod rsk;
 pub mod sco;
 pub mod server;

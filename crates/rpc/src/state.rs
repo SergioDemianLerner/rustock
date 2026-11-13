@@ -156,7 +156,7 @@ pub fn resolve_state_root(block_param: &str, state: &RpcState) -> Option<(TrieNo
     Some((root_node, header))
 }
 
-fn resolve_header(block_param: &str, store: &BlockStore) -> Option<Header> {
+pub fn resolve_header(block_param: &str, store: &BlockStore) -> Option<Header> {
     let head_num = store.head().ok()?
         .and_then(|h| store.header(h).ok().flatten())
         .map(|h| h.number)?;
