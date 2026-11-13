@@ -221,10 +221,6 @@ fn apply_batch(
     rustock_trie::bulk_put::put_bulk(root, &entries, store)
 }
 
-fn account_info_entry(addr: &Address, account: &revm::state::Account) -> (Vec<u8>, Vec<u8>) {
-    account_info_entry_with_witness(addr, account, None, None, None)
-}
-
 /// The account record to write, carrying the modification witness when the
 /// rule is active.
 ///
