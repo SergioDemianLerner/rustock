@@ -695,6 +695,57 @@ impl TrieNode {
         Some(subnodes)
     }
 
+    /// Every node the search for `key` visits, whether or not the key is
+    /// there.
+    ///
+    /// [`nodes_on_path`](Self::nodes_on_path) answers `None` for a key the
+    /// trie does not hold, which is right for an inclusion proof and useless
+    /// for proving the opposite. A client that is told "absent" and given
+    /// nothing has learned only that the peer said so; any peer could deny
+    /// any account by returning an empty array.
+    ///
+    /// This returns the nodes down to the point where the search stops --
+    /// the divergence -- which is exactly what a verifier needs to confirm
+    /// the trie really does end there. Deepest first, like `nodes_on_path`,
+    /// and identical to it whenever the key *is* present.
+    ///
+    /// `None` only when the store could not produce a node the walk needed,
+    /// which is incompleteness rather than absence and must not be reported
+    /// as a proof of either.
+    pub fn nodes_to_divergence(
+        &self,
+        key: &TrieKeySlice,
+        store: &dyn TrieStore,
+    ) -> Option<Vec<TrieNode>> {
+        // The search cannot continue past here: this node's own path is
+        // longer than what is left of the key, or disagrees with it. Either
+        // way this node is where the answer is decided, so it is the proof.
+        if self.shared_path.length() > key.length() {
+            return Some(vec![self.clone()]);
+        }
+        let common = key.common_path(&self.shared_path);
+        if common.length() < self.shared_path.length() {
+            return Some(vec![self.clone()]);
+        }
+        if common.length() == key.length() {
+            return Some(vec![self.clone()]);
+        }
+
+        let bit = key.get(common.length());
+        let child_ref = if bit == 0 { &self.left } else { &self.right };
+        match child_ref.try_resolve(store) {
+            // No child on that side: the trie ends here, and this node says so.
+            Resolution::Absent => Some(vec![self.clone()]),
+            Resolution::Missing(_) => None,
+            Resolution::Found(child) => {
+                let sub_key = key.slice(common.length() + 1, key.length());
+                let mut subnodes = child.nodes_to_divergence(&sub_key, store)?;
+                subnodes.push(self.clone());
+                Some(subnodes)
+            }
+        }
+    }
+
     /// Like [`get`](Self::get), but says which node was missing instead of
     /// answering "no value" when the trie is incomplete.
     ///

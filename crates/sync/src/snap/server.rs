@@ -675,16 +675,21 @@ impl SnapServer {
         let root_bytes = self.trie.get(header.state_root.as_slice())?;
         let root = TrieNode::from_message(&root_bytes, self.trie.as_ref());
 
+        // `nodes_to_divergence` rather than `nodes_on_path`: the two agree
+        // whenever the key is present, and when it is not this one returns
+        // the nodes down to where the search stops, which is what lets the
+        // client verify the absence instead of taking the peer's word for
+        // it. Answering an absent key with an empty array would let any peer
+        // deny any account by sending nothing.
+        //
+        // An empty array now means only one thing: this node could not walk
+        // the path at all, because its store is missing something.
         let path = |key: Vec<u8>| -> Vec<alloy_primitives::Bytes> {
-            match root.nodes_on_path(&TrieKeySlice::from_key(&key), self.trie.as_ref()) {
+            match root.nodes_to_divergence(&TrieKeySlice::from_key(&key), self.trie.as_ref()) {
                 Some(nodes) => nodes
                     .iter()
                     .map(|n| alloy_primitives::Bytes::from(n.to_message(self.trie.as_ref())))
                     .collect(),
-                // Absent. Deliberately not a shortened path: proving absence
-                // in a radix trie needs the divergence point and its
-                // siblings, and a truncated inclusion path would look like a
-                // proof without being one.
                 None => Vec::new(),
             }
         };
