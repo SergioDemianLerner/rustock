@@ -73,7 +73,29 @@ pub fn count_transaction_modifications(
         // balance are the whole of it here.
         let before = &account.original_info;
         let after = &account.info;
-        if before.nonce != after.nonce || before.balance != after.balance {
+        let moved = before.nonce != after.nonce || before.balance != after.balance;
+
+        // Coming into existence is a modification even when nothing moved.
+        //
+        // RSK keeps frontier account rules, so a contract created with no
+        // endowment has nonce 0 and balance 0 -- identical to the default
+        // `original_info` of an account that did not exist. Comparing values
+        // alone therefore counts nothing, while `apply_state_changes` still
+        // writes a brand-new record, and the account would be born with an
+        // unset witness: a light client watching that address would never
+        // learn it had appeared.
+        //
+        // Found by replaying mainnet #9,150,666, where a 34 KB CREATE
+        // deployed 0x4dd5b344AF24e3fEd2901360008A9F61016Fe77F with zero
+        // value and the next transaction in the same block called it.
+        //
+        // `Created` rather than `CreatedLocal` on purpose: revm's
+        // `JournalInner::finalize` also materialises touched, empty,
+        // previously-absent accounts this way, and those get a new trie
+        // record too, so they are equally new and equally worth witnessing.
+        let born = account.status.contains(AccountStatus::Created);
+
+        if moved || born {
             *counts.entry(*addr).or_insert(0) += 1;
         }
     }
@@ -144,6 +166,31 @@ mod tests {
         state.insert(addr, account(4, 0, 9));
         count_transaction_modifications(&state, 0, &mut counts);
         assert!(counts.is_empty());
+    }
+
+    /// Regression for mainnet #9,150,666: a contract created with no
+    /// endowment has nonce 0 and balance 0, identical to the default
+    /// `original_info` of an account that never existed. Comparing values
+    /// alone counts nothing, yet a new record is written -- so the account
+    /// would be born with an unset witness and a client watching it would
+    /// never see it appear.
+    #[test]
+    fn a_contract_created_with_nothing_still_counts() {
+        let addr = Address::repeat_byte(6);
+        let mut counts = ModificationCounts::new();
+
+        let mut created = account(0, 0, 0);
+        created.status |= AccountStatus::Created;
+
+        let mut state = EvmState::default();
+        state.insert(addr, created);
+        count_transaction_modifications(&state, 0, &mut counts);
+
+        assert_eq!(
+            counts.get(&addr),
+            Some(&1),
+            "coming into existence is a modification even when nothing moved"
+        );
     }
 
     #[test]

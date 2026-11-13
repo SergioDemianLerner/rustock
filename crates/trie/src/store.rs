@@ -570,7 +570,7 @@ mod embedding_threshold_tests {
         node.to_message(store)[0] & 0b0000_0010 != 0
     }
 
-    /// RSKIP-TBD test case 7, and the property the whole lazy activation
+    /// RSKIP-TBD test case 8, and the property the whole lazy activation
     /// rests on.
     ///
     /// A child stored separately under the 44-byte bound must stay stored
